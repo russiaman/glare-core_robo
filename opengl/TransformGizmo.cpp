@@ -13,7 +13,10 @@ Copyright Glare Technologies Limited 2026 -
 #include "../maths/mathstypes.h"
 #include "../maths/LineSegment4f.h"
 #include "../graphics/SRGBUtils.h"
+#include <chrono>
 
+
+static const float GIZMO_ANIM_DURATION = 0.2f; // seconds for all hover transitions
 
 static const Colour3f axis_arrows_default_cols[]   = { Colour3f(0.6f,0.2f,0.2f), Colour3f(0.2f,0.6f,0.2f), Colour3f(0.2f,0.2f,0.6f) };
 static const Colour3f axis_arrows_mouseover_cols[] = { Colour3f(1,0.45f,0.3f),   Colour3f(0.3f,1,0.3f),    Colour3f(0.3f,0.45f,1) };
@@ -32,6 +35,27 @@ TransformGizmo::TransformGizmo(OpenGLEngine* engine_, const Vec4f& gizmo_centre)
 	hovered_scale_plane(-1),
 	hovered_translate_plane(-1),
 	center_scale_engaged(false),
+	center_cube_src_matrix(Matrix4f::identity()),
+	center_cube_tgt_matrix(Matrix4f::identity()),
+	center_cube_anim_t(1.0f),
+	center_cube_prev_state(-1),
+	axis_cube_src_side  {0.f, 0.f, 0.f},
+	axis_cube_tgt_side  {0.f, 0.f, 0.f},
+	axis_cube_src_cfrac {0.f, 0.f, 0.f},
+	axis_cube_tgt_cfrac {0.f, 0.f, 0.f},
+	axis_cube_anim_t    {1.f, 1.f, 1.f},
+	axis_cube_prev_state{-1, -1, -1},
+	shaft_src_scale  {1.f, 1.f, 1.f},
+	shaft_tgt_scale  {1.f, 1.f, 1.f},
+	shaft_anim_t     {1.f, 1.f, 1.f},
+	shaft_prev_state {-1, -1, -1},
+	tp_src_size  {0.f, 0.f, 0.f},
+	tp_tgt_size  {0.f, 0.f, 0.f},
+	tp_src_alpha {0.5f, 0.5f, 0.5f},
+	tp_tgt_alpha {0.5f, 0.5f, 0.5f},
+	tp_anim_t    {1.f, 1.f, 1.f},
+	tp_prev_state{-1, -1, -1},
+	last_frame_time(-1.0),
 	grabbed_angle(0),
 	original_grabbed_angle(0),
 	grabbed_arc_angle_offset(0)
@@ -352,9 +376,25 @@ inline static bool clipLineToPlaneBackHalfSpace(const Planef& plane, Vec4f& a, V
 }
 
 
+static float cubicEaseOut(float t) { const float u = 1.f - t; return 1.f - u * u * u; }
+
+static Matrix4f lerpMatrix(const Matrix4f& a, const Matrix4f& b, float t)
+{
+	Matrix4f result;
+	for(int c = 0; c < 4; ++c)
+		result.setColumn(c, a.getColumn(c) + (b.getColumn(c) - a.getColumn(c)) * t);
+	return result;
+}
+
+
 void TransformGizmo::updateGizmoDrawTransform(const Vec4f& new_gizmo_centre)
 {
 	const Vec4f cam_pos = engine->getCurrentScene()->cam_to_world.getColumn(3); // = cam_to_world * Vec4f(0,0,0,1);
+
+	// Compute dt once per frame; used by all animation blocks below.
+	const double now_s = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+	const float  dt    = (last_frame_time < 0.0) ? 0.f : myMin(0.1f, (float)(now_s - last_frame_time));
+	last_frame_time    = now_s;
 
 	const Vec4f gizmo_centre = new_gizmo_centre;
 	const Vec4f cam_to_gizmo = gizmo_centre - cam_pos;
@@ -375,17 +415,41 @@ void TransformGizmo::updateGizmoDrawTransform(const Vec4f& new_gizmo_centre)
 	const float shaft_r = arrow_len * 0.01f;
 	for(int i=0; i<NUM_AXIS_ARROWS; ++i)
 	{
+		const float tgt_scale  = (hovered_axis == i) ? 1.07f : 1.0f;
+		const int   cur_state  = (hovered_axis == i) ? 1 : 0;
+
+		if(shaft_prev_state[i] < 0)
+		{
+			shaft_src_scale[i]  = tgt_scale;
+			shaft_tgt_scale[i]  = tgt_scale;
+			shaft_anim_t[i]     = 1.0f;
+			shaft_prev_state[i] = cur_state;
+		}
+		else if(cur_state != shaft_prev_state[i])
+		{
+			const float e = cubicEaseOut(shaft_anim_t[i]);
+			shaft_src_scale[i]  = shaft_src_scale[i] + (shaft_tgt_scale[i] - shaft_src_scale[i]) * e;
+			shaft_tgt_scale[i]  = tgt_scale;
+			shaft_anim_t[i]     = 0.f;
+			shaft_prev_state[i] = cur_state;
+		}
+		else
+		{
+			shaft_tgt_scale[i] = tgt_scale;
+		}
+
+		shaft_anim_t[i] = myMin(1.f, shaft_anim_t[i] + dt / GIZMO_ANIM_DURATION);
+		const float sc = shaft_src_scale[i] + (shaft_tgt_scale[i] - shaft_src_scale[i]) * cubicEaseOut(shaft_anim_t[i]);
+
 		const Vec4f dir = axis_arrow_segments[i].b - axis_arrow_segments[i].a;
 		const Vec4f dn  = dir * (1.f / dir.length());
 		const Vec4f arb = (std::fabs(dn[0]) < 0.9f) ? Vec4f(1,0,0,0) : Vec4f(0,1,0,0);
 		const Vec4f u   = normalise(crossProduct(dn, arb));
 		const Vec4f v   = crossProduct(dn, u);
-		const float r   = (hovered_axis == i) ? shaft_r * 1.07f : shaft_r;
-		const Vec4f d   = (hovered_axis == i) ? dir * 1.07f : dir;
 		Matrix4f m;
-		m.setColumn(0, u * r);
-		m.setColumn(1, v * r);
-		m.setColumn(2, d);
+		m.setColumn(0, u * (shaft_r * sc));
+		m.setColumn(1, v * (shaft_r * sc));
+		m.setColumn(2, dir * sc);
 		m.setColumn(3, axis_arrow_segments[i].a);
 		axis_arrow_objects[i]->ob_to_world_matrix = m;
 		engine->updateObjectTransformData(*axis_arrow_objects[i]);
@@ -406,27 +470,62 @@ void TransformGizmo::updateGizmoDrawTransform(const Vec4f& new_gizmo_centre)
 		{
 			const Vec4f dir_ws = axis_arrow_segments[i].b - axis_arrow_segments[i].a;
 
-			float side, center_frac;
+			// Target state: 0=default, 1=axis-hover, 2=cube-hover.
+			float tgt_side, tgt_cfrac;
+			int   cur_state;
 			if(hovered_axis == i)
 			{
-				// Axis hover: cube scales with the shaft from gizmo origin —
-				// both its position and size grow by the same factor.
-				side        = cube_ws_side * 1.07f;
-				center_frac = cx_mid * 1.07f;
+				tgt_side  = cube_ws_side * 1.07f;
+				tgt_cfrac = cx_mid * 1.07f;
+				cur_state = 1;
 			}
 			else if(hovered_cube == i)
 			{
-				// Cube hover only: grows in place relative to its own center.
-				side        = cube_ws_side * 1.25f;
-				center_frac = cx_mid;
+				tgt_side  = cube_ws_side * 1.25f;
+				tgt_cfrac = cx_mid;
+				cur_state = 2;
 			}
 			else
 			{
-				side        = cube_ws_side;
-				center_frac = cx_mid;
+				tgt_side  = cube_ws_side;
+				tgt_cfrac = cx_mid;
+				cur_state = 0;
 			}
 
-			const Vec4f cube_center_ws = axis_arrow_segments[i].a + dir_ws * center_frac;
+			if(axis_cube_prev_state[i] < 0)
+			{
+				// First frame: snap to target, no animation.
+				axis_cube_src_side[i]   = tgt_side;
+				axis_cube_tgt_side[i]   = tgt_side;
+				axis_cube_src_cfrac[i]  = tgt_cfrac;
+				axis_cube_tgt_cfrac[i]  = tgt_cfrac;
+				axis_cube_anim_t[i]     = 1.0f;
+				axis_cube_prev_state[i] = cur_state;
+			}
+			else if(cur_state != axis_cube_prev_state[i])
+			{
+				// State changed: snapshot current interpolated pos using stored OLD target.
+				const float e = cubicEaseOut(axis_cube_anim_t[i]);
+				axis_cube_src_side[i]   = axis_cube_src_side[i]  + (axis_cube_tgt_side[i]  - axis_cube_src_side[i])  * e;
+				axis_cube_src_cfrac[i]  = axis_cube_src_cfrac[i] + (axis_cube_tgt_cfrac[i] - axis_cube_src_cfrac[i]) * e;
+				axis_cube_tgt_side[i]   = tgt_side;
+				axis_cube_tgt_cfrac[i]  = tgt_cfrac;
+				axis_cube_anim_t[i]     = 0.f;
+				axis_cube_prev_state[i] = cur_state;
+			}
+			else
+			{
+				// Same state: keep target fresh (camera zoom changes cube_ws_side).
+				axis_cube_tgt_side[i]  = tgt_side;
+				axis_cube_tgt_cfrac[i] = tgt_cfrac;
+			}
+
+			axis_cube_anim_t[i] = myMin(1.f, axis_cube_anim_t[i] + dt / GIZMO_ANIM_DURATION);
+			const float e = cubicEaseOut(axis_cube_anim_t[i]);
+			const float side  = axis_cube_src_side[i]  + (axis_cube_tgt_side[i]  - axis_cube_src_side[i])  * e;
+			const float cfrac = axis_cube_src_cfrac[i] + (axis_cube_tgt_cfrac[i] - axis_cube_src_cfrac[i]) * e;
+
+			const Vec4f cube_center_ws = axis_arrow_segments[i].a + dir_ws * cfrac;
 			const float half = side * 0.5f;
 
 			Matrix4f m;
@@ -440,44 +539,72 @@ void TransformGizmo::updateGizmoDrawTransform(const Vec4f& new_gizmo_centre)
 	}
 
 
-	//----------------------- Update plane handles (2-axis scale) -----------------------
+	//----------------------- Update plane handles (2-axis translate), animated -----------------------
 	{
-		// Plane i uses these two axis segments: {Y,Z}, {X,Z}, {X,Y}
 		static const int plane_axes[3][2] = {{1,2},{0,2},{0,1}};
 		const float plane_size   = arrow_len * 0.156f;
-		const float outer_offset = arrow_len * 0.42f;  // outer planes start here along each axis
+		const float outer_offset = arrow_len * 0.42f;
+		const float base_size    = plane_size * 0.60f;
 
 		for(int i = 0; i < NUM_PLANES; ++i)
 		{
+			const float tgt_size  = (hovered_translate_plane == i) ? base_size * 1.2f : base_size;
+			const float tgt_alpha = (hovered_translate_plane == i) ? 1.0f : 0.5f;
+			const int   cur_state = (hovered_translate_plane == i) ? 1 : 0;
+
+			if(tp_prev_state[i] < 0)
+			{
+				tp_src_size[i]  = tp_tgt_size[i]  = tgt_size;
+				tp_src_alpha[i] = tp_tgt_alpha[i] = tgt_alpha;
+				tp_anim_t[i]    = 1.f;
+				tp_prev_state[i] = cur_state;
+			}
+			else if(cur_state != tp_prev_state[i])
+			{
+				const float e    = cubicEaseOut(tp_anim_t[i]);
+				tp_src_size[i]   = tp_src_size[i]  + (tp_tgt_size[i]  - tp_src_size[i])  * e;
+				tp_src_alpha[i]  = tp_src_alpha[i] + (tp_tgt_alpha[i] - tp_src_alpha[i]) * e;
+				tp_tgt_size[i]   = tgt_size;
+				tp_tgt_alpha[i]  = tgt_alpha;
+				tp_anim_t[i]     = 0.f;
+				tp_prev_state[i] = cur_state;
+			}
+			else
+			{
+				tp_tgt_size[i]  = tgt_size;
+				tp_tgt_alpha[i] = tgt_alpha;
+			}
+
+			tp_anim_t[i] = myMin(1.f, tp_anim_t[i] + dt / GIZMO_ANIM_DURATION);
+			const float e     = cubicEaseOut(tp_anim_t[i]);
+			const float size  = tp_src_size[i]  + (tp_tgt_size[i]  - tp_src_size[i])  * e;
+			const float alpha = tp_src_alpha[i] + (tp_tgt_alpha[i] - tp_src_alpha[i]) * e;
+
 			const int ai = plane_axes[i][0], bi = plane_axes[i][1];
 			const Vec4f dir_a = axis_arrow_segments[ai].b - axis_arrow_segments[ai].a;
 			const Vec4f dir_b = axis_arrow_segments[bi].b - axis_arrow_segments[bi].a;
 			const Vec4f unit_a = dir_a * (1.f / dir_a.length());
 			const Vec4f unit_b = dir_b * (1.f / dir_b.length());
-
 			Vec4f normal = crossProduct(unit_a, unit_b);
 			if(dot(normal, cam_pos - gizmo_centre) < 0.f)
 				normal = normal * -1.f;
 
-			// Outer plane (offset along both axes, pivot at its center)
-			{
-				const float base_size = plane_size * 0.60f; // 40% smaller than inner
-				const float size = (hovered_translate_plane == i) ? base_size * 1.25f : base_size;
-				// Center stays fixed; corner shifts so the plane scales from its center.
-				const Vec4f center = gizmo_centre + unit_a * (outer_offset + base_size * 0.5f) + unit_b * (outer_offset + base_size * 0.5f);
-				const Vec4f corner = center - unit_a * (size * 0.5f) - unit_b * (size * 0.5f);
-				Matrix4f m;
-				m.setColumn(0, unit_a * size);
-				m.setColumn(1, unit_b * size);
-				m.setColumn(2, normal);
-				m.setColumn(3, corner);
-				translate_plane_objects[i]->ob_to_world_matrix = m;
-				engine->updateObjectTransformData(*translate_plane_objects[i]);
-			}
+			// Center fixed; corner shifts so plane scales from its center.
+			const Vec4f center = gizmo_centre + unit_a * (outer_offset + base_size * 0.5f) + unit_b * (outer_offset + base_size * 0.5f);
+			const Vec4f corner = center - unit_a * (size * 0.5f) - unit_b * (size * 0.5f);
+			Matrix4f m;
+			m.setColumn(0, unit_a * size);
+			m.setColumn(1, unit_b * size);
+			m.setColumn(2, normal);
+			m.setColumn(3, corner);
+			translate_plane_objects[i]->ob_to_world_matrix = m;
+			translate_plane_objects[i]->materials[0].alpha = alpha;
+			engine->updateObjectTransformData(*translate_plane_objects[i]);
+			engine->objectMaterialsUpdated(*translate_plane_objects[i]);
 		}
 	}
 
-	//----------------------- Update center scale cube (morphs into hovered plane shape) -----------------------
+	//----------------------- Update center scale cube (morphs into hovered plane shape, animated) -----------------------
 	{
 		static const int plane_axes[3][2] = {{1,2},{0,2},{0,1}};
 		const float cube_side = arrow_len * 0.06f;
@@ -487,43 +614,66 @@ void TransformGizmo::updateGizmoDrawTransform(const Vec4f& new_gizmo_centre)
 		const float sy = cam_to_gizmo[1] > 0 ? -1.f : 1.f;
 		const float sz = cam_to_gizmo[2] > 0 ? -1.f : 1.f;
 
+		// Compute target matrix for the current hover state.
+		Matrix4f tgt_matrix;
 		if(hovered_scale_plane >= 0)
 		{
-			// Morph into a thin slab matching the hovered plane's orientation.
-			// Inner corner (gizmo_centre) is the far-from-camera pivot; slab extends toward cam.
-			const int i  = hovered_scale_plane;
-			const int ai = plane_axes[i][0], bi = plane_axes[i][1];
-			const Vec4f dir_a = axis_arrow_segments[ai].b - axis_arrow_segments[ai].a;
-			const Vec4f dir_b = axis_arrow_segments[bi].b - axis_arrow_segments[bi].a;
-			const Vec4f unit_a = dir_a * (1.f / dir_a.length());
-			const Vec4f unit_b = dir_b * (1.f / dir_b.length());
-			Vec4f normal = crossProduct(unit_a, unit_b);
+			const int i = hovered_scale_plane;
+			// Unit vectors along each world axis (direction away from camera, same as shafts).
+			const Vec4f unit_axes[3] = {
+				normalise(axis_arrow_segments[0].b - axis_arrow_segments[0].a),
+				normalise(axis_arrow_segments[1].b - axis_arrow_segments[1].a),
+				normalise(axis_arrow_segments[2].b - axis_arrow_segments[2].a),
+			};
+			Vec4f normal = crossProduct(unit_axes[plane_axes[i][0]], unit_axes[plane_axes[i][1]]);
 			if(dot(normal, cam_pos - gizmo_centre) < 0.f)
 				normal = normal * -1.f;
-
-			const float slab_size = arrow_len * 0.156f * 1.25f; // hover scale applied
+			const float slab_size = arrow_len * 0.156f * 1.25f;
 			const float thickness = cube_side * 0.18f;
-			// mesh origin at gizmo_centre, centered along normal
-			const Vec4f corner = gizmo_centre - normal * (thickness * 0.5f);
-			Matrix4f m;
-			m.setColumn(0, unit_a * slab_size);
-			m.setColumn(1, unit_b * slab_size);
-			m.setColumn(2, normal * thickness);
-			m.setColumn(3, corner);
-			center_scale_cube_object->ob_to_world_matrix = m;
+			// Column i = thin (normal) axis; other columns = slab axes in their natural world-axis slots.
+			// This aligns with the cube matrix (col0=X, col1=Y, col2=Z) so lerp produces a clean squish.
+			for(int c = 0; c < 3; ++c)
+				tgt_matrix.setColumn(c, (c == i) ? (normal * thickness) : (unit_axes[c] * slab_size));
+			tgt_matrix.setColumn(3, gizmo_centre - normal * (thickness * 0.5f));
 		}
 		else
 		{
-			// Default cube: far corner at gizmo_centre, grows toward camera.
-			// Center-hover: same shape but 1.25x larger.
 			const float side = (hovered_cube == 3) ? cube_side * 1.6f : cube_side;
-			Matrix4f m;
-			m.setColumn(0, Vec4f(sx * side, 0, 0, 0));
-			m.setColumn(1, Vec4f(0, sy * side, 0, 0));
-			m.setColumn(2, Vec4f(0, 0, sz * side, 0));
-			m.setColumn(3, gizmo_centre);
-			center_scale_cube_object->ob_to_world_matrix = m;
+			tgt_matrix.setColumn(0, Vec4f(sx * side, 0, 0, 0));
+			tgt_matrix.setColumn(1, Vec4f(0, sy * side, 0, 0));
+			tgt_matrix.setColumn(2, Vec4f(0, 0, sz * side, 0));
+			tgt_matrix.setColumn(3, gizmo_centre);
 		}
+
+		// State: -1=uninit, 0=default cube, 1=white cube, 2+i=slab plane i.
+		const int cur_state = (hovered_scale_plane >= 0) ? (2 + hovered_scale_plane) :
+		                      (hovered_cube == 3)        ? 1 : 0;
+
+		if(center_cube_prev_state < 0)
+		{
+			// First frame: snap to target, no animation.
+			center_cube_src_matrix = tgt_matrix;
+			center_cube_tgt_matrix = tgt_matrix;
+			center_cube_anim_t     = 1.0f;
+			center_cube_prev_state = cur_state;
+		}
+		else if(cur_state != center_cube_prev_state)
+		{
+			// State changed: start transition from current interpolated position.
+			center_cube_src_matrix = lerpMatrix(center_cube_src_matrix, center_cube_tgt_matrix, center_cube_anim_t);
+			center_cube_tgt_matrix = tgt_matrix;
+			center_cube_anim_t     = 0.f;
+			center_cube_prev_state = cur_state;
+		}
+		else
+		{
+			// Same state but gizmo may have moved — keep target fresh.
+			center_cube_tgt_matrix = tgt_matrix;
+		}
+
+		center_cube_anim_t = myMin(1.f, center_cube_anim_t + dt / GIZMO_ANIM_DURATION);
+
+		center_scale_cube_object->ob_to_world_matrix = lerpMatrix(center_cube_src_matrix, center_cube_tgt_matrix, cubicEaseOut(center_cube_anim_t));
 		engine->updateObjectTransformData(*center_scale_cube_object);
 	}
 

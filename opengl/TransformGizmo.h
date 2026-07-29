@@ -9,6 +9,7 @@ Copyright Glare Technologies Limited 2026 -
 #include "../maths/Vec4f.h"
 #include "../maths/vec2.h"
 #include "../maths/LineSegment4f.h"
+#include "../maths/Matrix4f.h"
 #include "../utils/Reference.h"
 #include <vector>
 
@@ -119,6 +120,37 @@ private:
 	int   hovered_scale_plane;      // -1 = none, [0,3) = inner scale plane handle (0=YZ,1=XZ,2=XY)
 	int   hovered_translate_plane;  // -1 = none, [0,3) = outer translate plane handle
 	bool  center_scale_engaged;     // true once the center cube has been hovered; required before scale-plane morph activates
+
+	// Center cube animation state
+	Matrix4f center_cube_src_matrix;
+	Matrix4f center_cube_tgt_matrix;
+	float    center_cube_anim_t;       // [0..1]
+	int      center_cube_prev_state;   // -1=uninit, 0=default, 1=white, 2+i=slab i
+
+	// Per-axis cube tip animation state
+	float axis_cube_src_side[NUM_AXIS_ARROWS];
+	float axis_cube_tgt_side[NUM_AXIS_ARROWS];
+	float axis_cube_src_cfrac[NUM_AXIS_ARROWS];
+	float axis_cube_tgt_cfrac[NUM_AXIS_ARROWS];
+	float axis_cube_anim_t[NUM_AXIS_ARROWS];     // [0..1]
+	int   axis_cube_prev_state[NUM_AXIS_ARROWS]; // -1=uninit, 0=default, 1=axis-hover, 2=cube-hover
+
+	// Per-axis shaft animation state (scale factor: 1.0 default, 1.07 hovered)
+	float shaft_src_scale[NUM_AXIS_ARROWS];
+	float shaft_tgt_scale[NUM_AXIS_ARROWS];
+	float shaft_anim_t[NUM_AXIS_ARROWS];         // [0..1]
+	int   shaft_prev_state[NUM_AXIS_ARROWS];     // -1=uninit, 0=default, 1=hovered
+
+	// Translate plane animation state (size + alpha)
+	float tp_src_size[NUM_PLANES];
+	float tp_tgt_size[NUM_PLANES];
+	float tp_src_alpha[NUM_PLANES];
+	float tp_tgt_alpha[NUM_PLANES];
+	float tp_anim_t[NUM_PLANES];                 // [0..1]
+	int   tp_prev_state[NUM_PLANES];             // -1=uninit, 0=default, 1=hovered
+
+	double last_frame_time;            // steady_clock seconds; -1.0 on first frame
+
 	Vec4f grabbed_point_ws;
 	Vec4f ob_origin_at_grab;
 	float grabbed_angle;

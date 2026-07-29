@@ -16,7 +16,8 @@ Copyright Glare Technologies Limited 2026 -
 #include <chrono>
 
 
-static const float GIZMO_ANIM_DURATION = 0.2f; // seconds for all hover transitions
+static const float GIZMO_ANIM_DURATION  = 0.2f; // seconds for all hover transitions
+static const int   GRABBED_CENTER_SCALE = 6;    // grabbed_axis value for uniform scale drag (0..2=translate, 3..5=rotation)
 
 static const Colour3f axis_arrows_default_cols[]   = { Colour3f(0.6f,0.2f,0.2f), Colour3f(0.2f,0.6f,0.2f), Colour3f(0.2f,0.2f,0.6f) };
 static const Colour3f axis_arrows_mouseover_cols[] = { Colour3f(1,0.45f,0.3f),   Colour3f(0.3f,1,0.3f),    Colour3f(0.3f,0.45f,1) };
@@ -58,7 +59,9 @@ TransformGizmo::TransformGizmo(OpenGLEngine* engine_, const Vec4f& gizmo_centre)
 	last_frame_time(-1.0),
 	grabbed_angle(0),
 	original_grabbed_angle(0),
-	grabbed_arc_angle_offset(0)
+	grabbed_arc_angle_offset(0),
+	grabbed_scale_center_px(Vec2f(0.f)),
+	grabbed_scale_ref_dist(1.f)
 {
 	{
 		static const Vec4f axis_tip_pos[3] = { Vec4f(1,0,0,1), Vec4f(0,1,0,1), Vec4f(0,0,1,1) };
@@ -802,7 +805,22 @@ int TransformGizmo::mouseOverAxisArrowOrRotArc(const Vec2f& px, Vec4f& closest_w
 
 bool TransformGizmo::mousePressed(const Vec2f& px, const Vec4f& ob_pos_ws, GizmoDelegateInterface* delegate)
 {
-	const int axis = mouseOverAxisArrowOrRotArc(px,  grabbed_point_ws);
+	// Center scale cube has highest grab priority (matches hover priority in updateMouseoverHighlight).
+	if(hovered_cube == 3)
+	{
+		grabbed_axis      = GRABBED_CENTER_SCALE;
+		ob_origin_at_grab = ob_pos_ws;
+
+		// Record gizmo center in screen space and mouse-to-center distance as scale reference.
+		Vec2f center_px;
+		grabbed_scale_center_px = worldToPixel(axis_arrow_segments[0].a, engine, center_px) ? center_px : px;
+		grabbed_scale_ref_dist  = myMax(1.f, (px - grabbed_scale_center_px).length());
+
+		delegate->onGrabStart(false);
+		return true;
+	}
+
+	const int axis = mouseOverAxisArrowOrRotArc(px, grabbed_point_ws);
 	if(axis < 0)
 		return false;
 
@@ -882,6 +900,15 @@ bool TransformGizmo::mouseMoved(const Vec2f& px, const Vec4f& ob_pos_ws, GizmoDe
 			const Vec4f total_translation = tentative - ob_origin_at_grab;
 			delegate->onTranslationDrag(total_translation, tentative);
 		}
+	}
+	else if(grabbed_axis == GRABBED_CENTER_SCALE)
+	{
+		// Uniform scale drag: scale factor = ratio of current to grab screen-space mouse→center distance.
+		// Drag away from gizmo center = larger; drag toward = smaller.
+		const float cur_dist    = myMax(1.f, (px - grabbed_scale_center_px).length());
+		const float total_scale = cur_dist / grabbed_scale_ref_dist;
+		updateGizmoDrawTransform(ob_origin_at_grab);
+		delegate->onUniformScaleDrag(total_scale);
 	}
 	else
 	{

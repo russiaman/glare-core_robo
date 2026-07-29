@@ -42,6 +42,10 @@ public:
 	// is_rotation: true if grabbing a rotation arc, false if a translation arrow.
 	virtual void onGrabStart(bool is_rotation) = 0;
 
+	// Called each mouseMoved tick during a uniform scale drag.
+	// total_scale is the cumulative scale factor since the handle was grabbed (1.0 = no change).
+	virtual void onUniformScaleDrag(float total_scale) = 0;
+
 	// Called when the user releases the mouse after a drag.
 	virtual void onGrabEnd() = 0;
 
@@ -156,4 +160,7 @@ private:
 	float grabbed_angle;
 	float original_grabbed_angle;
 	float grabbed_arc_angle_offset;
+
+	Vec2f grabbed_scale_center_px;  // screen-space gizmo center when center scale was grabbed
+	float grabbed_scale_ref_dist;   // screen-space mouse→center distance at grab start
 };

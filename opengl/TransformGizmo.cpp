@@ -17,7 +17,8 @@ Copyright Glare Technologies Limited 2026 -
 
 
 static const float GIZMO_ANIM_DURATION  = 0.2f; // seconds for all hover transitions
-static const int   GRABBED_CENTER_SCALE = 6;    // grabbed_axis value for uniform scale drag (0..2=translate, 3..5=rotation)
+static const int   GRABBED_CENTER_SCALE      = 6; // grabbed_axis: uniform scale (0..2=translate, 3..5=rotation)
+static const int   GRABBED_SCALE_PLANE_BASE  = 7; // grabbed_axis 7/8/9 = two-axis scale plane 0/1/2
 
 static const Colour3f axis_arrows_default_cols[]   = { Colour3f(0.6f,0.2f,0.2f), Colour3f(0.2f,0.6f,0.2f), Colour3f(0.2f,0.2f,0.6f) };
 static const Colour3f axis_arrows_mouseover_cols[] = { Colour3f(1,0.45f,0.3f),   Colour3f(0.3f,1,0.3f),    Colour3f(0.3f,0.45f,1) };
@@ -807,11 +808,19 @@ bool TransformGizmo::mousePressed(const Vec2f& px, const Vec4f& ob_pos_ws, Gizmo
 	// Center scale cube has highest grab priority (matches hover priority in updateMouseoverHighlight).
 	if(hovered_cube == 3)
 	{
-		grabbed_axis      = GRABBED_CENTER_SCALE;
-		ob_origin_at_grab = ob_pos_ws;
-
+		grabbed_axis           = GRABBED_CENTER_SCALE;
+		ob_origin_at_grab      = ob_pos_ws;
 		grabbed_scale_mouse_px = px;
+		delegate->onGrabStart(false);
+		return true;
+	}
 
+	// Two-axis scale plane (only active when center was previously engaged).
+	if(hovered_scale_plane >= 0 && center_scale_engaged)
+	{
+		grabbed_axis           = GRABBED_SCALE_PLANE_BASE + hovered_scale_plane;
+		ob_origin_at_grab      = ob_pos_ws;
+		grabbed_scale_mouse_px = px;
 		delegate->onGrabStart(false);
 		return true;
 	}
@@ -908,6 +917,17 @@ bool TransformGizmo::mouseMoved(const Vec2f& px, const Vec4f& ob_pos_ws, GizmoDe
 		grabbed_scale_mouse_px = px;
 		updateGizmoDrawTransform(ob_origin_at_grab);
 		delegate->onUniformScaleDrag(delta_scale);
+	}
+	else if(grabbed_axis >= GRABBED_SCALE_PLANE_BASE)
+	{
+		// Two-axis scale drag: same direction convention as uniform scale.
+		const int   plane_index = grabbed_axis - GRABBED_SCALE_PLANE_BASE;
+		const float dx          = px.x - grabbed_scale_mouse_px.x;
+		const float dy          = -(px.y - grabbed_scale_mouse_px.y);
+		const float delta_scale = std::exp((dx + dy) * 0.007f);
+		grabbed_scale_mouse_px  = px;
+		updateGizmoDrawTransform(ob_origin_at_grab);
+		delegate->onTwoAxisScaleDrag(plane_index, delta_scale);
 	}
 	else
 	{
@@ -1102,9 +1122,25 @@ void TransformGizmo::updateMouseoverHighlight(const Vec2f& px)
 	}
 
 	// Priority: virtual-center-zone > cube tips > outer planes > scale planes (only if center was engaged) > shafts/arcs.
-	hovered_cube          = mouseOverCubeHandle(px);
+	// Exception: when center_scale_engaged is already true, scale-plane slabs take priority over the centre-cube hit
+	// zone so the 14-px screen-space threshold doesn't steal clicks from slabs that originate at the gizmo origin.
+	hovered_cube          = -1;
 	hovered_scale_plane   = -1;
 	hovered_translate_plane = -1;
+
+	if(center_scale_engaged)
+	{
+		hovered_scale_plane = mouseOverScalePlaneHandle(px);
+		if(hovered_scale_plane >= 0)
+		{
+			hovered_axis = -1;
+			center_scale_cube_object->materials[0].albedo_linear_rgb = toLinearSRGB(axis_arrows_mouseover_cols[hovered_scale_plane]);
+			engine->objectMaterialsUpdated(*center_scale_cube_object);
+			return;
+		}
+	}
+
+	hovered_cube = mouseOverCubeHandle(px);
 
 	if(hovered_cube == 3)
 	{

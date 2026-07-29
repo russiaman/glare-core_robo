@@ -46,6 +46,11 @@ public:
 	// delta_scale is the multiplicative scale change since the last call (1.0 = no change).
 	virtual void onUniformScaleDrag(float delta_scale) = 0;
 
+	// Called each mouseMoved tick during a two-axis scale drag.
+	// plane_index: 0=YZ (X fixed), 1=XZ (Y fixed), 2=XY (Z fixed).
+	// delta_scale is the multiplicative scale change since the last call (1.0 = no change).
+	virtual void onTwoAxisScaleDrag(int plane_index, float delta_scale) = 0;
+
 	// Called when the user releases the mouse after a drag.
 	virtual void onGrabEnd() = 0;
 

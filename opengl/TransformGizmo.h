@@ -110,7 +110,6 @@ private:
 	GLObjectRef    rot_handle_arc_objects[3];
 
 	static const int NUM_PLANES = 3;
-	GLObjectRef    scale_plane_objects[NUM_PLANES];     // Uniform-scale handles at origin (0=YZ, 1=XZ, 2=XY). Currently disabled — not added to scene.
 	GLObjectRef    translate_plane_objects[NUM_PLANES]; // 2-axis translate handles, offset along both axes.
 	GLObjectRef    center_scale_cube_object;            // Single cube at gizmo centre; morphs into the hovered scale-plane shape on hover.
 

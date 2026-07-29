@@ -87,22 +87,8 @@ TransformGizmo::TransformGizmo(OpenGLEngine* engine_, const Vec4f& gizmo_centre)
 		engine->addObject(center_scale_cube_object);
 	}
 
-	// Inner scale plane handles disabled — replaced by center_scale_cube_object morphing.
-	auto quad_meshdata = MeshPrimitiveBuilding::makeUnitQuadMesh(*engine->vert_buf_allocator);
-	/* for(int i = 0; i < NUM_PLANES; ++i)
-	{
-		scale_plane_objects[i] = engine->allocateObject();
-		scale_plane_objects[i]->mesh_data = quad_meshdata;
-		scale_plane_objects[i]->materials.resize(1);
-		scale_plane_objects[i]->materials[0].albedo_linear_rgb = toLinearSRGB(axis_arrows_default_cols[i]);
-		scale_plane_objects[i]->materials[0].alpha = 0.5f;
-		scale_plane_objects[i]->materials[0].alpha_blend = true;
-		scale_plane_objects[i]->always_visible = true;
-		scale_plane_objects[i]->ob_to_world_matrix = Matrix4f::identity();
-		engine->addObject(scale_plane_objects[i]);
-	} */
-
 	// Outer plane handles: same colours, offset along both axes
+	auto quad_meshdata = MeshPrimitiveBuilding::makeUnitQuadMesh(*engine->vert_buf_allocator);
 	for(int i = 0; i < NUM_PLANES; ++i)
 	{
 		translate_plane_objects[i] = engine->allocateObject();
@@ -131,9 +117,6 @@ TransformGizmo::~TransformGizmo()
 	for(int i=0; i<NUM_AXIS_ARROWS; ++i)
 		checkRemoveObAndSetRefToNull(*engine, rot_handle_arc_objects[i]);
 
-
-	for(int i=0; i<NUM_PLANES; ++i)
-		checkRemoveObAndSetRefToNull(*engine, scale_plane_objects[i]); // null-ref no-op (scale planes are currently disabled)
 
 	for(int i=0; i<NUM_PLANES; ++i)
 		checkRemoveObAndSetRefToNull(*engine, translate_plane_objects[i]);
@@ -464,19 +447,6 @@ void TransformGizmo::updateGizmoDrawTransform(const Vec4f& new_gizmo_centre)
 			Vec4f normal = crossProduct(unit_a, unit_b);
 			if(dot(normal, cam_pos - gizmo_centre) < 0.f)
 				normal = normal * -1.f;
-
-			// Inner scale planes disabled — see center_scale_cube_object below.
-			/* {
-				const float hover_scale = (hovered_scale_plane == i || hovered_cube == 3) ? 1.25f : 1.0f;
-				const float size = plane_size * hover_scale;
-				Matrix4f m;
-				m.setColumn(0, unit_a * size);
-				m.setColumn(1, unit_b * size);
-				m.setColumn(2, normal);
-				m.setColumn(3, gizmo_centre);
-				scale_plane_objects[i]->ob_to_world_matrix = m;
-				engine->updateObjectTransformData(*scale_plane_objects[i]);
-			} */
 
 			// Outer plane (offset along both axes, pivot at its center)
 			{
@@ -940,7 +910,6 @@ void TransformGizmo::updateMouseoverHighlight(const Vec2f& px)
 	engine->objectMaterialsUpdated(*center_scale_cube_object);
 	for(int i = 0; i < NUM_PLANES; ++i)
 	{
-		// scale_plane_objects disabled — no reset needed.
 		translate_plane_objects[i]->materials[0].albedo_linear_rgb = toLinearSRGB(axis_arrows_default_cols[i]);
 		engine->objectMaterialsUpdated(*translate_plane_objects[i]);
 	}

@@ -91,15 +91,35 @@ private:
 	static bool worldToPixel(const Vec4f& ws_pos, OpenGLEngine* engine, Vec2f& px_out);
 	Vec4f pointOnLineWorldSpace(const Vec4f& p_a_ws, const Vec4f& p_b_ws, const Vec2f& px) const;
 
+	// Returns [0,3) for axis cube tip hover, 3 for center cube hover, -1 for none.
+	int mouseOverCubeHandle(const Vec2f& px) const;
+
+	// Returns [0,3) for inner plane handle hover (0=YZ, 1=XZ, 2=XY), -1 for none.
+	int mouseOverScalePlaneHandle(const Vec2f& px) const;
+
+	// Returns [0,3) for translate plane handle hover, -1 for none.
+	int mouseOverTranslatePlaneHandle(const Vec2f& px) const;
+
 	OpenGLEngine* engine;
 
 	static const int NUM_AXIS_ARROWS = 3;
 	LineSegment4f  axis_arrow_segments[NUM_AXIS_ARROWS];
-	GLObjectRef    axis_arrow_objects[NUM_AXIS_ARROWS];
+	GLObjectRef    axis_arrow_objects[NUM_AXIS_ARROWS]; // Shaft cylinders (translate handles).
+	GLObjectRef    axis_scale_cube_objects[NUM_AXIS_ARROWS];  // Per-axis scale handles (cube tips).
 	std::vector<LineSegment4f> rot_handle_lines[3];
 	GLObjectRef    rot_handle_arc_objects[3];
 
+	static const int NUM_PLANES = 3;
+	GLObjectRef    scale_plane_objects[NUM_PLANES];     // Uniform-scale handles at origin (0=YZ, 1=XZ, 2=XY). Currently disabled — not added to scene.
+	GLObjectRef    translate_plane_objects[NUM_PLANES]; // 2-axis translate handles, offset along both axes.
+	GLObjectRef    center_scale_cube_object;            // Single cube at gizmo centre; morphs into the hovered scale-plane shape on hover.
+
 	int   grabbed_axis;             // -1 = none, [0,3) = translation, [3,6) = rotation
+	int   hovered_axis;             // -1 = none; [0,3) shaft, [3,6) arc; excludes cube/plane hits
+	int   hovered_cube;             // -1 = none, [0,3) = axis cube tip, 3 = center cube
+	int   hovered_scale_plane;      // -1 = none, [0,3) = inner scale plane handle (0=YZ,1=XZ,2=XY)
+	int   hovered_translate_plane;  // -1 = none, [0,3) = outer translate plane handle
+	bool  center_scale_engaged;     // true once the center cube has been hovered; required before scale-plane morph activates
 	Vec4f grabbed_point_ws;
 	Vec4f ob_origin_at_grab;
 	float grabbed_angle;

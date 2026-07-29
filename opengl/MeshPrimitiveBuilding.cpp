@@ -227,6 +227,124 @@ Reference<OpenGLMeshRenderData> MeshPrimitiveBuilding::make3DArrowMesh(VertexBuf
 }
 
 
+// Shaft cylinder only — from (0,0,0) to (0.8,0,0) with radius 0.01.
+// Intended to be used with a separate cube-tip GLObject positioned at the shaft end.
+Reference<OpenGLMeshRenderData> MeshPrimitiveBuilding::make3DArrowShaftMesh(VertexBufferAllocator& allocator)
+{
+	const int res = 20;
+	const float shaft_r   = 0.01f;
+	// Mesh goes 0→1 in local X; the caller passes (a, shaft_end) to arrowObjectTransform
+	// so the segment length == shaft visual length with no dead zone.
+	const float shaft_len = 1.0f;
+	const Vec3f basis_i(0, 1, 0), basis_j(0, 0, 1), dir(1, 0, 0);
+
+	js::Vector<Vec3f, 16> verts(res * 4);
+	js::Vector<Vec3f, 16> normals(res * 4);
+	js::Vector<Vec2f, 16> uvs(res * 4);
+	js::Vector<uint32, 16> indices(res * 6);
+
+	for(int i = 0; i < res; ++i)
+	{
+		const float a0 = i       * Maths::get2Pi<float>() / res;
+		const float a1 = (i + 1) * Maths::get2Pi<float>() / res;
+		const Vec3f n0(basis_i * cos(a0) + basis_j * sin(a0));
+		const Vec3f n1(basis_i * cos(a1) + basis_j * sin(a1));
+		const int vi = i * 4;
+		normals[vi+0]=n0; normals[vi+1]=n1; normals[vi+2]=n1; normals[vi+3]=n0;
+		verts[vi+0] = n0 * shaft_r;
+		verts[vi+1] = n1 * shaft_r;
+		verts[vi+2] = n1 * shaft_r + dir * shaft_len;
+		verts[vi+3] = n0 * shaft_r + dir * shaft_len;
+		for(int k = 0; k < 4; ++k) uvs[vi+k] = Vec2f(0.f);
+		const int ii = i * 6;
+		indices[ii+0]=vi+0; indices[ii+1]=vi+1; indices[ii+2]=vi+2;
+		indices[ii+3]=vi+0; indices[ii+4]=vi+2; indices[ii+5]=vi+3;
+	}
+	return GLMeshBuilding::buildMeshRenderData(allocator, verts, normals, uvs, indices);
+}
+
+
+// Base at origin, tip at (1, 0, 0).  Shaft is a thin cylinder; tip is a cube instead of a cone.
+// Designed for gizmo scale handles: the cube is visually graspable and distinct from translation arrows.
+Reference<OpenGLMeshRenderData> MeshPrimitiveBuilding::make3DArrowWithCubeTipMesh(VertexBufferAllocator& allocator)
+{
+	const int res = 20;
+
+	const float length   = 1.0f;
+	const float shaft_r  = length * 0.01f;
+	const float shaft_len = length * 0.8f;
+	const float cs       = length * 0.03f;   // cube half-size in Y and Z
+	const float cx0      = shaft_len;         // cube X start = 0.80
+	const float cx1      = shaft_len + cs * 2.0f; // cube X end  = 0.92
+
+	const int shaft_verts   = res * 4;
+	const int shaft_indices = res * 6;
+	const int cube_verts    = 6 * 4;    // 6 faces, 4 verts each
+	const int cube_indices  = 6 * 6;    // 6 faces, 6 indices each
+
+	js::Vector<Vec3f, 16> verts(shaft_verts + cube_verts);
+	js::Vector<Vec3f, 16> normals(shaft_verts + cube_verts);
+	js::Vector<Vec2f, 16> uvs(shaft_verts + cube_verts);
+	js::Vector<uint32, 16> indices(shaft_indices + cube_indices);
+
+	const Vec3f dir(1, 0, 0);
+	const Vec3f basis_i(0, 1, 0);
+	const Vec3f basis_j(0, 0, 1);
+
+	// ---- Shaft (cylinder) ----
+	for(int i = 0; i < res; ++i)
+	{
+		const float a0 = i       * Maths::get2Pi<float>() / res;
+		const float a1 = (i + 1) * Maths::get2Pi<float>() / res;
+
+		const Vec3f n0(basis_i * cos(a0) + basis_j * sin(a0));
+		const Vec3f n1(basis_i * cos(a1) + basis_j * sin(a1));
+
+		const int vi = i * 4;
+		normals[vi + 0] = n0;  normals[vi + 1] = n1;  normals[vi + 2] = n1;  normals[vi + 3] = n0;
+		verts[vi + 0] = n0 * shaft_r;
+		verts[vi + 1] = n1 * shaft_r;
+		verts[vi + 2] = n1 * shaft_r + dir * shaft_len;
+		verts[vi + 3] = n0 * shaft_r + dir * shaft_len;
+		for(int k = 0; k < 4; ++k) uvs[vi + k] = Vec2f(0.f);
+
+		const int ii = i * 6;
+		indices[ii + 0] = vi + 0;  indices[ii + 1] = vi + 1;  indices[ii + 2] = vi + 2;
+		indices[ii + 3] = vi + 0;  indices[ii + 4] = vi + 2;  indices[ii + 5] = vi + 3;
+	}
+
+	// ---- Cube tip ----
+	// Vertex winding verified CCW from outside (outward normals) via cross-product check.
+	const Vec3f cube_face_verts[6][4] = {
+		{ Vec3f(cx1,-cs,-cs), Vec3f(cx1, cs,-cs), Vec3f(cx1, cs, cs), Vec3f(cx1,-cs, cs) }, // +X
+		{ Vec3f(cx0,-cs,-cs), Vec3f(cx0,-cs, cs), Vec3f(cx0, cs, cs), Vec3f(cx0, cs,-cs) }, // -X
+		{ Vec3f(cx0, cs, cs), Vec3f(cx1, cs, cs), Vec3f(cx1, cs,-cs), Vec3f(cx0, cs,-cs) }, // +Y
+		{ Vec3f(cx0,-cs,-cs), Vec3f(cx1,-cs,-cs), Vec3f(cx1,-cs, cs), Vec3f(cx0,-cs, cs) }, // -Y
+		{ Vec3f(cx0,-cs, cs), Vec3f(cx1,-cs, cs), Vec3f(cx1, cs, cs), Vec3f(cx0, cs, cs) }, // +Z
+		{ Vec3f(cx0, cs,-cs), Vec3f(cx1, cs,-cs), Vec3f(cx1,-cs,-cs), Vec3f(cx0,-cs,-cs) }, // -Z
+	};
+	const Vec3f cube_face_normals[6] = {
+		Vec3f(1,0,0), Vec3f(-1,0,0), Vec3f(0,1,0), Vec3f(0,-1,0), Vec3f(0,0,1), Vec3f(0,0,-1)
+	};
+
+	for(int f = 0; f < 6; ++f)
+	{
+		const int vi = shaft_verts + f * 4;
+		for(int k = 0; k < 4; ++k)
+		{
+			verts[vi + k]   = cube_face_verts[f][k];
+			normals[vi + k] = cube_face_normals[f];
+			uvs[vi + k]     = Vec2f(0.f);
+		}
+		const int ii = shaft_indices + f * 6;
+		indices[ii + 0] = vi + 0;  indices[ii + 1] = vi + 1;  indices[ii + 2] = vi + 2;
+		indices[ii + 3] = vi + 0;  indices[ii + 4] = vi + 2;  indices[ii + 5] = vi + 3;
+	}
+
+	return GLMeshBuilding::buildMeshRenderData(allocator, verts, normals, uvs, indices);
+}
+
+
 // Base will be at origin, tips will lie at (1, 0, 0), (0,1,0), (0,0,1)
 Reference<OpenGLMeshRenderData> MeshPrimitiveBuilding::make3DBasisArrowMesh(VertexBufferAllocator& allocator)
 {
@@ -1461,9 +1579,9 @@ Reference<OpenGLMeshRenderData> MeshPrimitiveBuilding::makeRotationArcHandleMesh
 
 	const Vec4f basis_j(0,0,1,0);
 
-	const float cyl_r = 0.02f;
-	const float head_len = 0.2f;
-	const float head_r = 0.04f; // Radius at base of head
+	const float cyl_r = 0.01f;
+	const float head_len = 0.1f;
+	const float head_r = 0.02f; // Radius at base of head
 
 	const float arc_start_angle = 0;
 

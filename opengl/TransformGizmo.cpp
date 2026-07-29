@@ -27,19 +27,39 @@ static const float arc_handle_half_angle = 1.5f;
 TransformGizmo::TransformGizmo(OpenGLEngine* engine_, const Vec4f& gizmo_centre)
 :	engine(engine_),
 	grabbed_axis(-1),
+	hovered_axis(-1),
+	hovered_cube(-1),
+	hovered_scale_plane(-1),
+	hovered_translate_plane(-1),
+	center_scale_engaged(false),
 	grabbed_angle(0),
 	original_grabbed_angle(0),
 	grabbed_arc_angle_offset(0)
 {
-	axis_arrow_objects[0] = engine->makeArrowObject(Vec4f(0,0,0,1), Vec4f(1, 0, 0, 1), Colour4f(0.6, 0.2, 0.2, 1.f), 1.f);
-	axis_arrow_objects[1] = engine->makeArrowObject(Vec4f(0,0,0,1), Vec4f(0, 1, 0, 1), Colour4f(0.2, 0.6, 0.2, 1.f), 1.f);
-	axis_arrow_objects[2] = engine->makeArrowObject(Vec4f(0,0,0,1), Vec4f(0, 0, 1, 1), Colour4f(0.2, 0.2, 0.6, 1.f), 1.f);
-
-	for(int i=0; i<NUM_AXIS_ARROWS; ++i)
 	{
-		axis_arrow_objects[i]->materials[0].albedo_linear_rgb = toLinearSRGB(axis_arrows_default_cols[i]);
-		axis_arrow_objects[i]->always_visible = true;
-		engine->addObject(axis_arrow_objects[i]);
+		static const Vec4f axis_tip_pos[3] = { Vec4f(1,0,0,1), Vec4f(0,1,0,1), Vec4f(0,0,1,1) };
+		auto shaft_meshdata = MeshPrimitiveBuilding::make3DArrowShaftMesh(*engine->vert_buf_allocator);
+		auto cube_meshdata  = MeshPrimitiveBuilding::makeCubeMesh(*engine->vert_buf_allocator);
+		for(int i = 0; i < NUM_AXIS_ARROWS; ++i)
+		{
+			// Shaft (translate handle)
+			axis_arrow_objects[i] = engine->allocateObject();
+			axis_arrow_objects[i]->ob_to_world_matrix = OpenGLEngine::arrowObjectTransform(Vec4f(0,0,0,1), axis_tip_pos[i], 1.f);
+			axis_arrow_objects[i]->mesh_data = shaft_meshdata;
+			axis_arrow_objects[i]->materials.resize(1);
+			axis_arrow_objects[i]->materials[0].albedo_linear_rgb = toLinearSRGB(axis_arrows_default_cols[i]);
+			axis_arrow_objects[i]->always_visible = true;
+			engine->addObject(axis_arrow_objects[i]);
+
+			// Cube tip (scale handle) — separate object for independent hover/scale
+			axis_scale_cube_objects[i] = engine->allocateObject();
+			axis_scale_cube_objects[i]->ob_to_world_matrix = Matrix4f::translationMatrix(gizmo_centre);
+			axis_scale_cube_objects[i]->mesh_data = cube_meshdata;
+			axis_scale_cube_objects[i]->materials.resize(1);
+			axis_scale_cube_objects[i]->materials[0].albedo_linear_rgb = toLinearSRGB(axis_arrows_default_cols[i]);
+			axis_scale_cube_objects[i]->always_visible = true;
+			engine->addObject(axis_scale_cube_objects[i]);
+		}
 	}
 
 	for(int i=0; i<3; ++i)
@@ -54,6 +74,48 @@ TransformGizmo::TransformGizmo(OpenGLEngine* engine_, const Vec4f& gizmo_centre)
 		engine->addObject(rot_handle_arc_objects[i]);
 	}
 
+
+	// Center scale cube: single cube that morphs into the hovered scale-plane shape.
+	{
+		auto cube_meshdata2 = MeshPrimitiveBuilding::makeCubeMesh(*engine->vert_buf_allocator);
+		center_scale_cube_object = engine->allocateObject();
+		center_scale_cube_object->mesh_data = cube_meshdata2;
+		center_scale_cube_object->materials.resize(1);
+		center_scale_cube_object->materials[0].albedo_linear_rgb = toLinearSRGB(Colour3f(0.55f, 0.55f, 0.55f));
+		center_scale_cube_object->always_visible = true;
+		center_scale_cube_object->ob_to_world_matrix = Matrix4f::identity();
+		engine->addObject(center_scale_cube_object);
+	}
+
+	// Inner scale plane handles disabled — replaced by center_scale_cube_object morphing.
+	auto quad_meshdata = MeshPrimitiveBuilding::makeUnitQuadMesh(*engine->vert_buf_allocator);
+	/* for(int i = 0; i < NUM_PLANES; ++i)
+	{
+		scale_plane_objects[i] = engine->allocateObject();
+		scale_plane_objects[i]->mesh_data = quad_meshdata;
+		scale_plane_objects[i]->materials.resize(1);
+		scale_plane_objects[i]->materials[0].albedo_linear_rgb = toLinearSRGB(axis_arrows_default_cols[i]);
+		scale_plane_objects[i]->materials[0].alpha = 0.5f;
+		scale_plane_objects[i]->materials[0].alpha_blend = true;
+		scale_plane_objects[i]->always_visible = true;
+		scale_plane_objects[i]->ob_to_world_matrix = Matrix4f::identity();
+		engine->addObject(scale_plane_objects[i]);
+	} */
+
+	// Outer plane handles: same colours, offset along both axes
+	for(int i = 0; i < NUM_PLANES; ++i)
+	{
+		translate_plane_objects[i] = engine->allocateObject();
+		translate_plane_objects[i]->mesh_data = quad_meshdata;
+		translate_plane_objects[i]->materials.resize(1);
+		translate_plane_objects[i]->materials[0].albedo_linear_rgb = toLinearSRGB(axis_arrows_default_cols[i]);
+		translate_plane_objects[i]->materials[0].alpha = 0.5f;
+		translate_plane_objects[i]->materials[0].alpha_blend = true;
+		translate_plane_objects[i]->always_visible = true;
+		translate_plane_objects[i]->ob_to_world_matrix = Matrix4f::identity();
+		engine->addObject(translate_plane_objects[i]);
+	}
+
 	updateGizmoDrawTransform(gizmo_centre);
 }
 
@@ -64,7 +126,19 @@ TransformGizmo::~TransformGizmo()
 		checkRemoveObAndSetRefToNull(*engine, axis_arrow_objects[i]);
 
 	for(int i=0; i<NUM_AXIS_ARROWS; ++i)
+		checkRemoveObAndSetRefToNull(*engine, axis_scale_cube_objects[i]);
+
+	for(int i=0; i<NUM_AXIS_ARROWS; ++i)
 		checkRemoveObAndSetRefToNull(*engine, rot_handle_arc_objects[i]);
+
+
+	for(int i=0; i<NUM_PLANES; ++i)
+		checkRemoveObAndSetRefToNull(*engine, scale_plane_objects[i]); // null-ref no-op (scale planes are currently disabled)
+
+	for(int i=0; i<NUM_PLANES; ++i)
+		checkRemoveObAndSetRefToNull(*engine, translate_plane_objects[i]);
+
+	checkRemoveObAndSetRefToNull(*engine, center_scale_cube_object);
 }
 
 
@@ -304,17 +378,172 @@ void TransformGizmo::updateGizmoDrawTransform(const Vec4f& new_gizmo_centre)
 	const Vec4f cam_to_gizmo = gizmo_centre - cam_pos;
 	const float control_scale = cam_to_gizmo.length() * 0.2f;
 
-	const float arrow_len = control_scale;
+	const float arrow_len = control_scale * 0.9f;
 
-	// Flip each arrow to point toward the camera.
-	axis_arrow_segments[0] = LineSegment4f(gizmo_centre, gizmo_centre + Vec4f(cam_to_gizmo[0] > 0 ? -arrow_len : arrow_len, 0, 0, 0));
-	axis_arrow_segments[1] = LineSegment4f(gizmo_centre, gizmo_centre + Vec4f(0, cam_to_gizmo[1] > 0 ? -arrow_len : arrow_len, 0, 0));
-	axis_arrow_segments[2] = LineSegment4f(gizmo_centre, gizmo_centre + Vec4f(0, 0, cam_to_gizmo[2] > 0 ? -arrow_len : arrow_len, 0));
+	// Segments end exactly at the shaft visual end (80% of arrow_len).
+	// The cube is positioned beyond segment.b — shaft picking covers only the shaft.
+	const float shaft_end = arrow_len * 0.80f;
+	axis_arrow_segments[0] = LineSegment4f(gizmo_centre, gizmo_centre + Vec4f(cam_to_gizmo[0] > 0 ? -shaft_end : shaft_end, 0, 0, 0));
+	axis_arrow_segments[1] = LineSegment4f(gizmo_centre, gizmo_centre + Vec4f(0, cam_to_gizmo[1] > 0 ? -shaft_end : shaft_end, 0, 0));
+	axis_arrow_segments[2] = LineSegment4f(gizmo_centre, gizmo_centre + Vec4f(0, 0, cam_to_gizmo[2] > 0 ? -shaft_end : shaft_end, 0));
 
+	// Update shaft objects (translate handles).
 	for(int i=0; i<NUM_AXIS_ARROWS; ++i)
 	{
-		axis_arrow_objects[i]->ob_to_world_matrix = OpenGLEngine::arrowObjectTransform(axis_arrow_segments[i].a, axis_arrow_segments[i].b, arrow_len);
+		Matrix4f m = OpenGLEngine::arrowObjectTransform(axis_arrow_segments[i].a, axis_arrow_segments[i].b, arrow_len);
+		if(hovered_axis == i)
+			m = m * Matrix4f::uniformScaleMatrix(1.07f);
+		axis_arrow_objects[i]->ob_to_world_matrix = m;
 		engine->updateObjectTransformData(*axis_arrow_objects[i]);
+	}
+
+	// Update axis cube tip objects (scale handles) — world-space axis-aligned boxes.
+	{
+		// segment b = shaft end (0.80 * arrow_len). Cube sits just beyond shaft end.
+		// Express cube center and size as fractions of segment length:
+		//   cube center = 0.83 * arrow_len = (0.83/0.80) * shaft_end
+		//   cube half   = 0.03 * arrow_len = (0.03/0.80) * shaft_end
+		static const float cx_mid = 0.83f / 0.80f;  // fraction of segment to cube center
+		static const float cs     = 0.03f / 0.80f;  // cube half-size as fraction of segment
+		const float seg_len = shaft_end; // segment length = shaft_end = 0.80 * arrow_len
+		const float cube_ws_side = cs * 2.0f * seg_len; // = 0.06 * arrow_len (same as before)
+
+		for(int i=0; i<NUM_AXIS_ARROWS; ++i)
+		{
+			const Vec4f dir_ws = axis_arrow_segments[i].b - axis_arrow_segments[i].a;
+
+			float side, center_frac;
+			if(hovered_axis == i)
+			{
+				// Axis hover: cube scales with the shaft from gizmo origin —
+				// both its position and size grow by the same factor.
+				side        = cube_ws_side * 1.07f;
+				center_frac = cx_mid * 1.07f;
+			}
+			else if(hovered_cube == i)
+			{
+				// Cube hover only: grows in place relative to its own center.
+				side        = cube_ws_side * 1.25f;
+				center_frac = cx_mid;
+			}
+			else
+			{
+				side        = cube_ws_side;
+				center_frac = cx_mid;
+			}
+
+			const Vec4f cube_center_ws = axis_arrow_segments[i].a + dir_ws * center_frac;
+			const float half = side * 0.5f;
+
+			Matrix4f m;
+			m.setColumn(0, Vec4f(side, 0, 0, 0));
+			m.setColumn(1, Vec4f(0, side, 0, 0));
+			m.setColumn(2, Vec4f(0, 0, side, 0));
+			m.setColumn(3, cube_center_ws - Vec4f(half, half, half, 0.f));
+			axis_scale_cube_objects[i]->ob_to_world_matrix = m;
+			engine->updateObjectTransformData(*axis_scale_cube_objects[i]);
+		}
+	}
+
+
+	//----------------------- Update plane handles (2-axis scale) -----------------------
+	{
+		// Plane i uses these two axis segments: {Y,Z}, {X,Z}, {X,Y}
+		static const int plane_axes[3][2] = {{1,2},{0,2},{0,1}};
+		const float plane_size   = arrow_len * 0.156f;
+		const float outer_offset = arrow_len * 0.42f;  // outer planes start here along each axis
+
+		for(int i = 0; i < NUM_PLANES; ++i)
+		{
+			const int ai = plane_axes[i][0], bi = plane_axes[i][1];
+			const Vec4f dir_a = axis_arrow_segments[ai].b - axis_arrow_segments[ai].a;
+			const Vec4f dir_b = axis_arrow_segments[bi].b - axis_arrow_segments[bi].a;
+			const Vec4f unit_a = dir_a * (1.f / dir_a.length());
+			const Vec4f unit_b = dir_b * (1.f / dir_b.length());
+
+			Vec4f normal = crossProduct(unit_a, unit_b);
+			if(dot(normal, cam_pos - gizmo_centre) < 0.f)
+				normal = normal * -1.f;
+
+			// Inner scale planes disabled — see center_scale_cube_object below.
+			/* {
+				const float hover_scale = (hovered_scale_plane == i || hovered_cube == 3) ? 1.25f : 1.0f;
+				const float size = plane_size * hover_scale;
+				Matrix4f m;
+				m.setColumn(0, unit_a * size);
+				m.setColumn(1, unit_b * size);
+				m.setColumn(2, normal);
+				m.setColumn(3, gizmo_centre);
+				scale_plane_objects[i]->ob_to_world_matrix = m;
+				engine->updateObjectTransformData(*scale_plane_objects[i]);
+			} */
+
+			// Outer plane (offset along both axes, pivot at its center)
+			{
+				const float base_size = plane_size * 0.60f; // 40% smaller than inner
+				const float size = (hovered_translate_plane == i) ? base_size * 1.25f : base_size;
+				// Center stays fixed; corner shifts so the plane scales from its center.
+				const Vec4f center = gizmo_centre + unit_a * (outer_offset + base_size * 0.5f) + unit_b * (outer_offset + base_size * 0.5f);
+				const Vec4f corner = center - unit_a * (size * 0.5f) - unit_b * (size * 0.5f);
+				Matrix4f m;
+				m.setColumn(0, unit_a * size);
+				m.setColumn(1, unit_b * size);
+				m.setColumn(2, normal);
+				m.setColumn(3, corner);
+				translate_plane_objects[i]->ob_to_world_matrix = m;
+				engine->updateObjectTransformData(*translate_plane_objects[i]);
+			}
+		}
+	}
+
+	//----------------------- Update center scale cube (morphs into hovered plane shape) -----------------------
+	{
+		static const int plane_axes[3][2] = {{1,2},{0,2},{0,1}};
+		const float cube_side = arrow_len * 0.06f;
+
+		// Cube/slab axes toward camera — same sign convention as arrow shafts.
+		const float sx = cam_to_gizmo[0] > 0 ? -1.f : 1.f;
+		const float sy = cam_to_gizmo[1] > 0 ? -1.f : 1.f;
+		const float sz = cam_to_gizmo[2] > 0 ? -1.f : 1.f;
+
+		if(hovered_scale_plane >= 0)
+		{
+			// Morph into a thin slab matching the hovered plane's orientation.
+			// Inner corner (gizmo_centre) is the far-from-camera pivot; slab extends toward cam.
+			const int i  = hovered_scale_plane;
+			const int ai = plane_axes[i][0], bi = plane_axes[i][1];
+			const Vec4f dir_a = axis_arrow_segments[ai].b - axis_arrow_segments[ai].a;
+			const Vec4f dir_b = axis_arrow_segments[bi].b - axis_arrow_segments[bi].a;
+			const Vec4f unit_a = dir_a * (1.f / dir_a.length());
+			const Vec4f unit_b = dir_b * (1.f / dir_b.length());
+			Vec4f normal = crossProduct(unit_a, unit_b);
+			if(dot(normal, cam_pos - gizmo_centre) < 0.f)
+				normal = normal * -1.f;
+
+			const float slab_size = arrow_len * 0.156f * 1.25f; // hover scale applied
+			const float thickness = cube_side * 0.18f;
+			// mesh origin at gizmo_centre, centered along normal
+			const Vec4f corner = gizmo_centre - normal * (thickness * 0.5f);
+			Matrix4f m;
+			m.setColumn(0, unit_a * slab_size);
+			m.setColumn(1, unit_b * slab_size);
+			m.setColumn(2, normal * thickness);
+			m.setColumn(3, corner);
+			center_scale_cube_object->ob_to_world_matrix = m;
+		}
+		else
+		{
+			// Default cube: far corner at gizmo_centre, grows toward camera.
+			// Center-hover: same shape but 1.25x larger.
+			const float side = (hovered_cube == 3) ? cube_side * 1.6f : cube_side;
+			Matrix4f m;
+			m.setColumn(0, Vec4f(sx * side, 0, 0, 0));
+			m.setColumn(1, Vec4f(0, sy * side, 0, 0));
+			m.setColumn(2, Vec4f(0, 0, sz * side, 0));
+			m.setColumn(3, gizmo_centre);
+			center_scale_cube_object->ob_to_world_matrix = m;
+		}
+		engine->updateObjectTransformData(*center_scale_cube_object);
 	}
 
 	//----------------------- Update rotation control handle arcs -----------------------
@@ -383,6 +612,9 @@ int TransformGizmo::mouseOverAxisArrowOrRotArc(const Vec2f& px, Vec4f& closest_w
 	const Vec4f ray_dir = engine->pixelToRayDirWS(px);
 
 	// Test translation arrows.
+	// Shaft radius is 0.01 * arrow_len — much thinner than the original arrow mesh.
+	// Use a tight fixed threshold so hover fires only on the shaft itself.
+	const float shaft_max_dist = 6.f;
 	for(int i=0; i<NUM_AXIS_ARROWS; ++i)
 	{
 		const LineSegment4f segment = clipLineSegmentToCameraFrontHalfSpace(axis_arrow_segments[i], cam_front_plane);
@@ -395,8 +627,8 @@ int TransformGizmo::mouseOverAxisArrowOrRotArc(const Vec2f& px, Vec4f& closest_w
 
 		const Vec4f closest_pt = closestPointOnLineToRay(segment, cam_pos, ray_dir);
 		const float cam_dist = closest_pt.getDist(cam_pos);
-		const float approx_radius_px = 0.03f * (float)viewport_w / cam_dist;
-		const float use_max_dist = myMax(max_selection_dist, approx_radius_px);
+		const float approx_radius_px = 0.005f * (float)viewport_w / cam_dist;
+		const float use_max_dist = myMax(shaft_max_dist, approx_radius_px);
 
 		if(d <= closest_dist && d < use_max_dist)
 		{
@@ -559,6 +791,134 @@ bool TransformGizmo::mouseReleased(GizmoDelegateInterface* delegate)
 }
 
 
+// Returns [0,3) for plane handle hover (0=YZ, 1=XZ, 2=XY), -1 for none.
+// Projects the quad corners to screen and does a parallelogram point-in test.
+int TransformGizmo::mouseOverScalePlaneHandle(const Vec2f& px) const
+{
+	static const int plane_axes[3][2] = {{1,2},{0,2},{0,1}};
+	const float seg_len   = (axis_arrow_segments[0].b - axis_arrow_segments[0].a).length();
+	const float arrow_len = seg_len / 0.80f;
+	const float plane_size = arrow_len * 0.156f * 1.69f;
+	const Vec4f gizmo_centre = axis_arrow_segments[0].a;
+
+	for(int i = 0; i < NUM_PLANES; ++i)
+	{
+		const int ai = plane_axes[i][0], bi = plane_axes[i][1];
+		const Vec4f dir_a = axis_arrow_segments[ai].b - axis_arrow_segments[ai].a;
+		const Vec4f dir_b = axis_arrow_segments[bi].b - axis_arrow_segments[bi].a;
+		const Vec4f unit_a = dir_a * (1.f / dir_a.length());
+		const Vec4f unit_b = dir_b * (1.f / dir_b.length());
+
+		const Vec4f p00 = gizmo_centre;
+		const Vec4f p10 = p00 + unit_a * plane_size;
+		const Vec4f p01 = p00 + unit_b * plane_size;
+
+		Vec2f s00, s10, s01;
+		if(!worldToPixel(p00, engine, s00)) continue;
+		if(!worldToPixel(p10, engine, s10)) continue;
+		if(!worldToPixel(p01, engine, s01)) continue;
+
+		// Parallelogram hit test using barycentric-style coordinates.
+		const float ux = s10[0]-s00[0], uy = s10[1]-s00[1];
+		const float vx = s01[0]-s00[0], vy = s01[1]-s00[1];
+		const float wx = px[0] -s00[0], wy = px[1] -s00[1];
+		const float uu = ux*ux + uy*uy, uv = ux*vx + uy*vy, vv = vx*vx + vy*vy;
+		const float uw = ux*wx + uy*wy, vw = vx*wx + vy*wy;
+		const float denom = uu*vv - uv*uv;
+		if(std::abs(denom) < 1e-6f) continue;
+		const float s = (vv*uw - uv*vw) / denom;
+		const float t = (uu*vw - uv*uw) / denom;
+		if(s >= 0.f && s <= 1.f && t >= 0.f && t <= 1.f)
+			return i;
+	}
+	return -1;
+}
+
+
+int TransformGizmo::mouseOverTranslatePlaneHandle(const Vec2f& px) const
+{
+	static const int plane_axes[3][2] = {{1,2},{0,2},{0,1}};
+	const float seg_len      = (axis_arrow_segments[0].b - axis_arrow_segments[0].a).length();
+	const float arrow_len    = seg_len / 0.80f;
+	const float plane_size   = arrow_len * 0.156f * 0.60f; // same 40% reduction as in draw
+	const float outer_offset = arrow_len * 0.42f;
+	const Vec4f gizmo_centre = axis_arrow_segments[0].a;
+
+	for(int i = 0; i < NUM_PLANES; ++i)
+	{
+		const int ai = plane_axes[i][0], bi = plane_axes[i][1];
+		const Vec4f dir_a = axis_arrow_segments[ai].b - axis_arrow_segments[ai].a;
+		const Vec4f dir_b = axis_arrow_segments[bi].b - axis_arrow_segments[bi].a;
+		const Vec4f unit_a = dir_a * (1.f / dir_a.length());
+		const Vec4f unit_b = dir_b * (1.f / dir_b.length());
+
+		const Vec4f p00 = gizmo_centre + unit_a * outer_offset + unit_b * outer_offset;
+		const Vec4f p10 = p00 + unit_a * plane_size;
+		const Vec4f p01 = p00 + unit_b * plane_size;
+
+		Vec2f s00, s10, s01;
+		if(!worldToPixel(p00, engine, s00)) continue;
+		if(!worldToPixel(p10, engine, s10)) continue;
+		if(!worldToPixel(p01, engine, s01)) continue;
+
+		const float ux = s10[0]-s00[0], uy = s10[1]-s00[1];
+		const float vx = s01[0]-s00[0], vy = s01[1]-s00[1];
+		const float wx = px[0] -s00[0], wy = px[1] -s00[1];
+		const float uu = ux*ux + uy*uy, uv = ux*vx + uy*vy, vv = vx*vx + vy*vy;
+		const float uw = ux*wx + uy*wy, vw = vx*wx + vy*wy;
+		const float denom = uu*vv - uv*uv;
+		if(std::abs(denom) < 1e-6f) continue;
+		const float s = (vv*uw - uv*vw) / denom;
+		const float t = (uu*vw - uv*uw) / denom;
+		if(s >= 0.f && s <= 1.f && t >= 0.f && t <= 1.f)
+			return i;
+	}
+	return -1;
+}
+
+
+// Returns [0,3) for axis cube tip hover, 3 for center cube hover, -1 for none.
+// Uses screen-space projected distance with a fixed pixel threshold.
+int TransformGizmo::mouseOverCubeHandle(const Vec2f& px) const
+{
+	const float threshold_px = 14.f;
+	float closest_dist = threshold_px;
+	int closest = -1;
+
+	// Axis cube tip centers: 83% along the arrow segment (cx0=0.80 + cs=0.03).
+	for(int i = 0; i < NUM_AXIS_ARROWS; ++i)
+	{
+		// Segment ends at shaft end (0.80*arrow_len); cube center is at 0.83*arrow_len = 0.83/0.80 of segment.
+		const Vec4f center_ws = axis_arrow_segments[i].a + (axis_arrow_segments[i].b - axis_arrow_segments[i].a) * (0.83f / 0.80f);
+		Vec2f center_px;
+		if(!worldToPixel(center_ws, engine, center_px)) continue;
+		const float d = (center_px - px).length();
+		if(d < closest_dist)
+		{
+			closest_dist = d;
+			closest = i;
+		}
+	}
+
+	// Center cube — origin == gizmo_centre == axis_arrow_segments[*].a.
+	{
+		const Vec4f center_ws = axis_arrow_segments[0].a;
+		Vec2f center_px;
+		if(worldToPixel(center_ws, engine, center_px))
+		{
+			const float d = (center_px - px).length();
+			if(d < closest_dist)
+			{
+				closest_dist = d;
+				closest = 3;
+			}
+		}
+	}
+
+	return closest;
+}
+
+
 void TransformGizmo::updateMouseoverHighlight(const Vec2f& px)
 {
 	// Reset all to default colours.
@@ -566,6 +926,8 @@ void TransformGizmo::updateMouseoverHighlight(const Vec2f& px)
 	{
 		axis_arrow_objects[i]->materials[0].albedo_linear_rgb = toLinearSRGB(axis_arrows_default_cols[i % 3]);
 		engine->objectMaterialsUpdated(*axis_arrow_objects[i]);
+		axis_scale_cube_objects[i]->materials[0].albedo_linear_rgb = toLinearSRGB(axis_arrows_default_cols[i % 3]);
+		engine->objectMaterialsUpdated(*axis_scale_cube_objects[i]);
 	}
 	for(int i=0; i<3; ++i)
 	{
@@ -573,8 +935,69 @@ void TransformGizmo::updateMouseoverHighlight(const Vec2f& px)
 		engine->objectMaterialsUpdated(*rot_handle_arc_objects[i]);
 	}
 
+	// Reset center scale cube to default grey and translate planes to default colours.
+	center_scale_cube_object->materials[0].albedo_linear_rgb = toLinearSRGB(Colour3f(0.55f, 0.55f, 0.55f));
+	engine->objectMaterialsUpdated(*center_scale_cube_object);
+	for(int i = 0; i < NUM_PLANES; ++i)
+	{
+		// scale_plane_objects disabled — no reset needed.
+		translate_plane_objects[i]->materials[0].albedo_linear_rgb = toLinearSRGB(axis_arrows_default_cols[i]);
+		engine->objectMaterialsUpdated(*translate_plane_objects[i]);
+	}
+
+	// Priority: virtual-center-zone > cube tips > outer planes > scale planes (only if center was engaged) > shafts/arcs.
+	hovered_cube          = mouseOverCubeHandle(px);
+	hovered_scale_plane   = -1;
+	hovered_translate_plane = -1;
+
+	if(hovered_cube == 3)
+	{
+		// Central zone: engage and show white cube.
+		center_scale_engaged = true;
+		hovered_axis = -1;
+		center_scale_cube_object->materials[0].albedo_linear_rgb = toLinearSRGB(Colour3f(1.f, 1.f, 1.f));
+		engine->objectMaterialsUpdated(*center_scale_cube_object);
+		return;
+	}
+
+	if(hovered_cube >= 0) // axis cube tip
+	{
+		center_scale_engaged = false;
+		hovered_axis = -1;
+		axis_scale_cube_objects[hovered_cube]->materials[0].albedo_linear_rgb = toLinearSRGB(axis_arrows_mouseover_cols[hovered_cube]);
+		engine->objectMaterialsUpdated(*axis_scale_cube_objects[hovered_cube]);
+		return;
+	}
+
+	hovered_translate_plane = mouseOverTranslatePlaneHandle(px);
+	if(hovered_translate_plane >= 0)
+	{
+		center_scale_engaged = false;
+		hovered_axis = -1;
+		translate_plane_objects[hovered_translate_plane]->materials[0].albedo_linear_rgb = toLinearSRGB(axis_arrows_mouseover_cols[hovered_translate_plane]);
+		engine->objectMaterialsUpdated(*translate_plane_objects[hovered_translate_plane]);
+		return;
+	}
+
+	// Scale plane morph only activates if the center cube was hovered first.
+	hovered_scale_plane = mouseOverScalePlaneHandle(px);
+	if(hovered_scale_plane >= 0 && center_scale_engaged)
+	{
+		hovered_axis = -1;
+		center_scale_cube_object->materials[0].albedo_linear_rgb = toLinearSRGB(axis_arrows_mouseover_cols[hovered_scale_plane]);
+		engine->objectMaterialsUpdated(*center_scale_cube_object);
+		return;
+	}
+
+	// Mouse is not over center or any scale plane — disengage.
+	if(hovered_scale_plane >= 0)
+		hovered_scale_plane = -1; // was in zone but not engaged — suppress
+	center_scale_engaged = false;
+
 	Vec4f dummy;
 	const int axis = mouseOverAxisArrowOrRotArc(px, dummy);
+	hovered_axis = axis;
+
 	if(axis < 0)
 		return;
 

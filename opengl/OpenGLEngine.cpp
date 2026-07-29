@@ -10489,10 +10489,18 @@ void OpenGLEngine::drawAlwaysVisibleObjects(const Matrix4f& view_matrix, const M
 				for(uint32 z = 0; z < mesh_data.batches.size(); ++z)
 				{
 					const uint32 mat_index = mesh_data.batches[z].material_index;
+					const bool use_alpha_blend = ob->materials[mat_index].alpha_blend;
+					if(use_alpha_blend)
+					{
+						glEnable(GL_BLEND);
+						glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+					}
 					const bool program_changed = checkUseProgram(ob->materials[mat_index].shader_prog.ptr()); // TODO: use sorting for these draws
 					if(program_changed)
 						setSharedUniformsForProg(*ob->materials[mat_index].shader_prog, view_matrix, proj_matrix);
 					drawBatch(*ob, ob->materials[mat_index], *ob->materials[mat_index].shader_prog, mesh_data, mesh_data.batches[z], /*batch_index=*/z); // Draw primitives for the given material
+					if(use_alpha_blend)
+						glDisable(GL_BLEND);
 				}
 			}
 		}

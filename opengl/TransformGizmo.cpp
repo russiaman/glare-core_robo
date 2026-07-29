@@ -60,8 +60,7 @@ TransformGizmo::TransformGizmo(OpenGLEngine* engine_, const Vec4f& gizmo_centre)
 	grabbed_angle(0),
 	original_grabbed_angle(0),
 	grabbed_arc_angle_offset(0),
-	grabbed_scale_center_px(Vec2f(0.f)),
-	grabbed_scale_ref_dist(1.f)
+	grabbed_scale_mouse_px(Vec2f(0.f))
 {
 	{
 		static const Vec4f axis_tip_pos[3] = { Vec4f(1,0,0,1), Vec4f(0,1,0,1), Vec4f(0,0,1,1) };
@@ -811,10 +810,7 @@ bool TransformGizmo::mousePressed(const Vec2f& px, const Vec4f& ob_pos_ws, Gizmo
 		grabbed_axis      = GRABBED_CENTER_SCALE;
 		ob_origin_at_grab = ob_pos_ws;
 
-		// Record gizmo center in screen space and mouse-to-center distance as scale reference.
-		Vec2f center_px;
-		grabbed_scale_center_px = worldToPixel(axis_arrow_segments[0].a, engine, center_px) ? center_px : px;
-		grabbed_scale_ref_dist  = myMax(1.f, (px - grabbed_scale_center_px).length());
+		grabbed_scale_mouse_px = px;
 
 		delegate->onGrabStart(false);
 		return true;
@@ -903,12 +899,15 @@ bool TransformGizmo::mouseMoved(const Vec2f& px, const Vec4f& ob_pos_ws, GizmoDe
 	}
 	else if(grabbed_axis == GRABBED_CENTER_SCALE)
 	{
-		// Uniform scale drag: scale factor = ratio of current to grab screen-space mouse→center distance.
-		// Drag away from gizmo center = larger; drag toward = smaller.
-		const float cur_dist    = myMax(1.f, (px - grabbed_scale_center_px).length());
-		const float total_scale = cur_dist / grabbed_scale_ref_dist;
+		// Uniform scale drag: right/up = larger, left/down = smaller.
+		// Screen Y increases downward, so negate dy.
+		// delta_scale is incremental (relative to last frame), matching the rotation delta_angle pattern.
+		const float dx = px.x - grabbed_scale_mouse_px.x;
+		const float dy = -(px.y - grabbed_scale_mouse_px.y);
+		const float delta_scale = std::exp((dx + dy) * 0.007f);
+		grabbed_scale_mouse_px = px;
 		updateGizmoDrawTransform(ob_origin_at_grab);
-		delegate->onUniformScaleDrag(total_scale);
+		delegate->onUniformScaleDrag(delta_scale);
 	}
 	else
 	{

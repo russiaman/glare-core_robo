@@ -43,8 +43,8 @@ public:
 	virtual void onGrabStart(bool is_rotation) = 0;
 
 	// Called each mouseMoved tick during a uniform scale drag.
-	// total_scale is the cumulative scale factor since the handle was grabbed (1.0 = no change).
-	virtual void onUniformScaleDrag(float total_scale) = 0;
+	// delta_scale is the multiplicative scale change since the last call (1.0 = no change).
+	virtual void onUniformScaleDrag(float delta_scale) = 0;
 
 	// Called when the user releases the mouse after a drag.
 	virtual void onGrabEnd() = 0;
@@ -161,6 +161,5 @@ private:
 	float original_grabbed_angle;
 	float grabbed_arc_angle_offset;
 
-	Vec2f grabbed_scale_center_px;  // screen-space gizmo center when center scale was grabbed
-	float grabbed_scale_ref_dist;   // screen-space mouse→center distance at grab start
+	Vec2f grabbed_scale_mouse_px;   // mouse position when center scale was grabbed
 };

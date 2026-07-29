@@ -38,14 +38,13 @@ TransformGizmo::TransformGizmo(OpenGLEngine* engine_, const Vec4f& gizmo_centre)
 {
 	{
 		static const Vec4f axis_tip_pos[3] = { Vec4f(1,0,0,1), Vec4f(0,1,0,1), Vec4f(0,0,1,1) };
-		auto shaft_meshdata = MeshPrimitiveBuilding::make3DArrowShaftMesh(*engine->vert_buf_allocator);
 		auto cube_meshdata  = MeshPrimitiveBuilding::makeCubeMesh(*engine->vert_buf_allocator);
 		for(int i = 0; i < NUM_AXIS_ARROWS; ++i)
 		{
-			// Shaft (translate handle)
+			// Shaft (translate handle) — standard cylinder mesh (local Z = shaft axis, radius 1).
 			axis_arrow_objects[i] = engine->allocateObject();
-			axis_arrow_objects[i]->ob_to_world_matrix = OpenGLEngine::arrowObjectTransform(Vec4f(0,0,0,1), axis_tip_pos[i], 1.f);
-			axis_arrow_objects[i]->mesh_data = shaft_meshdata;
+			axis_arrow_objects[i]->ob_to_world_matrix = Matrix4f::identity();
+			axis_arrow_objects[i]->mesh_data = engine->getCylinderMesh();
 			axis_arrow_objects[i]->materials.resize(1);
 			axis_arrow_objects[i]->materials[0].albedo_linear_rgb = toLinearSRGB(axis_arrows_default_cols[i]);
 			axis_arrow_objects[i]->always_visible = true;
@@ -371,11 +370,23 @@ void TransformGizmo::updateGizmoDrawTransform(const Vec4f& new_gizmo_centre)
 	axis_arrow_segments[2] = LineSegment4f(gizmo_centre, gizmo_centre + Vec4f(0, 0, cam_to_gizmo[2] > 0 ? -shaft_end : shaft_end, 0));
 
 	// Update shaft objects (translate handles).
+	// Cylinder mesh: local XY = radius 1, local Z = [0..1] length.
+	// Map: col0,col1 = perp axes * shaft_r; col2 = arrow direction (full length); col3 = start.
+	const float shaft_r = arrow_len * 0.01f;
 	for(int i=0; i<NUM_AXIS_ARROWS; ++i)
 	{
-		Matrix4f m = OpenGLEngine::arrowObjectTransform(axis_arrow_segments[i].a, axis_arrow_segments[i].b, arrow_len);
-		if(hovered_axis == i)
-			m = m * Matrix4f::uniformScaleMatrix(1.07f);
+		const Vec4f dir = axis_arrow_segments[i].b - axis_arrow_segments[i].a;
+		const Vec4f dn  = dir * (1.f / dir.length());
+		const Vec4f arb = (std::fabs(dn[0]) < 0.9f) ? Vec4f(1,0,0,0) : Vec4f(0,1,0,0);
+		const Vec4f u   = normalise(crossProduct(dn, arb));
+		const Vec4f v   = crossProduct(dn, u);
+		const float r   = (hovered_axis == i) ? shaft_r * 1.07f : shaft_r;
+		const Vec4f d   = (hovered_axis == i) ? dir * 1.07f : dir;
+		Matrix4f m;
+		m.setColumn(0, u * r);
+		m.setColumn(1, v * r);
+		m.setColumn(2, d);
+		m.setColumn(3, axis_arrow_segments[i].a);
 		axis_arrow_objects[i]->ob_to_world_matrix = m;
 		engine->updateObjectTransformData(*axis_arrow_objects[i]);
 	}

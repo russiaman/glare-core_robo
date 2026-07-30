@@ -1122,25 +1122,9 @@ void TransformGizmo::updateMouseoverHighlight(const Vec2f& px)
 	}
 
 	// Priority: virtual-center-zone > cube tips > outer planes > scale planes (only if center was engaged) > shafts/arcs.
-	// Exception: when center_scale_engaged is already true, scale-plane slabs take priority over the centre-cube hit
-	// zone so the 14-px screen-space threshold doesn't steal clicks from slabs that originate at the gizmo origin.
-	hovered_cube          = -1;
+	hovered_cube          = mouseOverCubeHandle(px);
 	hovered_scale_plane   = -1;
 	hovered_translate_plane = -1;
-
-	if(center_scale_engaged)
-	{
-		hovered_scale_plane = mouseOverScalePlaneHandle(px);
-		if(hovered_scale_plane >= 0)
-		{
-			hovered_axis = -1;
-			center_scale_cube_object->materials[0].albedo_linear_rgb = toLinearSRGB(axis_arrows_mouseover_cols[hovered_scale_plane]);
-			engine->objectMaterialsUpdated(*center_scale_cube_object);
-			return;
-		}
-	}
-
-	hovered_cube = mouseOverCubeHandle(px);
 
 	if(hovered_cube == 3)
 	{

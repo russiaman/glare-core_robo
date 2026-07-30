@@ -55,8 +55,6 @@ TransformGizmo::TransformGizmo(OpenGLEngine* engine_, const Vec4f& gizmo_centre)
 	shaft_prev_state {-1, -1, -1},
 	tp_src_size  {0.f, 0.f, 0.f},
 	tp_tgt_size  {0.f, 0.f, 0.f},
-	tp_src_alpha {0.5f, 0.5f, 0.5f},
-	tp_tgt_alpha {0.5f, 0.5f, 0.5f},
 	tp_anim_t    {1.f, 1.f, 1.f},
 	tp_prev_state{-1, -1, -1},
 	last_frame_time(-1.0),
@@ -123,8 +121,6 @@ TransformGizmo::TransformGizmo(OpenGLEngine* engine_, const Vec4f& gizmo_centre)
 		translate_plane_objects[i]->mesh_data = quad_meshdata;
 		translate_plane_objects[i]->materials.resize(1);
 		translate_plane_objects[i]->materials[0].albedo_linear_rgb = toLinearSRGB(axis_arrows_default_cols[i]);
-		translate_plane_objects[i]->materials[0].alpha = 0.5f;
-		translate_plane_objects[i]->materials[0].alpha_blend = true;
 		translate_plane_objects[i]->always_visible = true;
 		translate_plane_objects[i]->ob_to_world_matrix = Matrix4f::identity();
 		engine->addObject(translate_plane_objects[i]);
@@ -554,13 +550,11 @@ void TransformGizmo::updateGizmoDrawTransform(const Vec4f& new_gizmo_centre)
 		for(int i = 0; i < NUM_PLANES; ++i)
 		{
 			const float tgt_size  = (hovered_translate_plane == i) ? base_size * 1.2f : base_size;
-			const float tgt_alpha = (hovered_translate_plane == i) ? 1.0f : 0.5f;
 			const int   cur_state = (hovered_translate_plane == i) ? 1 : 0;
 
 			if(tp_prev_state[i] < 0)
 			{
 				tp_src_size[i]  = tp_tgt_size[i]  = tgt_size;
-				tp_src_alpha[i] = tp_tgt_alpha[i] = tgt_alpha;
 				tp_anim_t[i]    = 1.f;
 				tp_prev_state[i] = cur_state;
 			}
@@ -568,22 +562,18 @@ void TransformGizmo::updateGizmoDrawTransform(const Vec4f& new_gizmo_centre)
 			{
 				const float e    = cubicEaseOut(tp_anim_t[i]);
 				tp_src_size[i]   = tp_src_size[i]  + (tp_tgt_size[i]  - tp_src_size[i])  * e;
-				tp_src_alpha[i]  = tp_src_alpha[i] + (tp_tgt_alpha[i] - tp_src_alpha[i]) * e;
 				tp_tgt_size[i]   = tgt_size;
-				tp_tgt_alpha[i]  = tgt_alpha;
 				tp_anim_t[i]     = 0.f;
 				tp_prev_state[i] = cur_state;
 			}
 			else
 			{
 				tp_tgt_size[i]  = tgt_size;
-				tp_tgt_alpha[i] = tgt_alpha;
 			}
 
 			tp_anim_t[i] = myMin(1.f, tp_anim_t[i] + dt / GIZMO_ANIM_DURATION);
 			const float e     = cubicEaseOut(tp_anim_t[i]);
 			const float size  = tp_src_size[i]  + (tp_tgt_size[i]  - tp_src_size[i])  * e;
-			const float alpha = tp_src_alpha[i] + (tp_tgt_alpha[i] - tp_src_alpha[i]) * e;
 
 			const int ai = plane_axes[i][0], bi = plane_axes[i][1];
 			const Vec4f dir_a = axis_arrow_segments[ai].b - axis_arrow_segments[ai].a;
@@ -591,21 +581,26 @@ void TransformGizmo::updateGizmoDrawTransform(const Vec4f& new_gizmo_centre)
 			const Vec4f unit_a = dir_a * (1.f / dir_a.length());
 			const Vec4f unit_b = dir_b * (1.f / dir_b.length());
 			Vec4f normal = crossProduct(unit_a, unit_b);
-			if(dot(normal, cam_pos - gizmo_centre) < 0.f)
+			const bool flip = dot(normal, cam_pos - gizmo_centre) < 0.f;
+			if(flip)
 				normal = normal * -1.f;
+			// Swap col0/col1 on flip so cross(col0, col1) always matches the (possibly flipped) normal —
+			// keeps the mesh's winding consistent, otherwise a flipped normal alone mirrors the matrix
+			// (negative determinant), which reverses winding and gets the quad backface-culled from
+			// certain camera angles in the always-visible render pass.
+			const Vec4f col0 = flip ? unit_b : unit_a;
+			const Vec4f col1 = flip ? unit_a : unit_b;
 
 			// Center fixed; corner shifts so plane scales from its center.
 			const Vec4f center = gizmo_centre + unit_a * (outer_offset + base_size * 0.5f) + unit_b * (outer_offset + base_size * 0.5f);
 			const Vec4f corner = center - unit_a * (size * 0.5f) - unit_b * (size * 0.5f);
 			Matrix4f m;
-			m.setColumn(0, unit_a * size);
-			m.setColumn(1, unit_b * size);
+			m.setColumn(0, col0 * size);
+			m.setColumn(1, col1 * size);
 			m.setColumn(2, normal);
 			m.setColumn(3, corner);
 			translate_plane_objects[i]->ob_to_world_matrix = m;
-			translate_plane_objects[i]->materials[0].alpha = alpha;
 			engine->updateObjectTransformData(*translate_plane_objects[i]);
-			engine->objectMaterialsUpdated(*translate_plane_objects[i]);
 		}
 	}
 
@@ -633,7 +628,7 @@ void TransformGizmo::updateGizmoDrawTransform(const Vec4f& new_gizmo_centre)
 			Vec4f normal = crossProduct(unit_axes[plane_axes[i][0]], unit_axes[plane_axes[i][1]]);
 			if(dot(normal, cam_pos - gizmo_centre) < 0.f)
 				normal = normal * -1.f;
-			const float slab_size = arrow_len * 0.156f * 1.25f;
+			const float slab_size = arrow_len * 0.156f * 1.5f; // 1.25 * 1.2 (20% larger colored/hovered state)
 			const float thickness = cube_side * 0.18f;
 			// Column i = thin (normal) axis; other columns = slab axes in their natural world-axis slots.
 			// This aligns with the cube matrix (col0=X, col1=Y, col2=Z) so lerp produces a clean squish.
@@ -1039,7 +1034,7 @@ int TransformGizmo::mouseOverScalePlaneHandle(const Vec2f& px) const
 	static const int plane_axes[3][2] = {{1,2},{0,2},{0,1}};
 	const float seg_len   = (axis_arrow_segments[0].b - axis_arrow_segments[0].a).length();
 	const float arrow_len = seg_len / 0.80f;
-	const float plane_size = arrow_len * 0.156f * 1.69f;
+	const float plane_size = arrow_len * 0.156f * 1.69f * 1.2f; // 20% larger hover hit-zone
 	const Vec4f gizmo_centre = axis_arrow_segments[0].a;
 
 	for(int i = 0; i < NUM_PLANES; ++i)

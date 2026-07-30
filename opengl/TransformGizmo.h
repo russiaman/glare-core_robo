@@ -155,11 +155,9 @@ private:
 	float shaft_anim_t[NUM_AXIS_ARROWS];         // [0..1]
 	int   shaft_prev_state[NUM_AXIS_ARROWS];     // -1=uninit, 0=default, 1=hovered
 
-	// Translate plane animation state (size + alpha)
+	// Translate plane animation state (size)
 	float tp_src_size[NUM_PLANES];
 	float tp_tgt_size[NUM_PLANES];
-	float tp_src_alpha[NUM_PLANES];
-	float tp_tgt_alpha[NUM_PLANES];
 	float tp_anim_t[NUM_PLANES];                 // [0..1]
 	int   tp_prev_state[NUM_PLANES];             // -1=uninit, 0=default, 1=hovered
 

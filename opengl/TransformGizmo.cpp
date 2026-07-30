@@ -17,9 +17,10 @@ Copyright Glare Technologies Limited 2026 -
 
 
 static const float GIZMO_ANIM_DURATION  = 0.2f; // seconds for all hover transitions
-static const int   GRABBED_CENTER_SCALE      = 6; // grabbed_axis: uniform scale (0..2=translate, 3..5=rotation)
-static const int   GRABBED_SCALE_PLANE_BASE  = 7;  // grabbed_axis 7/8/9   = two-axis scale plane 0/1/2
+static const int   GRABBED_CENTER_SCALE      = 6;  // grabbed_axis: uniform scale (0..2=translate, 3..5=rotation)
+static const int   GRABBED_SCALE_PLANE_BASE  = 7;  // grabbed_axis 7/8/9    = two-axis scale plane 0/1/2
 static const int   GRABBED_AXIS_SCALE_BASE   = 10; // grabbed_axis 10/11/12 = per-axis scale (axis cube tip) 0/1/2
+static const int   GRABBED_TRANSLATE_PLANE_BASE = 13; // grabbed_axis 13/14/15 = two-axis translate plane 0/1/2
 
 static const Colour3f axis_arrows_default_cols[]   = { Colour3f(0.6f,0.2f,0.2f), Colour3f(0.2f,0.6f,0.2f), Colour3f(0.2f,0.2f,0.6f) };
 static const Colour3f axis_arrows_mouseover_cols[] = { Colour3f(1,0.45f,0.3f),   Colour3f(0.3f,1,0.3f),    Colour3f(0.3f,0.45f,1) };
@@ -826,6 +827,24 @@ bool TransformGizmo::mousePressed(const Vec2f& px, const Vec4f& ob_pos_ws, Gizmo
 		return true;
 	}
 
+	// Two-axis translate plane (outer quad handles).
+	if(hovered_translate_plane >= 0)
+	{
+		const int fixed_axis = hovered_translate_plane; // plane i omits axis i (plane_axes convention, see mouseOverTranslatePlaneHandle)
+		const Vec4f plane_normal = (fixed_axis == 0) ? Vec4f(1,0,0,0) : (fixed_axis == 1) ? Vec4f(0,1,0,0) : Vec4f(0,0,1,0);
+
+		const Vec4f cam_pos = engine->getCurrentScene()->cam_to_world.getColumn(3);
+		const Vec4f dir = engine->pixelToRayDirWS(px);
+		const Planef plane(ob_pos_ws, plane_normal);
+		const float t = plane.rayIntersect(cam_pos, dir);
+
+		grabbed_axis      = GRABBED_TRANSLATE_PLANE_BASE + hovered_translate_plane;
+		ob_origin_at_grab = ob_pos_ws;
+		grabbed_point_ws  = cam_pos + dir * t;
+		delegate->onGrabStart(false);
+		return true;
+	}
+
 	// Two-axis scale plane (only active when center was previously engaged).
 	if(hovered_scale_plane >= 0 && center_scale_engaged)
 	{
@@ -940,7 +959,7 @@ bool TransformGizmo::mouseMoved(const Vec2f& px, const Vec4f& ob_pos_ws, GizmoDe
 		updateGizmoDrawTransform(ob_origin_at_grab);
 		delegate->onTwoAxisScaleDrag(plane_index, delta_scale);
 	}
-	else if(grabbed_axis >= GRABBED_AXIS_SCALE_BASE)
+	else if(grabbed_axis >= GRABBED_AXIS_SCALE_BASE && grabbed_axis < GRABBED_TRANSLATE_PLANE_BASE)
 	{
 		// Per-axis scale drag: same direction convention as uniform/two-axis scale.
 		const int   axis_index   = grabbed_axis - GRABBED_AXIS_SCALE_BASE;
@@ -950,6 +969,29 @@ bool TransformGizmo::mouseMoved(const Vec2f& px, const Vec4f& ob_pos_ws, GizmoDe
 		grabbed_scale_mouse_px   = px;
 		updateGizmoDrawTransform(ob_origin_at_grab);
 		delegate->onAxisScaleDrag(axis_index, delta_scale);
+	}
+	else if(grabbed_axis >= GRABBED_TRANSLATE_PLANE_BASE)
+	{
+		// Two-axis translate drag: project mouse onto the plane through ob_origin_at_grab whose normal is the fixed axis.
+		const int plane_index = grabbed_axis - GRABBED_TRANSLATE_PLANE_BASE;
+		const int fixed_axis  = plane_index; // plane i omits axis i, see mouseOverTranslatePlaneHandle
+		const Vec4f plane_normal = (fixed_axis == 0) ? Vec4f(1,0,0,0) : (fixed_axis == 1) ? Vec4f(0,1,0,0) : Vec4f(0,0,1,0);
+
+		const Vec4f dir = engine->pixelToRayDirWS(px);
+		const Planef plane(ob_origin_at_grab, plane_normal);
+		const float t = plane.rayIntersect(cam_pos, dir);
+		const Vec4f plane_p = cam_pos + dir * t;
+
+		const float MAX_MOVE_DIST = 100.f;
+		Vec4f delta_p = plane_p - grabbed_point_ws;
+		Vec4f tentative = ob_origin_at_grab + delta_p;
+		if(tentative.getDist(ob_origin_at_grab) > MAX_MOVE_DIST)
+			tentative = ob_origin_at_grab + (tentative - ob_origin_at_grab) * MAX_MOVE_DIST / (tentative - ob_origin_at_grab).length();
+
+		updateGizmoDrawTransform(/*new_gizmo_centre=*/tentative);
+
+		const Vec4f total_translation = tentative - ob_origin_at_grab;
+		delegate->onTranslationDrag(total_translation, tentative);
 	}
 	else
 	{

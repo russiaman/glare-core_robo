@@ -360,6 +360,8 @@ struct GLObject
 
 	Reference<OpenGLMeshRenderData> mesh_data;
 
+	uint32 instance_vbo_stride_B; // Stride in bytes for the instance buffer bound at binding point 1.  Defaults to sizeof(Matrix4f) (64) for legacy instance-matrix instancing; GaussianSplatRenderer overrides this to sizeof(uint32) for its per-splat uint32 index buffer.
+
 	VAORef vert_vao; // Overrides mesh_data->vert_vao if non-null.  Having a vert_vao here allows us to enable instancing, by binding to the instance_matrix_vbo etc..
 
 	//IndexBufAllocationHandle instance_matrix_vbo_handle;

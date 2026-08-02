@@ -110,7 +110,6 @@ Copyright Glare Technologies Limited 2023 -
 #define OVERLAY_SHOW_JUST_TEX_W_FLAG		8
 
 
-
 // Needs to match definition in common_vert_structures.glsl
 #define OB_AND_MAT_INDICES_STRIDE			3
 
@@ -227,6 +226,7 @@ GLObject::GLObject() noexcept
 	index_vbo = NULL;
 	index_type_and_log2_size = 0;
 	instance_matrix_vbo_name = 0;
+	instance_vbo_stride_B = (uint32)sizeof(Matrix4f); // Default to legacy instance-matrix stride; GaussianSplatRenderer overrides for uint32 per-splat index buffers.
 	indices_vbo_handle_offset = 0;
 	vbo_handle_base_vertex = 0;
 }
@@ -5542,7 +5542,7 @@ void OpenGLEngine::bindMeshData(const GLObject& ob)
 			1, // binding point index
 			ob.instance_matrix_vbo_name, // buffer
 			0, // offset - offset of the first element within the buffer
-			sizeof(Matrix4f) // stride
+			ob.instance_vbo_stride_B // stride - sizeof(Matrix4f) for legacy instance matrices, sizeof(uint32) for Gaussian splat indices
 		);
 	}
 #endif

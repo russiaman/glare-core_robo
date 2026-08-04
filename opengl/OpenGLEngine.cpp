@@ -9000,7 +9000,12 @@ void OpenGLEngine::drawAlphaBlendedObjects(const Matrix4f& view_matrix, const Ma
 		
 
 		glEnable(GL_BLEND);
-		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+		// Plain glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA) applies GL_SRC_ALPHA to the alpha channel too, so it under-accumulates alpha itself (each
+		// layer contributes src.a^2 rather than src.a) - fine on native, but on web this framebuffer's alpha reaches the canvas (SDLClient.cpp sets
+		// premultipliedAlpha=false) and the browser composites the canvas over the page background using it, so alpha ending up well below 1 in covered
+		// areas washes the whole draw out toward the page background colour. drawOverlayObjects() (~line 10670) hit the exact same issue and already
+		// fixes it with glBlendFuncSeparate - mirroring that fix here. RGB blending is unaffected (still GL_SRC_ALPHA / GL_ONE_MINUS_SRC_ALPHA).
+		glBlendFuncSeparate(/*source RGB factor=*/GL_SRC_ALPHA, /*dest RGB factor=*/GL_ONE_MINUS_SRC_ALPHA, /*src alpha factor=*/GL_ONE, /*dest alpha factor=*/GL_ONE);
 		glDepthMask(GL_FALSE); // Disable writing to depth buffer - we don't want to occlude other transparent objects.
 
 		const Vec4f campos_ws = this->getCameraPositionWS();

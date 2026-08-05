@@ -1,0 +1,74 @@
+/*=====================================================================
+GaussianSplatLodTree.h
+-----------------------
+Copyright Glare Technologies Limited 2026 -
+=====================================================================*/
+#pragma once
+
+
+#include "../maths/vec3.h"
+#include "../maths/Vec4f.h"
+#include <vector>
+
+
+/*=====================================================================
+GaussianSplatLodTree
+---------------------
+CPU-side on-the-fly LoD tree for a Gaussian Splat cloud.
+
+Modelled on Spark's (sparkjs.dev) Tiny-LoD approach: a bottom-up voxel-grid
+merge builds a hierarchy of "virtual" splats, each a statistically-faithful
+stand-in for the splats below it, so that at render time a much smaller
+"frontier" of nodes (large/coarse ones standing in for many small ones where
+the camera is far away or the budget is tight) can represent the full splat
+count while staying visually close to the un-thinned cloud.
+
+A tree is built once per GaussianSplatData, in object space (see centre_os
+below), from the same flat positions/scales/rotations/colours arrays the
+decoder already produces - see GaussianSplatData::lod_tree. Building in
+object space (rather than world space) is what lets a moved/scaled object's
+tree be re-baked to world space the same way its leaf splats already are,
+without rebuilding the tree itself - a merged node transforms identically to
+a leaf one under a rigid + uniform-scale transform.
+
+Documented simplification: opacity is plain [0, 1], clamped at merge time
+(Spark's extended "D parameter" opacity model - a sharper-than-Gaussian
+falloff for densely-merged nodes instead of a hard clamp - is deferred, not
+implemented here).
+=====================================================================*/
+
+
+// One node of the LoD tree - either an original ("leaf") splat, or a merged stand-in for child_count children starting at child_start.
+struct GaussianSplatLodNode
+{
+	Vec3f centre_os; // Object-space centre, in whatever space buildGaussianSplatLodTree()'s input was given in - matches GaussianSplatData::positions' convention.
+	Vec3f scale; // Linear scale factors (already exponentiated), one per axis - matches GaussianSplatData::scales' convention.
+	Vec4f rotation; // Unit quaternion (x, y, z, w) - matches GaussianSplatData::rotations' convention.
+	Vec4f colour; // (r, g, b, opacity), all in [0, 1] - matches GaussianSplatData::colours' convention. See the file header comment re: the deferred D-parameter opacity model.
+	float feature_size; // 2 * max(scale.x, scale.y, scale.z) - the "how big does this node look" metric traversal prioritises nodes by.
+
+	uint32 child_start; // Index of the first child in the tree's linearised array. Always 0 on a node fresh out of mergeGaussianSplatLodNodes()/makeGaussianSplatLodLeafNode() - the tree builder is what actually places nodes into the array and fills this in.
+	uint16 child_count; // 0 = leaf (an original, unmerged splat). Always 0 on a node fresh out of mergeGaussianSplatLodNodes()/makeGaussianSplatLodLeafNode(), for the same reason as child_start.
+};
+
+
+// Builds a leaf node directly from one splat's un-merged attributes (e.g. from GaussianSplatData's parallel arrays). child_count = 0, feature_size computed from scale.
+GaussianSplatLodNode makeGaussianSplatLodLeafNode(const Vec3f& centre_os, const Vec3f& scale, const Vec4f& rotation, const Vec4f& colour);
+
+// Merges 'num_children' nodes (leaves, already-merged nodes, or a mix) into one parent node's attributes - see the .cpp for the maths. Only centre_os/scale/rotation/colour/feature_size are set on the result;
+// child_start/child_count are left at 0 - the tree builder, not this function, knows where the returned node will end up living in the linearised array. num_children must be >= 1.
+GaussianSplatLodNode mergeGaussianSplatLodNodes(const GaussianSplatLodNode* children, size_t num_children);
+
+// Builds a complete LoD tree from a flat splat cloud (Tiny-LoD style: bottom-up voxel-grid merge - see the .cpp for the algorithm). Transform-agnostic (see the centre_os field comment above) - operates in
+// whichever space 'centres' is given in, doesn't know or care about world transforms.
+//
+// Returns the tree linearised into a single array: the result's [0] is always the root; every node's children occupy the contiguous range [child_start, child_start + child_count) later in the array.
+//
+// num_splats must be >= 1. lod_base is the grid-step growth factor between levels (> 1) - Spark's default for this method is 1.5 (a non-integer base gives smoother LoD transitions than doubling).
+std::vector<GaussianSplatLodNode> buildGaussianSplatLodTree(const Vec3f* centres, const Vec3f* scales, const Vec4f* rotations, const Vec4f* colours, size_t num_splats, float lod_base = 1.5f);
+
+
+namespace GaussianSplatLodTreeTests
+{
+	void test();
+}

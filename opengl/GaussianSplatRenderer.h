@@ -26,6 +26,7 @@ namespace glare { class TaskManager; }
 class SplatCloud; // Defined in GaussianSplatRenderer.cpp - one drawable cloud, holding one or more splat objects.
 struct CloudMember; // Defined in GaussianSplatRenderer.cpp - one registered splat object within a cloud.
 class GaussianSplatSortScratch; // Defined in GaussianSplatRenderer.cpp - the reusable working buffers a background depth-sort uses.
+class GaussianSplatLodTraversalScratch; // Defined in GaussianSplatRenderer.cpp - the reusable working buffers a background LoD traversal uses.
 
 
 /*=====================================================================
@@ -166,6 +167,10 @@ private:
 	void drainSortResults();
 	void kickOffSorts();
 
+	void writePlaceholderSelection(SplatCloud& cloud); // Synchronous stand-in frontier (root-only per member with a tree, everything for a member without one), written after any structural change, until the next background traversal's result supersedes it.
+	void drainTraversalResults();
+	void kickOffTraversals();
+
 	Reference<OpenGLProgram> shader_prog; // Shared by every cloud.  Null until the first addObject().
 	Reference<OpenGLProgram> resolve_prog; // Resolves the splat accumulation buffer onto the main colour buffer.  Built alongside shader_prog.
 
@@ -183,4 +188,19 @@ private:
 
 	ThreadSafeQueue<Reference<ThreadMessage> > sort_result_queue; // Shared by every cloud; results carry the cloud id they belong to.
 	js::Vector<Reference<ThreadMessage>, 16> completed_msgs;
+
+	// LoD traversal: same pooling/in-flight-tracking shape as the sort state above, kept separate since the two are
+	// independent pipelines (see kickOffTraversals()/drainTraversalResults()).
+	std::vector<Reference<GaussianSplatLodTraversalScratch> > free_traversal_scratch;
+	int num_traversals_in_flight;
+	ThreadSafeQueue<Reference<ThreadMessage> > traversal_result_queue;
+	js::Vector<Reference<ThreadMessage>, 16> completed_traversal_msgs;
+
+	// Live-tunable from stage 7 onward (a Qt settings panel); hardcoded defaults until then.  pixel_scale_limit is roughly
+	// "stop refining once a node projects to about this many pixels"; max_splats_budget is a per-cloud cap on how many
+	// nodes one traversal may select, matched to what the old (pre-partitioning) renderer settled on after real-world
+	// testing at multi-million-splat scale (see Claude_LOD_plan.md's session notes) - a starting point, not a measured
+	// value for this architecture specifically.
+	float lod_pixel_scale_limit;
+	size_t lod_max_splats_budget;
 };

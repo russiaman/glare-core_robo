@@ -27,9 +27,11 @@ Copyright Glare Technologies Limited 2026 -
 #include "../utils/TaskManager.h"
 #include "../utils/ThreadSafeRefCounted.h"
 #include "../utils/Vector.h"
+#include <algorithm>
 #include <assert.h>
 #include <cstring>
 #include <limits>
+#include <queue>
 
 
 // How far the camera has to move before a cloud's depth order is worth recomputing.  Camera rotation is deliberately
@@ -70,7 +72,9 @@ class SplatCloud : public RefCounted
 public:
 	SplatCloud()
 	:	cloud_id(0), gpu_capacity_splats(0), total_splats(0), structure_generation(0), sort_in_flight(false),
-		have_last_sort_cam_pos(false), last_sort_cam_pos_ws(0.f), aabb_ws(js::AABBox::emptyAABBox()), added_to_engine(false)
+		have_last_sort_cam_pos(false), last_sort_cam_pos_ws(0.f), aabb_ws(js::AABBox::emptyAABBox()), added_to_engine(false),
+		topology_generation(0), traversal_in_flight(false), have_last_traversal_cam_pos(false), last_traversal_cam_pos_ws(0.f),
+		last_traversal_kicked_topology_generation(0)
 	{}
 
 	uint64 cloud_id; // Stable, never reused.  Sort results carry it, so a result for a cloud that has since been merged away can be dropped.
@@ -94,6 +98,17 @@ public:
 	bool sort_in_flight; // True from when a sort is kicked off until its precise result is applied.  The coarse result doesn't clear it.
 	bool have_last_sort_cam_pos;
 	Vec4f last_sort_cam_pos_ws; // Camera position as of the last sort kicked off (not necessarily completed).
+
+	// Bumped by anything that changes which nodes belong to this cloud or where (appendMemberToCloud() *and* rebuildCloud()) -
+	// a strict superset of structure_generation's bump conditions (which rebuildCloud() alone triggers). A pure append doesn't
+	// invalidate an in-flight sort's indices (the appended tail is already in identity order - see appendMemberToCloud()), but
+	// it does mean a new member's tree root is missing from any traversal already in flight, so that result can't be trusted
+	// once it lands; the newly appended member must appear in the *next* traversal even if the camera hasn't moved at all.
+	uint64 topology_generation;
+	bool traversal_in_flight; // True from when a traversal is kicked off until its result is applied (or dropped as stale).
+	bool have_last_traversal_cam_pos;
+	Vec4f last_traversal_cam_pos_ws; // Camera position as of the last traversal kicked off (not necessarily completed).
+	uint64 last_traversal_kicked_topology_generation; // topology_generation as of the last traversal kicked off - a mismatch against the live value means the cloud's structure has changed since, so it's unconditionally overdue for a fresh one (see kickOffTraversals()), the same idea as !have_last_sort_cam_pos for the sort.
 };
 
 
@@ -123,6 +138,29 @@ public:
 };
 
 
+// Reusable working buffers for the background LoD traversals - pooled the same way GaussianSplatSortScratch is, and for
+// the same reason (a large tree can make positions_snapshot/scales_snapshot run to a non-trivial size, so N clouds
+// shouldn't mean N sets of these).
+class GaussianSplatLodTraversalScratch : public ThreadSafeRefCounted
+{
+public:
+	// One member's tree and where it landed in the cloud's arrays, as of when the snapshot was taken.
+	struct MemberSnapshot
+	{
+		GaussianSplatDataRef splat_data; // Kept alive so the worker can read lod_tree from it directly - never mutated after decode, so safe to read cross-thread without copying its contents.
+		size_t offset;
+		size_t count;
+	};
+
+	js::Vector<Vec3f, 16> positions_snapshot; // A frozen copy of one cloud's world-space node positions (leaves + merged), taken on the main thread when a traversal is kicked off.
+	js::Vector<Vec3f, 16> scales_snapshot; // A frozen copy of the same cloud's world-space node scales, for feature_size = 2*max(scale) - see GaussianSplatLodTree.h's GaussianSplatLodNode::feature_size.
+	std::vector<MemberSnapshot> members_snapshot;
+
+	js::Vector<uint32, 16> selected_indices; // Output: this frame's frontier, as cloud-array indices.  Unsorted (heap-pop order) until stage 5 wires the depth-sort up to the selection - see kickOffSorts()'s use of cloudHasLodTree().
+	bool hit_budget_cap; // True if max_splats_budget stopped further expansion before pixel_scale converged - i.e. detail is being truncated by the budget, not just naturally coarse at this distance. Consumed by the diagnostics display from stage 6 onward.
+};
+
+
 namespace
 {
 
@@ -132,6 +170,20 @@ const size_t splat_tex_width = 4096; // Gives ~16.7M splat capacity where GL_MAX
 const int splat_index_attribute_loc = 1; // Forced in buildShadersIfNeeded().  Slot 1 is otherwise "normal_in", which splats have no use for.
 
 const int coarse_key_bits = 16; // How many high bits of the sort key the coarse stage buckets on, i.e. 65536 evenly spaced depth slices.
+
+const int max_concurrent_traversals = 2; // Mirrors max_concurrent_sorts above, for the same reason: caps traversal scratch memory at roughly this many clouds' worth rather than letting it scale with the world.
+
+
+// Whether any member of this cloud has a built LoD tree.  Drives two things: whether kickOffTraversals() bothers picking
+// this cloud at all (nothing to choose between without a tree), and, temporarily, whether kickOffSorts() skips it (see
+// that function's use of this) - a cloud with no tree anywhere in it behaves exactly as before LoD existed.
+bool cloudHasLodTree(const SplatCloud& cloud)
+{
+	for(size_t m=0; m<cloud.members.size(); ++m)
+		if(!cloud.members[m].splat_data->lod_tree.empty())
+			return true;
+	return false;
+}
 
 // The world-space radius a splat covers, from its centre.  gaussian_splat_vert_shader.glsl cuts the splat off at 3
 // sigma, so this matches what actually gets drawn.  Rotation is irrelevant: this bounds the splat in every direction.
@@ -337,11 +389,177 @@ private:
 };
 
 
+// Result of a background LoD traversal, handed back to the main thread.  drainTraversalResults() checks cloud_id, to drop
+// results for a cloud that has since been merged away or removed, and then topology_generation, to drop results computed
+// against a member set the cloud no longer has (see SplatCloud::topology_generation's comment for why this needs to be a
+// stricter counter than the sort's structure_generation).
+class GaussianSplatLodTraversalResultMsg : public ThreadMessage
+{
+public:
+	uint64 cloud_id;
+	uint64 topology_generation;
+	Reference<GaussianSplatLodTraversalScratch> scratch; // Holds the result buffer, and keeps it alive even if the renderer was torn down while the traversal ran.
+};
+
+
+// Best-first LoD frontier selection for one cloud, entirely on a worker thread.  No GL calls here.
+//
+// Runs one shared max-heap across every member of the cloud that has a built LoD tree, rather than one heap per member.
+// The reason a shared heap matters at all is to avoid reintroducing cross-object depth-blending bugs between members
+// whose bounds intersect on screen without intersecting in 3D - but mergeIntersectingClouds() already guarantees that
+// members with intersecting bounds share a cloud, so scoping the shared heap to "this cloud" (rather than "the whole
+// world", which an earlier, pre-partitioning version of this renderer needed) protects exactly the members where it's
+// load-bearing, and no more.  See GaussianSplatRenderer.h's Partitioning section.
+class GaussianSplatLodTraversalTask : public glare::Task
+{
+public:
+	GaussianSplatLodTraversalTask(uint64 cloud_id_, uint64 topology_generation_, const Reference<GaussianSplatLodTraversalScratch>& scratch_,
+		const Vec4f& cam_pos_ws_, float pixel_scale_limit_, size_t max_splats_budget_, float focal_px_, ThreadSafeQueue<Reference<ThreadMessage> >* result_queue_)
+	:	cloud_id(cloud_id_), topology_generation(topology_generation_), scratch(scratch_), cam_pos_ws(cam_pos_ws_),
+		pixel_scale_limit(pixel_scale_limit_), max_splats_budget(max_splats_budget_), focal_px(focal_px_), result_queue(result_queue_)
+	{}
+
+	virtual void run(size_t /*thread_index*/) override
+	{
+		const js::Vector<Vec3f, 16>& positions = scratch->positions_snapshot; // The frozen snapshot, never the live cloud arrays.
+		const js::Vector<Vec3f, 16>& scales = scratch->scales_snapshot;
+
+		js::Vector<uint32, 16>& output = scratch->selected_indices;
+		output.resizeNoCopy(0);
+
+		std::priority_queue<HeapItem, std::vector<HeapItem>, HeapItemLess> heap;
+
+		for(size_t mi=0; mi<scratch->members_snapshot.size(); ++mi)
+		{
+			const GaussianSplatLodTraversalScratch::MemberSnapshot& m = scratch->members_snapshot[mi];
+			if(m.splat_data->lod_tree.empty())
+			{
+				// No tree built for this member (yet, or ever) - nothing to choose between, so every one of its splats is
+				// always selected, exactly as it would be with no LoD at all.
+				for(size_t i=0; i<m.count; ++i)
+					output.push_back((uint32)(m.offset + i));
+			}
+			else
+				heap.push(makeHeapItem((uint32)mi, /*tree_local_idx=*/0, m.offset, positions, scales)); // Root is always node 0 - see buildGaussianSplatLodTree().
+		}
+
+		bool hit_budget_cap = false;
+		while(!heap.empty())
+		{
+			const HeapItem top = heap.top();
+			if(top.pixel_scale <= pixel_scale_limit)
+				break; // Converged: everything still in the heap is already fine-enough detail not to need expanding further - drained as-is below.
+
+			const GaussianSplatLodTraversalScratch::MemberSnapshot& m = scratch->members_snapshot[top.member_idx];
+			const GaussianSplatLodNode& node = m.splat_data->lod_tree[top.tree_local_idx];
+
+			if(node.child_count == 0)
+			{
+				// A leaf can't be expanded regardless of pixel_scale - it's already the finest detail this tree has.
+				heap.pop();
+				output.push_back((uint32)(m.offset + top.tree_local_idx));
+				continue;
+			}
+
+			// Expanding replaces this one heap entry with child_count new ones, so the projected total if the loop stopped
+			// right after this expansion would be output.size() + heap.size() - 1 + child_count.
+			if(output.size() + heap.size() - 1 + node.child_count > max_splats_budget)
+			{
+				hit_budget_cap = true;
+				break; // Leave this node, and the rest of the heap, to be drained as-is below - the budget, not convergence, is what stopped things here.
+			}
+
+			heap.pop();
+			for(uint32 c = node.child_start; c < (uint32)node.child_start + node.child_count; ++c)
+				heap.push(makeHeapItem(top.member_idx, c, m.offset, positions, scales));
+		}
+
+		// Whatever's left in the heap - either because pixel_scale converged, or the budget stopped further expansion - is
+		// exactly the rest of this frame's frontier.
+		while(!heap.empty())
+		{
+			const HeapItem top = heap.top();
+			heap.pop();
+			const GaussianSplatLodTraversalScratch::MemberSnapshot& m = scratch->members_snapshot[top.member_idx];
+			output.push_back((uint32)(m.offset + top.tree_local_idx));
+		}
+
+		// Sort the selection back-to-front by camera distance, here on the worker thread, with each node's distance
+		// computed exactly once (a decorate-sort) rather than recomputed per comparison - both done proactively, not as a
+		// follow-up fix: an earlier version of this renderer hit an equivalent bug twice at production scale (raw
+		// heap-pop order producing alpha-blend popping on camera movement, then a naive std::sort-with-recomputed-distance
+		// fix on the *main* thread causing a real FPS regression at 500K+ selected nodes - see Claude_LOD_plan.md's
+		// session notes). This is also why the old two-stage (coarse+precise) GaussianSplatSortTask isn't reused for the
+		// selection: that machinery exists to keep a much larger, unbounded whole-cloud sort off the main thread's
+		// critical path via a fast approximate first pass; a traversal's output is already budget-bounded, so one exact
+		// sort here is both simpler and fast enough - see kickOffSorts()'s cloudHasLodTree() guard, which leaves an
+		// LoD-active cloud to this sort instead of the old one.
+		struct DistIdx { float dist; uint32 idx; };
+		struct DistIdxGreater { inline bool operator () (const DistIdx& a, const DistIdx& b) const { return a.dist > b.dist; } }; // Farthest first, matching GaussianSplatSortResultMsg's convention for correct back-to-front premultiplied-alpha blending.
+
+		js::Vector<DistIdx, 16> decorated(output.size());
+		for(size_t i=0; i<output.size(); ++i)
+		{
+			const Vec3f& p = positions[output[i]];
+			decorated[i].dist = cam_pos_ws.getDist(Vec4f(p.x, p.y, p.z, 1.f));
+			decorated[i].idx = output[i];
+		}
+		std::sort(decorated.data(), decorated.data() + decorated.size(), DistIdxGreater());
+		for(size_t i=0; i<decorated.size(); ++i)
+			output[i] = decorated[i].idx;
+
+		scratch->hit_budget_cap = hit_budget_cap;
+
+		Reference<GaussianSplatLodTraversalResultMsg> msg = new GaussianSplatLodTraversalResultMsg();
+		msg->cloud_id = cloud_id;
+		msg->topology_generation = topology_generation;
+		msg->scratch = scratch;
+		result_queue->enqueue(msg);
+	}
+
+private:
+	// One entry under consideration in run()'s heap: either a tree root not yet examined, or a node whose parent was just
+	// expanded.  member_idx/tree_local_idx together identify the node; the corresponding cloud-array index (needed to read
+	// its baked world-space position/scale, and to write it to the output) is member.offset + tree_local_idx.
+	struct HeapItem
+	{
+		float pixel_scale;
+		uint32 member_idx;
+		uint32 tree_local_idx;
+	};
+	struct HeapItemLess { inline bool operator () (const HeapItem& a, const HeapItem& b) const { return a.pixel_scale < b.pixel_scale; } }; // std::priority_queue is a max-heap under operator<, so the largest pixel_scale (biggest on-screen feature) is always on top.
+
+	HeapItem makeHeapItem(uint32 member_idx, uint32 tree_local_idx, size_t member_offset, const js::Vector<Vec3f, 16>& positions, const js::Vector<Vec3f, 16>& scales) const
+	{
+		const size_t cloud_idx = member_offset + tree_local_idx;
+		const Vec3f& p = positions[cloud_idx];
+		const float dist = myMax(cam_pos_ws.getDist(Vec4f(p.x, p.y, p.z, 1.f)), 1.0e-6f); // Clamped away from zero so a node exactly at the camera doesn't produce an infinite pixel_scale.
+		const Vec3f& s = scales[cloud_idx];
+		const float feature_size = 2.f * myMax(s.x, myMax(s.y, s.z)); // Matches GaussianSplatLodNode::feature_size's definition, just computed from the world-baked scale rather than the object-space one, so uniform_scale_ws is already folded in.
+		HeapItem item;
+		item.pixel_scale = (feature_size / dist) * focal_px;
+		item.member_idx = member_idx;
+		item.tree_local_idx = tree_local_idx;
+		return item;
+	}
+
+	uint64 cloud_id;
+	uint64 topology_generation;
+	Reference<GaussianSplatLodTraversalScratch> scratch;
+	Vec4f cam_pos_ws;
+	float pixel_scale_limit;
+	size_t max_splats_budget;
+	float focal_px;
+	ThreadSafeQueue<Reference<ThreadMessage> >* result_queue;
+};
+
+
 } // end anonymous namespace
 
 
 GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
-:	opengl_engine(&opengl_engine_), next_handle(1), next_cloud_id(1), num_sorts_in_flight(0)
+:	opengl_engine(&opengl_engine_), next_handle(1), next_cloud_id(1), num_sorts_in_flight(0),
+	num_traversals_in_flight(0), lod_pixel_scale_limit(1.0f), lod_max_splats_budget(2000000)
 {}
 
 
@@ -663,30 +881,64 @@ static void bakeMember(SplatCloud& cloud, CloudMember& member)
 
 	js::AABBox aabb_ws = js::AABBox::emptyAABBox();
 
-	const size_t num_splats = splat_data.numSplats();
-	for(size_t i=0; i<num_splats; ++i)
+	if(splat_data.lod_tree.empty())
 	{
-		const Vec3f& os_pos   = splat_data.positions[i];
-		const Vec3f& os_scale = splat_data.scales[i];
-		const Vec4f& os_rot   = splat_data.rotations[i]; // (x, y, z, w)
+		// No LoD tree built (yet, or ever, for this object) - bake every leaf splat, as before.
+		const size_t num_splats = splat_data.numSplats();
+		for(size_t i=0; i<num_splats; ++i)
+		{
+			const Vec3f& os_pos   = splat_data.positions[i];
+			const Vec3f& os_scale = splat_data.scales[i];
+			const Vec4f& os_rot   = splat_data.rotations[i]; // (x, y, z, w)
 
-		const Vec4f rotated = rotation_ws.rotateVector(Vec4f(uniform_scale_ws * os_pos.x, uniform_scale_ws * os_pos.y, uniform_scale_ws * os_pos.z, 0.f));
-		const Vec4f world_pos = translation_ws + rotated; // translation_ws.w == 1 and rotated.w == 0, so world_pos.w == 1, as a point should be.
+			const Vec4f rotated = rotation_ws.rotateVector(Vec4f(uniform_scale_ws * os_pos.x, uniform_scale_ws * os_pos.y, uniform_scale_ws * os_pos.z, 0.f));
+			const Vec4f world_pos = translation_ws + rotated; // translation_ws.w == 1 and rotated.w == 0, so world_pos.w == 1, as a point should be.
 
-		const Quat<float> os_quat(os_rot[0], os_rot[1], os_rot[2], os_rot[3]);
-		const Quat<float> world_quat = rotation_ws * os_quat;
+			const Quat<float> os_quat(os_rot[0], os_rot[1], os_rot[2], os_rot[3]);
+			const Quat<float> world_quat = rotation_ws * os_quat;
 
-		const Vec3f world_scale = os_scale * uniform_scale_ws;
+			const Vec3f world_scale = os_scale * uniform_scale_ws;
 
-		const size_t dest = member.offset + i;
-		cloud.positions[dest] = toVec3f(world_pos);
-		cloud.scales   [dest] = world_scale;
-		cloud.rotations[dest] = world_quat.v; // Quat::v is already (x, y, z, w), matching our storage convention.
-		cloud.colours  [dest] = splat_data.colours[i]; // Colour and opacity aren't affected by the cloud's pose, but re-deriving them keeps this the single place a member's data is written.
+			const size_t dest = member.offset + i;
+			cloud.positions[dest] = toVec3f(world_pos);
+			cloud.scales   [dest] = world_scale;
+			cloud.rotations[dest] = world_quat.v; // Quat::v is already (x, y, z, w), matching our storage convention.
+			cloud.colours  [dest] = splat_data.colours[i]; // Colour and opacity aren't affected by the cloud's pose, but re-deriving them keeps this the single place a member's data is written.
 
-		const float radius = splat_cutoff_sigmas * myMax(world_scale.x, myMax(world_scale.y, world_scale.z));
-		aabb_ws.enlargeToHoldPoint(world_pos - Vec4f(radius, radius, radius, 0.f));
-		aabb_ws.enlargeToHoldPoint(world_pos + Vec4f(radius, radius, radius, 0.f));
+			const float radius = splat_cutoff_sigmas * myMax(world_scale.x, myMax(world_scale.y, world_scale.z));
+			aabb_ws.enlargeToHoldPoint(world_pos - Vec4f(radius, radius, radius, 0.f));
+			aabb_ws.enlargeToHoldPoint(world_pos + Vec4f(radius, radius, radius, 0.f));
+		}
+	}
+	else
+	{
+		// A tree exists - bake every node (leaves and merged internal nodes alike), not just the leaves, since any node could end up in a drawn LoD selection later. A merged node transforms identically to a
+		// leaf one under this rigid + uniform-scale bake, which is exactly why the tree is built in object space in the first place (see GaussianSplatLodTree.h).
+		const std::vector<GaussianSplatLodNode>& tree = splat_data.lod_tree;
+		for(size_t i=0; i<tree.size(); ++i)
+		{
+			const Vec3f& os_pos   = tree[i].centre_os;
+			const Vec3f& os_scale = tree[i].scale;
+			const Vec4f& os_rot   = tree[i].rotation; // (x, y, z, w)
+
+			const Vec4f rotated = rotation_ws.rotateVector(Vec4f(uniform_scale_ws * os_pos.x, uniform_scale_ws * os_pos.y, uniform_scale_ws * os_pos.z, 0.f));
+			const Vec4f world_pos = translation_ws + rotated;
+
+			const Quat<float> os_quat(os_rot[0], os_rot[1], os_rot[2], os_rot[3]);
+			const Quat<float> world_quat = rotation_ws * os_quat;
+
+			const Vec3f world_scale = os_scale * uniform_scale_ws;
+
+			const size_t dest = member.offset + i;
+			cloud.positions[dest] = toVec3f(world_pos);
+			cloud.scales   [dest] = world_scale;
+			cloud.rotations[dest] = world_quat.v;
+			cloud.colours  [dest] = tree[i].colour;
+
+			const float radius = splat_cutoff_sigmas * myMax(world_scale.x, myMax(world_scale.y, world_scale.z));
+			aabb_ws.enlargeToHoldPoint(world_pos - Vec4f(radius, radius, radius, 0.f));
+			aabb_ws.enlargeToHoldPoint(world_pos + Vec4f(radius, radius, radius, 0.f));
+		}
 	}
 
 	member.aabb_ws = aabb_ws;
@@ -709,6 +961,31 @@ void GaussianSplatRenderer::rebuildCloudAABB(SplatCloud& cloud)
 }
 
 
+// Synchronous placeholder frontier, written immediately after a structural change (append or rebuild), so the cloud
+// isn't left showing a stale or garbage selection for the one-to-a-few-frame gap before the next background traversal
+// completes.  Root-only for a member with a built tree (the cheapest non-empty frontier); every splat for a member
+// without one, since there's nothing to choose between without a tree.  Degrades to exactly the pre-LoD "draw
+// everything" behaviour when no member in the cloud has a tree at all.
+void GaussianSplatRenderer::writePlaceholderSelection(SplatCloud& cloud)
+{
+	js::Vector<uint32, 16> selection;
+	selection.reserve(cloud.members.size());
+
+	for(size_t m=0; m<cloud.members.size(); ++m)
+	{
+		const CloudMember& member = cloud.members[m];
+		if(member.splat_data->lod_tree.empty())
+			for(size_t i=0; i<member.count; ++i)
+				selection.push_back((uint32)(member.offset + i));
+		else
+			selection.push_back((uint32)member.offset); // Root is always node 0 of a member's tree - see buildGaussianSplatLodTree().
+	}
+
+	cloud.instance_index_vbo->updateData(0, selection.data(), selection.size() * sizeof(uint32));
+	cloud.ob->num_instances_to_draw = (int)selection.size();
+}
+
+
 void GaussianSplatRenderer::appendMemberToCloud(SplatCloud& cloud, const CloudMember& member_in)
 {
 	const size_t old_total = cloud.total_splats;
@@ -725,7 +1002,6 @@ void GaussianSplatRenderer::appendMemberToCloud(SplatCloud& cloud, const CloudMe
 	bakeMember(cloud, member);
 
 	cloud.total_splats = new_total;
-	cloud.ob->num_instances_to_draw = (int)new_total;
 
 	ensureGpuCapacity(cloud, new_total);
 
@@ -739,6 +1015,14 @@ void GaussianSplatRenderer::appendMemberToCloud(SplatCloud& cloud, const CloudMe
 	// bump structure_generation: a pure append leaves existing indices meaningful, so an in-flight sort's result still
 	// applies to the prefix it covers.
 	cloud.have_last_sort_cam_pos = false;
+
+	// A new member changes what this cloud's LoD frontier should be, and unlike the sort above, an in-flight traversal's
+	// result genuinely can't be trusted afterwards - it was computed against a member set that didn't include this one.
+	// topology_generation is a stricter counter than structure_generation for exactly this reason (see its declaration).
+	// writePlaceholderSelection() stands in with a cheap synchronous frontier until the next background traversal - kicked
+	// off because of the generation bump below, even if the camera hasn't moved - lands.
+	cloud.topology_generation++;
+	writePlaceholderSelection(cloud);
 }
 
 
@@ -760,8 +1044,6 @@ void GaussianSplatRenderer::rebuildCloud(SplatCloud& cloud)
 	for(size_t m=0; m<cloud.members.size(); ++m)
 		bakeMember(cloud, cloud.members[m]);
 
-	cloud.ob->num_instances_to_draw = (int)total;
-
 	ensureGpuCapacity(cloud, total);
 
 	uploadTexelRowsForSplatRange(cloud, 0, total);
@@ -772,6 +1054,12 @@ void GaussianSplatRenderer::rebuildCloud(SplatCloud& cloud)
 
 	cloud.structure_generation++; // Every member was renumbered, so any in-flight sort's indices no longer mean the same splats.
 	cloud.have_last_sort_cam_pos = false;
+
+	// Every member's offset just moved, so an in-flight traversal's result (indices computed against the old offsets)
+	// no longer means the same nodes - topology_generation++ (a stricter counter than structure_generation, see its
+	// declaration) makes kickOffTraversals() treat this cloud as unconditionally overdue for a fresh one.
+	cloud.topology_generation++;
+	writePlaceholderSelection(cloud);
 }
 
 
@@ -838,14 +1126,14 @@ GaussianSplatRenderer::Handle GaussianSplatRenderer::addObject(const GaussianSpl
 	buildShadersIfNeeded();
 
 	const size_t max_splats = maxSplatsPerCloud();
-	if(splat_data->numSplats() > max_splats)
-		throw glare::Exception("Can't render a splat cloud with " + toString(splat_data->numSplats()) + " splats: the per-cloud limit is " + toString(max_splats) + ".");
+	if(splat_data->numNodes() > max_splats) // Node count if an LoD tree has been built (wider than leaf count, since it includes merged internal nodes too), else leaf count - see GaussianSplatData::numNodes().
+		throw glare::Exception("Can't render a splat cloud with " + toString(splat_data->numNodes()) + " nodes: the per-cloud limit is " + toString(max_splats) + ".");
 
 	CloudMember member;
 	member.handle = next_handle++;
 	member.splat_data = splat_data;
 	member.offset = 0; // Assigned by appendMemberToCloud().
-	member.count = splat_data->numSplats();
+	member.count = splat_data->numNodes();
 	member.translation_ws = translation_ws;
 	member.rotation_ws = rotation_ws;
 	member.uniform_scale_ws = uniform_scale_ws;
@@ -1025,6 +1313,16 @@ void GaussianSplatRenderer::kickOffSorts()
 			if(cloud->total_splats == 0 || cloud->sort_in_flight)
 				continue;
 
+			// This sort targets the cloud's whole [0, total_splats) range, which for an LoD-active cloud is wider than
+			// what's actually being drawn (num_instances_to_draw is the traversal selection's size, not total_splats -
+			// see drainTraversalResults()).  Sorting the whole range would overwrite the selection at the front of
+			// instance_index_vbo with an unrelated full-cloud order.  An LoD-active cloud doesn't need this sort anyway:
+			// GaussianSplatLodTraversalTask::run() already sorts the selection itself, back-to-front, on the same worker
+			// thread that computed it - see its decorate-sort at the end of run() - so this whole-cloud sort is left to
+			// clouds with no LoD tree at all, which still draw every splat and still need it.
+			if(cloudHasLodTree(*cloud))
+				continue;
+
 			float ratio;
 			if(!cloud->have_last_sort_cam_pos)
 				ratio = std::numeric_limits<float>::max(); // Never sorted, or invalidated by a change to the cloud.
@@ -1071,11 +1369,138 @@ void GaussianSplatRenderer::kickOffSorts()
 }
 
 
+void GaussianSplatRenderer::drainTraversalResults()
+{
+	traversal_result_queue.dequeueAnyQueuedItems(completed_traversal_msgs);
+
+	for(size_t i=0; i<completed_traversal_msgs.size(); ++i)
+	{
+		const GaussianSplatLodTraversalResultMsg* const msg = static_cast<const GaussianSplatLodTraversalResultMsg*>(completed_traversal_msgs[i].ptr());
+
+		SplatCloud* cloud = NULL;
+		for(size_t c=0; c<clouds.size(); ++c)
+			if(clouds[c]->cloud_id == msg->cloud_id)
+			{
+				cloud = clouds[c].ptr();
+				break;
+			}
+
+		// Bookkeeping first, and unconditionally: the traversal has finished and its scratch is free to reuse whether or
+		// not the cloud it was for still exists.
+		num_traversals_in_flight--;
+		free_traversal_scratch.push_back(msg->scratch);
+		if(cloud)
+			cloud->traversal_in_flight = false;
+
+		// Drop results for a cloud that has since been merged away or removed, and results computed against a member set
+		// the cloud no longer has - see SplatCloud::topology_generation's comment.
+		if(!cloud || msg->topology_generation != cloud->topology_generation)
+			continue;
+
+		// Already sorted back-to-front by GaussianSplatLodTraversalTask::run()'s decorate-sort - nothing left to do here
+		// but write it.  kickOffSorts() never touches an LoD-active cloud (see its cloudHasLodTree() guard), so there's no
+		// separate sort state on the cloud to invalidate here the way a structural change invalidates the old sort's.
+		const js::Vector<uint32, 16>& selected = msg->scratch->selected_indices;
+		cloud->instance_index_vbo->updateData(0, selected.data(), selected.size() * sizeof(uint32));
+		cloud->ob->num_instances_to_draw = (int)selected.size();
+	}
+
+	completed_traversal_msgs.clear(); // Drop the references, so a scratch just returned to the pool isn't kept alive by a stale message.
+}
+
+
+void GaussianSplatRenderer::kickOffTraversals()
+{
+	glare::TaskManager* const task_manager = opengl_engine->getMainTaskManager();
+	if(task_manager == NULL)
+		return;
+
+	const OpenGLScene* const scene = opengl_engine->getCurrentScene();
+	const Vec4f cam_pos_ws = scene->cam_to_world.getColumn(3);
+
+	const Vec2i viewport_dims = opengl_engine->getViewportDims();
+	const float focal_x = (float)viewport_dims.x * scene->lens_sensor_dist / scene->use_sensor_width;
+	const float focal_y = (float)viewport_dims.y * scene->lens_sensor_dist / scene->use_sensor_height;
+	const float focal_px = (focal_x + focal_y) * 0.5f; // Average of the two axes - a splat's on-screen size only differs meaningfully per axis with a non-square viewport/sensor, close enough for the traversal's coarse pixel_scale budget.
+
+	while(num_traversals_in_flight < max_concurrent_traversals)
+	{
+		// Pick the cloud most overdue for a traversal, same "how far the camera has moved relative to this cloud's own
+		// threshold" idea kickOffSorts() uses, plus a structural check that has no sort equivalent: a cloud whose topology
+		// changed since its last kicked-off traversal is unconditionally overdue, even with zero camera movement, because
+		// an append that isn't in the traversal yet means a whole member is missing from the frontier - see
+		// SplatCloud::topology_generation's comment.
+		SplatCloud* best_cloud = NULL;
+		float best_ratio = 1.f;
+		for(size_t i=0; i<clouds.size(); ++i)
+		{
+			SplatCloud* const cloud = clouds[i].ptr();
+			if(cloud->total_splats == 0 || cloud->traversal_in_flight || !cloudHasLodTree(*cloud))
+				continue;
+
+			float ratio;
+			if(cloud->last_traversal_kicked_topology_generation != cloud->topology_generation)
+				ratio = std::numeric_limits<float>::max();
+			else if(!cloud->have_last_traversal_cam_pos)
+				ratio = std::numeric_limits<float>::max();
+			else
+			{
+				const float threshold = myMax(min_resort_move_threshold_ws, cloud->aabb_ws.distanceToPoint(cam_pos_ws) * resort_threshold_dist_fraction);
+				ratio = cam_pos_ws.getDist(cloud->last_traversal_cam_pos_ws) / threshold;
+			}
+
+			if(ratio > best_ratio)
+			{
+				best_ratio = ratio;
+				best_cloud = cloud;
+			}
+		}
+
+		if(best_cloud == NULL)
+			break;
+
+		Reference<GaussianSplatLodTraversalScratch> scratch;
+		if(free_traversal_scratch.empty())
+			scratch = new GaussianSplatLodTraversalScratch();
+		else
+		{
+			scratch = free_traversal_scratch.back();
+			free_traversal_scratch.pop_back();
+		}
+
+		// Freeze a snapshot of the cloud's current world-space node data and member layout, so the worker never touches
+		// the live, growable/mutable state - same rule the sort task follows, for the same reason.
+		scratch->positions_snapshot.resizeNoCopy(best_cloud->total_splats);
+		std::memcpy(scratch->positions_snapshot.data(), best_cloud->positions.data(), best_cloud->total_splats * sizeof(Vec3f));
+		scratch->scales_snapshot.resizeNoCopy(best_cloud->total_splats);
+		std::memcpy(scratch->scales_snapshot.data(), best_cloud->scales.data(), best_cloud->total_splats * sizeof(Vec3f));
+
+		scratch->members_snapshot.resize(best_cloud->members.size());
+		for(size_t m=0; m<best_cloud->members.size(); ++m)
+		{
+			scratch->members_snapshot[m].splat_data = best_cloud->members[m].splat_data;
+			scratch->members_snapshot[m].offset = best_cloud->members[m].offset;
+			scratch->members_snapshot[m].count = best_cloud->members[m].count;
+		}
+
+		best_cloud->traversal_in_flight = true;
+		best_cloud->have_last_traversal_cam_pos = true;
+		best_cloud->last_traversal_cam_pos_ws = cam_pos_ws;
+		best_cloud->last_traversal_kicked_topology_generation = best_cloud->topology_generation;
+		num_traversals_in_flight++;
+
+		task_manager->addTask(new GaussianSplatLodTraversalTask(best_cloud->cloud_id, best_cloud->topology_generation, scratch, cam_pos_ws,
+			lod_pixel_scale_limit, lod_max_splats_budget, focal_px, &traversal_result_queue));
+	}
+}
+
+
 void GaussianSplatRenderer::think()
 {
-	// Applying a completed sort is the only GL call in the whole depth-sort pipeline, which is why it happens here on
-	// the main thread rather than in the worker task.
+	// Applying a completed sort or traversal is the only GL call in either background pipeline, which is why both happen
+	// here on the main thread rather than in the worker tasks.
 	drainSortResults();
+	drainTraversalResults();
 
 	if(clouds.empty())
 		return;
@@ -1097,4 +1522,5 @@ void GaussianSplatRenderer::think()
 	}
 
 	kickOffSorts();
+	kickOffTraversals();
 }

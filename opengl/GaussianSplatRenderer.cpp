@@ -74,7 +74,7 @@ public:
 	:	cloud_id(0), gpu_capacity_splats(0), total_splats(0), structure_generation(0), sort_in_flight(false),
 		have_last_sort_cam_pos(false), last_sort_cam_pos_ws(0.f), aabb_ws(js::AABBox::emptyAABBox()), added_to_engine(false),
 		topology_generation(0), traversal_in_flight(false), have_last_traversal_cam_pos(false), last_traversal_cam_pos_ws(0.f),
-		last_traversal_kicked_topology_generation(0)
+		last_traversal_kicked_topology_generation(0), last_traversal_hit_budget_cap(false)
 	{}
 
 	uint64 cloud_id; // Stable, never reused.  Sort results carry it, so a result for a cloud that has since been merged away can be dropped.
@@ -109,6 +109,7 @@ public:
 	bool have_last_traversal_cam_pos;
 	Vec4f last_traversal_cam_pos_ws; // Camera position as of the last traversal kicked off (not necessarily completed).
 	uint64 last_traversal_kicked_topology_generation; // topology_generation as of the last traversal kicked off - a mismatch against the live value means the cloud's structure has changed since, so it's unconditionally overdue for a fresh one (see kickOffTraversals()), the same idea as !have_last_sort_cam_pos for the sort.
+	bool last_traversal_hit_budget_cap; // Copied from the most recently applied traversal result's GaussianSplatLodTraversalScratch::hit_budget_cap (which itself doesn't persist - the scratch goes back to the pool) - surfaced in getDiagnostics() as a "detail is being truncated by the budget" warning.
 };
 
 
@@ -559,7 +560,7 @@ private:
 
 GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 :	opengl_engine(&opengl_engine_), next_handle(1), next_cloud_id(1), num_sorts_in_flight(0),
-	num_traversals_in_flight(0), lod_pixel_scale_limit(1.0f), lod_max_splats_budget(2000000)
+	num_traversals_in_flight(0), lod_pixel_scale_limit(1.0f), lod_max_splats_budget(10000000), lod_resort_move_threshold_ws(0.1f)
 {}
 
 
@@ -667,6 +668,28 @@ std::string GaussianSplatRenderer::getDiagnostics() const
 			s.precise_indices.size() * sizeof(uint32) + s.temp_counts.size() * sizeof(uint32));
 	}
 
+	uint64 traversal_scratch_bytes = 0;
+	for(size_t i=0; i<free_traversal_scratch.size(); ++i)
+	{
+		const GaussianSplatLodTraversalScratch& s = *free_traversal_scratch[i];
+		traversal_scratch_bytes += (uint64)(s.positions_snapshot.size() * sizeof(Vec3f) + s.scales_snapshot.size() * sizeof(Vec3f) +
+			s.selected_indices.size() * sizeof(uint32));
+	}
+
+	// Total leaf count (pre-merge) vs total node count (leaves + merged, what's actually GPU-resident) across every
+	// LoD-active cloud - the ratio is what the plan's session notes call out as an expected ~1.3x-1.8x, a sanity check
+	// that the tree building/upload path is behaving, not a per-cloud figure.
+	size_t total_leaves_lod_active = 0, total_nodes_lod_active = 0;
+	for(size_t i=0; i<clouds.size(); ++i)
+	{
+		const SplatCloud& cloud = *clouds[i];
+		if(!cloudHasLodTree(cloud))
+			continue;
+		total_nodes_lod_active += cloud.total_splats;
+		for(size_t m=0; m<cloud.members.size(); ++m)
+			total_leaves_lod_active += cloud.members[m].splat_data->numSplats();
+	}
+
 	std::string s;
 	s += "Splat objects: " + toString(handle_to_cloud.size()) + "\n";
 	s += "Drawable clouds: " + toString(clouds.size()) + " (" + toString(num_merged_clouds) + " merged)\n";
@@ -679,6 +702,15 @@ std::string GaussianSplatRenderer::getDiagnostics() const
 	s += "Splat shader prog built:   " + boolToString(shader_prog && shader_prog->isBuilt()) + "\n";
 	s += "Resolve shader prog built: " + boolToString(resolve_prog && resolve_prog->isBuilt()) + "\n";
 
+	if(total_nodes_lod_active > 0)
+	{
+		s += "LoD traversals in flight: " + toString(num_traversals_in_flight) + " / " + toString(max_concurrent_traversals) + "\n";
+		s += "LoD traversal scratch pooled: " + toString(free_traversal_scratch.size()) + " buffers, " + getMBSizeString((size_t)traversal_scratch_bytes) + "\n";
+		s += "LoD nodes (leaves+merged) vs leaves, LoD-active clouds only: " + uInt64ToStringCommaSeparated(total_nodes_lod_active) + " vs " +
+			uInt64ToStringCommaSeparated(total_leaves_lod_active) + " (" + doubleToStringNDecimalPlaces((double)total_nodes_lod_active / myMax((size_t)1, total_leaves_lod_active), 2) + "x)\n";
+		s += "LoD pixel_scale_limit: " + doubleToStringNDecimalPlaces(lod_pixel_scale_limit, 2) + ", max_splats_budget: " + uInt64ToStringCommaSeparated(lod_max_splats_budget) + "\n";
+	}
+
 	// The per-cloud breakdown is what shows whether the partitioning is behaving - a world of separate captures should
 	// show one member per cloud.  Capped, since a world could hold many.
 	const size_t max_clouds_to_list = 8;
@@ -686,7 +718,17 @@ std::string GaussianSplatRenderer::getDiagnostics() const
 	{
 		const SplatCloud& cloud = *clouds[i];
 		s += "  cloud " + toString(cloud.cloud_id) + ": " + toString(cloud.members.size()) + (cloud.members.size() == 1 ? " member, " : " members, ") +
-			uInt64ToStringCommaSeparated(cloud.total_splats) + " splats" + (cloud.sort_in_flight ? ", sorting" : "") + "\n";
+			uInt64ToStringCommaSeparated(cloud.total_splats) + " nodes uploaded" + (cloud.sort_in_flight ? ", sorting" : "");
+
+		if(cloudHasLodTree(cloud))
+		{
+			s += ", " + uInt64ToStringCommaSeparated((uint64)cloud.ob->num_instances_to_draw) + " drawn (LoD)";
+			if(cloud.traversal_in_flight)
+				s += ", traversing";
+			if(cloud.last_traversal_hit_budget_cap)
+				s += " !WARNING! budget cap is limiting detail on this cloud";
+		}
+		s += "\n";
 	}
 	if(clouds.size() > max_clouds_to_list)
 		s += "  (" + toString(clouds.size() - max_clouds_to_list) + " more)\n";
@@ -1403,6 +1445,7 @@ void GaussianSplatRenderer::drainTraversalResults()
 		const js::Vector<uint32, 16>& selected = msg->scratch->selected_indices;
 		cloud->instance_index_vbo->updateData(0, selected.data(), selected.size() * sizeof(uint32));
 		cloud->ob->num_instances_to_draw = (int)selected.size();
+		cloud->last_traversal_hit_budget_cap = msg->scratch->hit_budget_cap; // Copied out here since the scratch itself goes back to the pool below and may be reused by a different cloud's traversal next.
 	}
 
 	completed_traversal_msgs.clear(); // Drop the references, so a scratch just returned to the pool isn't kept alive by a stale message.
@@ -1445,7 +1488,7 @@ void GaussianSplatRenderer::kickOffTraversals()
 				ratio = std::numeric_limits<float>::max();
 			else
 			{
-				const float threshold = myMax(min_resort_move_threshold_ws, cloud->aabb_ws.distanceToPoint(cam_pos_ws) * resort_threshold_dist_fraction);
+				const float threshold = myMax(lod_resort_move_threshold_ws, cloud->aabb_ws.distanceToPoint(cam_pos_ws) * resort_threshold_dist_fraction);
 				ratio = cam_pos_ws.getDist(cloud->last_traversal_cam_pos_ws) / threshold;
 			}
 

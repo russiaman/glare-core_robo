@@ -145,6 +145,15 @@ public:
 	// OpenGLEngine::draw(), after the frame's camera transform has been set.
 	void think();
 
+	// Live-tunable LoD traversal parameters (GaussianSplatSettingsWidget, Qt only) - take effect on a cloud's next
+	// traversal kick-off, no reload needed.  See kickOffTraversals()/GaussianSplatLodTraversalTask for how each is used.
+	float getPixelScaleLimit() const { return lod_pixel_scale_limit; }
+	void setPixelScaleLimit(float v) { lod_pixel_scale_limit = v; }
+	size_t getMaxSplatsBudget() const { return lod_max_splats_budget; }
+	void setMaxSplatsBudget(size_t v) { lod_max_splats_budget = v; }
+	float getResortMoveThresholdWS() const { return lod_resort_move_threshold_ws; }
+	void setResortMoveThresholdWS(float v) { lod_resort_move_threshold_ws = v; }
+
 private:
 	GLARE_DISABLE_COPY(GaussianSplatRenderer);
 
@@ -196,11 +205,14 @@ private:
 	ThreadSafeQueue<Reference<ThreadMessage> > traversal_result_queue;
 	js::Vector<Reference<ThreadMessage>, 16> completed_traversal_msgs;
 
-	// Live-tunable from stage 7 onward (a Qt settings panel); hardcoded defaults until then.  pixel_scale_limit is roughly
-	// "stop refining once a node projects to about this many pixels"; max_splats_budget is a per-cloud cap on how many
-	// nodes one traversal may select, matched to what the old (pre-partitioning) renderer settled on after real-world
-	// testing at multi-million-splat scale (see Claude_LOD_plan.md's session notes) - a starting point, not a measured
-	// value for this architecture specifically.
+	// Live-tunable via GaussianSplatSettingsWidget (Qt only); hardcoded defaults if that panel's saved settings are never
+	// applied (e.g. no UI). pixel_scale_limit is roughly "stop refining once a node projects to about this many pixels";
+	// max_splats_budget is a per-cloud cap on how many nodes one traversal may select, matched to what the old
+	// (pre-partitioning) renderer settled on after real-world testing at multi-million-splat scale (see
+	// Claude_LOD_plan.md's session notes) - a starting point, not a measured value for this architecture specifically.
+	// resort_move_threshold_ws is kickOffTraversals()'s own move-threshold floor, separate from the plain sort's
+	// min_resort_move_threshold_ws constant (non-LoD clouds aren't affected by this setting).
 	float lod_pixel_scale_limit;
 	size_t lod_max_splats_budget;
+	float lod_resort_move_threshold_ws;
 };

@@ -27,7 +27,7 @@ in vec4 frag_colour;
 uniform int splat_show_overdraw;
 
 // Note that there's deliberately no order-independent-transparency variant here.  Splat clouds are drawn by
-// drawSplatClouds(), which always renders to a single colour buffer with ordinary back-to-front alpha blending, never
+// drawSplatClouds(), which always renders to a single colour buffer with ordinary front-to-back alpha blending, never
 // through the OIT path - see the material setup in GaussianSplatRenderer::addObject() for why.
 layout(location = 0) out vec4 colour_out;
 

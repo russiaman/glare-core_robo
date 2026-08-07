@@ -36,10 +36,13 @@ Renders Gaussian splat clouds.  Owned by OpenGLEngine - get at it with
 OpenGLEngine::getSplatRenderer().  Callers register a cloud with addObject()
 and keep the returned Handle to later move or remove it.
 
-Splats are semi-transparent and have to be composited back-to-front, so every
-cloud carries a depth sort.  Clouds are drawn by OpenGLEngine::drawSplatClouds(),
-which is a pass of its own rather than part of the alpha-blended pass; see the
-comment there for why.
+Splats are semi-transparent and have to be composited in depth order, so every
+cloud carries a depth sort.  That order is front-to-back (nearest first), blended
+with the "under" operator - algebraically the same composite as the more usual
+back-to-front "over", but the only direction in which a pixel can be known to
+have saturated while there is still work left to skip.  Clouds are drawn by
+OpenGLEngine::drawSplatClouds(), which is a pass of its own rather than part of
+the alpha-blended pass; see the comment there for why.
 
 That pass blends into an accumulation buffer of its own and resolves it onto the
 main colour buffer afterwards, because splats have to be blended in the

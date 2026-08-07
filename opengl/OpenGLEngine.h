@@ -180,7 +180,7 @@ public:
 	bool decal;
 	bool participating_media;
 	bool alpha_blend;
-	bool splat_cloud; // Gaussian splat cloud.  Drawn in drawSplatClouds(), which orders whole clouds back-to-front against each other; see GaussianSplatRenderer.
+	bool splat_cloud; // Gaussian splat cloud.  Drawn in drawSplatClouds(), which orders whole clouds in depth order against each other; see GaussianSplatRenderer.
 	bool allow_alpha_test; // Alpha test (discard) will be done if albedo_texture has alpha.
 	bool sdf_text;
 	bool combined; // Is this a material on a combined object, consisting of multiple objects combined into a single object, using an atlas texture.
@@ -863,8 +863,12 @@ struct SplatCloudRange
 };
 
 
-// Permutes clouds[0, num_clouds) into the order they have to be drawn in, farthest first.  The clouds' AABBs must be
-// pairwise disjoint, which GaussianSplatRenderer guarantees by merging any that aren't.  range_stack is working space.
+// Permutes clouds[0, num_clouds) into depth order, farthest first.  The clouds' AABBs must be pairwise disjoint, which
+// GaussianSplatRenderer guarantees by merging any that aren't.  range_stack is working space.
+//
+// Note that drawSplatClouds() walks the result *backwards*, since splats composite front-to-back - the ordering problem
+// solved here is the same either way, so the function and its tests are left in the farthest-first convention rather
+// than inverted at the source.
 // Used by OpenGLEngine::drawSplatClouds(); declared here so OpenGLEngineTests can reach it.
 void orderSplatCloudsBackToFront(const GLObject** clouds, size_t num_clouds, const Vec4f& campos_ws, js::Vector<SplatCloudRange, 16>& range_stack);
 

@@ -291,7 +291,7 @@ public:
 	enum Stage
 	{
 		Stage_Coarse, // Fast approximate order.  Splats sharing a depth slice are in arbitrary relative order, which is far finer than the splats themselves.
-		Stage_Precise // Exact back-to-front order.
+		Stage_Precise // Exact front-to-back order.
 	};
 
 	uint64 cloud_id;
@@ -299,12 +299,12 @@ public:
 	Stage stage;
 	Reference<GaussianSplatSortScratch> scratch; // Holds the result buffer, and keeps it alive even if the renderer was torn down while the sort ran.
 
-	// Back-to-front (farthest first) instance order, ready to write into the cloud's instance_index_vbo.
+	// Front-to-back (nearest first) instance order, ready to write into the cloud's instance_index_vbo.
 	const js::Vector<uint32, 16>& sortedIndices() const { return (stage == Stage_Coarse) ? scratch->coarse_indices : scratch->precise_indices; }
 };
 
 
-// Sorts one cloud back-to-front by camera distance, entirely on a worker thread.  No GL calls here.
+// Sorts one cloud front-to-back by camera distance, entirely on a worker thread.  No GL calls here.
 class GaussianSplatSortTask : public glare::Task
 {
 public:
@@ -341,13 +341,14 @@ public:
 			max_dist = myMax(max_dist, dist);
 		}
 
-		// Pass 2: quantise those distances linearly over the whole uint32 key range, inverted so that ascending key
-		// order is farthest-first, as back-to-front alpha blending needs.  A linear key, rather than the float's own bit
-		// pattern (which sorts identically but spaces values by exponent), is what makes the coarse stage meaningful.
+		// Pass 2: quantise those distances linearly over the whole uint32 key range, so that ascending key order is
+		// nearest-first, as the front-to-back "under" blend needs - see OpenGLEngine::drawSplatClouds().  A linear key,
+		// rather than the float's own bit pattern (which sorts identically but spaces values by exponent), is what makes
+		// the coarse stage meaningful.
 		const float dist_range = myMax(max_dist - min_dist, 1.0e-9f); // Guards the degenerate equidistant case, where every key ends up 0 anyway.
 		const double key_scale = (double)std::numeric_limits<uint32>::max() / (double)dist_range;
 		for(size_t i=0; i<num_splats; ++i)
-			items[i].key = (uint32)((double)(max_dist - bitCast<float>(items[i].key)) * key_scale);
+			items[i].key = (uint32)((double)(bitCast<float>(items[i].key) - min_dist) * key_scale);
 
 		// Stage 1: a single counting-sort pass over the top coarse_key_bits of the key.  Much cheaper than the precise
 		// sort below, and already fine-grained enough to look right on its own, so it's posted immediately rather than
@@ -513,7 +514,7 @@ public:
 			output.push_back((uint32)(m.offset + top.tree_local_idx));
 		}
 
-		// Sort the selection back-to-front by camera distance, here on the worker thread, with each node's distance
+		// Sort the selection front-to-back by camera distance, here on the worker thread, with each node's distance
 		// computed exactly once (a decorate-sort) rather than recomputed per comparison - both done proactively, not as a
 		// follow-up fix: an earlier version of this renderer hit an equivalent bug twice at production scale (raw
 		// heap-pop order producing alpha-blend popping on camera movement, then a naive std::sort-with-recomputed-distance
@@ -524,7 +525,7 @@ public:
 		// sort here is both simpler and fast enough - see kickOffSorts()'s cloudHasLodTree() guard, which leaves an
 		// LoD-active cloud to this sort instead of the old one.
 		struct DistIdx { float dist; uint32 idx; };
-		struct DistIdxGreater { inline bool operator () (const DistIdx& a, const DistIdx& b) const { return a.dist > b.dist; } }; // Farthest first, matching GaussianSplatSortResultMsg's convention for correct back-to-front premultiplied-alpha blending.
+		struct DistIdxLess { inline bool operator () (const DistIdx& a, const DistIdx& b) const { return a.dist < b.dist; } }; // Nearest first, matching GaussianSplatSortResultMsg's convention for the front-to-back "under" blend.
 
 		js::Vector<DistIdx, 16> decorated(output.size());
 		for(size_t i=0; i<output.size(); ++i)
@@ -533,7 +534,7 @@ public:
 			decorated[i].dist = cam_pos_ws.getDist(Vec4f(p.x, p.y, p.z, 1.f));
 			decorated[i].idx = output[i];
 		}
-		std::sort(decorated.data(), decorated.data() + decorated.size(), DistIdxGreater());
+		std::sort(decorated.data(), decorated.data() + decorated.size(), DistIdxLess());
 		for(size_t i=0; i<decorated.size(); ++i)
 			output[i] = decorated[i].idx;
 
@@ -892,11 +893,11 @@ Reference<SplatCloud> GaussianSplatRenderer::allocCloud()
 	mat.shader_prog = shader_prog;
 	mat.auto_assign_shader = false;
 
-	// Route the object through OpenGLEngine::drawSplatClouds(), which orders whole clouds back-to-front against each
+	// Route the object through OpenGLEngine::drawSplatClouds(), which orders whole clouds in depth order against each
 	// other.  Neither of the engine's general-purpose passes will do: the transparent pass uses order-independent
 	// transparency on native, which accumulates colour additively and so has no notion of one splat occluding another -
 	// fine for a few glass surfaces, but splat clouds put hundreds of overlapping splats on every pixel, where it
-	// saturates to white.  The alpha-blended pass does blend back-to-front, but orders objects by distance to their
+	// saturates to white.  The alpha-blended pass does blend in depth order, but orders objects by distance to their
 	// AABB, which isn't an exact ordering for clouds that overlap in screen space.
 	mat.splat_cloud = true;
 
@@ -1499,7 +1500,7 @@ void GaussianSplatRenderer::kickOffSorts()
 			// what's actually being drawn (num_instances_to_draw is the traversal selection's size, not total_splats -
 			// see drainTraversalResults()).  Sorting the whole range would overwrite the selection at the front of
 			// instance_index_vbo with an unrelated full-cloud order.  An LoD-active cloud doesn't need this sort anyway:
-			// GaussianSplatLodTraversalTask::run() already sorts the selection itself, back-to-front, on the same worker
+			// GaussianSplatLodTraversalTask::run() already sorts the selection itself, front-to-back, on the same worker
 			// thread that computed it - see its decorate-sort at the end of run() - so this whole-cloud sort is left to
 			// clouds with no LoD tree at all, which still draw every splat and still need it.
 			if(cloudHasLodTree(*cloud))
@@ -1579,7 +1580,7 @@ void GaussianSplatRenderer::drainTraversalResults()
 		if(!cloud || msg->topology_generation != cloud->topology_generation)
 			continue;
 
-		// Already sorted back-to-front by GaussianSplatLodTraversalTask::run()'s decorate-sort - nothing left to do here
+		// Already sorted front-to-back by GaussianSplatLodTraversalTask::run()'s decorate-sort - nothing left to do here
 		// but write it.  kickOffSorts() never touches an LoD-active cloud (see its cloudHasLodTree() guard), so there's no
 		// separate sort state on the cloud to invalidate here the way a structural change invalidates the old sort's.
 		const js::Vector<uint32, 16>& selected = msg->scratch->selected_indices;

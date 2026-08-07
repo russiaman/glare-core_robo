@@ -9327,7 +9327,13 @@ void orderSplatCloudsBackToFront(const GLObject** clouds, size_t num_clouds, con
 
 
 /*
-Draws Gaussian splat clouds, back-to-front.
+Draws Gaussian splat clouds, front-to-back, compositing them with the "under" operator.
+
+Front-to-back rather than the more usual back-to-front because it is the only order in which a pixel can be known to be
+finished: once the splats nearer than the current one have been accumulated, whatever remains behind a pixel whose
+accumulated alpha has saturated cannot affect it, which is what lets that work be skipped.  Back-to-front reaches the
+same saturation only at the very end, when there is nothing left to skip.  The two orders are algebraically the same
+composite - see the blend func below.
 
 This is a separate pass from drawAlphaBlendedObjects() because splat clouds need an exact ordering against each other,
 which the distance-to-AABB key that pass sorts on doesn't provide (see splatCloudIsNearer() above).  Every cloud uses
@@ -9434,12 +9440,24 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 	}
 
 	glEnable(GL_BLEND);
-	// Normal mode: source factor GL_ONE since the splat shader outputs colour premultiplied by alpha. Overdraw debug
-	// mode: pure additive (GL_ONE, GL_ONE), so each surviving fragment's flat increment just sums, unweighted by alpha.
-	glBlendFunc(GL_ONE, show_overdraw ? GL_ONE : GL_ONE_MINUS_SRC_ALPHA);
+	// Normal mode: the "under" operator, dst += src * (1 - dst.a), which is what composites a front-to-back sequence.
+	// The source factor reads the *destination's* accumulated alpha, i.e. how much of this pixel earlier (nearer) splats
+	// have already covered, so each splat contributes only through what light still gets past them.  Algebraically this
+	// is the same composite as the old back-to-front (GL_ONE, GL_ONE_MINUS_SRC_ALPHA) "over", just accumulated in the
+	// opposite order - the accumulation buffer ends up holding the same (sum of c_i * a_i * T_i, coverage), so the
+	// resolve pass is unchanged.  Not bit-identical though: reordering hundreds of half-float additions rounds
+	// differently.  Front-to-back is the order a transmittance cutoff needs, since a pixel can only be known to be
+	// finished once the splats in front of it have been accumulated.
+	// Overdraw debug mode: pure additive (GL_ONE, GL_ONE), so each surviving fragment's flat increment just sums,
+	// unweighted by alpha, and is order-independent either way.
+	glBlendFunc(show_overdraw ? GL_ONE : GL_ONE_MINUS_DST_ALPHA, GL_ONE);
 	glDepthMask(GL_FALSE); // Disable writing to depth buffer - splats must not occlude each other or other transparent objects.
 
-	for(size_t i=0; i<num_visible; ++i)
+	// Walked in reverse of the order orderSplatCloudsBackToFront() produced, since splats now composite front-to-back
+	// (see the blend func above) and so the nearest cloud has to be drawn first.  Reversing here, rather than inverting
+	// that function, leaves its recursive partitioning - and the tests covering it in OpenGLEngineTests.cpp - alone: the
+	// ordering problem it solves is the same one either way, only the direction it is consumed in changed.
+	for(size_t i=num_visible; i-- > 0; )
 	{
 		const GLObject* const ob = visible_splat_clouds[i];
 		const uint32 batch_i = 0;

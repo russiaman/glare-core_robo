@@ -18,6 +18,9 @@ uniform sampler2D albedo_texture; // Packed splat data, 4 RGBA32F texels per spl
 uniform vec2 viewport_dims_px;
 uniform vec2 focal_len_px;
 uniform int splat_tex_width;
+uniform vec2 splat_size_clamp_min_max; // Diagnostic tool (GaussianSplatSettingsWidget, Qt only): culls any splat whose feature_size (2 * max scale axis, matching GaussianSplatLodNode::feature_size) falls outside [x, y]. 0 disables the respective bound (matches the "0 = unlimited" convention used by the Splats list search radius) - (0, 0), the default, disables the filter entirely.
+uniform int splat_size_clamp_invert; // 0 (default) = cull outside [min, max] (isolate a size range); non-zero = cull inside [min, max] instead (exclude a size range, leaving the rest of the cloud untouched). No effect while the clamp itself is disabled.
+uniform float splat_alpha_cutoff; // GaussianSplatSettingsWidget, Qt only. Sets the per-splat quad radius to exactly where alpha decays to this value, instead of the fixed 3-sigma bound below - see the derivation where it's used. Default 1/255 matches the fragment shader's own discard threshold exactly (lossless); raising it trims low-opacity splats' quads further, trading a sliver of their faint edge for less overdraw.
 
 out vec2 frag_screen_offset_px; // Pixel-space offset of this vertex from the splat's projected centre.
 out vec3 frag_conic; // Inverse 2D covariance (A, B, C) of [[A, B], [B, C]], for the per-pixel Gaussian evaluation.
@@ -43,6 +46,22 @@ void main()
 	vec3 scale  = vec3(t0.w, t1.x, t1.y);
 	vec4 rot    = vec4(t1.z, t1.w, t2.x, t2.y); // (x, y, z, w)
 	frag_colour = vec4(t2.z, t2.w, t3.x, t3.y); // (r, g, b, opacity)
+
+	// Diagnostic size filter - see splat_size_clamp_min_max above.  Checked before any of the projection maths below,
+	// since it needs only the raw world-space scale, not the view-dependent covariance.
+	float feature_size = 2.0 * max(scale.x, max(scale.y, scale.z));
+	bool clamp_active = (splat_size_clamp_min_max.x > 0.0) || (splat_size_clamp_min_max.y > 0.0);
+	bool below_min = (splat_size_clamp_min_max.x > 0.0) && (feature_size < splat_size_clamp_min_max.x);
+	bool above_max = (splat_size_clamp_min_max.y > 0.0) && (feature_size > splat_size_clamp_min_max.y);
+	bool outside_range = below_min || above_max;
+	bool cull_for_size = (splat_size_clamp_invert != 0) ? (clamp_active && !outside_range) : outside_range;
+	if(cull_for_size)
+	{
+		gl_Position = vec4(2.0, 2.0, 2.0, 1.0); // Push outside the clip volume.
+		frag_conic = vec3(0.0);
+		frag_screen_offset_px = vec2(0.0);
+		return;
+	}
 
 	vec4 pos_vs = view_matrix * (model_matrix * vec4(pos_os, 1.0));
 
@@ -108,12 +127,20 @@ void main()
 	vec2 axis1 = (cov2d_b != 0.0) ? normalize(vec2(cov2d_b, lambda1 - cov2d_a)) : ((cov2d_a >= cov2d_c) ? vec2(1.0, 0.0) : vec2(0.0, 1.0));
 	vec2 axis2 = vec2(-axis1.y, axis1.x);
 
+	// Opacity-aware sigma cutoff: alpha at k sigma out is opacity * exp(-0.5 * k^2), so solving for the k where that
+	// hits splat_alpha_cutoff gives k = sqrt(2 * ln(opacity / splat_alpha_cutoff)) - the exact radius beyond which this
+	// splat is invisible at the chosen threshold, rather than always drawing out to a fixed 3 sigma regardless of how
+	// transparent the splat is.  Clamped to the historical 3-sigma cap (99.7%) as a ceiling, and to 0 once opacity itself
+	// is at or below the cutoff (splat invisible even at its centre - degenerate zero-area quad, cheaper than branching).
+	float opacity = frag_colour.a;
+	float sigma_cutoff = (opacity > splat_alpha_cutoff) ? min(sqrt(2.0 * log(opacity / splat_alpha_cutoff)), 3.0) : 0.0;
+
 	// Clamp the screen-space radius.  Splats near the camera plane can have a legitimately huge but numerically extreme
 	// projected size, which without a cap turns a single nearby splat into a screen-covering quad.  Twice the viewport's
 	// larger dimension is generous enough never to visibly clip a real splat while still bounding the worst case.
 	float max_radius_px = 2.0 * max(viewport_dims_px.x, viewport_dims_px.y);
-	float radius1 = min(3.0 * sqrt(lambda1), max_radius_px); // 3 sigma, i.e. a 99.7% cutoff.
-	float radius2 = min(3.0 * sqrt(lambda2), max_radius_px);
+	float radius1 = min(sigma_cutoff * sqrt(lambda1), max_radius_px);
+	float radius2 = min(sigma_cutoff * sqrt(lambda2), max_radius_px);
 
 	vec2 screen_offset_px = position_in.x * radius1 * axis1 + position_in.y * radius2 * axis2;
 

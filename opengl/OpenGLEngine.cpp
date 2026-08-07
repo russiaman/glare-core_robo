@@ -9405,6 +9405,11 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 	// Without the main render framebuffer there's no attachment to swap and no depth renderbuffer we could attach
 	// alongside our own colour buffer, so splats blend straight into the target instead.  Nothing tone maps that target,
 	// so its contents are display-referred as well, and the splats' authored colours are already the values to write.
+	// Overdraw debug view (splat_renderer->getShowOverdraw()): still uses the accumulation buffer, same as normal
+	// rendering, just with a different blend func below and different contents - gaussian_splat_frag_shader.glsl
+	// writes a flat (1,0,0,1) per surviving fragment instead of a real splat colour, so accum.r ends up holding the raw
+	// per-pixel layer count, which the resolve pass maps to a colour ramp instead of doing its usual composite.
+	const bool show_overdraw = splat_renderer->getShowOverdraw();
 	const bool use_accum_buffer = allocSplatAccumBuffersIfNeeded();
 	if(use_accum_buffer)
 	{
@@ -9429,7 +9434,9 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 	}
 
 	glEnable(GL_BLEND);
-	glBlendFunc(/*source factor=*/GL_ONE, /*destination factor=*/GL_ONE_MINUS_SRC_ALPHA); // The splat shader outputs colour premultiplied by alpha.
+	// Normal mode: source factor GL_ONE since the splat shader outputs colour premultiplied by alpha. Overdraw debug
+	// mode: pure additive (GL_ONE, GL_ONE), so each surviving fragment's flat increment just sums, unweighted by alpha.
+	glBlendFunc(GL_ONE, show_overdraw ? GL_ONE : GL_ONE_MINUS_SRC_ALPHA);
 	glDepthMask(GL_FALSE); // Disable writing to depth buffer - splats must not occlude each other or other transparent objects.
 
 	for(size_t i=0; i<num_visible; ++i)
@@ -9538,6 +9545,7 @@ void OpenGLEngine::resolveSplatAccumBuffer()
 	const Reference<OpenGLProgram>& resolve_prog = splat_renderer->getResolveProgram();
 	assert(resolve_prog.nonNull()); // Non-null since a cloud was drawn, which means GaussianSplatRenderer built its shaders.
 	resolve_prog->useProgram();
+	splat_renderer->setResolveOverdrawUniforms(); // Overdraw debug view uniforms - see the method's own comment for why this can't go through the generic per-object uniform path.
 	bindMeshData(*unit_quad_meshdata);
 
 	bindTextureUnitToSampler(*current_scene->splat_accum_copy_texture, /*texture_unit_index=*/0, /*sampler_uniform_location=*/resolve_prog->albedo_texture_loc);

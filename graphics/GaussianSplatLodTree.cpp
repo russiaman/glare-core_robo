@@ -145,6 +145,7 @@ GaussianSplatLodNode makeGaussianSplatLodLeafNode(const Vec3f& centre_os, const 
 	node.rotation = rotation;
 	node.colour = colour;
 	node.feature_size = 2.f * myMax(scale.x, myMax(scale.y, scale.z));
+	node.layer_density = 0.f; // Nothing to recurse into - see the field's own comment.
 	node.child_start = 0;
 	node.child_count = 0;
 	return node;
@@ -217,6 +218,7 @@ GaussianSplatLodNode mergeGaussianSplatLodNodes(const GaussianSplatLodNode* chil
 	parent.colour = Vec4f(colour_rgb.x[0], colour_rgb.x[1], colour_rgb.x[2], myClamp(A, 0.f, 1.f));
 
 	parent.feature_size = 2.f * myMax(parent.scale.x, myMax(parent.scale.y, parent.scale.z));
+	parent.layer_density = 0.f; // Caller fills this in where it knows the merge voxel's step (buildGaussianSplatLodTree()) - this function has no notion of a voxel grid, so 0 (meaning "unknown/not applicable") is the only defensible default here (e.g. the tests in this file merge arbitrary node pairs with no voxel step at all).
 	parent.child_start = 0;
 	parent.child_count = 0;
 	return parent;
@@ -257,6 +259,38 @@ VoxelCoord voxelCoordForStep(const Vec3f& centre, float step)
 }
 
 
+// A splat's cross-section area, 3 sigma out - not feature_size's own 1 sigma (feature_size = 2 * max(scale), i.e. a
+// 2-sigma diameter) - matches the actual on-screen cutoff radius the renderer uses (GaussianSplatRenderer.cpp's
+// splat_cutoff_sigmas / the vertex shader's 3-sigma quad), so density estimates end up in the same units as what
+// actually gets drawn, not a ~9x-smaller 1-sigma proxy that would silently make every real value look far below any
+// sane threshold.
+float splatCrossSectionArea(float feature_size)
+{
+	const float r = feature_size * 1.5f;
+	return (float)NICKMATHS_PI * r * r;
+}
+
+
+// See GaussianSplatLodNode::layer_density's comment. 'cumulative_leaf_area' is the sum of splatCrossSectionArea()
+// over every *original leaf* splat beneath this node (not just its immediate merge children, which may themselves
+// already be coarse stand-ins for thousands of leaves further down - using only their own, much smaller, area would
+// wildly understate how packed the node's footprint really is).
+//
+// 'footprint_sum' is deliberately the sum of the *direct children's own* splatCrossSectionArea(feature_size) - not
+// splatCrossSectionArea(this node's own, just-computed feature_size). The two aren't the same thing: a widely-spread
+// merge's re-fit covariance can end up more compact along its single largest axis (what feature_size measures) than
+// the union of its children's footprints actually is, which silently produced a parent *denser* than every one of its
+// own children - observed in practice as the whole tree collapsing to a single root-level blob at any threshold below
+// the root's own inflated density, with no gradation. Building footprint_sum from the children's own areas instead
+// makes layer_density(parent) = (sum of child_i's cumulative area) / (sum of child_i's own footprint) - a weighted
+// average of the children's own density_i = cumulative_area_i / footprint_i - which is mathematically guaranteed to
+// land between min(density_i) and max(density_i). A parent can now never exceed the densest thing beneath it.
+float layerDensityFromSums(float cumulative_leaf_area, float footprint_sum)
+{
+	return cumulative_leaf_area / myMax(footprint_sum, 1.0e-12f);
+}
+
+
 } // end anonymous namespace
 
 
@@ -271,13 +305,16 @@ std::vector<GaussianSplatLodNode> buildGaussianSplatLodTree(const Vec3f* centres
 	// final array they'll end up living.
 	std::vector<GaussianSplatLodNode> raw_nodes;
 	std::vector<std::vector<uint32> > raw_children;
+	std::vector<float> raw_leaf_area_sum; // Parallel to raw_nodes: sum of splatCrossSectionArea() over every original leaf beneath each node - build-time-only bookkeeping for layer_density, not part of the final struct (would cost 4 bytes/node forever for a value only needed once, at merge time).
 	raw_nodes.reserve(num_splats * 2); // A generous guess (real trees seen in testing run ~1.3x-1.8x num_splats total nodes) - just avoids a few reallocations, doesn't need to be exact.
 	raw_children.reserve(num_splats * 2);
+	raw_leaf_area_sum.reserve(num_splats * 2);
 
 	for(size_t i = 0; i < num_splats; ++i)
 	{
 		raw_nodes.push_back(makeGaussianSplatLodLeafNode(centres[i], scales[i], rotations[i], colours[i]));
 		raw_children.push_back(std::vector<uint32>()); // Leaves have no children.
+		raw_leaf_area_sum.push_back(splatCrossSectionArea(raw_nodes.back().feature_size));
 	}
 
 	// Admission order: smallest splats first, so the coarsening process starts from the finest detail and works outward. A node only becomes eligible to be grouped with others once the current level's voxel
@@ -333,11 +370,21 @@ std::vector<GaussianSplatLodNode> buildGaussianSplatLodTree(const Vec3f* centres
 				for(size_t i = 0; i < group.size(); ++i)
 					group_nodes[i] = raw_nodes[group[i]];
 
+				float cumulative_leaf_area = 0.f;
+				float footprint_sum = 0.f;
+				for(uint32 idx : group)
+				{
+					cumulative_leaf_area += raw_leaf_area_sum[idx];
+					footprint_sum += splatCrossSectionArea(raw_nodes[idx].feature_size);
+				}
+
 				GaussianSplatLodNode parent = mergeGaussianSplatLodNodes(group_nodes.data(), group_nodes.size());
+				parent.layer_density = layerDensityFromSums(cumulative_leaf_area, footprint_sum);
 
 				const uint32 new_raw_id = (uint32)raw_nodes.size();
 				raw_nodes.push_back(parent);
 				raw_children.push_back(group); // group.size() is realistically always far below 65535 (a voxel holding tens of thousands of splats isn't a scene this builder is tuned for), so the eventual uint16 child_count cast is safe.
+				raw_leaf_area_sum.push_back(cumulative_leaf_area);
 				new_active.push_back(new_raw_id);
 				any_merge_happened = true;
 			}
@@ -354,10 +401,20 @@ std::vector<GaussianSplatLodNode> buildGaussianSplatLodTree(const Vec3f* centres
 			for(size_t i = 0; i < active.size(); ++i)
 				group_nodes[i] = raw_nodes[active[i]];
 
+			float cumulative_leaf_area = 0.f;
+			float footprint_sum = 0.f;
+			for(uint32 idx : active)
+			{
+				cumulative_leaf_area += raw_leaf_area_sum[idx];
+				footprint_sum += splatCrossSectionArea(raw_nodes[idx].feature_size);
+			}
+
 			GaussianSplatLodNode root = mergeGaussianSplatLodNodes(group_nodes.data(), group_nodes.size());
+			root.layer_density = layerDensityFromSums(cumulative_leaf_area, footprint_sum);
 			const uint32 new_raw_id = (uint32)raw_nodes.size();
 			raw_nodes.push_back(root);
 			raw_children.push_back(active);
+			raw_leaf_area_sum.push_back(cumulative_leaf_area);
 			active.assign(1, new_raw_id);
 			break;
 		}

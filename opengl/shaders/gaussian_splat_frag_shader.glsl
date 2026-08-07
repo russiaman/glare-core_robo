@@ -12,6 +12,20 @@ in vec2 frag_screen_offset_px;
 in vec3 frag_conic;
 in vec4 frag_colour;
 
+// Debug view (GaussianSplatSettingsWidget, Qt only). 0 (default) = normal splat colour. Non-zero = every surviving
+// fragment writes a flat value into the red channel instead, additively blended (drawSplatClouds() switches to
+// GL_ONE, GL_ONE for these modes) into the same accumulation buffer as normal, so accum.r ends up holding a per-pixel
+// sum that gaussian_splat_resolve_frag_shader.glsl maps to a colour ramp:
+//   1 = write 1.0 per fragment, so the sum is the raw layer count (depth complexity).
+//   2 = write the fragment's own alpha, so the sum is the total accumulated alpha over those layers.
+// Mode 2 exists to size up a front-to-back transmittance cutoff - the "early-Z for splats" a hardware blend pipeline
+// can't do per-fragment, since it never knows the accumulated alpha at shading time. Read together with mode 1:
+// mean_alpha = sum_alpha / layers, and front-to-back accumulation crosses T < 1/255 at about
+// ln(1/255) / ln(1 - mean_alpha) layers, so the fraction of fragment work such a cutoff could skip works out to
+// roughly sum_alpha / 5.54, independent of the layer count itself. A region with hundreds of layers but a small
+// sum_alpha is made of near-threshold splats that a cutoff would never reach - that case wants pruning, not early-out.
+uniform int splat_show_overdraw;
+
 // Note that there's deliberately no order-independent-transparency variant here.  Splat clouds are drawn by
 // drawSplatClouds(), which always renders to a single colour buffer with ordinary back-to-front alpha blending, never
 // through the OIT path - see the material setup in GaussianSplatRenderer::addObject() for why.
@@ -56,5 +70,8 @@ void main()
 	//
 	// Premultiplied by alpha: drawSplatClouds() blends with (GL_ONE, GL_ONE_MINUS_SRC_ALPHA), so the accumulation
 	// buffer ends up holding (sum of c_i * a_i * T_i, coverage), which is what the resolve pass wants.
-	colour_out = vec4(base_col * alpha, alpha);
+	if(splat_show_overdraw != 0)
+		colour_out = vec4((splat_show_overdraw == 2) ? alpha : 1.0, 0.0, 0.0, 1.0); // Alpha sum, or one layer - see the uniform comment above. 'alpha' is post-discard, so mode 2 sums exactly what the normal path would have blended.
+	else
+		colour_out = vec4(base_col * alpha, alpha);
 }

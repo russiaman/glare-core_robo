@@ -140,6 +140,19 @@ public:
 	// Returns an empty string if no splat object is registered, so it costs nothing in a world without any.
 	std::string getDiagnostics() const;
 
+	// One-off diagnostic (GaussianSplatSettingsWidget's "Count in frustum" button, Qt only): counts splats, across every
+	// cloud, that are both in the camera's current frustum and pass the size clamp above (same test as the shader's,
+	// including the invert flag - if the clamp is disabled, every in-frustum splat counts). O(total splats in the
+	// world); meant to be triggered once by a button click, not called per-frame. Answers "how many of what the size
+	// filter is currently isolating are actually in view right now" without needing a GPU capture.
+	size_t countSplatsInFrustum() const;
+
+	// Forces every cloud's LoD frontier to be recomputed on the next think()/kickOffTraversals(), bypassing the normal
+	// camera-movement threshold - for GaussianSplatSettingsWidget's live traversal parameters (pixel_scale_limit,
+	// max_splats_budget, max_layer_density, max_tree_depth), so a value change is visible immediately rather than
+	// waiting for the camera to move far enough to naturally trigger a re-traversal.
+	void forceTraversalRefresh();
+
 	// Per-frame update: refreshes the uniforms the shader needs for the covariance projection, applies any completed
 	// background sorts, and kicks off new ones for clouds whose camera has moved far enough.  Called by
 	// OpenGLEngine::draw(), after the frame's camera transform has been set.
@@ -153,6 +166,65 @@ public:
 	void setMaxSplatsBudget(size_t v) { lod_max_splats_budget = v; }
 	float getResortMoveThresholdWS() const { return lod_resort_move_threshold_ws; }
 	void setResortMoveThresholdWS(float v) { lod_resort_move_threshold_ws = v; }
+
+	// Live-tunable traversal cutoff on GaussianSplatLodNode::layer_density (see its own comment) - a node estimated to
+	// be this dense with overdraw is kept as its own merged approximation rather than expanded further, regardless of
+	// pixel_scale_limit. 0 (default) disables the check, matching the "0 = unlimited" convention used elsewhere in this
+	// panel (size_clamp, "Splats list" search radius).
+	float getMaxLayerDensity() const { return lod_max_layer_density; }
+	void setMaxLayerDensity(float v) { lod_max_layer_density = v; }
+
+	// Live-tunable hard ceiling on traversal depth from the tree root - "never unfold finer than this, anywhere in the
+	// world", independent of pixel_scale_limit/max_layer_density/max_splats_budget. 0 (default) disables the check.
+	int getMaxTreeDepth() const { return lod_max_tree_depth; }
+	void setMaxTreeDepth(int v) { lod_max_tree_depth = v; }
+
+	// Diagnostic tool, not a LoD parameter: culls any splat whose feature_size (2 * max scale axis, matching
+	// GaussianSplatLodNode::feature_size) falls outside [min, max], directly in the vertex shader, regardless of
+	// whether the cloud has a LoD tree. Used to locate abnormally large/degenerate splats (e.g. under-reconstructed
+	// scene edges) by narrowing the range until the offending splat drops out. 0 disables the respective bound
+	// (matches the "0 = unlimited" convention the Splats list panel's search radius uses) - default (0, 0) is off.
+	float getSizeClampMin() const { return splat_size_clamp_min; }
+	void setSizeClampMin(float v) { splat_size_clamp_min = v; }
+	float getSizeClampMax() const { return splat_size_clamp_max; }
+	void setSizeClampMax(float v) { splat_size_clamp_max = v; }
+	// false (default) = cull outside [min, max] (isolate a size range); true = cull inside [min, max] instead
+	// (exclude a size range, leaving the rest of the cloud untouched). No effect while the clamp itself is disabled.
+	bool getSizeClampInvert() const { return splat_size_clamp_invert; }
+	void setSizeClampInvert(bool v) { splat_size_clamp_invert = v; }
+
+	// Per-splat quad radius is cut to exactly where alpha decays to this value (opacity * exp(-0.5*k^2) = alpha_cutoff),
+	// instead of a fixed 3-sigma bound - see the derivation in gaussian_splat_vert_shader.glsl. Default 1/255 matches
+	// the fragment shader's own discard threshold, so it changes zero pixels vs the old fixed-3-sigma behaviour; raising
+	// it trims low-opacity splats' quads further (less overdraw, at the cost of their faintest edge).
+	float getAlphaCutoff() const { return splat_alpha_cutoff; }
+	void setAlphaCutoff(float v) { splat_alpha_cutoff = v; }
+
+	// Overdraw debug view: 0 (default) = normal rendering. Non-zero = every splat writes a flat additive increment
+	// instead of its real colour, into the same accumulation buffer as normal, which the resolve pass then colour-ramps
+	// - see gaussian_splat_frag_shader.glsl and OpenGLEngine::drawSplatClouds(). Mode 1 sums 1.0 per fragment, giving
+	// depth complexity (layers per pixel), which is what drives blend cost rather than raw splat count. Mode 2 sums the
+	// fragments' alpha instead; read against mode 1's layer count it estimates how much fragment work a front-to-back
+	// transmittance cutoff could skip (~sum_alpha / 5.54) - see the derivation in the fragment shader's uniform comment.
+	int getShowOverdrawMode() const { return splat_show_overdraw_mode; }
+	void setShowOverdrawMode(int v) { splat_show_overdraw_mode = v; }
+
+	// Whether any overdraw debug mode is active - what the draw path needs, since every mode shares the same additive
+	// blend func and only the accumulated value differs.
+	bool getShowOverdraw() const { return splat_show_overdraw_mode != 0; }
+
+	// Range the overdraw ramp maps to blue..green..red, in whichever units getShowOverdrawMode() is accumulating -
+	// see gaussian_splat_resolve_frag_shader.glsl. No effect while getShowOverdraw() is false.
+	float getOverdrawRangeMin() const { return splat_overdraw_range_min; }
+	void setOverdrawRangeMin(float v) { splat_overdraw_range_min = v; }
+	float getOverdrawRangeMax() const { return splat_overdraw_range_max; }
+	void setOverdrawRangeMax(float v) { splat_overdraw_range_max = v; }
+
+	// Sets the resolve program's overdraw-view uniforms from the current getShowOverdrawMode()/getOverdrawRangeMin()/
+	// getOverdrawRangeMax() values. Called by OpenGLEngine::resolveSplatAccumBuffer() right after the resolve program
+	// is bound: that draw is one manual full-viewport quad with no material, so it bypasses the generic per-object
+	// user-uniform path the main splat program's addObject()/think() machinery uses for its own uniforms.
+	void setResolveOverdrawUniforms() const;
 
 private:
 	GLARE_DISABLE_COPY(GaussianSplatRenderer);
@@ -215,4 +287,25 @@ private:
 	float lod_pixel_scale_limit;
 	size_t lod_max_splats_budget;
 	float lod_resort_move_threshold_ws;
+
+	// See getMaxLayerDensity() above. 0 disables the check.
+	float lod_max_layer_density;
+
+	// See getMaxTreeDepth() above. 0 disables the check.
+	int lod_max_tree_depth;
+
+	// See getSizeClampMin()/getSizeClampMax() above. Defaults (0, 0) disable both bounds, so never exclude a real splat.
+	float splat_size_clamp_min;
+	float splat_size_clamp_max;
+	bool splat_size_clamp_invert;
+
+	// See getAlphaCutoff() above. Default 1/255 is lossless (matches the fragment shader's fixed discard threshold).
+	float splat_alpha_cutoff;
+
+	// See getShowOverdrawMode() above. 0 = off.
+	int splat_show_overdraw_mode;
+
+	// See getOverdrawRangeMin()/getOverdrawRangeMax() above.
+	float splat_overdraw_range_min;
+	float splat_overdraw_range_max;
 };

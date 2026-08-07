@@ -74,7 +74,7 @@ public:
 	:	cloud_id(0), gpu_capacity_splats(0), total_splats(0), structure_generation(0), sort_in_flight(false),
 		have_last_sort_cam_pos(false), last_sort_cam_pos_ws(0.f), aabb_ws(js::AABBox::emptyAABBox()), added_to_engine(false),
 		topology_generation(0), traversal_in_flight(false), have_last_traversal_cam_pos(false), last_traversal_cam_pos_ws(0.f),
-		last_traversal_kicked_topology_generation(0), last_traversal_hit_budget_cap(false)
+		last_traversal_kicked_topology_generation(0), last_traversal_hit_budget_cap(false), last_traversal_hit_density_cap(false), last_traversal_hit_depth_cap(false)
 	{}
 
 	uint64 cloud_id; // Stable, never reused.  Sort results carry it, so a result for a cloud that has since been merged away can be dropped.
@@ -110,6 +110,8 @@ public:
 	Vec4f last_traversal_cam_pos_ws; // Camera position as of the last traversal kicked off (not necessarily completed).
 	uint64 last_traversal_kicked_topology_generation; // topology_generation as of the last traversal kicked off - a mismatch against the live value means the cloud's structure has changed since, so it's unconditionally overdue for a fresh one (see kickOffTraversals()), the same idea as !have_last_sort_cam_pos for the sort.
 	bool last_traversal_hit_budget_cap; // Copied from the most recently applied traversal result's GaussianSplatLodTraversalScratch::hit_budget_cap (which itself doesn't persist - the scratch goes back to the pool) - surfaced in getDiagnostics() as a "detail is being truncated by the budget" warning.
+	bool last_traversal_hit_density_cap; // As above, for GaussianSplatLodTraversalScratch::hit_density_cap.
+	bool last_traversal_hit_depth_cap; // As above, for GaussianSplatLodTraversalScratch::hit_depth_cap.
 };
 
 
@@ -159,6 +161,8 @@ public:
 
 	js::Vector<uint32, 16> selected_indices; // Output: this frame's frontier, as cloud-array indices.  Unsorted (heap-pop order) until stage 5 wires the depth-sort up to the selection - see kickOffSorts()'s use of cloudHasLodTree().
 	bool hit_budget_cap; // True if max_splats_budget stopped further expansion before pixel_scale converged - i.e. detail is being truncated by the budget, not just naturally coarse at this distance. Consumed by the diagnostics display from stage 6 onward.
+	bool hit_density_cap; // True if getMaxLayerDensity() stopped at least one node's expansion this traversal - see GaussianSplatLodNode::layer_density.
+	bool hit_depth_cap; // True if getMaxTreeDepth() stopped at least one node's expansion this traversal.
 };
 
 
@@ -415,9 +419,9 @@ class GaussianSplatLodTraversalTask : public glare::Task
 {
 public:
 	GaussianSplatLodTraversalTask(uint64 cloud_id_, uint64 topology_generation_, const Reference<GaussianSplatLodTraversalScratch>& scratch_,
-		const Vec4f& cam_pos_ws_, float pixel_scale_limit_, size_t max_splats_budget_, float focal_px_, ThreadSafeQueue<Reference<ThreadMessage> >* result_queue_)
+		const Vec4f& cam_pos_ws_, float pixel_scale_limit_, size_t max_splats_budget_, float max_layer_density_, int max_tree_depth_, float focal_px_, ThreadSafeQueue<Reference<ThreadMessage> >* result_queue_)
 	:	cloud_id(cloud_id_), topology_generation(topology_generation_), scratch(scratch_), cam_pos_ws(cam_pos_ws_),
-		pixel_scale_limit(pixel_scale_limit_), max_splats_budget(max_splats_budget_), focal_px(focal_px_), result_queue(result_queue_)
+		pixel_scale_limit(pixel_scale_limit_), max_splats_budget(max_splats_budget_), max_layer_density(max_layer_density_), max_tree_depth(max_tree_depth_), focal_px(focal_px_), result_queue(result_queue_)
 	{}
 
 	virtual void run(size_t /*thread_index*/) override
@@ -441,10 +445,12 @@ public:
 					output.push_back((uint32)(m.offset + i));
 			}
 			else
-				heap.push(makeHeapItem((uint32)mi, /*tree_local_idx=*/0, m.offset, positions, scales)); // Root is always node 0 - see buildGaussianSplatLodTree().
+				heap.push(makeHeapItem((uint32)mi, /*tree_local_idx=*/0, m.offset, /*depth=*/0, positions, scales)); // Root is always node 0 - see buildGaussianSplatLodTree().
 		}
 
 		bool hit_budget_cap = false;
+		bool hit_density_cap = false;
+		bool hit_depth_cap = false;
 		while(!heap.empty())
 		{
 			const HeapItem top = heap.top();
@@ -462,6 +468,28 @@ public:
 				continue;
 			}
 
+			// Density-capped: expanding this node would recurse into a region estimated to be this dense with overdraw
+			// (see GaussianSplatLodNode::layer_density) - stop here and use this node's own merged approximation
+			// instead, regardless of how coarse its pixel_scale still looks. max_layer_density <= 0 disables this check
+			// (the "0 = unlimited" convention GaussianSplatSettingsWidget's other debug knobs use).
+			if(max_layer_density > 0.f && node.layer_density > max_layer_density)
+			{
+				hit_density_cap = true;
+				heap.pop();
+				output.push_back((uint32)(m.offset + top.tree_local_idx));
+				continue;
+			}
+
+			// Depth-capped: a hard, global ceiling on how many levels traversal may unfold, independent of pixel_scale/
+			// density/budget - "the tree will never unfold finer than this, anywhere". max_tree_depth <= 0 disables it.
+			if(max_tree_depth > 0 && top.depth >= (uint32)max_tree_depth)
+			{
+				hit_depth_cap = true;
+				heap.pop();
+				output.push_back((uint32)(m.offset + top.tree_local_idx));
+				continue;
+			}
+
 			// Expanding replaces this one heap entry with child_count new ones, so the projected total if the loop stopped
 			// right after this expansion would be output.size() + heap.size() - 1 + child_count.
 			if(output.size() + heap.size() - 1 + node.child_count > max_splats_budget)
@@ -472,7 +500,7 @@ public:
 
 			heap.pop();
 			for(uint32 c = node.child_start; c < (uint32)node.child_start + node.child_count; ++c)
-				heap.push(makeHeapItem(top.member_idx, c, m.offset, positions, scales));
+				heap.push(makeHeapItem(top.member_idx, c, m.offset, top.depth + 1, positions, scales));
 		}
 
 		// Whatever's left in the heap - either because pixel_scale converged, or the budget stopped further expansion - is
@@ -510,6 +538,8 @@ public:
 			output[i] = decorated[i].idx;
 
 		scratch->hit_budget_cap = hit_budget_cap;
+		scratch->hit_density_cap = hit_density_cap;
+		scratch->hit_depth_cap = hit_depth_cap;
 
 		Reference<GaussianSplatLodTraversalResultMsg> msg = new GaussianSplatLodTraversalResultMsg();
 		msg->cloud_id = cloud_id;
@@ -527,10 +557,11 @@ private:
 		float pixel_scale;
 		uint32 member_idx;
 		uint32 tree_local_idx;
+		uint32 depth; // 0 for a tree root, parent's depth + 1 for each expansion - see max_tree_depth's use in run().
 	};
 	struct HeapItemLess { inline bool operator () (const HeapItem& a, const HeapItem& b) const { return a.pixel_scale < b.pixel_scale; } }; // std::priority_queue is a max-heap under operator<, so the largest pixel_scale (biggest on-screen feature) is always on top.
 
-	HeapItem makeHeapItem(uint32 member_idx, uint32 tree_local_idx, size_t member_offset, const js::Vector<Vec3f, 16>& positions, const js::Vector<Vec3f, 16>& scales) const
+	HeapItem makeHeapItem(uint32 member_idx, uint32 tree_local_idx, size_t member_offset, uint32 depth, const js::Vector<Vec3f, 16>& positions, const js::Vector<Vec3f, 16>& scales) const
 	{
 		const size_t cloud_idx = member_offset + tree_local_idx;
 		const Vec3f& p = positions[cloud_idx];
@@ -541,6 +572,7 @@ private:
 		item.pixel_scale = (feature_size / dist) * focal_px;
 		item.member_idx = member_idx;
 		item.tree_local_idx = tree_local_idx;
+		item.depth = depth;
 		return item;
 	}
 
@@ -550,6 +582,8 @@ private:
 	Vec4f cam_pos_ws;
 	float pixel_scale_limit;
 	size_t max_splats_budget;
+	float max_layer_density;
+	int max_tree_depth;
 	float focal_px;
 	ThreadSafeQueue<Reference<ThreadMessage> >* result_queue;
 };
@@ -560,7 +594,10 @@ private:
 
 GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 :	opengl_engine(&opengl_engine_), next_handle(1), next_cloud_id(1), num_sorts_in_flight(0),
-	num_traversals_in_flight(0), lod_pixel_scale_limit(1.0f), lod_max_splats_budget(10000000), lod_resort_move_threshold_ws(0.1f)
+	num_traversals_in_flight(0), lod_pixel_scale_limit(1.0f), lod_max_splats_budget(10000000), lod_resort_move_threshold_ws(0.1f),
+	lod_max_layer_density(0.0f), lod_max_tree_depth(0),
+	splat_size_clamp_min(0.0f), splat_size_clamp_max(0.0f), splat_size_clamp_invert(false), splat_alpha_cutoff(1.0f / 255.0f),
+	splat_show_overdraw_mode(0), splat_overdraw_range_min(2.0f), splat_overdraw_range_max(100.0f)
 {}
 
 
@@ -595,6 +632,10 @@ void GaussianSplatRenderer::buildShadersIfNeeded()
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Vec2, "viewport_dims_px");
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Vec2, "focal_len_px");
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,  "splat_tex_width");
+	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Vec2, "splat_size_clamp_min_max");
+	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,  "splat_size_clamp_invert");
+	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_alpha_cutoff");
+	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,  "splat_show_overdraw");
 
 
 	// Splats blend into an accumulation buffer of their own rather than straight onto the main colour buffer, so that
@@ -609,6 +650,22 @@ void GaussianSplatRenderer::buildShadersIfNeeded()
 		/*wait_for_build_to_complete=*/!opengl_engine->parallel_shader_compile_support
 	);
 	opengl_engine->addProgram(resolve_prog);
+
+	// Registered via appendUserUniformInfo() rather than resolved with a direct getUniformLocation() call here, since
+	// resolve_prog's build may still be in flight (parallel_shader_compile_support) at this point - appendUserUniformInfo
+	// is what resolves a pending uniform's location once the build actually completes; see its own comment. Read back
+	// by setResolveOverdrawUniforms(), in this same order, once resolveSplatAccumBuffer() has bound the program.
+	resolve_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "splat_show_overdraw");
+	resolve_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_overdraw_range_min");
+	resolve_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_overdraw_range_max");
+}
+
+
+void GaussianSplatRenderer::setResolveOverdrawUniforms() const
+{
+	glUniform1i(resolve_prog->user_uniform_info[0].loc, splat_show_overdraw_mode);
+	glUniform1f(resolve_prog->user_uniform_info[1].loc, splat_overdraw_range_min);
+	glUniform1f(resolve_prog->user_uniform_info[2].loc, splat_overdraw_range_max);
 }
 
 
@@ -633,6 +690,61 @@ size_t GaussianSplatRenderer::numSplatsInWorld() const
 size_t GaussianSplatRenderer::numObjectsInWorld() const
 {
 	return handle_to_cloud.size();
+}
+
+
+void GaussianSplatRenderer::forceTraversalRefresh()
+{
+	for(size_t i=0; i<clouds.size(); ++i)
+		clouds[i]->have_last_traversal_cam_pos = false; // Makes kickOffTraversals() treat every cloud as unconditionally overdue, the same way a cloud that has never been traversed is - see its ratio computation.
+}
+
+
+// Point-in-frustum test, same accept/reject convention as OpenGLEngine.cpp's AABBIntersectsFrustum() (outside if
+// dot(normal, point) >= plane.getD() for any plane), just for one point rather than an AABB's 8 corners.
+static inline bool pointInFrustum(const Planef* frustum_clip_planes, int num_frustum_clip_planes, const Vec4f& pos_ws)
+{
+	for(int i=0; i<num_frustum_clip_planes; ++i)
+		if(dot(frustum_clip_planes[i].getNormal(), pos_ws) >= frustum_clip_planes[i].getD())
+			return false;
+	return true;
+}
+
+
+size_t GaussianSplatRenderer::countSplatsInFrustum() const
+{
+	const OpenGLScene* scene = opengl_engine->getCurrentScene();
+	const Planef* frustum_clip_planes = scene->frustum_clip_planes;
+	const int num_frustum_clip_planes = scene->num_frustum_clip_planes;
+
+	const bool clamp_active = (splat_size_clamp_min > 0.f) || (splat_size_clamp_max > 0.f);
+
+	size_t count = 0;
+	for(size_t c=0; c<clouds.size(); ++c)
+	{
+		const SplatCloud& cloud = *clouds[c];
+		for(size_t i=0; i<cloud.total_splats; ++i)
+		{
+			const Vec3f& pos = cloud.positions[i];
+			if(!pointInFrustum(frustum_clip_planes, num_frustum_clip_planes, Vec4f(pos.x, pos.y, pos.z, 1.f)))
+				continue;
+
+			if(clamp_active)
+			{
+				const Vec3f& scale = cloud.scales[i];
+				const float feature_size = 2.f * myMax(scale.x, myMax(scale.y, scale.z));
+				const bool below_min = (splat_size_clamp_min > 0.f) && (feature_size < splat_size_clamp_min);
+				const bool above_max = (splat_size_clamp_max > 0.f) && (feature_size > splat_size_clamp_max);
+				const bool outside_range = below_min || above_max;
+				const bool excluded = splat_size_clamp_invert ? !outside_range : outside_range;
+				if(excluded)
+					continue;
+			}
+
+			count++;
+		}
+	}
+	return count;
 }
 
 
@@ -727,8 +839,36 @@ std::string GaussianSplatRenderer::getDiagnostics() const
 				s += ", traversing";
 			if(cloud.last_traversal_hit_budget_cap)
 				s += " !WARNING! budget cap is limiting detail on this cloud";
+			if(cloud.last_traversal_hit_density_cap)
+				s += " !WARNING! density cap is limiting detail on this cloud";
+			if(cloud.last_traversal_hit_depth_cap)
+				s += " !WARNING! depth cap is limiting detail on this cloud";
+			s += "\n";
+
+			// TEMP diagnostic while calibrating max_layer_density (GaussianSplatLodNode::layer_density): root density and
+			// its immediate children's range, per member, so a sane threshold can be read off directly instead of guessed.
+			for(size_t m=0; m<cloud.members.size(); ++m)
+			{
+				const std::vector<GaussianSplatLodNode>& tree = cloud.members[m].splat_data->lod_tree;
+				if(tree.empty())
+					continue;
+				s += "    member " + toString(m) + " tree: root density " + doubleToStringNDecimalPlaces(tree[0].layer_density, 1);
+				if(tree[0].child_count > 0)
+				{
+					float min_d = tree[tree[0].child_start].layer_density;
+					float max_d = min_d;
+					for(uint32 c = tree[0].child_start + 1; c < (uint32)tree[0].child_start + tree[0].child_count; ++c)
+					{
+						min_d = myMin(min_d, tree[c].layer_density);
+						max_d = myMax(max_d, tree[c].layer_density);
+					}
+					s += ", " + toString(tree[0].child_count) + " root children density [" + doubleToStringNDecimalPlaces(min_d, 1) + ", " + doubleToStringNDecimalPlaces(max_d, 1) + "]";
+				}
+				s += "\n";
+			}
 		}
-		s += "\n";
+		else
+			s += "\n";
 	}
 	if(clouds.size() > max_clouds_to_list)
 		s += "  (" + toString(clouds.size() - max_clouds_to_list) + " more)\n";
@@ -764,7 +904,7 @@ Reference<SplatCloud> GaussianSplatRenderer::allocCloud()
 	// MATERIAL_ALPHA_BLEND_BITFLAG on the batch, which is how the opaque pass, the depth pre-pass and the shadow passes
 	// know to skip it.  OpenGLEngine::addObject() keys off splat_cloud to put the object in exactly one of the two sets.
 	mat.alpha_blend = true;
-	mat.user_uniform_vals.resize(3); // viewport_dims_px and focal_len_px are set by think().
+	mat.user_uniform_vals.resize(7); // viewport_dims_px, focal_len_px, splat_size_clamp_min_max, splat_size_clamp_invert, splat_alpha_cutoff and splat_show_overdraw are set by think().
 	mat.user_uniform_vals[2].intval = (int)splat_tex_width;
 
 	// Build a real (if minimal) texture and VAO up front: adding the object to the engine before it has those would
@@ -1446,6 +1586,8 @@ void GaussianSplatRenderer::drainTraversalResults()
 		cloud->instance_index_vbo->updateData(0, selected.data(), selected.size() * sizeof(uint32));
 		cloud->ob->num_instances_to_draw = (int)selected.size();
 		cloud->last_traversal_hit_budget_cap = msg->scratch->hit_budget_cap; // Copied out here since the scratch itself goes back to the pool below and may be reused by a different cloud's traversal next.
+		cloud->last_traversal_hit_density_cap = msg->scratch->hit_density_cap;
+		cloud->last_traversal_hit_depth_cap = msg->scratch->hit_depth_cap;
 	}
 
 	completed_traversal_msgs.clear(); // Drop the references, so a scratch just returned to the pool isn't kept alive by a stale message.
@@ -1533,7 +1675,7 @@ void GaussianSplatRenderer::kickOffTraversals()
 		num_traversals_in_flight++;
 
 		task_manager->addTask(new GaussianSplatLodTraversalTask(best_cloud->cloud_id, best_cloud->topology_generation, scratch, cam_pos_ws,
-			lod_pixel_scale_limit, lod_max_splats_budget, focal_px, &traversal_result_queue));
+			lod_pixel_scale_limit, lod_max_splats_budget, lod_max_layer_density, lod_max_tree_depth, focal_px, &traversal_result_queue));
 	}
 }
 
@@ -1562,6 +1704,10 @@ void GaussianSplatRenderer::think()
 		mat.user_uniform_vals[0].vec2 = Vec2f((float)viewport_dims.x, (float)viewport_dims.y);
 		mat.user_uniform_vals[1].vec2 = Vec2f(focal_x, focal_y);
 		// user_uniform_vals[2] (splat_tex_width) is constant, and was set in allocCloud().
+		mat.user_uniform_vals[3].vec2 = Vec2f(splat_size_clamp_min, splat_size_clamp_max);
+		mat.user_uniform_vals[4].intval = splat_size_clamp_invert ? 1 : 0;
+		mat.user_uniform_vals[5].floatval = splat_alpha_cutoff;
+		mat.user_uniform_vals[6].intval = splat_show_overdraw_mode;
 	}
 
 	kickOffSorts();

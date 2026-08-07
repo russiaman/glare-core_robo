@@ -229,6 +229,7 @@ GLObject::GLObject() noexcept
 	index_type_and_log2_size = 0;
 	instance_matrix_vbo_name = 0;
 	instance_vbo_stride_B = (uint32)sizeof(Matrix4f);
+	instance_vbo_offset_B = 0;
 	indices_vbo_handle_offset = 0;
 	vbo_handle_base_vertex = 0;
 }
@@ -5558,7 +5559,7 @@ void OpenGLEngine::bindMeshData(const GLObject& ob)
 		glBindVertexBuffer(
 			1, // binding point index
 			ob.instance_matrix_vbo_name, // buffer
-			0, // offset - offset of the first element within the buffer
+			ob.instance_vbo_offset_B, // offset - offset of the first element within the buffer.  0 for every ordinary instanced object; see the field's comment for who sets it.
 			ob.instance_vbo_stride_B // stride
 		);
 	}

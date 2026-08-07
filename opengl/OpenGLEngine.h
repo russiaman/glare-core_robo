@@ -357,6 +357,7 @@ struct GLObject
 	uint32 index_type_and_log2_size; // Lower 16 bits are GLenum index_type, upper 16 bits are log_2(size) of index type in bytes (e.g. 0, 1, 2 for 1 B, 2 B, or 4 B)
 	GLuint instance_matrix_vbo_name;
 	uint32 instance_vbo_stride_B; // Stride of the per-instance data in instance_matrix_vbo.  sizeof(Matrix4f) for ordinary instance matrices (the default), but an object using instance_matrix_vbo for some other kind of per-instance data needs to set this to match.
+	uint32 instance_vbo_offset_B; // Byte offset of the first instance to draw within instance_matrix_vbo.  0 (the default) draws from the start, which is what every ordinary instanced object wants.  Set non-zero to draw a sub-range of the instance data without re-uploading it - see OpenGLEngine::drawSplatClouds(), which walks one cloud's depth-sorted instance indices in consecutive slices so it can test what has already accumulated between them.
 	uint32 indices_vbo_handle_offset;
 	uint32 vbo_handle_base_vertex;
 	

@@ -1656,6 +1656,7 @@ public:
 	// doing anything for the current view.
 	uint64 last_num_splat_clouds_drawn;
 	uint64 last_num_splats_drawn;
+	uint64 last_num_splat_draw_calls; // How many draws those splats took, i.e. how many non-empty slices - see getNumDrawSlices().
 private:
 
 	// Working space for drawSplatClouds()'s ordering pass, kept to avoid allocating every frame.

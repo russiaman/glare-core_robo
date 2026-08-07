@@ -203,6 +203,16 @@ public:
 	float getAlphaCutoff() const { return splat_alpha_cutoff; }
 	void setAlphaCutoff(float v) { splat_alpha_cutoff = v; }
 
+	// How many consecutive sub-ranges each cloud's depth-sorted splats are drawn in, nearest range first. 1 (default) is
+	// one draw per cloud, exactly as before this existed. Higher values change nothing on their own - the ranges are
+	// drawn back to back in the same order, so the blend is identical - and exist to give the front-to-back saturation
+	// test somewhere to run: it can only look at what has accumulated so far between draws, never during one. See
+	// OpenGLEngine::drawSplatClouds(). The right value is a scene-dependent trade (a slice has to be fine enough to end
+	// inside a dense region, and each boundary costs a full pass over the region), hence a live parameter rather than a
+	// constant.
+	int getNumDrawSlices() const { return splat_num_draw_slices; }
+	void setNumDrawSlices(int v) { splat_num_draw_slices = v; }
+
 	// Overdraw debug view: 0 (default) = normal rendering. Non-zero = every splat writes a flat additive increment
 	// instead of its real colour, into the same accumulation buffer as normal, which the resolve pass then colour-ramps
 	// - see gaussian_splat_frag_shader.glsl and OpenGLEngine::drawSplatClouds(). Mode 1 sums 1.0 per fragment, giving
@@ -304,6 +314,9 @@ private:
 
 	// See getAlphaCutoff() above. Default 1/255 is lossless (matches the fragment shader's fixed discard threshold).
 	float splat_alpha_cutoff;
+
+	// See getNumDrawSlices() above. Default 1 = one draw per cloud, i.e. no slicing.
+	int splat_num_draw_slices;
 
 	// See getShowOverdrawMode() above. 0 = off.
 	int splat_show_overdraw_mode;

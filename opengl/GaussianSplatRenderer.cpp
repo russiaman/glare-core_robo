@@ -598,6 +598,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	num_traversals_in_flight(0), lod_pixel_scale_limit(1.0f), lod_max_splats_budget(10000000), lod_resort_move_threshold_ws(0.1f),
 	lod_max_layer_density(0.0f), lod_max_tree_depth(0),
 	splat_size_clamp_min(0.0f), splat_size_clamp_max(0.0f), splat_size_clamp_invert(false), splat_alpha_cutoff(1.0f / 255.0f),
+	splat_num_draw_slices(1),
 	splat_show_overdraw_mode(0), splat_overdraw_range_min(2.0f), splat_overdraw_range_max(100.0f)
 {}
 
@@ -809,6 +810,9 @@ std::string GaussianSplatRenderer::getDiagnostics() const
 	s += "Clouds drawn last frame: " + toString(opengl_engine->last_num_splat_clouds_drawn) + "\n";
 	s += "Splats: " + uInt64ToStringCommaSeparated(total_splats) + " total, " + uInt64ToStringCommaSeparated(largest_cloud_splats) + " in largest cloud\n";
 	s += "Splats drawn last frame: " + uInt64ToStringCommaSeparated(opengl_engine->last_num_splats_drawn) + "\n";
+	// Draw calls rather than slices: a cloud with fewer splats than slices leaves some empty, so the two only agree
+	// when there is something to draw in every one.
+	s += "Draw slices: " + toString(splat_num_draw_slices) + " (" + toString(opengl_engine->last_num_splat_draw_calls) + " draw calls last frame)\n";
 	s += "Sorts in flight: " + toString(num_sorts_in_flight) + " / " + toString(max_concurrent_sorts) + "\n";
 	s += "GPU mem: " + getMBSizeString((size_t)tex_bytes) + " data textures, " + getMBSizeString((size_t)index_vbo_bytes) + " index VBOs\n";
 	s += "Sort scratch pooled: " + toString(free_scratch.size()) + " buffers, " + getMBSizeString((size_t)scratch_bytes) + "\n";

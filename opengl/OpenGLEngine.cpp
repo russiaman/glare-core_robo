@@ -458,6 +458,7 @@ OpenGLEngine::OpenGLEngine(const OpenGLEngineSettings& settings_)
 	last_num_obs_in_frustum(0),
 	last_num_splat_clouds_drawn(0),
 	last_num_splats_drawn(0),
+	last_num_splat_draw_calls(0),
 	splat_depth_copy_works(false),
 	print_output(NULL),
 	tex_CPU_mem_usage(0),
@@ -9331,6 +9332,42 @@ void orderSplatCloudsBackToFront(const GLObject** clouds, size_t num_clouds, con
 }
 
 
+#if DO_INDIVIDUAL_VAO_ALLOC
+/*
+Points the object's instance attribute at ob.instance_vbo_offset_B bytes into its instance buffer, in the VAO that is
+currently bound.
+
+Needed because this path (Mac, Emscripten/WebGL) has no glBindVertexBuffer(): attribute offsets are baked into the VAO
+by glVertexAttribPointer() when it is created, so bindMeshData() has nothing to pass instance_vbo_offset_B to and the
+field is not read there at all.  Re-specifying the pointer is the same change made the way this path allows.
+
+It lives here rather than in bindMeshData() because every ordinary instanced object draws its instance data from the
+start, and would pay for a state change it never needs.  The offset persists in the VAO afterwards, which is harmless
+only because the caller sets it before every draw of this object - see drawSplatClouds().
+*/
+static void setInstanceAttribPointerOffset(const GLObject& ob)
+{
+	assert(ob.vert_vao.nonNull()); // An object drawing sub-ranges of instance data has its own VAO, built against its own instance buffer.
+
+	const VertexSpec& vertex_spec = ob.vert_vao->vertex_spec;
+	for(size_t i=0; i<vertex_spec.attributes.size(); ++i)
+	{
+		const VertexAttrib& attr = vertex_spec.attributes[i];
+		if(attr.instancing && attr.enabled && attr.vbo.nonNull())
+		{
+			glBindBuffer(GL_ARRAY_BUFFER, attr.vbo->bufferName()); // glVertexAttribPointer() records whichever buffer is bound here.
+			const uint64 offset = (uint64)attr.offset + (uint64)ob.instance_vbo_offset_B;
+			if(attr.integer_attribute)
+				glVertexAttribIPointer((uint32)i, attr.num_comps, attr.type, attr.stride, (void*)offset);
+			else
+				glVertexAttribPointer((uint32)i, attr.num_comps, attr.type, attr.normalised, attr.stride, (void*)offset);
+			glBindBuffer(GL_ARRAY_BUFFER, 0);
+		}
+	}
+}
+#endif
+
+
 // Copies the depth buffer of framebuffer 'src_framebuffer_name' into dest_framebuffer, and returns whether the driver
 // accepted the copy.  Depth blits are rejected outright when the formats don't match, which is what makes this usable
 // as a test of whether they do - see allocSplatAccumBuffersIfNeeded(), which settles the format that way.
@@ -9381,6 +9418,7 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 
 	last_num_splat_clouds_drawn = 0;
 	last_num_splats_drawn = 0;
+	last_num_splat_draw_calls = 0;
 
 	if(current_scene->splat_cloud_objects.empty())
 		return;
@@ -9488,20 +9526,59 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 	glBlendFunc(show_overdraw ? GL_ONE : GL_ONE_MINUS_DST_ALPHA, GL_ONE);
 	glDepthMask(GL_FALSE); // Disable writing to depth buffer - splats must not occlude each other or other transparent objects.
 
+	// Each cloud's splats are drawn in num_slices consecutive sub-ranges of its depth-sorted instance index buffer,
+	// nearest range first.  On its own this changes nothing: the ranges are drawn back to back, in the order one draw
+	// would have used, so the blend result is the same for any num_slices.  The point is the boundaries between them.
+	// The hardware blend pipeline never knows a pixel's accumulated alpha while it is shading - the outer loop is over
+	// splats, not pixels - so the only place a front-to-back composite can ask "which pixels are finished?" is between
+	// draws.  Slicing creates those places; what to do at them comes next.
+	//
+	// Slicing is nested inside the cloud loop rather than interleaved across clouds, which is what keeps the overall
+	// order (clouds front-to-back, splats front-to-back within each) exactly what it was.
+	const int num_slices = myClamp(splat_renderer->getNumDrawSlices(), 1, 1024);
+
 	// Walked in reverse of the order orderSplatCloudsBackToFront() produced, since splats now composite front-to-back
 	// (see the blend func above) and so the nearest cloud has to be drawn first.  Reversing here, rather than inverting
 	// that function, leaves its recursive partitioning - and the tests covering it in OpenGLEngineTests.cpp - alone: the
 	// ordering problem it solves is the same one either way, only the direction it is consumed in changed.
 	for(size_t i=num_visible; i-- > 0; )
 	{
-		const GLObject* const ob = visible_splat_clouds[i];
+		// Const cast so the slice range can be set on the object below.  visible_splat_clouds holds const pointers
+		// because the ordering pass above only reads them; the objects are the scene's own and are not const.
+		GLObject* const ob = const_cast<GLObject*>(visible_splat_clouds[i]);
 		const uint32 batch_i = 0;
 		const bool program_changed = checkUseProgram(ob->batch_draw_info[batch_i].getProgramIndex());
 		if(program_changed) // Only true on the first cloud drawn: every splat cloud shares one program.
 			setSharedUniformsForProg(*prog_vector[ob->batch_draw_info[batch_i].getProgramIndex()].ptr(), view_matrix, proj_matrix);
 
-		bindMeshData(*ob);
-		drawBatchWithDenormalisedData(*ob, ob->batch_draw_info[batch_i], batch_i);
+		const int cloud_num_instances = ob->num_instances_to_draw;
+
+		for(int slice=0; slice<num_slices; ++slice)
+		{
+			// Split by position in the buffer rather than by distance: the sort has already put it in depth order, so an
+			// index split is free, and it also bounds the work per slice, which a distance split would not.  Computed as
+			// two rounded fractions of the total so the slices tile [0, cloud_num_instances) exactly, with no gap or
+			// overlap at the boundaries - a splat drawn twice would be blended twice.
+			const int slice_begin = (int)(((int64)cloud_num_instances *  slice)      / num_slices);
+			const int slice_end   = (int)(((int64)cloud_num_instances * (slice + 1)) / num_slices);
+			if(slice_end == slice_begin)
+				continue; // Empty slice, i.e. fewer splats in this cloud than slices.
+
+			ob->instance_vbo_offset_B = (uint32)(slice_begin * sizeof(uint32)); // One uint32 splat index per instance - see GaussianSplatRenderer::rebuildVAO().
+			ob->num_instances_to_draw = slice_end - slice_begin;
+
+			bindMeshData(*ob);
+#if DO_INDIVIDUAL_VAO_ALLOC
+			setInstanceAttribPointerOffset(*ob); // bindMeshData() has nowhere to apply instance_vbo_offset_B on this path - see the function.
+#endif
+			drawBatchWithDenormalisedData(*ob, ob->batch_draw_info[batch_i], batch_i);
+			last_num_splat_draw_calls++;
+		}
+
+		// Put back what the LoD traversal left, so everything outside this pass - the diagnostics display, the next
+		// frame's culling - sees the whole cloud rather than its last slice.
+		ob->instance_vbo_offset_B = 0;
+		ob->num_instances_to_draw = cloud_num_instances;
 	}
 
 	flushDrawCommandsAndUnbindPrograms();

@@ -458,6 +458,7 @@ OpenGLEngine::OpenGLEngine(const OpenGLEngineSettings& settings_)
 	last_num_obs_in_frustum(0),
 	last_num_splat_clouds_drawn(0),
 	last_num_splats_drawn(0),
+	splat_depth_copy_works(false),
 	print_output(NULL),
 	tex_CPU_mem_usage(0),
 	tex_GPU_mem_usage(0),
@@ -7304,9 +7305,12 @@ void OpenGLEngine::draw()
 			cur_scene->transparent_accum_renderbuffer = NULL;
 			cur_scene->total_transmittance_renderbuffer = NULL;
 			cur_scene->splat_accum_renderbuffer = NULL; // Reallocated by drawSplatClouds() if the scene has splat clouds.
+			cur_scene->splat_accum_depth_renderbuffer = NULL;
 
 			cur_scene->main_render_framebuffer = NULL;
 			cur_scene->main_render_copy_framebuffer = NULL;
+			cur_scene->splat_accum_framebuffer = NULL; // Attaches main_depth_renderbuffer, which is about to be replaced, so it can't outlive it.
+			cur_scene->splat_accum_copy_framebuffer = NULL;
 
 			main_texture_size_changed = true;
 		}
@@ -9327,6 +9331,26 @@ void orderSplatCloudsBackToFront(const GLObject** clouds, size_t num_clouds, con
 }
 
 
+// Copies the depth buffer of framebuffer 'src_framebuffer_name' into dest_framebuffer, and returns whether the driver
+// accepted the copy.  Depth blits are rejected outright when the formats don't match, which is what makes this usable
+// as a test of whether they do - see allocSplatAccumBuffersIfNeeded(), which settles the format that way.
+static bool blitDepthBuffer(GLuint src_framebuffer_name, FrameBuffer& dest_framebuffer, GLsizei w, GLsizei h, bool check_for_errors)
+{
+	if(check_for_errors)
+		while(glGetError() != GL_NO_ERROR) {} // Clear any error left over from earlier, so what is read back below is this blit's.
+
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, src_framebuffer_name);
+	dest_framebuffer.bindForDrawing();
+
+	glBlitFramebuffer(/*srcX0=*/0, /*srcY0=*/0, /*srcX1=*/w, /*srcY1=*/h, /*dstX0=*/0, /*dstY0=*/0, /*dstX1=*/w, /*dstY1=*/h,
+		GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, 0); // Unbind any framebuffer from readback operations.
+
+	return check_for_errors ? (glGetError() == GL_NO_ERROR) : true;
+}
+
+
 /*
 Draws Gaussian splat clouds, front-to-back, compositing them with the "under" operator.
 
@@ -9403,41 +9427,51 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 	// so whatever order the pass below happens to settle on for them is left alone.
 	orderSplatCloudsBackToFront(visible_splat_clouds.data(), num_visible, campos_ws, splat_cloud_range_stack);
 
-	// Splats blend into an accumulation buffer of their own rather than straight onto the main colour buffer, so that
-	// the blend runs in the display-referred sRGB space they were fitted in and the engine's display transform can be
-	// inverted once afterwards instead of per splat - see gaussian_splat_frag_shader.glsl for why that matters.  The
-	// accumulation buffer takes the place of the main colour buffer on main_render_framebuffer, which is what gives it
-	// the scene's depth buffer to test against, at a matching sample count.
+	// Splats blend into an accumulation buffer of their own, on a framebuffer of their own, rather than straight onto
+	// the main colour buffer.  Two reasons:
 	//
-	// Without the main render framebuffer there's no attachment to swap and no depth renderbuffer we could attach
-	// alongside our own colour buffer, so splats blend straight into the target instead.  Nothing tone maps that target,
-	// so its contents are display-referred as well, and the splats' authored colours are already the values to write.
-	// Overdraw debug view (splat_renderer->getShowOverdraw()): still uses the accumulation buffer, same as normal
-	// rendering, just with a different blend func below and different contents - gaussian_splat_frag_shader.glsl
-	// writes a flat (1,0,0,1) per surviving fragment instead of a real splat colour, so accum.r ends up holding the raw
-	// per-pixel layer count, which the resolve pass maps to a colour ramp instead of doing its usual composite.
+	// - The blend has to run in the display-referred sRGB space the splats were fitted in, so that the engine's display
+	//   transform can be inverted once afterwards instead of per splat - see gaussian_splat_frag_shader.glsl.
+	// - The front-to-back "under" blend below reads the *destination's* alpha as "how much of this pixel is already
+	//   covered", which only means that in a buffer that started the frame at zero.  An ordinary colour target is
+	//   already opaque, so 1 - dst.a would be zero everywhere and every splat would contribute nothing at all.
+	//
+	// Overdraw debug view (splat_renderer->getShowOverdraw()): same buffer, same setup, just a different blend func
+	// below and different contents - gaussian_splat_frag_shader.glsl writes a flat (1,0,0,1) per surviving fragment
+	// instead of a real splat colour, so accum.r ends up holding the raw per-pixel layer count, which the resolve pass
+	// maps to a colour ramp instead of doing its usual composite.
 	const bool show_overdraw = splat_renderer->getShowOverdraw();
-	const bool use_accum_buffer = allocSplatAccumBuffersIfNeeded();
-	if(use_accum_buffer)
-	{
-		assert(current_scene->main_render_framebuffer->getAttachedRenderBufferName(GL_COLOR_ATTACHMENT0) == current_scene->main_colour_renderbuffer->buffer_name);
-		current_scene->main_render_framebuffer->attachRenderBuffer(*current_scene->splat_accum_renderbuffer, GL_COLOR_ATTACHMENT0); // Replaces the colour buffer as GL_COLOR_ATTACHMENT0.  Restored in resolveSplatAccumBuffer().
-		current_scene->main_render_framebuffer->bindForDrawing();
-		setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to the accumulation buffer (not the normal buffer).
 
-		// NOTE that glClearBufferfv uses draw buffer indices, so glDrawBuffers() needs to be called first.
-		const float col_zero[4] = { 0, 0, 0, 0 };
-		glClearBufferfv(GL_COLOR, /*drawBuffer=*/0, col_zero);
-	}
-	else
+	// The framebuffer the rest of the frame is being drawn into.  It supplies the depth the splats test against, and the
+	// resolve pass has to composite onto it and leave it bound behind us.
+	const GLuint scene_target_framebuffer_name = (current_scene->render_to_main_render_framebuffer && current_scene->main_render_framebuffer.nonNull()) ? current_scene->main_render_framebuffer->buffer_name :
+		(this->target_frame_buffer.nonNull() ? this->target_frame_buffer->buffer_name : 0);
+
+	allocSplatAccumBuffersIfNeeded(scene_target_framebuffer_name);
+
+	if(current_scene->splat_accum_depth_renderbuffer.nonNull() && splat_depth_copy_works)
 	{
-		if(this->target_frame_buffer)
-		{
-			this->target_frame_buffer->bindForDrawing();
-			setSingleDrawBuffer(GL_COLOR_ATTACHMENT0);
-		}
-		else
-			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0); // Bind to default frame buffer and use the draw buffer set already for it.
+		// There was no scene depth renderbuffer to attach to our framebuffer alongside the accumulation buffer, so copy
+		// the scene's depth into one of our own - splats still have to be occluded by the opaque geometry already drawn.
+		// Costs one full-screen depth blit per frame, which is noise next to the fill the splats themselves do.
+		blitDepthBuffer(scene_target_framebuffer_name, *current_scene->splat_accum_framebuffer, (GLsizei)current_scene->splat_accum_depth_renderbuffer->xRes(),
+			(GLsizei)current_scene->splat_accum_depth_renderbuffer->yRes(), /*check_for_errors=*/false); // Already established at allocation time that the driver accepts this blit.
+	}
+
+	current_scene->splat_accum_framebuffer->bindForDrawing();
+	setSingleDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+	// NOTE that glClearBufferfv uses draw buffer indices, so glDrawBuffers() needs to be called first.
+	const float col_zero[4] = { 0, 0, 0, 0 };
+	glClearBufferfv(GL_COLOR, /*drawBuffer=*/0, col_zero);
+
+	if(current_scene->splat_accum_depth_renderbuffer.nonNull() && !splat_depth_copy_works)
+	{
+		// No depth format the scene's depth could be copied into (reported once, at allocation).  Clear to the far plane
+		// rather than leave the buffer uninitialised: splats then draw unoccluded, which is wrong but consistent and
+		// recognisable, instead of being tested against whatever happens to be in memory.
+		const float far_depth = use_reverse_z ? 0.f : 1.f;
+		glClearBufferfv(GL_DEPTH, /*drawBuffer=*/0, &far_depth);
 	}
 
 	glEnable(GL_BLEND);
@@ -9475,42 +9509,164 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 	glDepthMask(GL_TRUE); // Re-enable writing to depth buffer.
 	glDisable(GL_BLEND);
 
-	if(use_accum_buffer)
-		resolveSplatAccumBuffer();
+	resolveSplatAccumBuffer(scene_target_framebuffer_name);
 }
 
 
-// Allocates the buffer splat clouds blend into, and the texture the MSAA samples in it are resolved down to.
-// Returns false if the accumulation buffer can't be used for the current scene, in which case splats are blended
-// directly into whatever is being drawn to - see drawSplatClouds().
-bool OpenGLEngine::allocSplatAccumBuffersIfNeeded()
-{
-	if(!current_scene->render_to_main_render_framebuffer || current_scene->main_colour_renderbuffer.isNull())
-		return false;
+/*
+Fills candidates_out with the depth formats a buffer receiving a depth blit from framebuffer 'framebuffer_name' might
+need, most likely first, and returns how many were written.
 
-	// Match the main colour buffer exactly: the two are swapped on the same framebuffer, so they have to agree with its
-	// depth attachment on size and sample count, and glBlitFramebuffer requires matching sizes as well.
-	const size_t xres      = current_scene->main_colour_renderbuffer->xRes();
-	const size_t yres      = current_scene->main_colour_renderbuffer->yRes();
-	const int msaa_samples = current_scene->main_colour_renderbuffer->MSAASamples();
+This is a search rather than a query because the two are not the same problem.  A depth blit is only accepted between
+*identical* internal formats - it is not an approximation the driver will make - and GL will only tell us the attachment's
+bit depths, which do not determine the internal format.  In particular a WebGL canvas asked for depth and no stencil
+reports 24 depth bits and 0 stencil bits, and is nonetheless commonly backed by a packed DEPTH24_STENCIL8 buffer, which
+a DEPTH_COMPONENT24 buffer does not match.  So the query is used to order the guesses and the driver settles it - see
+allocSplatAccumBuffersIfNeeded(), which keeps the first candidate a trial blit succeeds with.
+
+The default framebuffer names its attachments GL_DEPTH/GL_STENCIL rather than GL_DEPTH_ATTACHMENT etc., hence the two
+cases below.
+*/
+static int depthFormatCandidatesForFrameBuffer(GLuint framebuffer_name, OpenGLTextureFormat* candidates_out)
+{
+	const GLuint prev_binding = FrameBuffer::getCurrentlyBoundDrawFrameBuffer();
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffer_name);
+
+	const GLenum depth_attachment   = (framebuffer_name == 0) ? GL_DEPTH   : GL_DEPTH_ATTACHMENT;
+	const GLenum stencil_attachment = (framebuffer_name == 0) ? GL_STENCIL : GL_STENCIL_ATTACHMENT;
+
+	GLint depth_bits = 0, component_type = 0, stencil_bits = 0;
+	glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, depth_attachment, GL_FRAMEBUFFER_ATTACHMENT_DEPTH_SIZE, &depth_bits);
+	glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, depth_attachment, GL_FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE, &component_type);
+
+	// Only ask about the stencil attachment if there is one: querying its size when there isn't is an error.
+	GLint stencil_ob_type = GL_NONE;
+	glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, stencil_attachment, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &stencil_ob_type);
+	if(stencil_ob_type != GL_NONE)
+		glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, stencil_attachment, GL_FRAMEBUFFER_ATTACHMENT_STENCIL_SIZE, &stencil_bits);
+
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prev_binding);
+
+	conPrint("Scene target framebuffer depth: " + toString(depth_bits) + " bits (" + ((component_type == GL_FLOAT) ? "float" : "fixed-point") + "), stencil: " + toString(stencil_bits) + " bits");
+
+	int num = 0;
+	if(component_type == GL_FLOAT)
+		candidates_out[num++] = OpenGLTextureFormat::Format_Depth_Float;
+	else if(depth_bits <= 16 && stencil_bits == 0)
+		candidates_out[num++] = OpenGLTextureFormat::Format_Depth_Uint16;
+
+	// Packed first for everything else, including a 24-bit buffer that claims to have no stencil: that claim describes
+	// what the context was asked for, not what was allocated to serve it.
+	candidates_out[num++] = OpenGLTextureFormat::Format_Depth_Uint24_Stencil8;
+	candidates_out[num++] = OpenGLTextureFormat::Format_Depth_Uint24;
+	candidates_out[num++] = OpenGLTextureFormat::Format_Depth_Uint16;
+	return num;
+}
+
+
+// Attachment point a depth buffer of this format goes at: a packed depth-stencil buffer is one buffer serving both, so
+// it is attached once, at the combined point.
+static GLenum attachmentPointForDepthFormat(OpenGLTextureFormat format)
+{
+	return (format == OpenGLTextureFormat::Format_Depth_Uint24_Stencil8) ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT;
+}
+
+
+/*
+Allocates the framebuffer splat clouds blend into: the accumulation buffer itself, the depth buffer they are tested
+against, and the texture the accumulated result is read back through by the resolve pass.
+
+The pass has a framebuffer of its own rather than borrowing main_render_framebuffer's colour attachment, because the
+accumulation buffer has to begin the frame with alpha zero for the "under" blend to mean anything - see
+drawSplatClouds().  Owning the framebuffer is what makes that true regardless of how the scene is configured: without it
+a scene rendering straight into the default framebuffer has nowhere to accumulate, and the splats would have to fall
+back to a different blend, a different sort order and no way to test what has accumulated so far.
+
+Depth still has to be the scene's, so that splats are occluded by walls.  Where the scene renders into
+main_render_framebuffer, its depth renderbuffer is attached to ours as well - the same buffer, no copy, sample counts
+match by construction.  Otherwise there is nothing to share, so we allocate a depth buffer of our own and
+drawSplatClouds() copies the scene's depth into it once per frame.
+*/
+void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffer_name)
+{
+	const bool share_scene_depth = current_scene->render_to_main_render_framebuffer && current_scene->main_depth_renderbuffer.nonNull();
+
+	size_t xres, yres;
+	int msaa_samples;
+	if(share_scene_depth)
+	{
+		// Must agree with the depth buffer we are about to share on size and sample count.
+		xres         = current_scene->main_depth_renderbuffer->xRes();
+		yres         = current_scene->main_depth_renderbuffer->yRes();
+		msaa_samples = current_scene->main_depth_renderbuffer->MSAASamples();
+	}
+	else
+	{
+		xres = (size_t)myMax(16, current_scene->viewport_w);
+		yres = (size_t)myMax(16, current_scene->viewport_h);
+		msaa_samples = 1; // Single-sampled: our depth buffer is filled by a blit, and glBlitFramebuffer can't write into a multisampled draw framebuffer.
+	}
 
 	if(current_scene->splat_accum_renderbuffer.nonNull() &&
 		current_scene->splat_accum_renderbuffer->xRes() == xres &&
 		current_scene->splat_accum_renderbuffer->yRes() == yres &&
-		current_scene->splat_accum_renderbuffer->MSAASamples() == msaa_samples)
-		return true; // Already allocated at the right size.
+		current_scene->splat_accum_renderbuffer->MSAASamples() == msaa_samples &&
+		current_scene->splat_accum_depth_renderbuffer.isNull() == share_scene_depth) // Also reallocate if the scene gained or lost a depth buffer we can share.
+		return; // Already allocated, in the right size and configuration.
 
 	// RGBA rather than the main colour buffer's format, which has no alpha channel on desktop: the resolve pass needs
 	// the accumulated coverage as well as the accumulated colour.
 	const OpenGLTextureFormat splat_accum_format = OpenGLTextureFormat::Format_RGBA_Linear_Half;
 
-	// Free any existing buffers first, to reduce max mem usage.
-	current_scene->splat_accum_copy_texture = NULL;
-	current_scene->splat_accum_renderbuffer = NULL;
+	// Free any existing buffers first, to reduce max mem usage.  Framebuffers last, after what was attached to them.
+	current_scene->splat_accum_copy_texture       = NULL;
+	current_scene->splat_accum_renderbuffer       = NULL;
+	current_scene->splat_accum_depth_renderbuffer = NULL;
+	current_scene->splat_accum_framebuffer        = NULL;
+	current_scene->splat_accum_copy_framebuffer   = NULL;
 
-	conPrint("Allocating splat accumulation buffer with width " + toString(xres) + " and height " + toString(yres) + ", MSAA samples " + toString(msaa_samples));
+	conPrint("Allocating splat accumulation buffer with width " + toString(xres) + " and height " + toString(yres) + ", MSAA samples " + toString(msaa_samples) +
+		(share_scene_depth ? ", sharing the scene depth buffer" : ", with a depth buffer of its own"));
 
 	current_scene->splat_accum_renderbuffer = new RenderBuffer(xres, yres, msaa_samples, splat_accum_format);
+
+	current_scene->splat_accum_framebuffer = new FrameBuffer();
+	current_scene->splat_accum_framebuffer->attachRenderBuffer(*current_scene->splat_accum_renderbuffer, GL_COLOR_ATTACHMENT0);
+
+	if(share_scene_depth)
+	{
+		current_scene->splat_accum_framebuffer->attachRenderBuffer(*current_scene->main_depth_renderbuffer, GL_DEPTH_ATTACHMENT);
+		splat_depth_copy_works = false; // Nothing to copy: the buffer is shared, not duplicated.
+	}
+	else
+	{
+		// Take the first depth format the driver will accept a blit from the scene's depth buffer into - see
+		// depthFormatCandidatesForFrameBuffer() for why this can't just be looked up.  Each attempt replaces the
+		// previous one's attachment, so at most one depth buffer is ever attached.
+		OpenGLTextureFormat candidates[4];
+		const int num_candidates = depthFormatCandidatesForFrameBuffer(scene_target_framebuffer_name, candidates);
+
+		splat_depth_copy_works = false;
+		for(int i=0; i<num_candidates; ++i)
+		{
+			current_scene->splat_accum_depth_renderbuffer = NULL; // Free the previous attempt's buffer before allocating the next.
+			current_scene->splat_accum_depth_renderbuffer = new RenderBuffer(xres, yres, msaa_samples, candidates[i]);
+			current_scene->splat_accum_framebuffer->attachRenderBuffer(*current_scene->splat_accum_depth_renderbuffer, attachmentPointForDepthFormat(candidates[i]));
+
+			if(blitDepthBuffer(scene_target_framebuffer_name, *current_scene->splat_accum_framebuffer, (GLsizei)xres, (GLsizei)yres, /*check_for_errors=*/true))
+			{
+				conPrint("Splat accumulation depth buffer format: " + std::string(textureFormatString(candidates[i])));
+				splat_depth_copy_works = true;
+				break;
+			}
+		}
+
+		if(!splat_depth_copy_works)
+			conPrint("Error: found no depth format the scene's depth buffer can be copied into, so splats will not be occluded by scene geometry.");
+	}
+
+	if(!current_scene->splat_accum_framebuffer->isComplete())
+		conPrint("Error: splat accumulation framebuffer is not complete.");
 
 	current_scene->splat_accum_copy_texture = new OpenGLTexture(xres, yres, this,
 		ArrayRef<uint8>(), // data
@@ -9521,40 +9677,36 @@ bool OpenGLEngine::allocSplatAccumBuffersIfNeeded()
 		/*MSAA_samples=*/1
 	);
 
-	return true;
+	current_scene->splat_accum_copy_framebuffer = new FrameBuffer();
+	current_scene->splat_accum_copy_framebuffer->attachTexture(*current_scene->splat_accum_copy_texture, GL_COLOR_ATTACHMENT0);
 }
 
 
 /*
-Composites the accumulation buffer the splats were blended into onto the main colour buffer, with the engine's display
-transform inverted once over the finished blend.
+Composites the accumulation buffer the splats were blended into onto the buffer the rest of the frame is being drawn
+into, with the engine's display transform inverted once over the finished blend.
 
 The MSAA samples are resolved by the blit, i.e. before the divide by coverage in the resolve shader.  That is the right
 order: the samples hold premultiplied colour and coverage, so averaging them and then dividing weights each sample by
 how much of it the splats actually covered, whereas dividing per-sample first would weight a barely covered sample the
 same as a fully covered one.
 */
-void OpenGLEngine::resolveSplatAccumBuffer()
+void OpenGLEngine::resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name)
 {
 	DebugGroup debug_group("resolveSplatAccumBuffer()");
 	TracyGpuZone("resolveSplatAccumBuffer");
 
-	assert(current_scene->splat_accum_renderbuffer.nonNull() && current_scene->splat_accum_copy_texture.nonNull());
+	assert(current_scene->splat_accum_framebuffer.nonNull() && current_scene->splat_accum_copy_framebuffer.nonNull() && current_scene->splat_accum_copy_texture.nonNull());
 
 	//----------------------- Copy the accumulation renderbuffer to splat_accum_copy_texture, so it can be read -----------------------
-	current_scene->main_render_copy_framebuffer->attachTexture(*current_scene->splat_accum_copy_texture, GL_COLOR_ATTACHMENT0);
-
-	blitFrameBuffer(/*src_framebuffer=*/*current_scene->main_render_framebuffer, /*dest_framebuffer=*/*current_scene->main_render_copy_framebuffer,
-		/*num_buffers_to_copy=*/1, // Just the accumulation buffer, which drawSplatClouds() attached at GL_COLOR_ATTACHMENT0.
+	blitFrameBuffer(/*src_framebuffer=*/*current_scene->splat_accum_framebuffer, /*dest_framebuffer=*/*current_scene->splat_accum_copy_framebuffer,
+		/*num_buffers_to_copy=*/1, // The splat accumulation framebuffer has just the one colour attachment.
 		/*copy_buf0_colour=*/true, /*copy_buf0_depth=*/false);
 
-	// Restore the attachments both framebuffers had before this pass.
-	current_scene->main_render_framebuffer->attachRenderBuffer(*current_scene->main_colour_renderbuffer, GL_COLOR_ATTACHMENT0);
-	current_scene->main_render_copy_framebuffer->attachTexture(*current_scene->main_colour_copy_texture, GL_COLOR_ATTACHMENT0);
-
-	//----------------------- Composite onto the main colour buffer -----------------------
-	current_scene->main_render_framebuffer->bindForDrawing();
-	setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer (not normal buffer)
+	//----------------------- Composite onto the buffer the frame is being drawn into -----------------------
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, scene_target_framebuffer_name);
+	if(scene_target_framebuffer_name != 0)
+		setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer (not normal buffer).  The default framebuffer has no such attachment, and the draw buffer set for it already is the right one.
 
 	glDepthMask(GL_FALSE); // Don't write to z-buffer: the splats were depth tested as they were drawn, this is just a composite.
 	glDisable(GL_DEPTH_TEST); // Don't depth test

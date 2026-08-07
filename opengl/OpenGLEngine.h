@@ -678,7 +678,12 @@ public:
 
 	// Gaussian splat clouds blend into a buffer of their own, which is then resolved onto the main colour buffer - see
 	// OpenGLEngine::drawSplatClouds().  Allocated there on demand, so a scene with no splat clouds doesn't pay for it.
+	// The splat pass owns its framebuffer rather than borrowing main_render_framebuffer's colour attachment, so that it
+	// works the same way whether or not the scene renders to offscreen renderbuffers.
+	Reference<FrameBuffer> splat_accum_framebuffer;
 	Reference<RenderBuffer> splat_accum_renderbuffer;
+	Reference<RenderBuffer> splat_accum_depth_renderbuffer; // Non-null only when there is no scene depth renderbuffer to share; receives a copy of the scene's depth each frame.
+	Reference<FrameBuffer> splat_accum_copy_framebuffer;
 	OpenGLTextureRef splat_accum_copy_texture;
 
 
@@ -1437,8 +1442,8 @@ private:
 	void drawDecals(const Matrix4f& view_matrix, const Matrix4f& proj_matrix);
 	void drawAlphaBlendedObjects(const Matrix4f& view_matrix, const Matrix4f& proj_matrix);
 	void drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& proj_matrix);
-	bool allocSplatAccumBuffersIfNeeded(); // Allocates the buffers splat clouds blend into, matching the main colour buffer.  Returns false if they're unavailable.
-	void resolveSplatAccumBuffer(); // Composites the splat accumulation buffer onto the main colour buffer, undoing the engine's display transform once.
+	void allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffer_name); // Allocates the framebuffer splat clouds blend into, and the depth buffer they test against.
+	void resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name); // Composites the splat accumulation buffer onto the buffer the frame is being drawn into, undoing the engine's display transform once.
 public:
 	// Renders Gaussian splat clouds.  Owned by the engine, and cheap until the first cloud is registered with it: it
 	// doesn't build its shaders until then.  draw() drives it, so callers only need addObject()/removeObject().
@@ -1656,6 +1661,11 @@ private:
 	// Working space for drawSplatClouds()'s ordering pass, kept to avoid allocating every frame.
 	js::Vector<const GLObject*, 16> visible_splat_clouds;
 	js::Vector<SplatCloudRange, 16> splat_cloud_range_stack;
+
+	// Whether the splat accumulation framebuffer has a depth buffer of its own that the scene's depth can actually be
+	// copied into.  Settled once, when the buffers are allocated, by trying the copy - see
+	// allocSplatAccumBuffersIfNeeded().  False when the scene's depth buffer is shared instead, and so needs no copy.
+	bool splat_depth_copy_works;
 	std::vector<uint32> temp_counts;
 	uint32 num_prog_changes;
 	uint32 num_vao_binds;

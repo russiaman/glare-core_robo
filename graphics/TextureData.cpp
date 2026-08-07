@@ -43,6 +43,8 @@ size_t bytesPerPixel(OpenGLTextureFormat format)
 		case Format_RGBA_Linear_Half: return 8;
 		case Format_Depth_Float: return 4;
 		case Format_Depth_Uint16: return 2;
+		case Format_Depth_Uint24: return 4; // GL_DEPTH_COMPONENT24 is stored padded to 32 bits.
+		case Format_Depth_Uint24_Stencil8: return 4;
 		default:
 			assert(0);
 			return 1;
@@ -91,6 +93,8 @@ size_t numChannels(OpenGLTextureFormat format)
 		case Format_RGBA_Linear_Half: return 4;
 		case Format_Depth_Float: return 1;
 		case Format_Depth_Uint16: return 1;
+		case Format_Depth_Uint24: return 1;
+		case Format_Depth_Uint24_Stencil8: return 2;
 		case Format_Compressed_DXT_RGB_Uint8: return 3;
 		case Format_Compressed_DXT_RGBA_Uint8: return 4;
 		case Format_Compressed_DXT_SRGB_Uint8: return 3;
@@ -126,6 +130,8 @@ const char* textureFormatString(OpenGLTextureFormat format)
 		case Format_RGBA_Linear_Half: return "Format_RGBA_Linear_Half";
 		case Format_Depth_Float: return "Format_Depth_Float";
 		case Format_Depth_Uint16: return "Format_Depth_Uint16";
+		case Format_Depth_Uint24: return "Format_Depth_Uint24";
+		case Format_Depth_Uint24_Stencil8: return "Format_Depth_Uint24_Stencil8";
 		case Format_Compressed_DXT_RGB_Uint8: return "Format_Compressed_DXT_RGB_Uint8";
 		case Format_Compressed_DXT_RGBA_Uint8: return "Format_Compressed_DXT_RGBA_Uint8";
 		case Format_Compressed_DXT_SRGB_Uint8: return "Format_Compressed_DXT_SRGB_Uint8";
@@ -167,6 +173,8 @@ double TextureData::uncompressedBitsPerChannel() const
 		case Format_RGBA_Linear_Half: return 16;
 		case Format_Depth_Float: return 32; // ?
 		case Format_Depth_Uint16: return 16;
+		case Format_Depth_Uint24: return 24;
+		case Format_Depth_Uint24_Stencil8: return 16; // Averaged over the two channels: 24 bits of depth and 8 of stencil.
 		case Format_Compressed_DXT_RGB_Uint8: return 8;
 		case Format_Compressed_DXT_RGBA_Uint8: return 8;
 		case Format_Compressed_DXT_SRGB_Uint8: return 8;

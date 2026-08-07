@@ -54,6 +54,8 @@ enum OpenGLTextureFormat
 	Format_RGBA_Linear_Half,
 	Format_Depth_Float,
 	Format_Depth_Uint16,
+	Format_Depth_Uint24,               // GL_DEPTH_COMPONENT24
+	Format_Depth_Uint24_Stencil8,      // GL_DEPTH24_STENCIL8
 	Format_Compressed_DXT_RGB_Uint8,   // BC1 / DXT1, linear sRGB colour space
 	Format_Compressed_DXT_RGBA_Uint8,  // BC3 / DXT5, linear sRGB colour space
 	Format_Compressed_DXT_SRGB_Uint8,  // BC1 / DXT1, non-linear sRGB colour space

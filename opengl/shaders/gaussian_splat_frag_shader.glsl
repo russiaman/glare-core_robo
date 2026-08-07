@@ -68,8 +68,8 @@ void main()
 	// blends this pass into a buffer of its own and inverts the transform once, after the blend - see
 	// gaussian_splat_resolve_frag_shader.glsl.
 	//
-	// Premultiplied by alpha: drawSplatClouds() blends with (GL_ONE, GL_ONE_MINUS_SRC_ALPHA), so the accumulation
-	// buffer ends up holding (sum of c_i * a_i * T_i, coverage), which is what the resolve pass wants.
+	// Premultiplied by alpha: drawSplatClouds() blends with (GL_ONE_MINUS_DST_ALPHA, GL_ONE), the "under" operator, so
+	// the accumulation buffer ends up holding (sum of c_i * a_i * T_i, coverage), which is what the resolve pass wants.
 	if(splat_show_overdraw != 0)
 		colour_out = vec4((splat_show_overdraw == 2) ? alpha : 1.0, 0.0, 0.0, 1.0); // Alpha sum, or one layer - see the uniform comment above. 'alpha' is post-discard, so mode 2 sums exactly what the normal path would have blended.
 	else

@@ -263,6 +263,16 @@ void OpenGLTexture::getGLFormat(OpenGLTextureFormat format_, GLint& internal_for
 		gl_format = GL_DEPTH_COMPONENT;
 		type = GL_UNSIGNED_SHORT;
 		break;
+	case Format_Depth_Uint24:
+		internal_format = GL_DEPTH_COMPONENT24;
+		gl_format = GL_DEPTH_COMPONENT;
+		type = GL_UNSIGNED_INT;
+		break;
+	case Format_Depth_Uint24_Stencil8:
+		internal_format = GL_DEPTH24_STENCIL8;
+		gl_format = GL_DEPTH_STENCIL;
+		type = GL_UNSIGNED_INT_24_8;
+		break;
 	case Format_Compressed_DXT_RGB_Uint8:
 		internal_format = GL_EXT_COMPRESSED_RGB_S3TC_DXT1_EXT;
 		gl_format = GL_RGB;

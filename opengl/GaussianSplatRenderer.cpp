@@ -8,6 +8,7 @@ Copyright Glare Technologies Limited 2026 -
 
 #include "IncludeOpenGL.h"
 #include "OpenGLEngine.h"
+#include "RenderBuffer.h" // For the accumulation buffer's dimensions in getDiagnostics().
 #include "OpenGLMeshRenderData.h"
 #include "OpenGLShader.h"
 #include "OpenGLTexture.h"
@@ -663,14 +664,6 @@ void GaussianSplatRenderer::buildShadersIfNeeded()
 }
 
 
-void GaussianSplatRenderer::setResolveOverdrawUniforms() const
-{
-	glUniform1i(resolve_prog->user_uniform_info[0].loc, splat_show_overdraw_mode);
-	glUniform1f(resolve_prog->user_uniform_info[1].loc, splat_overdraw_range_min);
-	glUniform1f(resolve_prog->user_uniform_info[2].loc, splat_overdraw_range_max);
-}
-
-
 size_t GaussianSplatRenderer::maxSplatsPerCloud() const
 {
 	// The texture width is fixed at splat_tex_width, which any conformant implementation supports.  The height is capped
@@ -805,6 +798,20 @@ std::string GaussianSplatRenderer::getDiagnostics() const
 	}
 
 	std::string s;
+
+	// Splats are fill-rate bound, so the pixel count is as much a part of "how much work is this" as the splat count -
+	// and it is the first thing to check before comparing two clients' frame rates against each other.  The accumulation
+	// buffer's own size is listed separately because it, not the viewport, is what the splats actually shade into: the
+	// two agree today, and saying so out loud is how a future divergence gets noticed.
+	const int viewport_w = opengl_engine->getViewPortWidth();
+	const int viewport_h = opengl_engine->getViewPortHeight();
+	s += "Viewport: " + toString(viewport_w) + " x " + toString(viewport_h) + " (" +
+		doubleToStringNDecimalPlaces((double)viewport_w * viewport_h * 1.0e-6, 2) + " Mpixel)";
+	if(opengl_engine->getCurrentScene()->splat_accum_renderbuffer.nonNull())
+		s += ", accumulation buffer " + toString(opengl_engine->getCurrentScene()->splat_accum_renderbuffer->xRes()) + " x " +
+			toString(opengl_engine->getCurrentScene()->splat_accum_renderbuffer->yRes());
+	s += "\n";
+
 	s += "Splat objects: " + toString(handle_to_cloud.size()) + "\n";
 	s += "Drawable clouds: " + toString(clouds.size()) + " (" + toString(num_merged_clouds) + " merged)\n";
 	s += "Clouds drawn last frame: " + toString(opengl_engine->last_num_splat_clouds_drawn) + "\n";
@@ -813,6 +820,19 @@ std::string GaussianSplatRenderer::getDiagnostics() const
 	// Draw calls rather than slices: a cloud with fewer splats than slices leaves some empty, so the two only agree
 	// when there is something to draw in every one.
 	s += "Draw slices: " + toString(splat_num_draw_slices) + " (" + toString(opengl_engine->last_num_splat_draw_calls) + " draw calls last frame)\n";
+	// Every live-tunable parameter, printed whether or not it is at its default.  Only the desktop client has a panel to
+	// set these from, so the web runs on the hardcoded defaults, and the usual reason for reading this section at all is
+	// to work out why the two clients look different on the same scene - which needs the values themselves, not just the
+	// ones that happen to be interesting.  Not printed: the LoD tree's lod_base, which belongs to the client and is only
+	// consumed when a .sog is loaded, so it isn't the renderer's to report.
+	s += "Live params: pixel_scale_limit " + doubleToStringNDecimalPlaces(lod_pixel_scale_limit, 2) +
+		", max_splats_budget " + uInt64ToStringCommaSeparated(lod_max_splats_budget) +
+		", resort_move_threshold_ws " + doubleToStringNDecimalPlaces(lod_resort_move_threshold_ws, 3) + "\n";
+	s += "             max_layer_density " + doubleToStringNDecimalPlaces(lod_max_layer_density, 1) + (lod_max_layer_density == 0 ? " (disabled)" : "") +
+		", max_tree_depth " + toString(lod_max_tree_depth) + (lod_max_tree_depth == 0 ? " (disabled)" : "") + "\n";
+	s += "             size_clamp [" + doubleToStringNDecimalPlaces(splat_size_clamp_min, 3) + ", " + doubleToStringNDecimalPlaces(splat_size_clamp_max, 3) + "]" +
+		((splat_size_clamp_min == 0 && splat_size_clamp_max == 0) ? " (disabled)" : (splat_size_clamp_invert ? " inverted" : "")) +
+		", alpha_cutoff " + doubleToStringNDecimalPlaces(splat_alpha_cutoff, 4) + "\n";
 	s += "Sorts in flight: " + toString(num_sorts_in_flight) + " / " + toString(max_concurrent_sorts) + "\n";
 	s += "GPU mem: " + getMBSizeString((size_t)tex_bytes) + " data textures, " + getMBSizeString((size_t)index_vbo_bytes) + " index VBOs\n";
 	s += "Sort scratch pooled: " + toString(free_scratch.size()) + " buffers, " + getMBSizeString((size_t)scratch_bytes) + "\n";
@@ -825,7 +845,6 @@ std::string GaussianSplatRenderer::getDiagnostics() const
 		s += "LoD traversal scratch pooled: " + toString(free_traversal_scratch.size()) + " buffers, " + getMBSizeString((size_t)traversal_scratch_bytes) + "\n";
 		s += "LoD nodes (leaves+merged) vs leaves, LoD-active clouds only: " + uInt64ToStringCommaSeparated(total_nodes_lod_active) + " vs " +
 			uInt64ToStringCommaSeparated(total_leaves_lod_active) + " (" + doubleToStringNDecimalPlaces((double)total_nodes_lod_active / myMax((size_t)1, total_leaves_lod_active), 2) + "x)\n";
-		s += "LoD pixel_scale_limit: " + doubleToStringNDecimalPlaces(lod_pixel_scale_limit, 2) + ", max_splats_budget: " + uInt64ToStringCommaSeparated(lod_max_splats_budget) + "\n";
 	}
 
 	// The per-cloud breakdown is what shows whether the partitioning is behaving - a world of separate captures should

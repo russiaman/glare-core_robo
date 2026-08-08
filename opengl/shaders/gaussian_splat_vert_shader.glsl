@@ -154,8 +154,14 @@ void main()
 	// variance, which barely decays by the clamped quad edge and so produces a hard straight-edged cutoff instead of a
 	// soft fade.  Using the clamped radius as the effective sigma makes alpha fade to ~0 at the quad boundary, and is a
 	// no-op whenever the radius wasn't clamped.
-	float eff_lambda1 = (radius1 * radius1) * (1.0 / 9.0); // radius = 3*sqrt(lambda), so lambda = (radius/3)^2.
-	float eff_lambda2 = (radius2 * radius2) * (1.0 / 9.0);
+	//
+	// The radius is sigma_cutoff sigmas out, so lambda = (radius / sigma_cutoff)^2 - not (radius/3)^2, which held only
+	// while the radius was always a fixed 3 sigma.  Dividing by 9 regardless narrows the Gaussian itself by
+	// sigma_cutoff/3 whenever the opacity-aware cutoff above bites, so splat_alpha_cutoff quietly shrank low-opacity
+	// splats rather than only trimming the tail the fragment shader discards anyway.
+	float inv_cutoff_sq = 1.0 / max(sigma_cutoff * sigma_cutoff, 1.0e-6); // Guarded for sigma_cutoff = 0, i.e. a splat at or below the cutoff, whose quad is degenerate and rasterises nothing.
+	float eff_lambda1 = (radius1 * radius1) * inv_cutoff_sq;
+	float eff_lambda2 = (radius2 * radius2) * inv_cutoff_sq;
 	float inv_l1 = 1.0 / eff_lambda1;
 	float inv_l2 = 1.0 / eff_lambda2;
 	frag_conic = vec3(

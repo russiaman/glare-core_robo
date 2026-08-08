@@ -9824,11 +9824,16 @@ void OpenGLEngine::markSaturatedSplatPixels()
 	blitFrameBuffer(/*src_framebuffer=*/*current_scene->splat_accum_framebuffer, /*dest_framebuffer=*/*current_scene->splat_accum_copy_framebuffer,
 		/*num_buffers_to_copy=*/1, /*copy_buf0_colour=*/true, /*copy_buf0_depth=*/false);
 
-	//----------------------- Write the stencil -----------------------
+	//----------------------- Write the mark -----------------------
 	current_scene->splat_accum_framebuffer->bindForDrawing();
 
 	glDisable(GL_BLEND);
-	glDisable(GL_DEPTH_TEST); // Every fragment the shader lets through must be written, whatever is in the buffer already.
+	// Every fragment the shader lets through must be written, whatever is in the buffer already - but NOT by disabling
+	// the depth test: with GL_DEPTH_TEST off, GL does not write the depth buffer at all, whatever glDepthMask() says.
+	// Written that way the mark never landed, and the gate ran at full cost while doing nothing.  GL_ALWAYS is how to
+	// write unconditionally and still write - the same trick, for the same reason, as in partiallyClearBuffer().
+	glEnable(GL_DEPTH_TEST);
+	glDepthFunc(GL_ALWAYS);
 	glDepthMask(GL_TRUE); // The one pass in the splat path that writes depth: it is the mark.
 	glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE); // Leave the accumulated colour alone - the depth write is this pass's only output.
 
@@ -9848,6 +9853,7 @@ void OpenGLEngine::markSaturatedSplatPixels()
 
 	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 	glDepthMask(GL_FALSE); // Back to how the slice draws run: splats test depth but never write it.
+	glDepthFunc(use_reverse_z ? GL_GREATER : GL_LESS); // Back to the frame's depth func, as draw() sets it - the marked pixels have to fail it.
 	glEnable(GL_DEPTH_TEST);
 	glEnable(GL_BLEND); // The blend func itself was set by drawSplatClouds() and is not disturbed here.
 }

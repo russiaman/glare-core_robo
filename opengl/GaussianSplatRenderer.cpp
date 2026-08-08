@@ -599,7 +599,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	num_traversals_in_flight(0), lod_pixel_scale_limit(1.0f), lod_max_splats_budget(10000000), lod_resort_move_threshold_ws(0.1f),
 	lod_max_layer_density(0.0f), lod_max_tree_depth(0),
 	splat_size_clamp_min(0.0f), splat_size_clamp_max(0.0f), splat_size_clamp_invert(false), splat_alpha_cutoff(1.0f / 255.0f),
-	splat_num_draw_slices(1),
+	splat_num_draw_slices(1), splat_saturation_gate_enabled(false), splat_saturation_threshold(1.0f - 1.0f / 255.0f),
 	splat_show_overdraw_mode(0), splat_overdraw_range_min(2.0f), splat_overdraw_range_max(100.0f)
 {}
 
@@ -661,6 +661,40 @@ void GaussianSplatRenderer::buildShadersIfNeeded()
 	resolve_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "splat_show_overdraw");
 	resolve_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_overdraw_range_min");
 	resolve_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_overdraw_range_max");
+
+
+	// Marks the pixels the composite has already finished with, between draw slices - see
+	// OpenGLEngine::markSaturatedSplatPixels().  Shares the resolve pass's full-viewport quad vertex shader, since it is
+	// the same geometry doing the same job.  No frag_utils_glsl here: this shader reads one channel and discards, and
+	// has no use for the display transform the resolve shader needs.
+	saturation_mask_prog = new OpenGLProgram(
+		"gaussian splat saturation mask prog",
+		new OpenGLShader(shader_dir + "/gaussian_splat_resolve_vert_shader.glsl", version_directive, key_defs + preprocessor_defines, GL_VERTEX_SHADER),
+		new OpenGLShader(shader_dir + "/gaussian_splat_saturation_mask_frag_shader.glsl", version_directive, key_defs + preprocessor_defines, GL_FRAGMENT_SHADER),
+		opengl_engine->getAndIncrNextProgramIndex(),
+		/*wait_for_build_to_complete=*/!opengl_engine->parallel_shader_compile_support
+	);
+	opengl_engine->addProgram(saturation_mask_prog);
+
+	// Same reason as resolve_prog's uniforms above: the build may still be in flight here, and appendUserUniformInfo() is
+	// what resolves the location once it completes.  Read back by setSaturationMaskUniforms().
+	saturation_mask_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_saturation_threshold");
+	saturation_mask_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_saturated_depth");
+}
+
+
+void GaussianSplatRenderer::setSaturationMaskUniforms(float saturated_depth) const
+{
+	glUniform1f(saturation_mask_prog->user_uniform_info[0].loc, splat_saturation_threshold);
+	glUniform1f(saturation_mask_prog->user_uniform_info[1].loc, saturated_depth);
+}
+
+
+void GaussianSplatRenderer::setResolveOverdrawUniforms() const
+{
+	glUniform1i(resolve_prog->user_uniform_info[0].loc, splat_show_overdraw_mode);
+	glUniform1f(resolve_prog->user_uniform_info[1].loc, splat_overdraw_range_min);
+	glUniform1f(resolve_prog->user_uniform_info[2].loc, splat_overdraw_range_max);
 }
 
 
@@ -820,6 +854,24 @@ std::string GaussianSplatRenderer::getDiagnostics() const
 	// Draw calls rather than slices: a cloud with fewer splats than slices leaves some empty, so the two only agree
 	// when there is something to draw in every one.
 	s += "Draw slices: " + toString(splat_num_draw_slices) + " (" + toString(opengl_engine->last_num_splat_draw_calls) + " draw calls last frame)\n";
+	// Says why it isn't running, not just that it isn't: every reason below leaves the picture correct and the
+	// optimisation silently absent, which is the hardest kind of thing to notice.
+	std::string gate_state;
+	if(!splat_saturation_gate_enabled)
+		gate_state = "off";
+	else if(splat_num_draw_slices <= 1)
+		gate_state = "enabled, but idle - needs more than one draw slice";
+	else if(splat_show_overdraw_mode != 0)
+		gate_state = "enabled, but idle - not used in the overdraw views, where accumulated alpha counts layers rather than coverage";
+	else if(!opengl_engine->splat_accum_gate_available)
+		gate_state = "enabled, but UNAVAILABLE - the accumulation framebuffer has no depth buffer of its own to mark";
+	else if(saturation_mask_prog.isNull() || !saturation_mask_prog->isBuilt())
+		gate_state = "enabled, but idle - mask shader not built yet";
+	else
+		gate_state = "on";
+
+	s += "Saturation gate: " + gate_state + ", threshold " + doubleToStringNDecimalPlaces(splat_saturation_threshold, 4) + "\n";
+
 	// Every live-tunable parameter, printed whether or not it is at its default.  Only the desktop client has a panel to
 	// set these from, so the web runs on the hardcoded defaults, and the usual reason for reading this section at all is
 	// to work out why the two clients look different on the same scene - which needs the values themselves, not just the

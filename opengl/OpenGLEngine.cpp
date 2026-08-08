@@ -460,6 +460,7 @@ OpenGLEngine::OpenGLEngine(const OpenGLEngineSettings& settings_)
 	last_num_splats_drawn(0),
 	last_num_splat_draw_calls(0),
 	splat_depth_copy_works(false),
+	splat_accum_gate_available(false),
 	print_output(NULL),
 	tex_CPU_mem_usage(0),
 	tex_GPU_mem_usage(0),
@@ -9480,6 +9481,17 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 	// maps to a colour ramp instead of doing its usual composite.
 	const bool show_overdraw = splat_renderer->getShowOverdraw();
 
+	// Each cloud's splats are drawn in num_slices consecutive sub-ranges of its depth-sorted instance index buffer,
+	// nearest range first.  On its own this changes nothing: the ranges are drawn back to back, in the order one draw
+	// would have used, so the blend result is the same for any num_slices.  The point is the boundaries between them.
+	// The hardware blend pipeline never knows a pixel's accumulated alpha while it is shading - the outer loop is over
+	// splats, not pixels - so the only place a front-to-back composite can ask "which pixels are finished?" is between
+	// draws.  Slicing creates those places; markSaturatedSplatPixels() is what happens at them.
+	//
+	// Slicing is nested inside the cloud loop rather than interleaved across clouds, which is what keeps the overall
+	// order (clouds front-to-back, splats front-to-back within each) exactly what it was.
+	const int num_slices = myClamp(splat_renderer->getNumDrawSlices(), 1, 1024);
+
 	// The framebuffer the rest of the frame is being drawn into.  It supplies the depth the splats test against, and the
 	// resolve pass has to composite onto it and leave it bound behind us.
 	const GLuint scene_target_framebuffer_name = (current_scene->render_to_main_render_framebuffer && current_scene->main_render_framebuffer.nonNull()) ? current_scene->main_render_framebuffer->buffer_name :
@@ -9502,6 +9514,13 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 	// NOTE that glClearBufferfv uses draw buffer indices, so glDrawBuffers() needs to be called first.
 	const float col_zero[4] = { 0, 0, 0, 0 };
 	glClearBufferfv(GL_COLOR, /*drawBuffer=*/0, col_zero);
+
+	// The saturation gate rejects splats at pixels the composite has already finished with - see
+	// markSaturatedSplatPixels().  It needs a depth buffer of its own to mark them in, and more than one slice to have
+	// somewhere to do the marking between.  Not used in the overdraw debug views: those blend additively, so the
+	// accumulated alpha there is a layer count rather than a coverage and the threshold would mean nothing.
+	const bool use_saturation_gate = splat_renderer->getSaturationGateEnabled() && (num_slices > 1) && !show_overdraw && splat_accum_gate_available &&
+		splat_renderer->getSaturationMaskProgram().nonNull() && splat_renderer->getSaturationMaskProgram()->isBuilt();
 
 	if(current_scene->splat_accum_depth_renderbuffer.nonNull() && !splat_depth_copy_works)
 	{
@@ -9526,17 +9545,6 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 	glBlendFunc(show_overdraw ? GL_ONE : GL_ONE_MINUS_DST_ALPHA, GL_ONE);
 	glDepthMask(GL_FALSE); // Disable writing to depth buffer - splats must not occlude each other or other transparent objects.
 
-	// Each cloud's splats are drawn in num_slices consecutive sub-ranges of its depth-sorted instance index buffer,
-	// nearest range first.  On its own this changes nothing: the ranges are drawn back to back, in the order one draw
-	// would have used, so the blend result is the same for any num_slices.  The point is the boundaries between them.
-	// The hardware blend pipeline never knows a pixel's accumulated alpha while it is shading - the outer loop is over
-	// splats, not pixels - so the only place a front-to-back composite can ask "which pixels are finished?" is between
-	// draws.  Slicing creates those places; what to do at them comes next.
-	//
-	// Slicing is nested inside the cloud loop rather than interleaved across clouds, which is what keeps the overall
-	// order (clouds front-to-back, splats front-to-back within each) exactly what it was.
-	const int num_slices = myClamp(splat_renderer->getNumDrawSlices(), 1, 1024);
-
 	// Walked in reverse of the order orderSplatCloudsBackToFront() produced, since splats now composite front-to-back
 	// (see the blend func above) and so the nearest cloud has to be drawn first.  Reversing here, rather than inverting
 	// that function, leaves its recursive partitioning - and the tests covering it in OpenGLEngineTests.cpp - alone: the
@@ -9547,10 +9555,6 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 		// because the ordering pass above only reads them; the objects are the scene's own and are not const.
 		GLObject* const ob = const_cast<GLObject*>(visible_splat_clouds[i]);
 		const uint32 batch_i = 0;
-		const bool program_changed = checkUseProgram(ob->batch_draw_info[batch_i].getProgramIndex());
-		if(program_changed) // Only true on the first cloud drawn: every splat cloud shares one program.
-			setSharedUniformsForProg(*prog_vector[ob->batch_draw_info[batch_i].getProgramIndex()].ptr(), view_matrix, proj_matrix);
-
 		const int cloud_num_instances = ob->num_instances_to_draw;
 
 		for(int slice=0; slice<num_slices; ++slice)
@@ -9563,6 +9567,19 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 			const int slice_end   = (int)(((int64)cloud_num_instances * (slice + 1)) / num_slices);
 			if(slice_end == slice_begin)
 				continue; // Empty slice, i.e. fewer splats in this cloud than slices.
+
+			// Before every slice but the first, take stock of what the slices already drawn have covered.  Doing it here
+			// rather than after each draw means an empty trailing slice, or the last slice of the last cloud, doesn't pay
+			// for a census whose result nothing would read.
+			if(use_saturation_gate && (last_num_splat_draw_calls > 0))
+				markSaturatedSplatPixels();
+
+			// Inside the slice loop, not outside it: the marking pass above binds a program of its own and leaves none
+			// bound, so the splat program has to be re-established after every one of them.  checkUseProgram() is a no-op
+			// when it is still bound, which is every slice that wasn't preceded by a census.
+			const bool program_changed = checkUseProgram(ob->batch_draw_info[batch_i].getProgramIndex());
+			if(program_changed)
+				setSharedUniformsForProg(*prog_vector[ob->batch_draw_info[batch_i].getProgramIndex()].ptr(), view_matrix, proj_matrix);
 
 			ob->instance_vbo_offset_B = (uint32)(slice_begin * sizeof(uint32)); // One uint32 splat index per instance - see GaussianSplatRenderer::rebuildVAO().
 			ob->num_instances_to_draw = slice_end - slice_begin;
@@ -9666,7 +9683,18 @@ drawSplatClouds() copies the scene's depth into it once per frame.
 */
 void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffer_name)
 {
-	const bool share_scene_depth = current_scene->render_to_main_render_framebuffer && current_scene->main_depth_renderbuffer.nonNull();
+	// The saturation gate marks a finished pixel by writing near depth into it, so that everything drawn behind fails the
+	// depth test the splats already perform - see markSaturatedSplatPixels().  That means it needs a depth buffer it is
+	// allowed to destroy, which the scene's own is not.  So with the gate on we stop sharing and take the depth-copy path,
+	// and with it off we keep sharing, which costs nothing.  Toggling the gate flips share_scene_depth and so reallocates,
+	// which is what makes the switch take effect.
+	//
+	// Two things are given up while the gate is on: a full-screen depth blit per frame (small next to the fill the gate
+	// saves), and MSAA on the splats where the scene has it, since a blit cannot write into a multisampled buffer.  The
+	// second matters little here - splat edges are soft by construction, which is why MSAA was already a candidate for
+	// disabling on this pass.
+	const bool want_own_depth = splat_renderer->getSaturationGateEnabled();
+	const bool share_scene_depth = current_scene->render_to_main_render_framebuffer && current_scene->main_depth_renderbuffer.nonNull() && !want_own_depth;
 
 	size_t xres, yres;
 	int msaa_samples;
@@ -9696,14 +9724,15 @@ void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffe
 	const OpenGLTextureFormat splat_accum_format = OpenGLTextureFormat::Format_RGBA_Linear_Half;
 
 	// Free any existing buffers first, to reduce max mem usage.  Framebuffers last, after what was attached to them.
-	current_scene->splat_accum_copy_texture       = NULL;
-	current_scene->splat_accum_renderbuffer       = NULL;
-	current_scene->splat_accum_depth_renderbuffer = NULL;
-	current_scene->splat_accum_framebuffer        = NULL;
-	current_scene->splat_accum_copy_framebuffer   = NULL;
+	current_scene->splat_accum_copy_texture         = NULL;
+	current_scene->splat_accum_renderbuffer         = NULL;
+	current_scene->splat_accum_depth_renderbuffer   = NULL;
+	current_scene->splat_accum_framebuffer          = NULL;
+	current_scene->splat_accum_copy_framebuffer     = NULL;
 
 	conPrint("Allocating splat accumulation buffer with width " + toString(xres) + " and height " + toString(yres) + ", MSAA samples " + toString(msaa_samples) +
-		(share_scene_depth ? ", sharing the scene depth buffer" : ", with a depth buffer of its own"));
+		(share_scene_depth ? ", sharing the scene depth buffer" : ", with a depth buffer of its own") +
+		(want_own_depth ? ", writable by the saturation gate" : ""));
 
 	current_scene->splat_accum_renderbuffer = new RenderBuffer(xres, yres, msaa_samples, splat_accum_format);
 
@@ -9742,6 +9771,9 @@ void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffe
 			conPrint("Error: found no depth format the scene's depth buffer can be copied into, so splats will not be occluded by scene geometry.");
 	}
 
+	// The gate needs a depth buffer it is allowed to write into, which is exactly the one the copy above produced.
+	splat_accum_gate_available = current_scene->splat_accum_depth_renderbuffer.nonNull() && splat_depth_copy_works;
+
 	if(!current_scene->splat_accum_framebuffer->isComplete())
 		conPrint("Error: splat accumulation framebuffer is not complete.");
 
@@ -9756,6 +9788,68 @@ void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffe
 
 	current_scene->splat_accum_copy_framebuffer = new FrameBuffer();
 	current_scene->splat_accum_copy_framebuffer->attachTexture(*current_scene->splat_accum_copy_texture, GL_COLOR_ATTACHMENT0);
+}
+
+
+/*
+Writes 1 into the splat accumulation framebuffer's stencil buffer at every pixel whose accumulated coverage has reached
+the saturation threshold, leaving the rest at 0.  Run between draw slices; drawSplatClouds() then draws the following
+slices with a stencil test that rejects the marked pixels, before the fragment shader runs on them.
+
+This is the "early-Z for splats" that the hardware pipeline cannot do by itself.  A pixel whose coverage has saturated
+cannot be changed by anything drawn behind it, but the blend unit never knows a pixel's accumulated alpha at shading
+time, and with splats as the outer loop there is no per-pixel loop to break out of.  Asking the question once between
+slices, for the whole screen at once, and answering it through a state the rasteriser already consults, is the shape
+that fits.
+
+The accumulation buffer has to be copied before it can be read: a buffer attached to the framebuffer being drawn to
+cannot be sampled, and it is a renderbuffer besides.  That copy - one full-screen blit, plus this full-screen pass - is
+what bounds how many slices are worth using.
+
+With MSAA the copy resolves the samples, so the threshold is tested against a pixel's average coverage and the stencil
+value applies to all of its samples.  At the edge of a saturated region that is slightly wrong in both directions; the
+region interiors, which is where the work being skipped actually is, are unaffected.
+*/
+void OpenGLEngine::markSaturatedSplatPixels()
+{
+	DebugGroup debug_group("markSaturatedSplatPixels()");
+	TracyGpuZone("markSaturatedSplatPixels");
+
+	const Reference<OpenGLProgram>& mask_prog = splat_renderer->getSaturationMaskProgram();
+	assert(mask_prog.nonNull() && mask_prog->isBuilt()); // Checked by the caller before the gate is enabled at all.
+
+	flushDrawCommandsAndUnbindPrograms(); // Submits the slice just drawn, and drops the cached program binding, since this pass binds one of its own.
+
+	//----------------------- Copy the accumulation buffer so it can be read -----------------------
+	blitFrameBuffer(/*src_framebuffer=*/*current_scene->splat_accum_framebuffer, /*dest_framebuffer=*/*current_scene->splat_accum_copy_framebuffer,
+		/*num_buffers_to_copy=*/1, /*copy_buf0_colour=*/true, /*copy_buf0_depth=*/false);
+
+	//----------------------- Write the stencil -----------------------
+	current_scene->splat_accum_framebuffer->bindForDrawing();
+
+	glDisable(GL_BLEND);
+	glDisable(GL_DEPTH_TEST); // Every fragment the shader lets through must be written, whatever is in the buffer already.
+	glDepthMask(GL_TRUE); // The one pass in the splat path that writes depth: it is the mark.
+	glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE); // Leave the accumulated colour alone - the depth write is this pass's only output.
+
+	mask_prog->useProgram();
+	// The near plane, in whichever direction the engine's depth convention runs.  A pixel marked with it fails the depth
+	// comparison against everything, since nothing can be nearer than the nearest representable value.
+	splat_renderer->setSaturationMaskUniforms(/*saturated_depth=*/use_reverse_z ? 1.f : 0.f);
+	bindMeshData(*unit_quad_meshdata);
+	bindTextureUnitToSampler(*current_scene->splat_accum_copy_texture, /*texture_unit_index=*/0, /*sampler_uniform_location=*/mask_prog->albedo_texture_loc);
+
+	drawElementsBaseVertex(GL_TRIANGLES, (GLsizei)unit_quad_meshdata->batches[0].num_indices, unit_quad_meshdata->getIndexType(),
+		(void*)unit_quad_meshdata->getBatch0IndicesTotalBufferOffset(), unit_quad_meshdata->vbo_handle.base_vertex);
+
+	//----------------------- Restore the state the slice draws run in -----------------------
+	OpenGLProgram::useNoPrograms();
+	unbindTextureFromTextureUnit(*current_scene->splat_accum_copy_texture, /*texture_unit_index=*/0); // Otherwise Chrome reports a feedback loop between the framebuffer and the active texture.
+
+	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+	glDepthMask(GL_FALSE); // Back to how the slice draws run: splats test depth but never write it.
+	glEnable(GL_DEPTH_TEST);
+	glEnable(GL_BLEND); // The blend func itself was set by drawSplatClouds() and is not disturbed here.
 }
 
 

@@ -682,7 +682,7 @@ public:
 	// works the same way whether or not the scene renders to offscreen renderbuffers.
 	Reference<FrameBuffer> splat_accum_framebuffer;
 	Reference<RenderBuffer> splat_accum_renderbuffer;
-	Reference<RenderBuffer> splat_accum_depth_renderbuffer; // Non-null only when there is no scene depth renderbuffer to share; receives a copy of the scene's depth each frame.
+	Reference<RenderBuffer> splat_accum_depth_renderbuffer; // Non-null when the scene's depth renderbuffer isn't being shared; receives a copy of the scene's depth each frame, which the saturation gate then writes into.
 	Reference<FrameBuffer> splat_accum_copy_framebuffer;
 	OpenGLTextureRef splat_accum_copy_texture;
 
@@ -1443,6 +1443,7 @@ private:
 	void drawAlphaBlendedObjects(const Matrix4f& view_matrix, const Matrix4f& proj_matrix);
 	void drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& proj_matrix);
 	void allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffer_name); // Allocates the framebuffer splat clouds blend into, and the depth buffer they test against.
+	void markSaturatedSplatPixels(); // Stencils the pixels whose accumulated coverage has reached the saturation threshold, so later draw slices skip them.
 	void resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name); // Composites the splat accumulation buffer onto the buffer the frame is being drawn into, undoing the engine's display transform once.
 public:
 	// Renders Gaussian splat clouds.  Owned by the engine, and cheap until the first cloud is registered with it: it
@@ -1657,6 +1658,12 @@ public:
 	uint64 last_num_splat_clouds_drawn;
 	uint64 last_num_splats_drawn;
 	uint64 last_num_splat_draw_calls; // How many draws those splats took, i.e. how many non-empty slices - see getNumDrawSlices().
+
+	// Whether the splat accumulation framebuffer has a depth buffer of its own, which the saturation gate needs: the gate
+	// works by writing near depth into finished pixels, and the scene's own depth buffer must not be written to.  False
+	// disables the gate rather than the whole pass, and is reported in the diagnostics, since a silently inactive
+	// optimisation is worse than a missing one.
+	bool splat_accum_gate_available;
 private:
 
 	// Working space for drawSplatClouds()'s ordering pass, kept to avoid allocating every frame.
@@ -1667,6 +1674,7 @@ private:
 	// copied into.  Settled once, when the buffers are allocated, by trying the copy - see
 	// allocSplatAccumBuffersIfNeeded().  False when the scene's depth buffer is shared instead, and so needs no copy.
 	bool splat_depth_copy_works;
+
 	std::vector<uint32> temp_counts;
 	uint32 num_prog_changes;
 	uint32 num_vao_binds;

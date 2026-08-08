@@ -213,6 +213,33 @@ public:
 	int getNumDrawSlices() const { return splat_num_draw_slices; }
 	void setNumDrawSlices(int v) { splat_num_draw_slices = v; }
 
+	// Whether to reject splats at pixels the composite has already finished with. false (default) draws every slice in
+	// full, so the slice count alone stays a no-op and the two can be compared directly. Needs more than one slice to do
+	// anything, and is ignored in the overdraw debug views, where the blend is additive and the accumulated alpha counts
+	// layers rather than coverage. Turning it on also changes how the accumulation framebuffer is built - it needs a
+	// depth buffer the gate may write into - so it is not free to toggle every frame. See
+	// OpenGLEngine::markSaturatedSplatPixels().
+	bool getSaturationGateEnabled() const { return splat_saturation_gate_enabled; }
+	void setSaturationGateEnabled(bool v) { splat_saturation_gate_enabled = v; }
+
+	// Accumulated coverage at or above which the gate treats a pixel as finished. Default 1 - 1/255: the light still
+	// getting through is then under one 8-bit level, which is where the reference 3DGS rasteriser ends its own per-pixel
+	// loop. Lowering it skips more work and starts to be visible, so it is the knob for trading the two off. Note the
+	// accumulation buffer is RGBA16F, whose steps near 1.0 are about 0.0005 wide - settings closer to 1 than that are
+	// not distinguishable.
+	float getSaturationThreshold() const { return splat_saturation_threshold; }
+	void setSaturationThreshold(float v) { splat_saturation_threshold = v; }
+
+	// The program OpenGLEngine::markSaturatedSplatPixels() marks finished pixels with. Null until the first addObject(),
+	// like the splat program itself.
+	const Reference<OpenGLProgram>& getSaturationMaskProgram() const { return saturation_mask_prog; }
+
+	// Sets that program's uniforms from the current getSaturationThreshold(), plus the depth value a finished pixel is
+	// marked with, which is the caller's since it depends on the engine's depth direction. Called once the mask program
+	// is bound, for the same reason setResolveOverdrawUniforms() exists: the pass is one manual full-viewport quad with
+	// no material, so it bypasses the generic per-object uniform path.
+	void setSaturationMaskUniforms(float saturated_depth) const;
+
 	// Overdraw debug view: 0 (default) = normal rendering. Non-zero = every splat writes a flat additive increment
 	// instead of its real colour, into the same accumulation buffer as normal, which the resolve pass then colour-ramps
 	// - see gaussian_splat_frag_shader.glsl and OpenGLEngine::drawSplatClouds(). Mode 1 sums 1.0 per fragment, giving
@@ -267,6 +294,7 @@ private:
 
 	Reference<OpenGLProgram> shader_prog; // Shared by every cloud.  Null until the first addObject().
 	Reference<OpenGLProgram> resolve_prog; // Resolves the splat accumulation buffer onto the main colour buffer.  Built alongside shader_prog.
+	Reference<OpenGLProgram> saturation_mask_prog; // Marks finished pixels between draw slices.  Built alongside shader_prog.
 
 	OpenGLEngine* opengl_engine;
 
@@ -317,6 +345,10 @@ private:
 
 	// See getNumDrawSlices() above. Default 1 = one draw per cloud, i.e. no slicing.
 	int splat_num_draw_slices;
+
+	// See getSaturationGateEnabled()/getSaturationThreshold() above. Off by default.
+	bool splat_saturation_gate_enabled;
+	float splat_saturation_threshold;
 
 	// See getShowOverdrawMode() above. 0 = off.
 	int splat_show_overdraw_mode;

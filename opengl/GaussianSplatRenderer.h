@@ -230,6 +230,17 @@ public:
 	float getSaturationThreshold() const { return splat_saturation_threshold; }
 	void setSaturationThreshold(float v) { splat_saturation_threshold = v; }
 
+	// Whether the accumulation buffer is RGBA8 rather than the default RGBA16F, halving the bytes every splat fragment
+	// blends. Measured on an RTX 3070 at 5.0 Mpixel with 2.9M splats drawn: about a third off the splat pass, which is
+	// what says the pass is bound by blend bandwidth more than by anything else. The cost is precision: the composite
+	// is a chain of hundreds of blends per pixel, and the resolve then divides the accumulated colour by the accumulated
+	// coverage, so quantisation is amplified exactly where coverage is small - cloud silhouettes and thin, sparse
+	// regions, not the dense areas where the fill cost is. Whether that is acceptable is a judgement about a given
+	// scene, which is why this is a switch and not a new default. Like the saturation gate, toggling it rebuilds the
+	// accumulation framebuffer, so it is not free to change every frame.
+	bool getAccumBuffer8Bit() const { return splat_accum_buffer_8bit; }
+	void setAccumBuffer8Bit(bool v) { splat_accum_buffer_8bit = v; }
+
 	// The program OpenGLEngine::markSaturatedSplatPixels() marks finished pixels with. Null until the first addObject(),
 	// like the splat program itself.
 	const Reference<OpenGLProgram>& getSaturationMaskProgram() const { return saturation_mask_prog; }
@@ -349,6 +360,9 @@ private:
 	// See getSaturationGateEnabled()/getSaturationThreshold() above. Off by default.
 	bool splat_saturation_gate_enabled;
 	float splat_saturation_threshold;
+
+	// See getAccumBuffer8Bit() above. Off by default, i.e. the RGBA16F buffer this pass has always used.
+	bool splat_accum_buffer_8bit;
 
 	// See getShowOverdrawMode() above. 0 = off.
 	int splat_show_overdraw_mode;

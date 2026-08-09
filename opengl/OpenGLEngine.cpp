@@ -460,6 +460,7 @@ OpenGLEngine::OpenGLEngine(const OpenGLEngineSettings& settings_)
 	last_num_splats_drawn(0),
 	last_num_splat_draw_calls(0),
 	splat_depth_copy_works(false),
+	splat_accum_buffer_format(OpenGLTextureFormat::Format_RGBA_Linear_Half),
 	splat_accum_gate_available(false),
 	print_output(NULL),
 	tex_CPU_mem_usage(0),
@@ -9712,16 +9713,22 @@ void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffe
 		msaa_samples = 1; // Single-sampled: our depth buffer is filled by a blit, and glBlitFramebuffer can't write into a multisampled draw framebuffer.
 	}
 
+	// RGBA rather than the main colour buffer's format, which has no alpha channel on desktop: the resolve pass needs
+	// the accumulated coverage as well as the accumulated colour.  Half or 8-bit per channel is a live choice, since it
+	// trades most of the splat pass's blend bandwidth against precision in the sparsely covered parts of the image -
+	// see GaussianSplatRenderer::getAccumBuffer8Bit().
+	const OpenGLTextureFormat splat_accum_format = splat_renderer->getAccumBuffer8Bit() ? OpenGLTextureFormat::Format_RGBA_Linear_Uint8 :
+		OpenGLTextureFormat::Format_RGBA_Linear_Half;
+
 	if(current_scene->splat_accum_renderbuffer.nonNull() &&
 		current_scene->splat_accum_renderbuffer->xRes() == xres &&
 		current_scene->splat_accum_renderbuffer->yRes() == yres &&
 		current_scene->splat_accum_renderbuffer->MSAASamples() == msaa_samples &&
+		splat_accum_buffer_format == splat_accum_format && // Flipping the format rebuilds, same as toggling the gate does.
 		current_scene->splat_accum_depth_renderbuffer.isNull() == share_scene_depth) // Also reallocate if the scene gained or lost a depth buffer we can share.
 		return; // Already allocated, in the right size and configuration.
 
-	// RGBA rather than the main colour buffer's format, which has no alpha channel on desktop: the resolve pass needs
-	// the accumulated coverage as well as the accumulated colour.
-	const OpenGLTextureFormat splat_accum_format = OpenGLTextureFormat::Format_RGBA_Linear_Half;
+	splat_accum_buffer_format = splat_accum_format;
 
 	// Free any existing buffers first, to reduce max mem usage.  Framebuffers last, after what was attached to them.
 	current_scene->splat_accum_copy_texture         = NULL;
@@ -9730,7 +9737,8 @@ void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffe
 	current_scene->splat_accum_framebuffer          = NULL;
 	current_scene->splat_accum_copy_framebuffer     = NULL;
 
-	conPrint("Allocating splat accumulation buffer with width " + toString(xres) + " and height " + toString(yres) + ", MSAA samples " + toString(msaa_samples) +
+	conPrint("Allocating splat accumulation buffer with width " + toString(xres) + " and height " + toString(yres) +
+		", format " + std::string(textureFormatString(splat_accum_format)) + ", MSAA samples " + toString(msaa_samples) +
 		(share_scene_depth ? ", sharing the scene depth buffer" : ", with a depth buffer of its own") +
 		(want_own_depth ? ", writable by the saturation gate" : ""));
 

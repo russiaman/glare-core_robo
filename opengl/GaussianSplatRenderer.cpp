@@ -600,6 +600,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	lod_max_layer_density(0.0f), lod_max_tree_depth(0),
 	splat_size_clamp_min(0.0f), splat_size_clamp_max(0.0f), splat_size_clamp_invert(false), splat_alpha_cutoff(1.0f / 255.0f),
 	splat_num_draw_slices(1), splat_saturation_gate_enabled(false), splat_saturation_threshold(1.0f - 1.0f / 255.0f),
+	splat_accum_buffer_8bit(false),
 	splat_show_overdraw_mode(0), splat_overdraw_range_min(2.0f), splat_overdraw_range_max(100.0f)
 {}
 
@@ -885,6 +886,7 @@ std::string GaussianSplatRenderer::getDiagnostics() const
 	s += "             size_clamp [" + doubleToStringNDecimalPlaces(splat_size_clamp_min, 3) + ", " + doubleToStringNDecimalPlaces(splat_size_clamp_max, 3) + "]" +
 		((splat_size_clamp_min == 0 && splat_size_clamp_max == 0) ? " (disabled)" : (splat_size_clamp_invert ? " inverted" : "")) +
 		", alpha_cutoff " + doubleToStringNDecimalPlaces(splat_alpha_cutoff, 4) + "\n";
+	s += "             accumulation buffer " + std::string(splat_accum_buffer_8bit ? "RGBA8" : "RGBA16F") + "\n";
 	s += "Sorts in flight: " + toString(num_sorts_in_flight) + " / " + toString(max_concurrent_sorts) + "\n";
 	s += "GPU mem: " + getMBSizeString((size_t)tex_bytes) + " data textures, " + getMBSizeString((size_t)index_vbo_bytes) + " index VBOs\n";
 	s += "Sort scratch pooled: " + toString(free_scratch.size()) + " buffers, " + getMBSizeString((size_t)scratch_bytes) + "\n";

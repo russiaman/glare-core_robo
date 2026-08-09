@@ -1675,6 +1675,11 @@ private:
 	// allocSplatAccumBuffersIfNeeded().  False when the scene's depth buffer is shared instead, and so needs no copy.
 	bool splat_depth_copy_works;
 
+	// The colour format the splat accumulation buffer was last built with, so that flipping
+	// GaussianSplatRenderer::getAccumBuffer8Bit() rebuilds it.  RenderBuffer does not remember its own format, and the
+	// engine's copy of the answer is cheaper than giving it one.
+	OpenGLTextureFormat splat_accum_buffer_format;
+
 	std::vector<uint32> temp_counts;
 	uint32 num_prog_changes;
 	uint32 num_vao_binds;

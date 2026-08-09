@@ -26,6 +26,7 @@ Copyright Glare Technologies Limited 2026 -
 #include "../utils/Sort.h"
 #include "../utils/Task.h"
 #include "../utils/TaskManager.h"
+#include "../utils/Timer.h" // For timing the synchronous traversal getFrustumStructureReport() runs.
 #include "../utils/ThreadSafeRefCounted.h"
 #include "../utils/Vector.h"
 #include <algorithm>
@@ -409,6 +410,42 @@ public:
 };
 
 
+// Why the traversal stopped unfolding the tree at a particular frontier node.  Only recorded when a caller asks for it
+// (see GaussianSplatRenderer::getFrustumStructureReport()); the normal per-frame traversal doesn't collect any of this.
+//
+// The distinction that matters is between the reasons a knob can move and the one it can't: Converged/DensityCap/DepthCap/
+// BudgetCap all mean "a coarser stand-in exists above this node and the traversal chose not to use it", so the LoD
+// parameters still have room; Leaf means the tree has nothing coarser to offer at this position without going up a level
+// that the traversal has already rejected as too big, i.e. the hierarchy is fully unfolded here and only changing the
+// source cloud (merging or pruning splats) can reduce the fill cost.
+enum FrontierStopReason
+{
+	FrontierStop_Leaf = 0,   // An original, unmerged splat - the finest detail this tree has.
+	FrontierStop_Converged,  // pixel_scale fell to or below pixel_scale_limit, so expanding further would buy nothing visible.
+	FrontierStop_DensityCap, // max_layer_density stopped expansion here - see GaussianSplatLodNode::layer_density.
+	FrontierStop_DepthCap,   // max_tree_depth stopped expansion here.
+	FrontierStop_BudgetCap,  // max_splats_budget stopped expansion, and this node was drained from the heap as-is.
+	FrontierStop_NoTree,     // The member has no LoD tree at all, so every one of its splats is always selected.
+	FrontierStop_NumReasons
+};
+
+
+// One selected node, as recorded for the structure report.  Carries where the node came from rather than just its cloud
+// index, so the report can read the node's own tree fields (child_count, layer_density) without a reverse lookup.
+//
+// Recorded into a vector of its own rather than parallel to GaussianSplatLodTraversalScratch::selected_indices, because
+// run() re-sorts that one front-to-back at the end and a parallel array would have to be permuted with it.  These records
+// are self-describing, so their order doesn't matter.
+struct FrontierNodeRecord
+{
+	uint32 cloud_idx;      // Index into the cloud's world-space arrays: member offset + tree_local_idx.
+	uint32 member_idx;     // Index into GaussianSplatLodTraversalScratch::members_snapshot.
+	uint32 tree_local_idx; // Index into that member's lod_tree.  Meaningless when stop_reason is FrontierStop_NoTree.
+	uint16 depth;          // Levels below the tree root.  0 for a root, and for a member with no tree.
+	uint16 stop_reason;    // A FrontierStopReason.
+};
+
+
 // Best-first LoD frontier selection for one cloud, entirely on a worker thread.  No GL calls here.
 //
 // Runs one shared max-heap across every member of the cloud that has a built LoD tree, rather than one heap per member.
@@ -420,10 +457,15 @@ public:
 class GaussianSplatLodTraversalTask : public glare::Task
 {
 public:
+	// result_queue_ may be null, and frontier_record_ may be non-null, for a synchronous run made purely to inspect the
+	// frontier - see GaussianSplatRenderer::getFrustumStructureReport().  Both are null/absent for the normal per-frame
+	// traversal, where the enqueued result is the whole point and nothing wants the per-node breakdown.
 	GaussianSplatLodTraversalTask(uint64 cloud_id_, uint64 topology_generation_, const Reference<GaussianSplatLodTraversalScratch>& scratch_,
-		const Vec4f& cam_pos_ws_, float pixel_scale_limit_, size_t max_splats_budget_, float max_layer_density_, int max_tree_depth_, float focal_px_, ThreadSafeQueue<Reference<ThreadMessage> >* result_queue_)
+		const Vec4f& cam_pos_ws_, float pixel_scale_limit_, size_t max_splats_budget_, float max_layer_density_, int max_tree_depth_, float focal_px_, ThreadSafeQueue<Reference<ThreadMessage> >* result_queue_,
+		js::Vector<FrontierNodeRecord, 16>* frontier_record_ = NULL)
 	:	cloud_id(cloud_id_), topology_generation(topology_generation_), scratch(scratch_), cam_pos_ws(cam_pos_ws_),
-		pixel_scale_limit(pixel_scale_limit_), max_splats_budget(max_splats_budget_), max_layer_density(max_layer_density_), max_tree_depth(max_tree_depth_), focal_px(focal_px_), result_queue(result_queue_)
+		pixel_scale_limit(pixel_scale_limit_), max_splats_budget(max_splats_budget_), max_layer_density(max_layer_density_), max_tree_depth(max_tree_depth_), focal_px(focal_px_), result_queue(result_queue_),
+		frontier_record(frontier_record_)
 	{}
 
 	virtual void run(size_t /*thread_index*/) override
@@ -444,7 +486,10 @@ public:
 				// No tree built for this member (yet, or ever) - nothing to choose between, so every one of its splats is
 				// always selected, exactly as it would be with no LoD at all.
 				for(size_t i=0; i<m.count; ++i)
+				{
 					output.push_back((uint32)(m.offset + i));
+					recordFrontierNode((uint32)(m.offset + i), (uint32)mi, (uint32)i, /*depth=*/0, FrontierStop_NoTree);
+				}
 			}
 			else
 				heap.push(makeHeapItem((uint32)mi, /*tree_local_idx=*/0, m.offset, /*depth=*/0, positions, scales)); // Root is always node 0 - see buildGaussianSplatLodTree().
@@ -467,6 +512,7 @@ public:
 				// A leaf can't be expanded regardless of pixel_scale - it's already the finest detail this tree has.
 				heap.pop();
 				output.push_back((uint32)(m.offset + top.tree_local_idx));
+				recordFrontierNode((uint32)(m.offset + top.tree_local_idx), top.member_idx, top.tree_local_idx, top.depth, FrontierStop_Leaf);
 				continue;
 			}
 
@@ -479,6 +525,7 @@ public:
 				hit_density_cap = true;
 				heap.pop();
 				output.push_back((uint32)(m.offset + top.tree_local_idx));
+				recordFrontierNode((uint32)(m.offset + top.tree_local_idx), top.member_idx, top.tree_local_idx, top.depth, FrontierStop_DensityCap);
 				continue;
 			}
 
@@ -489,6 +536,7 @@ public:
 				hit_depth_cap = true;
 				heap.pop();
 				output.push_back((uint32)(m.offset + top.tree_local_idx));
+				recordFrontierNode((uint32)(m.offset + top.tree_local_idx), top.member_idx, top.tree_local_idx, top.depth, FrontierStop_DepthCap);
 				continue;
 			}
 
@@ -513,6 +561,11 @@ public:
 			heap.pop();
 			const GaussianSplatLodTraversalScratch::MemberSnapshot& m = scratch->members_snapshot[top.member_idx];
 			output.push_back((uint32)(m.offset + top.tree_local_idx));
+			// Both exits above leave the heap non-empty, so the two have to be told apart here rather than by which one
+			// broke the loop: a node small enough to have converged was going to stay in the heap either way, and counting
+			// it as budget-stopped would overstate how much the budget is actually costing.
+			recordFrontierNode((uint32)(m.offset + top.tree_local_idx), top.member_idx, top.tree_local_idx, top.depth,
+				(top.pixel_scale <= pixel_scale_limit) ? FrontierStop_Converged : FrontierStop_BudgetCap);
 		}
 
 		// Sort the selection front-to-back by camera distance, here on the worker thread, with each node's distance
@@ -543,14 +596,33 @@ public:
 		scratch->hit_density_cap = hit_density_cap;
 		scratch->hit_depth_cap = hit_depth_cap;
 
-		Reference<GaussianSplatLodTraversalResultMsg> msg = new GaussianSplatLodTraversalResultMsg();
-		msg->cloud_id = cloud_id;
-		msg->topology_generation = topology_generation;
-		msg->scratch = scratch;
-		result_queue->enqueue(msg);
+		// A null queue means nobody is waiting for this frontier to be drawn - the caller ran the task itself and reads the
+		// scratch directly.  Enqueueing anyway would have drainTraversalResults() apply a selection, and decrement an
+		// in-flight count, for a traversal it never kicked off.
+		if(result_queue != NULL)
+		{
+			Reference<GaussianSplatLodTraversalResultMsg> msg = new GaussianSplatLodTraversalResultMsg();
+			msg->cloud_id = cloud_id;
+			msg->topology_generation = topology_generation;
+			msg->scratch = scratch;
+			result_queue->enqueue(msg);
+		}
 	}
 
 private:
+	inline void recordFrontierNode(uint32 cloud_idx, uint32 member_idx, uint32 tree_local_idx, uint32 depth, FrontierStopReason reason)
+	{
+		if(frontier_record == NULL)
+			return;
+		FrontierNodeRecord rec;
+		rec.cloud_idx = cloud_idx;
+		rec.member_idx = member_idx;
+		rec.tree_local_idx = tree_local_idx;
+		rec.depth = (uint16)myMin(depth, (uint32)65535);
+		rec.stop_reason = (uint16)reason;
+		frontier_record->push_back(rec);
+	}
+
 	// One entry under consideration in run()'s heap: either a tree root not yet examined, or a node whose parent was just
 	// expanded.  member_idx/tree_local_idx together identify the node; the corresponding cloud-array index (needed to read
 	// its baked world-space position/scale, and to write it to the output) is member.offset + tree_local_idx.
@@ -588,6 +660,7 @@ private:
 	int max_tree_depth;
 	float focal_px;
 	ThreadSafeQueue<Reference<ThreadMessage> >* result_queue;
+	js::Vector<FrontierNodeRecord, 16>* frontier_record; // Null (the normal case) means don't record anything - see recordFrontierNode().
 };
 
 
@@ -811,6 +884,393 @@ size_t GaussianSplatRenderer::countSplatsInFrustum() const
 		}
 	}
 	return count;
+}
+
+
+// Focal length in pixels for the current view, averaged over the two axes - a splat's on-screen size only differs
+// meaningfully per axis with a non-square viewport/sensor, which is close enough for the traversal's coarse pixel_scale
+// budget.  Shared by kickOffTraversals() and getFrustumStructureReport() rather than written out twice, because the report
+// classifies nodes as converged by comparing against the same pixel_scale the traversal computed: derived differently,
+// the two would disagree exactly at the boundary the report is trying to describe.
+static float focalPxForScene(const OpenGLScene& scene, const Vec2i& viewport_dims)
+{
+	const float focal_x = (float)viewport_dims.x * scene.lens_sensor_dist / scene.use_sensor_width;
+	const float focal_y = (float)viewport_dims.y * scene.lens_sensor_dist / scene.use_sensor_height;
+	return (focal_x + focal_y) * 0.5f;
+}
+
+
+// One line per bucket: label, count, share of the total, and a bar scaled to the largest bucket.  Empty buckets in the
+// middle are printed rather than skipped - a gap in a distribution is itself information.
+static std::string histogramLines(const std::string& indent, const std::vector<std::string>& labels, const std::vector<size_t>& counts)
+{
+	assert(labels.size() == counts.size());
+
+	size_t total = 0, largest = 0;
+	for(size_t i=0; i<counts.size(); ++i)
+	{
+		total += counts[i];
+		largest = myMax(largest, counts[i]);
+	}
+	if(total == 0)
+		return indent + "(empty)\n";
+
+	size_t label_w = 0;
+	for(size_t i=0; i<labels.size(); ++i)
+		label_w = myMax(label_w, labels[i].size());
+
+	const size_t max_bar_chars = 40;
+
+	std::string s;
+	for(size_t i=0; i<counts.size(); ++i)
+	{
+		const size_t bar_len = (counts[i] * max_bar_chars) / largest;
+		s += indent + rightSpacePad(labels[i], (unsigned int)label_w) + "  " +
+			leftPad(uInt64ToStringCommaSeparated(counts[i]), ' ', 13) + "  " +
+			leftPad(doubleToStringNDecimalPlaces(100.0 * (double)counts[i] / (double)total, 1), ' ', 5) + "%  " +
+			std::string(bar_len, '#') + "\n";
+	}
+	return s;
+}
+
+
+// Which layer_density bucket a value falls in, and the labels for all of them.  Bucketed geometrically because the
+// interesting range spans three orders of magnitude: a node over an empty wall and a node over the measured "blur splat"
+// region differ by a factor of hundreds, not by a few units.
+static const size_t num_density_buckets = 11;
+static const char* const density_bucket_labels[num_density_buckets] = { "0 (leaf)", "0 - 1", "1 - 2", "2 - 4", "4 - 8", "8 - 16", "16 - 32", "32 - 64", "64 - 128", "128 - 256", "256 +" };
+static size_t densityBucket(float density)
+{
+	if(density <= 0.f)  return 0;
+	if(density < 1.f)   return 1;
+	if(density < 2.f)   return 2;
+	if(density < 4.f)   return 3;
+	if(density < 8.f)   return 4;
+	if(density < 16.f)  return 5;
+	if(density < 32.f)  return 6;
+	if(density < 64.f)  return 7;
+	if(density < 128.f) return 8;
+	if(density < 256.f) return 9;
+	return 10;
+}
+
+
+// Same idea for a node's child count, which is small and dense at the low end (the voxel-grid merge produces mostly
+// 2-8 children) and has a long thin tail worth seeing as one bucket rather than a hundred empty lines.
+static const size_t num_child_count_buckets = 12;
+static const char* const child_count_bucket_labels[num_child_count_buckets] = { "1", "2", "3", "4", "5", "6", "7", "8", "9 - 12", "13 - 16", "17 - 32", "33 +" };
+static size_t childCountBucket(uint32 child_count)
+{
+	if(child_count <= 8)  return child_count - 1; // Only called for internal nodes, so child_count >= 1.
+	if(child_count <= 12) return 8;
+	if(child_count <= 16) return 9;
+	if(child_count <= 32) return 10;
+	return 11;
+}
+
+
+static const char* const stop_reason_labels[FrontierStop_NumReasons] =
+{
+	"leaf (finest detail there is)",
+	"converged (pixel_scale <= limit)",
+	"density cap",
+	"depth cap",
+	"budget cap",
+	"member has no LoD tree"
+};
+
+
+void GaussianSplatRenderer::fillTraversalScratch(const SplatCloud& cloud, GaussianSplatLodTraversalScratch& scratch) const
+{
+	// Freeze a snapshot of the cloud's current world-space node data and member layout, so a worker never touches the live,
+	// growable/mutable state - same rule the sort task follows, for the same reason.
+	scratch.positions_snapshot.resizeNoCopy(cloud.total_splats);
+	std::memcpy(scratch.positions_snapshot.data(), cloud.positions.data(), cloud.total_splats * sizeof(Vec3f));
+	scratch.scales_snapshot.resizeNoCopy(cloud.total_splats);
+	std::memcpy(scratch.scales_snapshot.data(), cloud.scales.data(), cloud.total_splats * sizeof(Vec3f));
+
+	scratch.members_snapshot.resize(cloud.members.size());
+	for(size_t m=0; m<cloud.members.size(); ++m)
+	{
+		scratch.members_snapshot[m].splat_data = cloud.members[m].splat_data;
+		scratch.members_snapshot[m].offset = cloud.members[m].offset;
+		scratch.members_snapshot[m].count = cloud.members[m].count;
+	}
+}
+
+
+std::string GaussianSplatRenderer::getFrustumStructureReport()
+{
+	if(clouds.empty())
+		return "No splat clouds registered.\n";
+
+	const OpenGLScene* const scene = opengl_engine->getCurrentScene();
+	const Planef* const frustum_clip_planes = scene->frustum_clip_planes;
+	const int num_frustum_clip_planes = scene->num_frustum_clip_planes;
+	const Vec4f cam_pos_ws = scene->cam_to_world.getColumn(3);
+	const Vec2i viewport_dims = opengl_engine->getViewportDims();
+	const float focal_px = focalPxForScene(*scene, viewport_dims);
+
+	Timer timer;
+
+	std::string s = "==== Gaussian splat frustum structure report ====\n";
+	s += "Camera at (" + doubleToStringNDecimalPlaces(cam_pos_ws[0], 2) + ", " + doubleToStringNDecimalPlaces(cam_pos_ws[1], 2) + ", " + doubleToStringNDecimalPlaces(cam_pos_ws[2], 2) + "), " +
+		"viewport " + toString(viewport_dims.x) + " x " + toString(viewport_dims.y) + " (" + doubleToStringNDecimalPlaces((double)viewport_dims.x * viewport_dims.y * 1.0e-6, 2) + " Mpixel), " +
+		"focal " + doubleToStringNDecimalPlaces(focal_px, 1) + " px\n";
+	s += "Traversal params: pixel_scale_limit " + doubleToStringNDecimalPlaces(lod_pixel_scale_limit, 2) +
+		", max_splats_budget " + uInt64ToStringCommaSeparated(lod_max_splats_budget) +
+		", max_layer_density " + doubleToStringNDecimalPlaces(lod_max_layer_density, 1) + (lod_max_layer_density == 0 ? " (off)" : "") +
+		", max_tree_depth " + toString(lod_max_tree_depth) + (lod_max_tree_depth == 0 ? " (off)" : "") + "\n";
+	s += "Frustum test is on a node's centre: a node whose centre is just outside still rasterises, so the in-frustum\n"
+		 "figures below slightly understate what is actually being shaded.\n";
+
+	// World-wide roll-up, accumulated across the clouds below.
+	size_t world_frontier = 0, world_frontier_in_frustum = 0, world_leaves_in_frustum = 0, world_frontier_leaves_in_frustum = 0;
+	size_t world_reason_counts[FrontierStop_NumReasons];
+	for(size_t i=0; i<FrontierStop_NumReasons; ++i)
+		world_reason_counts[i] = 0;
+
+	const size_t max_clouds_to_report = 8;
+	for(size_t c=0; c<myMin(clouds.size(), max_clouds_to_report); ++c)
+	{
+		SplatCloud& cloud = *clouds[c];
+
+		s += "\n--- cloud " + toString(cloud.cloud_id) + ": " + toString(cloud.members.size()) + (cloud.members.size() == 1 ? " member, " : " members, ") +
+			uInt64ToStringCommaSeparated(cloud.total_splats) + " nodes uploaded ---\n";
+
+		if(cloud.total_splats == 0)
+		{
+			s += "  (empty)\n";
+			continue;
+		}
+
+		if(!cloudHasLodTree(cloud))
+		{
+			// Nothing to traverse, so every splat is drawn as-is.  Still worth a line: a cloud without a tree is invisible
+			// to every LoD knob, and that is exactly the kind of thing a report like this exists to make obvious.
+			size_t in_frustum = 0;
+			for(size_t i=0; i<cloud.total_splats; ++i)
+			{
+				const Vec3f& p = cloud.positions[i];
+				if(pointInFrustum(frustum_clip_planes, num_frustum_clip_planes, Vec4f(p.x, p.y, p.z, 1.f)))
+					in_frustum++;
+			}
+			s += "  No LoD tree on any member - every splat is always drawn.  " + uInt64ToStringCommaSeparated(in_frustum) + " of them in frustum.\n";
+			world_frontier += cloud.total_splats;
+			world_frontier_in_frustum += in_frustum;
+			world_reason_counts[FrontierStop_NoTree] += in_frustum;
+			continue;
+		}
+
+		// Re-run this cloud's traversal here on the main thread, with the current camera and the current live parameters,
+		// recording why it stopped at each selected node.  The per-frame traversal's frontier isn't kept on the CPU - it
+		// goes straight into the instance index VBO and its scratch returns to the pool - so reading the live one would
+		// mean holding a permanent copy of every selection, for a button pressed a handful of times per session.  Re-running
+		// costs one traversal per click and gives the same answer, the task being a pure function of its inputs.
+		Reference<GaussianSplatLodTraversalScratch> scratch;
+		if(free_traversal_scratch.empty())
+			scratch = new GaussianSplatLodTraversalScratch();
+		else
+		{
+			scratch = free_traversal_scratch.back();
+			free_traversal_scratch.pop_back();
+		}
+
+		fillTraversalScratch(cloud, *scratch);
+
+		js::Vector<FrontierNodeRecord, 16> frontier;
+		frontier.reserve(cloud.total_splats);
+
+		// Null result queue: this frontier is for reading, not for drawing - see the task's own comment there.
+		GaussianSplatLodTraversalTask task(cloud.cloud_id, cloud.topology_generation, scratch, cam_pos_ws,
+			lod_pixel_scale_limit, lod_max_splats_budget, lod_max_layer_density, lod_max_tree_depth, focal_px, /*result_queue=*/NULL, &frontier);
+		task.run(0);
+
+		free_traversal_scratch.push_back(scratch); // Back to the pool before anything below can early-out.
+
+		//----------------------------- Structure of the trees themselves -----------------------------
+		// Independent of the camera: what the hierarchy offers, against which the frontier below says what was taken.
+		size_t tree_nodes = 0, tree_leaves = 0, tree_max_depth = 0, leaves_in_frustum = 0;
+		std::vector<size_t> child_count_hist(num_child_count_buckets, 0);
+		std::vector<size_t> level_hist; // Nodes per level, grown as deeper levels turn up.
+		js::Vector<uint16, 16> node_depth;
+
+		for(size_t m=0; m<cloud.members.size(); ++m)
+		{
+			const std::vector<GaussianSplatLodNode>& tree = cloud.members[m].splat_data->lod_tree;
+			if(tree.empty())
+				continue;
+			const size_t member_offset = cloud.members[m].offset;
+
+			// A node's children always sit later in the array than the node itself (see buildGaussianSplatLodTree()), so one
+			// forward pass assigns every depth: a node's own depth is final by the time the pass reaches it.
+			node_depth.resizeNoCopy(tree.size());
+			node_depth[0] = 0;
+			for(size_t i=0; i<tree.size(); ++i)
+			{
+				const GaussianSplatLodNode& node = tree[i];
+				const uint16 depth = node_depth[i];
+				if(level_hist.size() <= (size_t)depth)
+					level_hist.resize((size_t)depth + 1, 0);
+				level_hist[depth]++;
+				tree_max_depth = myMax(tree_max_depth, (size_t)depth);
+
+				if(node.child_count == 0)
+				{
+					tree_leaves++;
+					const Vec3f& p = cloud.positions[member_offset + i];
+					if(pointInFrustum(frustum_clip_planes, num_frustum_clip_planes, Vec4f(p.x, p.y, p.z, 1.f)))
+						leaves_in_frustum++;
+				}
+				else
+				{
+					child_count_hist[childCountBucket(node.child_count)]++;
+					for(uint32 ch = node.child_start; ch < (uint32)node.child_start + node.child_count; ++ch)
+						node_depth[ch] = (uint16)(depth + 1);
+				}
+			}
+			tree_nodes += tree.size();
+		}
+
+		s += "  Trees: " + uInt64ToStringCommaSeparated(tree_nodes) + " nodes (" + uInt64ToStringCommaSeparated(tree_leaves) + " leaves, " +
+			uInt64ToStringCommaSeparated(tree_nodes - tree_leaves) + " merged), " + toString(tree_max_depth + 1) + " levels deep\n";
+
+		//----------------------------- The frontier the traversal selected -----------------------------
+		size_t reason_counts[FrontierStop_NumReasons];
+		for(size_t i=0; i<FrontierStop_NumReasons; ++i)
+			reason_counts[i] = 0;
+
+		std::vector<size_t> frontier_depth_hist(tree_max_depth + 1, 0);
+		std::vector<size_t> density_hist(num_density_buckets, 0);
+		size_t frontier_in_frustum = 0, frontier_leaves_in_frustum = 0;
+		double depth_sum = 0;
+
+		for(size_t i=0; i<frontier.size(); ++i)
+		{
+			const FrontierNodeRecord& rec = frontier[i];
+			const Vec3f& p = cloud.positions[rec.cloud_idx];
+			if(!pointInFrustum(frustum_clip_planes, num_frustum_clip_planes, Vec4f(p.x, p.y, p.z, 1.f)))
+				continue;
+
+			frontier_in_frustum++;
+			reason_counts[myMin((size_t)rec.stop_reason, (size_t)FrontierStop_NumReasons - 1)]++;
+			depth_sum += rec.depth;
+			if((size_t)rec.depth < frontier_depth_hist.size())
+				frontier_depth_hist[rec.depth]++;
+
+			if(rec.stop_reason != FrontierStop_NoTree)
+			{
+				const GaussianSplatLodNode& node = cloud.members[rec.member_idx].splat_data->lod_tree[rec.tree_local_idx];
+				density_hist[densityBucket(node.layer_density)]++;
+				if(node.child_count == 0)
+					frontier_leaves_in_frustum++;
+			}
+		}
+
+		s += "  Frontier: " + uInt64ToStringCommaSeparated(frontier.size()) + " nodes selected, " +
+			uInt64ToStringCommaSeparated(frontier_in_frustum) + " with centre in frustum\n";
+
+		// Self-check, so the report doesn't have to be believed on its own word: the traversal re-run here must produce the
+		// same number of nodes as the one whose result is currently in the instance index VBO.  A mismatch means the two are
+		// not the same computation, and every figure below is describing a frontier that is not the one on screen.
+		//
+		// One legitimate way to see a mismatch: the live selection is only refreshed once the camera has moved past this
+		// cloud's threshold (or a parameter change forced it), so a report taken while the camera is still moving, or in the
+		// frame or two after a parameter change, is compared against a frontier computed for a slightly different camera.
+		// Stand still for a moment and take it again before treating a difference as a bug.
+		{
+			const size_t live_frontier = (size_t)myMax(0, cloud.ob->num_instances_to_draw);
+			s += "  Live frontier currently in the index VBO: " + uInt64ToStringCommaSeparated(live_frontier);
+			if(live_frontier == frontier.size())
+				s += " - matches\n";
+			else
+				s += " - DIFFERS by " + uInt64ToStringCommaSeparated((live_frontier > frontier.size()) ? (live_frontier - frontier.size()) : (frontier.size() - live_frontier)) +
+					(cloud.traversal_in_flight ? " (a traversal is in flight - the live figure is about to be replaced)\n" : " (camera moved since the live traversal, or the report is not reproducing it)\n");
+		}
+
+		// The headline number.  The frontier covers the leaves in view; how close the two counts are is how much of the
+		// hierarchy's saving is actually being taken at this camera position.  At 1.0 the tree is fully unfolded in view and
+		// no LoD parameter can remove a single drawn splat - only changing the cloud itself can.
+		s += "  Leaves in frustum: " + uInt64ToStringCommaSeparated(leaves_in_frustum) + ", covered by " +
+			uInt64ToStringCommaSeparated(frontier_in_frustum) + " frontier nodes = " +
+			doubleToStringNDecimalPlaces(100.0 * (double)frontier_in_frustum / (double)myMax((size_t)1, leaves_in_frustum), 1) + "% unfolded\n";
+		s += "  Of the in-frustum frontier, " + uInt64ToStringCommaSeparated(frontier_leaves_in_frustum) + " are leaves and " +
+			uInt64ToStringCommaSeparated(frontier_in_frustum - frontier_leaves_in_frustum) + " are merged stand-ins\n";
+
+		s += "\n  In-frustum frontier, by why the traversal stopped there:\n";
+		{
+			std::vector<std::string> labels(FrontierStop_NumReasons);
+			std::vector<size_t> counts(FrontierStop_NumReasons);
+			for(size_t i=0; i<FrontierStop_NumReasons; ++i)
+			{
+				labels[i] = stop_reason_labels[i];
+				counts[i] = reason_counts[i];
+				world_reason_counts[i] += reason_counts[i];
+			}
+			s += histogramLines("    ", labels, counts);
+		}
+
+		s += "\n  In-frustum frontier, by depth below the tree root (mean " +
+			doubleToStringNDecimalPlaces(depth_sum / (double)myMax((size_t)1, frontier_in_frustum), 2) + "):\n";
+		{
+			std::vector<std::string> labels(frontier_depth_hist.size());
+			for(size_t i=0; i<labels.size(); ++i)
+				labels[i] = "level " + toString(i);
+			s += histogramLines("    ", labels, frontier_depth_hist);
+		}
+
+		s += "\n  Whole tree, nodes per level:\n";
+		{
+			std::vector<std::string> labels(level_hist.size());
+			for(size_t i=0; i<labels.size(); ++i)
+				labels[i] = "level " + toString(i);
+			s += histogramLines("    ", labels, level_hist);
+		}
+
+		s += "\n  Whole tree, children per merged node (branching factor):\n";
+		{
+			std::vector<std::string> labels(num_child_count_buckets);
+			for(size_t i=0; i<num_child_count_buckets; ++i)
+				labels[i] = child_count_bucket_labels[i];
+			s += histogramLines("    ", labels, child_count_hist);
+		}
+
+		s += "\n  In-frustum frontier, by layer_density (estimated overdraw if the node were unfolded to leaves):\n";
+		{
+			std::vector<std::string> labels(num_density_buckets);
+			for(size_t i=0; i<num_density_buckets; ++i)
+				labels[i] = density_bucket_labels[i];
+			s += histogramLines("    ", labels, density_hist);
+		}
+
+		world_frontier += frontier.size();
+		world_frontier_in_frustum += frontier_in_frustum;
+		world_leaves_in_frustum += leaves_in_frustum;
+		world_frontier_leaves_in_frustum += frontier_leaves_in_frustum;
+	}
+
+	if(clouds.size() > max_clouds_to_report)
+		s += "\n(" + toString(clouds.size() - max_clouds_to_report) + " further clouds not reported)\n";
+
+	if(clouds.size() > 1)
+	{
+		s += "\n--- world total ---\n";
+		s += "  Frontier " + uInt64ToStringCommaSeparated(world_frontier) + " nodes, " + uInt64ToStringCommaSeparated(world_frontier_in_frustum) + " in frustum, of which " +
+			uInt64ToStringCommaSeparated(world_frontier_leaves_in_frustum) + " leaves\n";
+		s += "  Leaves in frustum " + uInt64ToStringCommaSeparated(world_leaves_in_frustum) + " = " +
+			doubleToStringNDecimalPlaces(100.0 * (double)world_frontier_in_frustum / (double)myMax((size_t)1, world_leaves_in_frustum), 1) + "% unfolded\n";
+		std::vector<std::string> labels(FrontierStop_NumReasons);
+		std::vector<size_t> counts(FrontierStop_NumReasons);
+		for(size_t i=0; i<FrontierStop_NumReasons; ++i)
+		{
+			labels[i] = stop_reason_labels[i];
+			counts[i] = world_reason_counts[i];
+		}
+		s += histogramLines("    ", labels, counts);
+	}
+
+	s += "\nReport took " + doubleToStringNDecimalPlaces(timer.elapsed() * 1.0e3, 1) + " ms (one full traversal per cloud, on the main thread).\n";
+	return s;
 }
 
 
@@ -1776,20 +2236,7 @@ void GaussianSplatRenderer::kickOffTraversals()
 			free_traversal_scratch.pop_back();
 		}
 
-		// Freeze a snapshot of the cloud's current world-space node data and member layout, so the worker never touches
-		// the live, growable/mutable state - same rule the sort task follows, for the same reason.
-		scratch->positions_snapshot.resizeNoCopy(best_cloud->total_splats);
-		std::memcpy(scratch->positions_snapshot.data(), best_cloud->positions.data(), best_cloud->total_splats * sizeof(Vec3f));
-		scratch->scales_snapshot.resizeNoCopy(best_cloud->total_splats);
-		std::memcpy(scratch->scales_snapshot.data(), best_cloud->scales.data(), best_cloud->total_splats * sizeof(Vec3f));
-
-		scratch->members_snapshot.resize(best_cloud->members.size());
-		for(size_t m=0; m<best_cloud->members.size(); ++m)
-		{
-			scratch->members_snapshot[m].splat_data = best_cloud->members[m].splat_data;
-			scratch->members_snapshot[m].offset = best_cloud->members[m].offset;
-			scratch->members_snapshot[m].count = best_cloud->members[m].count;
-		}
+		fillTraversalScratch(*best_cloud, *scratch);
 
 		best_cloud->traversal_in_flight = true;
 		best_cloud->have_last_traversal_cam_pos = true;

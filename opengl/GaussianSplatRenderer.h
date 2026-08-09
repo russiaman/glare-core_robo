@@ -150,6 +150,23 @@ public:
 	// filter is currently isolating are actually in view right now" without needing a GPU capture.
 	size_t countSplatsInFrustum() const;
 
+	// One-off diagnostic (GaussianSplatSettingsWidget's "Frustum report" button, Qt only): a multi-line breakdown of what
+	// the LoD hierarchy offers at the current camera position and what the traversal actually took from it, for every
+	// cloud in the world rather than any particular object.
+	//
+	// Answers one question the per-frame diagnostics can't: for each drawn node, *why* the traversal stopped unfolding
+	// there. That splits the drawn splats into the ones a LoD parameter could still remove (converged, or stopped by the
+	// density/depth/budget caps - a coarser stand-in exists above them) and the ones no parameter can (leaves, where the
+	// tree has nothing coarser left and only merging or pruning the source cloud can reduce the fill cost). Alongside it,
+	// how much of the tree is unfolded in view, the depth and branching of the trees themselves, and the layer_density
+	// distribution of what is being drawn - which is what says whether the density cap has anything to bite on.
+	//
+	// Runs one full traversal per cloud synchronously, on the main thread, with the current camera and the current live
+	// parameters (the per-frame frontier isn't kept on the CPU to read back), so it costs a visible hitch on a large cloud
+	// - meant for a button click, never per frame. Changes no renderer state: the traversal's result is read and dropped,
+	// not applied.
+	std::string getFrustumStructureReport();
+
 	// Forces every cloud's LoD frontier to be recomputed on the next think()/kickOffTraversals(), bypassing the normal
 	// camera-movement threshold - for GaussianSplatSettingsWidget's live traversal parameters (pixel_scale_limit,
 	// max_splats_budget, max_layer_density, max_tree_depth), so a value change is visible immediately rather than
@@ -356,6 +373,7 @@ private:
 	void writePlaceholderSelection(SplatCloud& cloud); // Synchronous stand-in frontier (root-only per member with a tree, everything for a member without one), written after any structural change, until the next background traversal's result supersedes it.
 	void drainTraversalResults();
 	void kickOffTraversals();
+	void fillTraversalScratch(const SplatCloud& cloud, GaussianSplatLodTraversalScratch& scratch) const; // Freezes a cloud's world-space node data and member layout into a scratch, ready for a traversal to read without touching the live arrays.
 
 	Reference<OpenGLProgram> shader_prog; // Shared by every cloud.  Null until the first addObject().
 	Reference<OpenGLProgram> resolve_prog; // Resolves the splat accumulation buffer onto the main colour buffer.  Built alongside shader_prog.

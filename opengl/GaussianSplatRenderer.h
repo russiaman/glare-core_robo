@@ -214,17 +214,21 @@ public:
 	void setNumDrawSlices(int v) { splat_num_draw_slices = v; }
 
 	// Ratio between the sizes of consecutive draw slices: each slice holds this many times as many splats as the one
-	// before it. 1 (default) makes them all equal, which is what slicing did before this existed.
+	// before it. 1 (default) makes them all equal, which is what slicing did before this existed. Values below 1 make
+	// each slice smaller than the last, i.e. a coarse start and a finely sliced tail.
 	//
-	// Equal slices put the boundaries in the wrong places. Coverage saturates within the first few percent of a
-	// depth-sorted cloud, but with N equal slices the first chance to notice is only after 1/N of it - at N=4, a
-	// quarter of the splats have already been blended before anything can be skipped. The only way to ask early was to
-	// slice finely everywhere and pay for a full-screen pass at every boundary, which is why the measured saving kept
-	// growing all the way to N=32.
+	// This knob exists because *where* the boundaries fall decides how much the saturation test can skip, and equal
+	// spacing is only one guess at that. Which way to lean follows from the scene: a pixel is finished once its
+	// accumulated coverage passes the threshold, so with a mean per-splat alpha of a it takes ln(1 - threshold)/ln(1 - a)
+	// layers to get there - about 63 at a = 0.07, against the 350 or so layers a dense region of the measured scene has.
+	// So nothing is saturated over roughly the first fifth of a depth-sorted cloud, and a boundary placed inside that
+	// region costs a full-screen pass and skips nothing. Past it, pixels keep finishing steadily, so each further check
+	// catches a new batch: what pays is asking *often after the knee*, not asking early.
 	//
-	// Growth > 1 puts the boundaries where the answer changes: a first slice of a few percent, then progressively
-	// coarser ones over the tail, where saturation is already settled and there is little left to learn. 2.0 with 5
-	// slices gives roughly 3%, 6%, 13%, 26%, 52%.
+	// Measured on the reference scene, with 4 slices: growth 2 (boundaries at 7/20/47%) was worth under a millisecond,
+	// growth 3 (2/10/33%) cost two, and equal slices, whose first boundary at 25% already lands just past the knee,
+	// were close to the best of the three. Hence the range below 1 - and hence, ultimately, that the real lever is the
+	// number of checks rather than their placement, which is limited by what one check costs.
 	float getSliceGrowth() const { return splat_slice_growth; }
 	void setSliceGrowth(float v) { splat_slice_growth = v; }
 

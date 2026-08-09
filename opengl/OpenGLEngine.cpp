@@ -9534,9 +9534,10 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 	// order (clouds front-to-back, splats front-to-back within each) exactly what it was.
 	const int num_slices = myClamp(splat_renderer->getNumDrawSlices(), 1, 1024);
 
-	// Clamped from below at 1: growth < 1 would make the *first* slice the biggest, which is the opposite of what the
-	// saturation test wants.  The upper bound is where a first slice of one splat is already reached with few slices.
-	const float slice_growth = myClamp(splat_renderer->getSliceGrowth(), 1.f, 16.f);
+	// Below 1 the first slice is the biggest and the tail is finely sliced, which is the useful direction when nothing
+	// saturates early - see GaussianSplatRenderer::getSliceGrowth().  Bounded either side only to keep the extremes,
+	// where the first or last slice rounds to a single splat, from being reachable by accident.
+	const float slice_growth = myClamp(splat_renderer->getSliceGrowth(), 0.25f, 16.f);
 
 	// The framebuffer the rest of the frame is being drawn into.  It supplies the depth the splats test against, and the
 	// resolve pass has to composite onto it and leave it bound behind us.

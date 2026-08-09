@@ -20,6 +20,18 @@ uniform vec2 focal_len_px;
 uniform int splat_tex_width;
 uniform vec2 splat_size_clamp_min_max; // Diagnostic tool (GaussianSplatSettingsWidget, Qt only): culls any splat whose feature_size (2 * max scale axis, matching GaussianSplatLodNode::feature_size) falls outside [x, y]. 0 disables the respective bound (matches the "0 = unlimited" convention used by the Splats list search radius) - (0, 0), the default, disables the filter entirely.
 uniform int splat_size_clamp_invert; // 0 (default) = cull outside [min, max] (isolate a size range); non-zero = cull inside [min, max] instead (exclude a size range, leaving the rest of the cloud untouched). No effect while the clamp itself is disabled.
+// The saturation gate: a mask of the pixels the composite has already finished with, rebuilt between draw slices - see
+// gaussian_splat_saturation_mask_frag_shader.glsl.  splat_saturation_mask_block is how many screen pixels across one
+// mask texel covers, or 0 when the gate is not running, which is also the only state in which the texture may hold
+// anything meaningless.
+//
+// Tested here, per splat, rather than per fragment: a fragment-side test was measured and saved nothing at all, because
+// one texture fetch across the hundreds of millions of fragments this pass shades costs about what the blending it
+// skips is worth.  Here the fetch is paid once per splat - a hundred times less often - and a splat that fails takes
+// its rasterisation and its whole quad's worth of shading with it, not just the blending.
+uniform sampler2D splat_saturation_mask_texture;
+uniform int splat_saturation_mask_block;
+
 uniform float splat_alpha_cutoff; // GaussianSplatSettingsWidget, Qt only. Sets the per-splat quad radius to exactly where alpha decays to this value, instead of the fixed 3-sigma bound below - see the derivation where it's used. Default 1/255 matches the fragment shader's own discard threshold exactly (lossless); raising it trims low-opacity splats' quads further, trading a sliver of their faint edge for less overdraw.
 
 out vec2 frag_screen_offset_px; // Pixel-space offset of this vertex from the splat's projected centre.
@@ -145,6 +157,48 @@ void main()
 	vec2 screen_offset_px = position_in.x * radius1 * axis1 + position_in.y * radius2 * axis2;
 
 	vec4 clip_pos = proj_matrix * pos_vs;
+
+	// The saturation gate.  Drop the whole splat if every mask texel its quad can touch is already marked finished:
+	// nothing it could contribute would survive the composite.
+	//
+	// Conservative in two ways, both deliberate.  The bound on the quad's half-extent is radius1 + radius2, which is at
+	// least the true per-axis extent of the rotated ellipse's quad, so the texels tested always cover the quad.  And the
+	// test is skipped entirely for a quad spanning more than 2x2 texels, which is what keeps this to four fetches with
+	// no mip pyramid: a bigger quad simply draws, at no cost beyond the fetches.  How big "2x2 texels" is in pixels is
+	// the mask downscale, so that knob now also sets which splats are eligible to be culled.
+	if(splat_saturation_mask_block > 0)
+	{
+		vec2 centre_px = ((clip_pos.xy / clip_pos.w) * 0.5 + 0.5) * viewport_dims_px;
+		float extent_px = radius1 + radius2;
+
+		float block = float(splat_saturation_mask_block);
+		ivec2 lo = ivec2(floor((centre_px - extent_px) / block));
+		ivec2 hi = ivec2(floor((centre_px + extent_px) / block));
+
+		if(all(lessThanEqual(hi - lo, ivec2(1))))
+		{
+			// Clamped to the mask, which loses nothing: whatever falls outside it is off screen, and produces no
+			// fragments whether this splat is culled or not.
+			ivec2 mask_max = textureSize(splat_saturation_mask_texture, /*mip level=*/0) - ivec2(1);
+			lo = clamp(lo, ivec2(0), mask_max);
+			hi = clamp(hi, ivec2(0), mask_max);
+
+			float marked = min(
+				min(texelFetch(splat_saturation_mask_texture, ivec2(lo.x, lo.y), 0).r, texelFetch(splat_saturation_mask_texture, ivec2(hi.x, lo.y), 0).r),
+				min(texelFetch(splat_saturation_mask_texture, ivec2(lo.x, hi.y), 0).r, texelFetch(splat_saturation_mask_texture, ivec2(hi.x, hi.y), 0).r));
+
+			if(marked > 0.5)
+			{
+				gl_Position = vec4(2.0, 2.0, 2.0, 1.0); // Push outside the clip volume.
+				frag_conic = vec3(0.0);
+				frag_screen_offset_px = vec2(0.0);
+				return;
+			}
+		}
+	}
+
+	// Note that the mask test above used clip_pos as the splat's *centre*, before this offset moves it to this vertex's
+	// corner: the test is about the whole quad, and all four of its vertices have to reach the same verdict.
 	clip_pos.xy += (screen_offset_px / viewport_dims_px) * 2.0 * clip_pos.w; // Offset in clip space, premultiplied by w so it survives the perspective divide unchanged.
 	gl_Position = clip_pos;
 

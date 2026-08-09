@@ -7,7 +7,8 @@
 // for the pass setup and OpenGLEngine::drawSplatClouds() for why slices exist.
 //
 // The mask is an ordinary colour texture, usually at a fraction of the screen resolution, which
-// gaussian_splat_frag_shader.glsl samples and discards on.  It used to be a depth buffer instead, marked with the near
+// gaussian_splat_vert_shader.glsl samples to drop whole splats that can no longer contribute.  It used to be a depth
+// buffer instead, marked with the near
 // plane so that the rasteriser's own depth test threw the fragments out before shading - which rejects earlier and so
 // saves more per fragment.  It was abandoned because of what it costs to have: the accumulation framebuffer cannot be
 // allowed to write into the scene's depth buffer, so the gate needed a private copy of it, and a depth buffer filled by

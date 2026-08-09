@@ -26,12 +26,9 @@ in vec4 frag_colour;
 // sum_alpha is made of near-threshold splats that a cutoff would never reach - that case wants pruning, not early-out.
 uniform int splat_show_overdraw;
 
-// The saturation gate: a mask of the pixels the composite has already finished with, rebuilt between draw slices - see
-// gaussian_splat_saturation_mask_frag_shader.glsl. splat_saturation_mask_block is how many screen pixels across one
-// mask texel covers, or 0 when the gate is not running, which is also the only state in which the texture below may
-// hold anything meaningless.
-uniform sampler2D splat_saturation_mask_texture;
-uniform int splat_saturation_mask_block;
+// Note that the saturation gate is not tested here.  It was, and it saved nothing: a texture fetch per fragment, over
+// the hundreds of millions of fragments this pass shades, costs about what the blending it skips is worth.  The test
+// lives in the vertex shader instead, where it is paid once per splat - see gaussian_splat_vert_shader.glsl.
 
 // Note that there's deliberately no order-independent-transparency variant here.  Splat clouds are drawn by
 // drawSplatClouds(), which always renders to a single colour buffer with ordinary front-to-back alpha blending, never
@@ -41,19 +38,6 @@ layout(location = 0) out vec4 colour_out;
 
 void main()
 {
-	// First, before any of the splat maths: has this pixel already finished?  Nothing drawn behind a saturated pixel can
-	// change it, so the cheapest possible exit is the right one.  The branch is on a uniform, so a frame with the gate
-	// off pays for nothing but the comparison.
-	if(splat_saturation_mask_block > 0)
-	{
-		// Integer division, so this pixel lands in the block the mask pass actually computed from it.  Dividing by a
-		// float scale instead rounds the wrong way for some pixels - the mask's size is a rounded-up division of the
-		// viewport's - and reading a neighbouring texel would skip pixels that are not finished.
-		ivec2 mask_coord = ivec2(gl_FragCoord.xy) / splat_saturation_mask_block;
-		if(texelFetch(splat_saturation_mask_texture, mask_coord, /*mip level=*/0).r > 0.5)
-			discard;
-	}
-
 	// Evaluate the 2D Gaussian at this pixel: exponent = -0.5 * offset^T * conic * offset, where conic is the inverse 2D
 	// covariance (see gaussian_splat_vert_shader.glsl).
 	float power = -0.5 * (frag_conic.x * frag_screen_offset_px.x * frag_screen_offset_px.x

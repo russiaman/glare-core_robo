@@ -682,9 +682,14 @@ public:
 	// works the same way whether or not the scene renders to offscreen renderbuffers.
 	Reference<FrameBuffer> splat_accum_framebuffer;
 	Reference<RenderBuffer> splat_accum_renderbuffer;
-	Reference<RenderBuffer> splat_accum_depth_renderbuffer; // Non-null when the scene's depth renderbuffer isn't being shared; receives a copy of the scene's depth each frame, which the saturation gate then writes into.
+	Reference<RenderBuffer> splat_accum_depth_renderbuffer; // Non-null when the scene's depth renderbuffer isn't being shared; receives a copy of the scene's depth each frame.
 	Reference<FrameBuffer> splat_accum_copy_framebuffer;
 	OpenGLTextureRef splat_accum_copy_texture;
+
+	// The saturation gate's mask of finished pixels, usually a fraction of the viewport's resolution - see
+	// OpenGLEngine::markSaturatedSplatPixels(), which writes it, and gaussian_splat_frag_shader.glsl, which reads it.
+	Reference<FrameBuffer> splat_saturation_mask_framebuffer;
+	OpenGLTextureRef splat_saturation_mask_texture;
 
 
 	Reference<FrameBuffer> pre_dof_framebuffer;
@@ -1679,6 +1684,11 @@ private:
 	// GaussianSplatRenderer::getAccumBuffer8Bit() rebuilds it.  RenderBuffer does not remember its own format, and the
 	// engine's copy of the answer is cheaper than giving it one.
 	OpenGLTextureFormat splat_accum_buffer_format;
+
+	// How many accumulation-buffer pixels across one saturation mask texel covers, as the mask was actually allocated.
+	// Kept rather than recomputed from the two sizes: the mask's is a rounded-up division, so dividing them back gives
+	// the wrong answer whenever the viewport is not a multiple of the block (2786 / ceil(2786/4) is 3, not 4).
+	int splat_saturation_mask_block;
 
 	std::vector<uint32> temp_counts;
 	uint32 num_prog_changes;

@@ -241,11 +241,22 @@ public:
 	// Whether to reject splats at pixels the composite has already finished with. false (default) draws every slice in
 	// full, so the slice count alone stays a no-op and the two can be compared directly. Needs more than one slice to do
 	// anything, and is ignored in the overdraw debug views, where the blend is additive and the accumulated alpha counts
-	// layers rather than coverage. Turning it on also changes how the accumulation framebuffer is built - it needs a
-	// depth buffer the gate may write into - so it is not free to toggle every frame. See
-	// OpenGLEngine::markSaturatedSplatPixels().
+	// layers rather than coverage. See OpenGLEngine::markSaturatedSplatPixels().
 	bool getSaturationGateEnabled() const { return splat_saturation_gate_enabled; }
 	void setSaturationGateEnabled(bool v) { splat_saturation_gate_enabled = v; }
+
+	// How many screen pixels across one texel of the saturation mask covers. 1 = a mask at full resolution, 4 (default)
+	// = a mask with a sixteenth of the pixels.
+	//
+	// The mask is what the gate marks and what the splat shader tests, so its resolution sets both what a mark costs and
+	// how precisely finished regions can be described. Coarsening it is close to free on the second count: a texel is
+	// marked only if *every* pixel under it is finished (see the mask shader), so the picture stays exactly correct and
+	// the only loss is the partly finished texels along the boundary of a saturated region, which are a shrinking
+	// fraction of it as the region grows. On the first count it is most of the win: the mark pass writes 1/16 as many
+	// pixels at 4, and 1/16 of a pass is what makes checking often affordable, which is the lever the measurements
+	// pointed at.
+	int getSaturationMaskDownscale() const { return splat_saturation_mask_downscale; }
+	void setSaturationMaskDownscale(int v) { splat_saturation_mask_downscale = v; }
 
 	// Accumulated coverage at or above which the gate treats a pixel as finished. Default 1 - 1/255: the light still
 	// getting through is then under one 8-bit level, which is where the reference 3DGS rasteriser ends its own per-pixel
@@ -270,11 +281,25 @@ public:
 	// like the splat program itself.
 	const Reference<OpenGLProgram>& getSaturationMaskProgram() const { return saturation_mask_prog; }
 
-	// Sets that program's uniforms from the current getSaturationThreshold(), plus the depth value a finished pixel is
-	// marked with, which is the caller's since it depends on the engine's depth direction. Called once the mask program
-	// is bound, for the same reason setResolveOverdrawUniforms() exists: the pass is one manual full-viewport quad with
-	// no material, so it bypasses the generic per-object uniform path.
-	void setSaturationMaskUniforms(float saturated_depth) const;
+	// Location of the splat program's saturation-mask sampler, or -1 if the program has no such uniform. Resolved on
+	// first use rather than in buildShadersIfNeeded(), since the build may still be in flight there; the draw path only
+	// asks once the program reports isBuilt(). The engine binds the texture itself - the material path has no support
+	// for sampler uniforms - hence a location rather than a setter here.
+	int getSplatMaskTexUniformLoc();
+
+	// How many screen pixels across one mask texel covers, or 0 to switch the test in the splat shader off entirely.
+	// A block size rather than its reciprocal because the shader divides by it in integer arithmetic: the mask's size is
+	// a rounded-up division, so a float scale would round the wrong way for some pixels and send them to a neighbouring
+	// texel - which is not conservative, and so shows. Set by the draw path each frame rather than by think(), because
+	// whether the gate actually runs is the draw path's decision - and a splat shader that tests a mask nobody wrote
+	// would be reading stale texels.
+	void setSplatMaskBlockSize(int block_size);
+
+	// Sets that program's uniforms from the current getSaturationThreshold(), plus how many accumulation-buffer pixels
+	// across one mask texel covers, which is the caller's since it depends on the size the mask was actually allocated
+	// at. Called once the mask program is bound, for the same reason setResolveOverdrawUniforms() exists: the pass is
+	// one manual full-viewport quad with no material, so it bypasses the generic per-object uniform path.
+	void setSaturationMaskUniforms(int block_size) const;
 
 	// Overdraw debug view: 0 (default) = normal rendering. Non-zero = every splat writes a flat additive increment
 	// instead of its real colour, into the same accumulation buffer as normal, which the resolve pass then colour-ramps
@@ -385,9 +410,14 @@ private:
 	// See getSliceGrowth() above. Default 1 = every slice the same size.
 	float splat_slice_growth;
 
-	// See getSaturationGateEnabled()/getSaturationThreshold() above. Off by default.
+	// See getSaturationGateEnabled()/getSaturationThreshold()/getSaturationMaskDownscale() above. Off by default.
 	bool splat_saturation_gate_enabled;
 	float splat_saturation_threshold;
+	int splat_saturation_mask_downscale;
+
+	// See getSplatMaskTexUniformLoc(). -2 means "not looked up yet", which -1 cannot mean, that being GL's answer for
+	// a uniform the linker dropped.
+	int splat_mask_tex_uniform_loc;
 
 	// See getAccumBuffer8Bit() above. Off by default, i.e. the RGBA16F buffer this pass has always used.
 	bool splat_accum_buffer_8bit;

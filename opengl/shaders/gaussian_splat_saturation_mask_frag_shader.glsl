@@ -2,24 +2,28 @@
 // gaussian_splat_saturation_mask_frag_shader.glsl
 // Copyright Glare Technologies Limited 2026 -
 //
-// Marks the pixels that the front-to-back splat composite has already finished with, so that the splats still to be
-// drawn behind them can be rejected before they are shaded.  Run between draw slices - see
-// OpenGLEngine::markSaturatedSplatPixels() for the pass setup and OpenGLEngine::drawSplatClouds() for why slices exist.
+// Builds the mask of pixels that the front-to-back splat composite has already finished with, so that the splats still
+// to be drawn behind them can leave immediately.  Run between draw slices - see OpenGLEngine::markSaturatedSplatPixels()
+// for the pass setup and OpenGLEngine::drawSplatClouds() for why slices exist.
 //
-// The mark is a depth write, not a colour one: colour writes are masked off, and a finished pixel is stamped with the
-// near-plane depth value.  Everything drawn behind it then fails the depth comparison the splats already perform, so the
-// rejection costs no extra per-fragment work and needs no buffer beyond the depth copy the pass already owns.
+// The mask is an ordinary colour texture, usually at a fraction of the screen resolution, which
+// gaussian_splat_frag_shader.glsl samples and discards on.  It used to be a depth buffer instead, marked with the near
+// plane so that the rasteriser's own depth test threw the fragments out before shading - which rejects earlier and so
+// saves more per fragment.  It was abandoned because of what it costs to have: the accumulation framebuffer cannot be
+// allowed to write into the scene's depth buffer, so the gate needed a private copy of it, and a depth buffer filled by
+// blitting has neither the coarse per-tile summaries nor the compression a rasterised one does.  Measured, that cost
+// 3.5 ms with nothing occluding the cloud and 8.7 ms with it mostly occluded, against about 2 ms saved.  A texture of
+// our own costs nothing of the sort, and being small is what makes checking often affordable.
 //
-// Stencil would express this more directly, but a stencil buffer has to be attached alongside the depth one, and the
-// combination of a depth-only format with a separate stencil buffer is refused outright by many drivers.  Making the
-// depth buffer packed instead works, but measurably slows every depth test done against it - which, at hundreds of
-// millions of splat fragments a frame, cost more than the gate saved.
+// One texel is marked only when *every* pixel under it is finished, which is what keeps the picture exactly right at a
+// coarse mask: a pixel is skipped only if it was itself saturated.  The cost of the conservatism is the partly finished
+// texels around the edge of a saturated region, which keep being drawn - a shrinking share of the region as it grows.
 
 precision highp float;
 precision highp sampler2D;
 
 // A copy of the splat accumulation buffer, since a buffer cannot be sampled while it is attached to the framebuffer
-// being drawn to.  Only the alpha channel is read here.
+// being drawn to.  Only the alpha channel, the accumulated coverage, is read here.
 uniform sampler2D albedo_texture;
 
 // Accumulated coverage at or above which a pixel counts as finished.  Coverage is 1 - transmittance, so the meaningful
@@ -27,22 +31,32 @@ uniform sampler2D albedo_texture;
 // reference 3DGS rasteriser stops its own per-pixel loop.
 uniform float splat_saturation_threshold;
 
-// The depth value that marks a pixel as finished - the near plane, whose value depends on the engine's depth direction,
-// so it is passed in rather than assumed here.
-uniform float splat_saturated_depth;
+// How many accumulation-buffer pixels across one mask texel covers.  1 makes this a full-resolution mask and the loop
+// below a single fetch.
+uniform int splat_mask_block_size;
 
 out vec4 colour_out;
 
 
 void main()
 {
-	// Same indexing as the resolve pass: the accumulation buffer matches the viewport and this quad covers all of it, so
-	// the fragment's own coordinates address it directly.
-	float coverage = texelFetch(albedo_texture, ivec2(gl_FragCoord.xy), /*mip level=*/0).a;
+	// This pass draws into the mask, so the fragment's own coordinates are mask texels; the block they stand for starts
+	// at block_size times that.
+	ivec2 block_begin = ivec2(gl_FragCoord.xy) * splat_mask_block_size;
+	ivec2 accum_size  = textureSize(albedo_texture, /*mip level=*/0);
 
-	if(coverage < splat_saturation_threshold)
-		discard; // Not finished - leave this pixel's depth alone, so later slices still draw into it.
+	float min_coverage = 1.0;
+	for(int y=0; y<splat_mask_block_size; ++y)
+		for(int x=0; x<splat_mask_block_size; ++x)
+		{
+			// Clamped rather than skipped: the viewport is not necessarily a multiple of the block size, and re-reading
+			// an in-range pixel is harmless here (it only ever makes the minimum smaller, i.e. keeps drawing), whereas
+			// an out-of-range texelFetch is undefined.
+			ivec2 coord = min(block_begin + ivec2(x, y), accum_size - ivec2(1));
+			min_coverage = min(min_coverage, texelFetch(albedo_texture, coord, /*mip level=*/0).a);
+		}
 
-	gl_FragDepth = splat_saturated_depth; // The mark.
-	colour_out = vec4(0.0); // Masked off by glColorMask(); written only because a fragment shader must have an output.
+	// Written for every texel, not discarded: the mask is rebuilt in place each time, so an unmarked texel has to be
+	// actively cleared rather than left holding what the previous pass put there.
+	colour_out = vec4((min_coverage >= splat_saturation_threshold) ? 1.0 : 0.0);
 }

@@ -600,6 +600,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	lod_max_layer_density(0.0f), lod_max_tree_depth(0),
 	splat_size_clamp_min(0.0f), splat_size_clamp_max(0.0f), splat_size_clamp_invert(false), splat_alpha_cutoff(1.0f / 255.0f),
 	splat_num_draw_slices(1), splat_slice_growth(1.0f), splat_saturation_gate_enabled(false), splat_saturation_threshold(1.0f - 1.0f / 255.0f),
+	splat_saturation_mask_downscale(4), splat_mask_tex_uniform_loc(-2),
 	splat_accum_buffer_8bit(false),
 	splat_show_overdraw_mode(0), splat_overdraw_range_min(2.0f), splat_overdraw_range_max(100.0f)
 {}
@@ -640,6 +641,7 @@ void GaussianSplatRenderer::buildShadersIfNeeded()
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,  "splat_size_clamp_invert");
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_alpha_cutoff");
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,  "splat_show_overdraw");
+	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int, "splat_saturation_mask_block"); // 0 disables the test - see setSplatMaskBlockSize().
 
 
 	// Splats blend into an accumulation buffer of their own rather than straight onto the main colour buffer, so that
@@ -680,14 +682,32 @@ void GaussianSplatRenderer::buildShadersIfNeeded()
 	// Same reason as resolve_prog's uniforms above: the build may still be in flight here, and appendUserUniformInfo() is
 	// what resolves the location once it completes.  Read back by setSaturationMaskUniforms().
 	saturation_mask_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_saturation_threshold");
-	saturation_mask_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_saturated_depth");
+	saturation_mask_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "splat_mask_block_size");
 }
 
 
-void GaussianSplatRenderer::setSaturationMaskUniforms(float saturated_depth) const
+int GaussianSplatRenderer::getSplatMaskTexUniformLoc()
+{
+	if(splat_mask_tex_uniform_loc == -2)
+	{
+		assert(shader_prog.nonNull() && shader_prog->isBuilt()); // getUniformLocation() on a program still being linked would return -1 and be cached as such.
+		splat_mask_tex_uniform_loc = shader_prog->getUniformLocation("splat_saturation_mask_texture");
+	}
+	return splat_mask_tex_uniform_loc;
+}
+
+
+void GaussianSplatRenderer::setSplatMaskBlockSize(int block_size)
+{
+	for(size_t i=0; i<clouds.size(); ++i)
+		clouds[i]->ob->materials[0].user_uniform_vals[7].intval = block_size;
+}
+
+
+void GaussianSplatRenderer::setSaturationMaskUniforms(int block_size) const
 {
 	glUniform1f(saturation_mask_prog->user_uniform_info[0].loc, splat_saturation_threshold);
-	glUniform1f(saturation_mask_prog->user_uniform_info[1].loc, saturated_depth);
+	glUniform1i(saturation_mask_prog->user_uniform_info[1].loc, block_size);
 }
 
 
@@ -866,13 +886,18 @@ std::string GaussianSplatRenderer::getDiagnostics() const
 	else if(splat_show_overdraw_mode != 0)
 		gate_state = "enabled, but idle - not used in the overdraw views, where accumulated alpha counts layers rather than coverage";
 	else if(!opengl_engine->splat_accum_gate_available)
-		gate_state = "enabled, but UNAVAILABLE - the accumulation framebuffer has no depth buffer of its own to mark";
+		gate_state = "enabled, but UNAVAILABLE - the saturation mask framebuffer could not be built";
 	else if(saturation_mask_prog.isNull() || !saturation_mask_prog->isBuilt())
 		gate_state = "enabled, but idle - mask shader not built yet";
 	else
 		gate_state = "on";
 
-	s += "Saturation gate: " + gate_state + ", threshold " + doubleToStringNDecimalPlaces(splat_saturation_threshold, 4) + "\n";
+	s += "Saturation gate: " + gate_state + ", threshold " + doubleToStringNDecimalPlaces(splat_saturation_threshold, 4) +
+		", mask 1/" + toString(splat_saturation_mask_downscale) + " res";
+	if(opengl_engine->getCurrentScene()->splat_saturation_mask_texture.nonNull())
+		s += " (" + toString(opengl_engine->getCurrentScene()->splat_saturation_mask_texture->xRes()) + " x " +
+			toString(opengl_engine->getCurrentScene()->splat_saturation_mask_texture->yRes()) + ")";
+	s += "\n";
 
 	// Every live-tunable parameter, printed whether or not it is at its default.  Only the desktop client has a panel to
 	// set these from, so the web runs on the hardcoded defaults, and the usual reason for reading this section at all is
@@ -983,7 +1008,7 @@ Reference<SplatCloud> GaussianSplatRenderer::allocCloud()
 	// MATERIAL_ALPHA_BLEND_BITFLAG on the batch, which is how the opaque pass, the depth pre-pass and the shadow passes
 	// know to skip it.  OpenGLEngine::addObject() keys off splat_cloud to put the object in exactly one of the two sets.
 	mat.alpha_blend = true;
-	mat.user_uniform_vals.resize(7); // viewport_dims_px, focal_len_px, splat_size_clamp_min_max, splat_size_clamp_invert, splat_alpha_cutoff and splat_show_overdraw are set by think().
+	mat.user_uniform_vals.resize(8); // All but splat_tex_width below are set by think().
 	mat.user_uniform_vals[2].intval = (int)splat_tex_width;
 
 	// Build a real (if minimal) texture and VAO up front: adding the object to the engine before it has those would

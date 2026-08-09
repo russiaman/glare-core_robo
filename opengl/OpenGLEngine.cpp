@@ -170,7 +170,9 @@ enum TextureUnitIndices
 	SSAO_SPECULAR_TEXTURE_UNIT_INDEX,
 	PREPASS_COLOUR_COPY_TEXTURE_UNIT_INDEX,
 	PREPASS_NORMAL_COPY_TEXTURE_UNIT_INDEX,
-	PREPASS_DEPTH_COPY_TEXTURE_UNIT_INDEX
+	PREPASS_DEPTH_COPY_TEXTURE_UNIT_INDEX,
+
+	SPLAT_SATURATION_MASK_TEXTURE_UNIT_INDEX // The splat program's second texture, after the packed splat data - see drawSplatClouds().
 };
 
 
@@ -462,6 +464,7 @@ OpenGLEngine::OpenGLEngine(const OpenGLEngineSettings& settings_)
 	splat_depth_copy_works(false),
 	splat_accum_buffer_format(OpenGLTextureFormat::Format_RGBA_Linear_Half),
 	splat_accum_gate_available(false),
+	splat_saturation_mask_block(1),
 	print_output(NULL),
 	tex_CPU_mem_usage(0),
 	tex_GPU_mem_usage(0),
@@ -9582,6 +9585,20 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 	const bool use_saturation_gate = splat_renderer->getSaturationGateEnabled() && (num_slices > 1) && !show_overdraw && splat_accum_gate_available &&
 		splat_renderer->getSaturationMaskProgram().nonNull() && splat_renderer->getSaturationMaskProgram()->isBuilt();
 
+	// Tells the splat shader whether to test the mask at all, and how many pixels a texel of it covers.  Set here rather
+	// than in the renderer's think(), since whether the gate runs this frame is decided just above: a shader testing a
+	// mask nobody wrote would be reading whatever the last frame left there.
+	splat_renderer->setSplatMaskBlockSize(use_saturation_gate ? splat_saturation_mask_block : 0);
+
+	if(use_saturation_gate)
+	{
+		// Nothing is finished before the first slice of the frame has been drawn, and the mask still holds the last
+		// frame's answer, which was computed for a different camera.  Cheap - it is a fraction of the viewport.
+		current_scene->splat_saturation_mask_framebuffer->bindForDrawing();
+		glClearBufferfv(GL_COLOR, /*drawBuffer=*/0, col_zero);
+		current_scene->splat_accum_framebuffer->bindForDrawing();
+	}
+
 	if(current_scene->splat_accum_depth_renderbuffer.nonNull() && !splat_depth_copy_works)
 	{
 		// No depth format the scene's depth could be copied into (reported once, at allocation).  Clear to the far plane
@@ -9638,7 +9655,18 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 			// when it is still bound, which is every slice that wasn't preceded by a census.
 			const bool program_changed = checkUseProgram(ob->batch_draw_info[batch_i].getProgramIndex());
 			if(program_changed)
+			{
 				setSharedUniformsForProg(*prog_vector[ob->batch_draw_info[batch_i].getProgramIndex()].ptr(), view_matrix, proj_matrix);
+
+				// The gate's mask.  Bound whether or not the gate is running, since a declared sampler with no texture
+				// bound is invalid in WebGL even where the shader's uniform branch never samples it.  Sampler uniforms
+				// are not something the material path can carry, hence the manual bind - see
+				// GaussianSplatRenderer::getSplatMaskTexUniformLoc().
+				const int mask_tex_loc = splat_renderer->getSplatMaskTexUniformLoc();
+				if(mask_tex_loc >= 0)
+					bindTextureUnitToSampler(*current_scene->splat_saturation_mask_texture, /*texture_unit_index=*/SPLAT_SATURATION_MASK_TEXTURE_UNIT_INDEX,
+						/*sampler_uniform_location=*/mask_tex_loc);
+			}
 
 			ob->instance_vbo_offset_B = (uint32)(slice_begin * sizeof(uint32)); // One uint32 splat index per instance - see GaussianSplatRenderer::rebuildVAO().
 			ob->num_instances_to_draw = slice_end - slice_begin;
@@ -9745,18 +9773,11 @@ drawSplatClouds() copies the scene's depth into it once per frame.
 */
 void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffer_name)
 {
-	// The saturation gate marks a finished pixel by writing near depth into it, so that everything drawn behind fails the
-	// depth test the splats already perform - see markSaturatedSplatPixels().  That means it needs a depth buffer it is
-	// allowed to destroy, which the scene's own is not.  So with the gate on we stop sharing and take the depth-copy path,
-	// and with it off we keep sharing, which costs nothing.  Toggling the gate flips share_scene_depth and so reallocates,
-	// which is what makes the switch take effect.
-	//
-	// Two things are given up while the gate is on: a full-screen depth blit per frame (small next to the fill the gate
-	// saves), and MSAA on the splats where the scene has it, since a blit cannot write into a multisampled buffer.  The
-	// second matters little here - splat edges are soft by construction, which is why MSAA was already a candidate for
-	// disabling on this pass.
-	const bool want_own_depth = splat_renderer->getSaturationGateEnabled();
-	const bool share_scene_depth = current_scene->render_to_main_render_framebuffer && current_scene->main_depth_renderbuffer.nonNull() && !want_own_depth;
+	// Whatever the gate is doing, the scene's depth buffer is shared when there is one to share: the gate marks finished
+	// pixels in a colour mask of its own now, and touches depth not at all.  It used to mark them in depth, which meant
+	// it needed a private copy of the scene's, and that copy cost 3.5-8.7 ms in depth tests - see
+	// gaussian_splat_saturation_mask_frag_shader.glsl.
+	const bool share_scene_depth = current_scene->render_to_main_render_framebuffer && current_scene->main_depth_renderbuffer.nonNull();
 
 	size_t xres, yres;
 	int msaa_samples;
@@ -9781,11 +9802,22 @@ void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffe
 	const OpenGLTextureFormat splat_accum_format = splat_renderer->getAccumBuffer8Bit() ? OpenGLTextureFormat::Format_RGBA_Linear_Uint8 :
 		OpenGLTextureFormat::Format_RGBA_Linear_Half;
 
+	// The gate's mask, at 1/downscale of the accumulation buffer, rounded up so that the blocks cover it - see
+	// gaussian_splat_saturation_mask_frag_shader.glsl.  Allocated whether or not the gate is currently on: it is a few
+	// hundred kilobytes, and having it always present is what lets the gate be toggled without reallocating anything.
+	const size_t mask_block = (size_t)myClamp(splat_renderer->getSaturationMaskDownscale(), 1, 16);
+	const size_t mask_xres = Maths::roundedUpDivide(xres, mask_block);
+	const size_t mask_yres = Maths::roundedUpDivide(yres, mask_block);
+	splat_saturation_mask_block = (int)mask_block;
+
 	if(current_scene->splat_accum_renderbuffer.nonNull() &&
 		current_scene->splat_accum_renderbuffer->xRes() == xres &&
 		current_scene->splat_accum_renderbuffer->yRes() == yres &&
 		current_scene->splat_accum_renderbuffer->MSAASamples() == msaa_samples &&
 		splat_accum_buffer_format == splat_accum_format && // Flipping the format rebuilds, same as toggling the gate does.
+		current_scene->splat_saturation_mask_texture.nonNull() &&
+		current_scene->splat_saturation_mask_texture->xRes() == mask_xres && // Changing the mask downscale rebuilds too.
+		current_scene->splat_saturation_mask_texture->yRes() == mask_yres &&
 		current_scene->splat_accum_depth_renderbuffer.isNull() == share_scene_depth) // Also reallocate if the scene gained or lost a depth buffer we can share.
 		return; // Already allocated, in the right size and configuration.
 
@@ -9797,11 +9829,13 @@ void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffe
 	current_scene->splat_accum_depth_renderbuffer   = NULL;
 	current_scene->splat_accum_framebuffer          = NULL;
 	current_scene->splat_accum_copy_framebuffer     = NULL;
+	current_scene->splat_saturation_mask_texture    = NULL;
+	current_scene->splat_saturation_mask_framebuffer = NULL;
 
 	conPrint("Allocating splat accumulation buffer with width " + toString(xres) + " and height " + toString(yres) +
 		", format " + std::string(textureFormatString(splat_accum_format)) + ", MSAA samples " + toString(msaa_samples) +
 		(share_scene_depth ? ", sharing the scene depth buffer" : ", with a depth buffer of its own") +
-		(want_own_depth ? ", writable by the saturation gate" : ""));
+		", saturation mask " + toString(mask_xres) + " x " + toString(mask_yres));
 
 	current_scene->splat_accum_renderbuffer = new RenderBuffer(xres, yres, msaa_samples, splat_accum_format);
 
@@ -9840,11 +9874,27 @@ void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffe
 			conPrint("Error: found no depth format the scene's depth buffer can be copied into, so splats will not be occluded by scene geometry.");
 	}
 
-	// The gate needs a depth buffer it is allowed to write into, which is exactly the one the copy above produced.
-	splat_accum_gate_available = current_scene->splat_accum_depth_renderbuffer.nonNull() && splat_depth_copy_works;
-
 	if(!current_scene->splat_accum_framebuffer->isComplete())
 		conPrint("Error: splat accumulation framebuffer is not complete.");
+
+	// Single-channel 8-bit: the mask is a yes/no per texel, and the splat shader reads .r.
+	current_scene->splat_saturation_mask_texture = new OpenGLTexture(mask_xres, mask_yres, this,
+		ArrayRef<uint8>(), // data
+		OpenGLTextureFormat::Format_Greyscale_Uint8,
+		OpenGLTexture::Filtering_Nearest, // Read with texelFetch(), which ignores filtering, but nearest is what it means.
+		OpenGLTexture::Wrapping_Clamp,
+		false, // has_mipmaps
+		/*MSAA_samples=*/1
+	);
+
+	current_scene->splat_saturation_mask_framebuffer = new FrameBuffer();
+	current_scene->splat_saturation_mask_framebuffer->attachTexture(*current_scene->splat_saturation_mask_texture, GL_COLOR_ATTACHMENT0);
+
+	// The gate needs somewhere to put the mask and somewhere to read the accumulated coverage from, and nothing else -
+	// in particular no depth buffer of its own, which is what it used to need.
+	splat_accum_gate_available = current_scene->splat_saturation_mask_framebuffer->isComplete();
+	if(!splat_accum_gate_available)
+		conPrint("Error: splat saturation mask framebuffer is not complete.");
 
 	current_scene->splat_accum_copy_texture = new OpenGLTexture(xres, yres, this,
 		ArrayRef<uint8>(), // data
@@ -9861,23 +9911,22 @@ void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffe
 
 
 /*
-Writes 1 into the splat accumulation framebuffer's stencil buffer at every pixel whose accumulated coverage has reached
-the saturation threshold, leaving the rest at 0.  Run between draw slices; drawSplatClouds() then draws the following
-slices with a stencil test that rejects the marked pixels, before the fragment shader runs on them.
+Rebuilds the mask of pixels whose accumulated coverage has reached the saturation threshold.  Run between draw slices;
+gaussian_splat_frag_shader.glsl samples the mask and discards immediately at marked pixels, so the splats drawn after
+this are not blended there.
 
-This is the "early-Z for splats" that the hardware pipeline cannot do by itself.  A pixel whose coverage has saturated
+This is the "early-out for splats" that the hardware pipeline cannot do by itself.  A pixel whose coverage has saturated
 cannot be changed by anything drawn behind it, but the blend unit never knows a pixel's accumulated alpha at shading
 time, and with splats as the outer loop there is no per-pixel loop to break out of.  Asking the question once between
-slices, for the whole screen at once, and answering it through a state the rasteriser already consults, is the shape
-that fits.
+slices, for the whole screen at once, is the shape that fits.
 
 The accumulation buffer has to be copied before it can be read: a buffer attached to the framebuffer being drawn to
-cannot be sampled, and it is a renderbuffer besides.  That copy - one full-screen blit, plus this full-screen pass - is
-what bounds how many slices are worth using.
+cannot be sampled, and it is a renderbuffer besides.  So one check is a full-screen blit plus this pass, and this pass
+writes only 1/downscale^2 as many pixels as the screen has, which is what bounds how many checks are worth doing.
 
-With MSAA the copy resolves the samples, so the threshold is tested against a pixel's average coverage and the stencil
-value applies to all of its samples.  At the edge of a saturated region that is slightly wrong in both directions; the
-region interiors, which is where the work being skipped actually is, are unaffected.
+With MSAA the copy resolves the samples, so the threshold is tested against a pixel's average coverage.  At the edge of
+a saturated region that is slightly wrong in both directions; the region interiors, which is where the work being
+skipped actually is, are unaffected.
 */
 void OpenGLEngine::markSaturatedSplatPixels()
 {
@@ -9901,23 +9950,15 @@ void OpenGLEngine::markSaturatedSplatPixels()
 	blitFrameBuffer(/*src_framebuffer=*/*current_scene->splat_accum_framebuffer, /*dest_framebuffer=*/*current_scene->splat_accum_copy_framebuffer,
 		/*num_buffers_to_copy=*/1, /*copy_buf0_colour=*/true, /*copy_buf0_depth=*/false);
 
-	//----------------------- Write the mark -----------------------
-	current_scene->splat_accum_framebuffer->bindForDrawing();
+	//----------------------- Write the mask -----------------------
+	current_scene->splat_saturation_mask_framebuffer->bindForDrawing();
+	glViewport(0, 0, (GLsizei)current_scene->splat_saturation_mask_texture->xRes(), (GLsizei)current_scene->splat_saturation_mask_texture->yRes());
 
 	glDisable(GL_BLEND);
-	// Every fragment the shader lets through must be written, whatever is in the buffer already - but NOT by disabling
-	// the depth test: with GL_DEPTH_TEST off, GL does not write the depth buffer at all, whatever glDepthMask() says.
-	// Written that way the mark never landed, and the gate ran at full cost while doing nothing.  GL_ALWAYS is how to
-	// write unconditionally and still write - the same trick, for the same reason, as in partiallyClearBuffer().
-	glEnable(GL_DEPTH_TEST);
-	glDepthFunc(GL_ALWAYS);
-	glDepthMask(GL_TRUE); // The one pass in the splat path that writes depth: it is the mark.
-	glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE); // Leave the accumulated colour alone - the depth write is this pass's only output.
+	glDisable(GL_DEPTH_TEST); // The mask framebuffer has no depth attachment, and every texel of it is rewritten regardless.
 
 	mask_prog->useProgram();
-	// The near plane, in whichever direction the engine's depth convention runs.  A pixel marked with it fails the depth
-	// comparison against everything, since nothing can be nearer than the nearest representable value.
-	splat_renderer->setSaturationMaskUniforms(/*saturated_depth=*/use_reverse_z ? 1.f : 0.f);
+	splat_renderer->setSaturationMaskUniforms(splat_saturation_mask_block);
 	bindMeshData(*unit_quad_meshdata);
 	bindTextureUnitToSampler(*current_scene->splat_accum_copy_texture, /*texture_unit_index=*/0, /*sampler_uniform_location=*/mask_prog->albedo_texture_loc);
 
@@ -9928,10 +9969,9 @@ void OpenGLEngine::markSaturatedSplatPixels()
 	OpenGLProgram::useNoPrograms();
 	unbindTextureFromTextureUnit(*current_scene->splat_accum_copy_texture, /*texture_unit_index=*/0); // Otherwise Chrome reports a feedback loop between the framebuffer and the active texture.
 
-	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-	glDepthMask(GL_FALSE); // Back to how the slice draws run: splats test depth but never write it.
-	glDepthFunc(use_reverse_z ? GL_GREATER : GL_LESS); // Back to the frame's depth func, as draw() sets it - the marked pixels have to fail it.
-	glEnable(GL_DEPTH_TEST);
+	current_scene->splat_accum_framebuffer->bindForDrawing();
+	glViewport(0, 0, (GLsizei)current_scene->splat_accum_renderbuffer->xRes(), (GLsizei)current_scene->splat_accum_renderbuffer->yRes());
+	glEnable(GL_DEPTH_TEST); // Back to how the slice draws run: splats test depth (against the scene's) but never write it.
 	glEnable(GL_BLEND); // The blend func itself was set by drawSplatClouds() and is not disturbed here.
 
 	if(time_this_mark)

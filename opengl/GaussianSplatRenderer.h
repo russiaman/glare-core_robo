@@ -225,10 +225,16 @@ public:
 	// region costs a full-screen pass and skips nothing. Past it, pixels keep finishing steadily, so each further check
 	// catches a new batch: what pays is asking *often after the knee*, not asking early.
 	//
-	// Measured on the reference scene, with 4 slices: growth 2 (boundaries at 7/20/47%) was worth under a millisecond,
-	// growth 3 (2/10/33%) cost two, and equal slices, whose first boundary at 25% already lands just past the knee,
-	// were close to the best of the three. Hence the range below 1 - and hence, ultimately, that the real lever is the
-	// number of checks rather than their placement, which is limited by what one check costs.
+	// Measured on the reference scene, both directions lose to equal spacing, and monotonically. With 4 slices, growth 2
+	// (boundaries at 7/20/47%) was worth under a millisecond and growth 3 (2/10/33%) cost two. With 6 slices, moving the
+	// boundaries the other way - growth 0.85, 0.7, 0.5, i.e. first boundary at 24%, 34%, 51% - cost 1.4, 2.3 and 2.6 ms.
+	// The reason both ends lose is that a check's value is the number of pixels already finished times the number of
+	// splats still to come: crowding the checks before the knee makes the first factor zero, crowding them into the tail
+	// makes the second one small, and spreading them evenly integrates the product best.
+	//
+	// So placement is not the lever; the number of checks is, and that is limited by what one check costs. The knob is
+	// kept because the knee is a property of the scene, not a constant: anything that raises the mean per-splat alpha -
+	// pruning, merging near-coplanar splats - moves it earlier and makes growth above 1 worth re-testing.
 	float getSliceGrowth() const { return splat_slice_growth; }
 	void setSliceGrowth(float v) { splat_slice_growth = v; }
 

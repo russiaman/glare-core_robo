@@ -484,6 +484,7 @@ OpenGLEngine::OpenGLEngine(const OpenGLEngineSettings& settings_)
 	depth_draw_last_num_vao_binds(0),
 	depth_draw_last_num_vbo_binds(0),
 	depth_draw_last_num_indices_drawn(0),
+	time_splat_mark_pass_this_frame(false),
 	last_total_draw_GPU_time(0),
 	last_dynamic_depth_draw_GPU_time(0),
 	last_static_depth_draw_GPU_time(0),
@@ -497,6 +498,9 @@ OpenGLEngine::OpenGLEngine(const OpenGLEngineSettings& settings_)
 	last_bloom_GPU_time(0),
 	last_final_imaging_GPU_time(0),
 	last_fog_post_process_GPU_time(0),
+	last_draw_splats_GPU_time(0),
+	last_splat_depth_blit_GPU_time(0),
+	last_mark_saturated_splats_GPU_time(0),
 	last_num_animated_obs_processed(0),
 	last_num_decal_batches_drawn(0),
 	next_program_index(0),
@@ -2522,6 +2526,9 @@ void OpenGLEngine::checkCreateProfilingQueries()
 		this->bloom_gpu_timer = new Query();
 		this->final_imaging_gpu_timer = new Query();
 		this->fog_post_process_gpu_timer = new Query();
+		this->draw_splats_gpu_timer = new Query();
+		this->splat_depth_blit_gpu_timer = new Query();
+		this->mark_saturated_splats_gpu_timer = new Query();
 
 #if EMSCRIPTEN
 		// Chrome/web doesn't support timestamp queries: https://codereview.chromium.org/1800383002
@@ -7985,6 +7992,15 @@ void OpenGLEngine::draw()
 
 		if(fog_post_process_gpu_timer->waitingForResult() && fog_post_process_gpu_timer->checkResultAvailable())
 			last_fog_post_process_GPU_time = fog_post_process_gpu_timer->getTimeElapsed();
+
+		if(draw_splats_gpu_timer->waitingForResult() && draw_splats_gpu_timer->checkResultAvailable())
+			last_draw_splats_GPU_time = draw_splats_gpu_timer->getTimeElapsed();
+
+		if(splat_depth_blit_gpu_timer->waitingForResult() && splat_depth_blit_gpu_timer->checkResultAvailable())
+			last_splat_depth_blit_GPU_time = splat_depth_blit_gpu_timer->getTimeElapsed();
+
+		if(mark_saturated_splats_gpu_timer->waitingForResult() && mark_saturated_splats_gpu_timer->checkResultAvailable())
+			last_mark_saturated_splats_GPU_time = mark_saturated_splats_gpu_timer->getTimeElapsed();
 	}
 
 	if(cur_scene->collect_stats)
@@ -9500,14 +9516,27 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 
 	allocSplatAccumBuffersIfNeeded(scene_target_framebuffer_name);
 
+	// Which of the two nested timers this frame measures - see time_splat_mark_pass_this_frame.
+	time_splat_mark_pass_this_frame = !time_splat_mark_pass_this_frame;
+	const bool time_splat_draw = query_profiling_enabled && current_scene->collect_stats && time_individual_passes && !time_splat_mark_pass_this_frame;
+
 	if(current_scene->splat_accum_depth_renderbuffer.nonNull() && splat_depth_copy_works)
 	{
 		// There was no scene depth renderbuffer to attach to our framebuffer alongside the accumulation buffer, so copy
 		// the scene's depth into one of our own - splats still have to be occluded by the opaque geometry already drawn.
 		// Costs one full-screen depth blit per frame, which is noise next to the fill the splats themselves do.
+		if(query_profiling_enabled && current_scene->collect_stats && time_individual_passes && splat_depth_blit_gpu_timer->isIdle())
+			splat_depth_blit_gpu_timer->beginTimerQuery();
+
 		blitDepthBuffer(scene_target_framebuffer_name, *current_scene->splat_accum_framebuffer, (GLsizei)current_scene->splat_accum_depth_renderbuffer->xRes(),
 			(GLsizei)current_scene->splat_accum_depth_renderbuffer->yRes(), /*check_for_errors=*/false); // Already established at allocation time that the driver accepts this blit.
+
+		if(query_profiling_enabled && splat_depth_blit_gpu_timer->isRunning())
+			splat_depth_blit_gpu_timer->endTimerQuery();
 	}
+
+	if(time_splat_draw && draw_splats_gpu_timer->isIdle())
+		draw_splats_gpu_timer->beginTimerQuery();
 
 	current_scene->splat_accum_framebuffer->bindForDrawing();
 	setSingleDrawBuffer(GL_COLOR_ATTACHMENT0);
@@ -9605,6 +9634,9 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 	glDisable(GL_BLEND);
 
 	resolveSplatAccumBuffer(scene_target_framebuffer_name);
+
+	if(query_profiling_enabled && draw_splats_gpu_timer->isRunning())
+		draw_splats_gpu_timer->endTimerQuery();
 }
 
 
@@ -9828,6 +9860,14 @@ void OpenGLEngine::markSaturatedSplatPixels()
 
 	flushDrawCommandsAndUnbindPrograms(); // Submits the slice just drawn, and drops the cached program binding, since this pass binds one of its own.
 
+	// Only the first mark of the frame is timed - isIdle() is false for the rest - so the number printed is the cost of
+	// one rewrite, not of all of them.  Per-rewrite is the useful form: how many there are is the num_slices knob, and
+	// it is the per-rewrite cost that decides how far that knob can be turned.
+	const bool time_this_mark = query_profiling_enabled && current_scene->collect_stats && time_individual_passes && time_splat_mark_pass_this_frame &&
+		mark_saturated_splats_gpu_timer->isIdle();
+	if(time_this_mark)
+		mark_saturated_splats_gpu_timer->beginTimerQuery();
+
 	//----------------------- Copy the accumulation buffer so it can be read -----------------------
 	blitFrameBuffer(/*src_framebuffer=*/*current_scene->splat_accum_framebuffer, /*dest_framebuffer=*/*current_scene->splat_accum_copy_framebuffer,
 		/*num_buffers_to_copy=*/1, /*copy_buf0_colour=*/true, /*copy_buf0_depth=*/false);
@@ -9864,6 +9904,9 @@ void OpenGLEngine::markSaturatedSplatPixels()
 	glDepthFunc(use_reverse_z ? GL_GREATER : GL_LESS); // Back to the frame's depth func, as draw() sets it - the marked pixels have to fail it.
 	glEnable(GL_DEPTH_TEST);
 	glEnable(GL_BLEND); // The blend func itself was set by drawSplatClouds() and is not disturbed here.
+
+	if(time_this_mark)
+		mark_saturated_splats_gpu_timer->endTimerQuery();
 }
 
 
@@ -13728,6 +13771,9 @@ std::string OpenGLEngine::getDiagnostics() const
 	s += "fog post-process  : " + doubleToStringNSigFigs(last_fog_post_process_GPU_time * 1.0e3, 4) + " ms\n";
 	s += "final imaging     : " + doubleToStringNSigFigs(last_final_imaging_GPU_time * 1.0e3, 4) + " ms\n";
 	s += "overlay obs       : " + doubleToStringNSigFigs(last_draw_overlay_obs_GPU_time * 1.0e3, 4) + " ms\n";
+	s += "splat depth blit  : " + doubleToStringNSigFigs(last_splat_depth_blit_GPU_time * 1.0e3, 4) + " ms\n";
+	s += "draw splats       : " + doubleToStringNSigFigs(last_draw_splats_GPU_time * 1.0e3, 4) + " ms\n";
+	s += "splat sat. mark   : " + doubleToStringNSigFigs(last_mark_saturated_splats_GPU_time * 1.0e3, 4) + " ms (one rewrite)\n";
 	s += "total             : " + doubleToStringNSigFigs(last_total_draw_GPU_time * 1.0e3, 4) + " ms\n";
 	s += "\n";
 

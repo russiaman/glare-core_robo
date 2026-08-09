@@ -1701,6 +1701,20 @@ private:
 	Reference<Query> bloom_gpu_timer;
 	Reference<Query> final_imaging_gpu_timer;
 	Reference<Query> fog_post_process_gpu_timer;
+
+	// The splat pass and the two things that run inside it - see drawSplatClouds().  Timed because the splat pass's cost
+	// was otherwise only reachable as 'total minus the sum of the named passes', and such a subtraction has already
+	// produced a wrong frame breakdown once.
+	Reference<Query> draw_splats_gpu_timer;
+	Reference<Query> splat_depth_blit_gpu_timer;
+	Reference<Query> mark_saturated_splats_gpu_timer;
+
+	// GL_TIME_ELAPSED queries do not nest, and the saturation mark pass runs between the splat draw slices, i.e. inside
+	// the region draw_splats_gpu_timer covers.  So the two are timed on alternate frames, this flag saying which one
+	// this frame is.  Costs each of them half its update rate, which is nothing next to how long a camera sits still
+	// while the numbers are being read.
+	bool time_splat_mark_pass_this_frame;
+
 	Reference<BufferedTimeElapsedQuery> buffered_total_timer;
 	
 	uint32 last_num_prog_changes;
@@ -1732,6 +1746,9 @@ private:
 	double last_bloom_GPU_time;
 	double last_final_imaging_GPU_time;
 	double last_fog_post_process_GPU_time;
+	double last_draw_splats_GPU_time;
+	double last_splat_depth_blit_GPU_time;
+	double last_mark_saturated_splats_GPU_time;
 
 	uint32 last_num_animated_obs_processed;
 

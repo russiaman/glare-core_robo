@@ -105,6 +105,22 @@ void FrameBuffer::attachTexture(OpenGLTexture& tex, GLenum attachment_point)
 }
 
 
+void FrameBuffer::attachTextureMipLevel(OpenGLTexture& tex, GLenum attachment_point, int mip_level)
+{
+#if CHECK_GL_CONTEXT
+	assert(QGLContext::currentContext() == context);
+#endif
+
+	// The size of the level being drawn into, not of the texture: the caller sets the viewport from these.
+	xres = myMax<size_t>(1, tex.xRes() >> mip_level);
+	yres = myMax<size_t>(1, tex.yRes() >> mip_level);
+
+	bindForDrawing();
+
+	glFramebufferTexture2D(GL_FRAMEBUFFER, attachment_point, tex.getTextureTarget(), tex.texture_handle, mip_level);
+}
+
+
 void FrameBuffer::detachTexture(OpenGLTexture& tex, GLenum attachment_point)
 {
 	bindForDrawing(); // Bind this frame buffer

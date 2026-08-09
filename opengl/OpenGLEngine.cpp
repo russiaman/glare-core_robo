@@ -465,6 +465,7 @@ OpenGLEngine::OpenGLEngine(const OpenGLEngineSettings& settings_)
 	splat_accum_buffer_format(OpenGLTextureFormat::Format_RGBA_Linear_Half),
 	splat_accum_gate_available(false),
 	splat_saturation_mask_block(1),
+	splat_saturation_mask_num_levels(1),
 	print_output(NULL),
 	tex_CPU_mem_usage(0),
 	tex_GPU_mem_usage(0),
@@ -9583,19 +9584,27 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 	// somewhere to do the marking between.  Not used in the overdraw debug views: those blend additively, so the
 	// accumulated alpha there is a layer count rather than a coverage and the threshold would mean nothing.
 	const bool use_saturation_gate = splat_renderer->getSaturationGateEnabled() && (num_slices > 1) && !show_overdraw && splat_accum_gate_available &&
-		splat_renderer->getSaturationMaskProgram().nonNull() && splat_renderer->getSaturationMaskProgram()->isBuilt();
+		splat_renderer->getSaturationMaskProgram().nonNull() && splat_renderer->getSaturationMaskProgram()->isBuilt() &&
+		splat_renderer->getMaskReduceProgram().nonNull() && splat_renderer->getMaskReduceProgram()->isBuilt();
 
 	// Tells the splat shader whether to test the mask at all, and how many pixels a texel of it covers.  Set here rather
 	// than in the renderer's think(), since whether the gate runs this frame is decided just above: a shader testing a
 	// mask nobody wrote would be reading whatever the last frame left there.
-	splat_renderer->setSplatMaskBlockSize(use_saturation_gate ? splat_saturation_mask_block : 0);
+	splat_renderer->setSplatMaskBlockSize(use_saturation_gate ? splat_saturation_mask_block : 0, splat_saturation_mask_num_levels - 1);
 
 	if(use_saturation_gate)
 	{
 		// Nothing is finished before the first slice of the frame has been drawn, and the mask still holds the last
 		// frame's answer, which was computed for a different camera.  Cheap - it is a fraction of the viewport.
-		current_scene->splat_saturation_mask_framebuffer->bindForDrawing();
-		glClearBufferfv(GL_COLOR, /*drawBuffer=*/0, col_zero);
+		//
+		// Every level, not just level 0: the first slice is drawn before the first mark, so it tests a pyramid nobody
+		// has written this frame, and a coarse level left over from the previous camera position culls splats that are
+		// not finished at all.  That shows as a strobe, worse the bigger the first slice is.
+		for(int level=0; level<splat_saturation_mask_num_levels; ++level)
+		{
+			current_scene->splat_mask_reduce_framebuffer->attachTextureMipLevel(*current_scene->splat_saturation_mask_texture, GL_COLOR_ATTACHMENT0, level);
+			glClearBufferfv(GL_COLOR, /*drawBuffer=*/0, col_zero);
+		}
 		current_scene->splat_accum_framebuffer->bindForDrawing();
 	}
 
@@ -9831,6 +9840,7 @@ void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffe
 	current_scene->splat_accum_copy_framebuffer     = NULL;
 	current_scene->splat_saturation_mask_texture    = NULL;
 	current_scene->splat_saturation_mask_framebuffer = NULL;
+	current_scene->splat_mask_reduce_framebuffer    = NULL;
 
 	conPrint("Allocating splat accumulation buffer with width " + toString(xres) + " and height " + toString(yres) +
 		", format " + std::string(textureFormatString(splat_accum_format)) + ", MSAA samples " + toString(msaa_samples) +
@@ -9877,18 +9887,28 @@ void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffe
 	if(!current_scene->splat_accum_framebuffer->isComplete())
 		conPrint("Error: splat accumulation framebuffer is not complete.");
 
-	// Single-channel 8-bit: the mask is a yes/no per texel, and the splat shader reads .r.
+	// Single-channel 8-bit: the mask is a yes/no per texel, and the splat shader reads .r.  Mipmapped, but as a pyramid
+	// of minima rather than of averages - built by hand between draw slices, since GL's own mipmap generation averages.
 	current_scene->splat_saturation_mask_texture = new OpenGLTexture(mask_xres, mask_yres, this,
 		ArrayRef<uint8>(), // data
 		OpenGLTextureFormat::Format_Greyscale_Uint8,
-		OpenGLTexture::Filtering_Nearest, // Read with texelFetch(), which ignores filtering, but nearest is what it means.
+		OpenGLTexture::Filtering_Fancy, // Not for the filtering itself - the mask is only ever read with texelFetch, which ignores it - but because OpenGLTexture only allocates storage for the mip levels when the filtering is Fancy.
 		OpenGLTexture::Wrapping_Clamp,
-		false, // has_mipmaps
+		true, // has_mipmaps
 		/*MSAA_samples=*/1
 	);
 
+	// One level per halving, down to a level that is a single texel in its smaller axis - by which point one fetch
+	// answers for a strip of the screen, and no splat's quad is bigger than that.
+	splat_saturation_mask_num_levels = 1;
+	for(size_t s = myMin(mask_xres, mask_yres); s > 1; s /= 2)
+		splat_saturation_mask_num_levels++;
+	splat_saturation_mask_num_levels = myMin(splat_saturation_mask_num_levels, (int)current_scene->splat_saturation_mask_texture->getNumMipMapLevelsAllocated());
+
 	current_scene->splat_saturation_mask_framebuffer = new FrameBuffer();
 	current_scene->splat_saturation_mask_framebuffer->attachTexture(*current_scene->splat_saturation_mask_texture, GL_COLOR_ATTACHMENT0);
+
+	current_scene->splat_mask_reduce_framebuffer = new FrameBuffer(); // Re-attached to a different level for each reduction pass.
 
 	// The gate needs somewhere to put the mask and somewhere to read the accumulated coverage from, and nothing else -
 	// in particular no depth buffer of its own, which is what it used to need.
@@ -9965,9 +9985,39 @@ void OpenGLEngine::markSaturatedSplatPixels()
 	drawElementsBaseVertex(GL_TRIANGLES, (GLsizei)unit_quad_meshdata->batches[0].num_indices, unit_quad_meshdata->getIndexType(),
 		(void*)unit_quad_meshdata->getBatch0IndicesTotalBufferOffset(), unit_quad_meshdata->vbo_handle.base_vertex);
 
+	unbindTextureFromTextureUnit(*current_scene->splat_accum_copy_texture, /*texture_unit_index=*/0); // Otherwise Chrome reports a feedback loop between the framebuffer and the active texture.
+
+	//----------------------- Reduce it up the pyramid, by minimum -----------------------
+	// Each pass reads one level and writes the next, which is only defined if the level being read is the only one the
+	// sampler can see - hence the base/max level pair around each pass.  See gaussian_splat_mask_reduce_frag_shader.glsl.
+	const Reference<OpenGLProgram>& reduce_prog = splat_renderer->getMaskReduceProgram();
+	OpenGLTexture& mask_tex = *current_scene->splat_saturation_mask_texture;
+
+	reduce_prog->useProgram();
+	for(int level=1; level<splat_saturation_mask_num_levels; ++level)
+	{
+		current_scene->splat_mask_reduce_framebuffer->attachTextureMipLevel(mask_tex, GL_COLOR_ATTACHMENT0, level);
+		glViewport(0, 0, (GLsizei)myMax<size_t>(1, mask_tex.xRes() >> level), (GLsizei)myMax<size_t>(1, mask_tex.yRes() >> level));
+
+		bindTextureUnitToSampler(mask_tex, /*texture_unit_index=*/0, /*sampler_uniform_location=*/reduce_prog->albedo_texture_loc);
+		glTexParameteri(mask_tex.getTextureTarget(), GL_TEXTURE_BASE_LEVEL, level - 1);
+		glTexParameteri(mask_tex.getTextureTarget(), GL_TEXTURE_MAX_LEVEL,  level - 1);
+
+		drawElementsBaseVertex(GL_TRIANGLES, (GLsizei)unit_quad_meshdata->batches[0].num_indices, unit_quad_meshdata->getIndexType(),
+			(void*)unit_quad_meshdata->getBatch0IndicesTotalBufferOffset(), unit_quad_meshdata->vbo_handle.base_vertex);
+	}
+
+	// Back to the whole pyramid being visible, which is what the vertex shader picks a level from.
+	if(splat_saturation_mask_num_levels > 1)
+	{
+		bindTextureUnitToSampler(mask_tex, /*texture_unit_index=*/0, /*sampler_uniform_location=*/reduce_prog->albedo_texture_loc);
+		glTexParameteri(mask_tex.getTextureTarget(), GL_TEXTURE_BASE_LEVEL, 0);
+		glTexParameteri(mask_tex.getTextureTarget(), GL_TEXTURE_MAX_LEVEL,  splat_saturation_mask_num_levels - 1);
+	}
+
 	//----------------------- Restore the state the slice draws run in -----------------------
 	OpenGLProgram::useNoPrograms();
-	unbindTextureFromTextureUnit(*current_scene->splat_accum_copy_texture, /*texture_unit_index=*/0); // Otherwise Chrome reports a feedback loop between the framebuffer and the active texture.
+	unbindTextureFromTextureUnit(mask_tex, /*texture_unit_index=*/0);
 
 	current_scene->splat_accum_framebuffer->bindForDrawing();
 	glViewport(0, 0, (GLsizei)current_scene->splat_accum_renderbuffer->xRes(), (GLsizei)current_scene->splat_accum_renderbuffer->yRes());

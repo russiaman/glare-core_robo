@@ -281,6 +281,10 @@ public:
 	// like the splat program itself.
 	const Reference<OpenGLProgram>& getSaturationMaskProgram() const { return saturation_mask_prog; }
 
+	// The program that halves the mask, taking the minimum of each 2x2 block, to build the pyramid the vertex shader
+	// picks a level from. Null until the first addObject(), like the programs above.
+	const Reference<OpenGLProgram>& getMaskReduceProgram() const { return mask_reduce_prog; }
+
 	// Location of the splat program's saturation-mask sampler, or -1 if the program has no such uniform. Resolved on
 	// first use rather than in buildShadersIfNeeded(), since the build may still be in flight there; the draw path only
 	// asks once the program reports isBuilt(). The engine binds the texture itself - the material path has no support
@@ -293,7 +297,7 @@ public:
 	// texel - which is not conservative, and so shows. Set by the draw path each frame rather than by think(), because
 	// whether the gate actually runs is the draw path's decision - and a splat shader that tests a mask nobody wrote
 	// would be reading stale texels.
-	void setSplatMaskBlockSize(int block_size);
+	void setSplatMaskBlockSize(int block_size, int max_level);
 
 	// Sets that program's uniforms from the current getSaturationThreshold(), plus how many accumulation-buffer pixels
 	// across one mask texel covers, which is the caller's since it depends on the size the mask was actually allocated
@@ -356,6 +360,7 @@ private:
 	Reference<OpenGLProgram> shader_prog; // Shared by every cloud.  Null until the first addObject().
 	Reference<OpenGLProgram> resolve_prog; // Resolves the splat accumulation buffer onto the main colour buffer.  Built alongside shader_prog.
 	Reference<OpenGLProgram> saturation_mask_prog; // Marks finished pixels between draw slices.  Built alongside shader_prog.
+	Reference<OpenGLProgram> mask_reduce_prog; // Halves the mask, by minimum, to build its pyramid.  Built alongside shader_prog.
 
 	OpenGLEngine* opengl_engine;
 

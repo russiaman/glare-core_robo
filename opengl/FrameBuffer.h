@@ -38,6 +38,7 @@ public:
 
 	// attachment_point is GL_DEPTH_ATTACHMENT, GL_COLOR_ATTACHMENT0 etc..
 	void attachTexture(OpenGLTexture& tex, GLenum attachment_point);
+	void attachTextureMipLevel(OpenGLTexture& tex, GLenum attachment_point, int mip_level); // As above, but renders into one level of a mipmapped texture - used to build a min-reduction pyramid, see OpenGLEngine::markSaturatedSplatPixels().
 	void detachTexture(OpenGLTexture& tex, GLenum attachment_point); // detach the attached texture
 
 	void attachRenderBuffer(RenderBuffer& render_buffer, GLenum attachment_point);

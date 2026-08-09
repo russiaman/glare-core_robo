@@ -31,6 +31,7 @@ uniform int splat_size_clamp_invert; // 0 (default) = cull outside [min, max] (i
 // its rasterisation and its whole quad's worth of shading with it, not just the blending.
 uniform sampler2D splat_saturation_mask_texture;
 uniform int splat_saturation_mask_block;
+uniform int splat_saturation_mask_max_level; // Coarsest level of the mask's min-pyramid, so that a big quad can be answered with one fetch rather than many.
 
 uniform float splat_alpha_cutoff; // GaussianSplatSettingsWidget, Qt only. Sets the per-splat quad radius to exactly where alpha decays to this value, instead of the fixed 3-sigma bound below - see the derivation where it's used. Default 1/255 matches the fragment shader's own discard threshold exactly (lossless); raising it trims low-opacity splats' quads further, trading a sliver of their faint edge for less overdraw.
 
@@ -161,31 +162,44 @@ void main()
 	// The saturation gate.  Drop the whole splat if every mask texel its quad can touch is already marked finished:
 	// nothing it could contribute would survive the composite.
 	//
-	// Conservative in two ways, both deliberate.  The bound on the quad's half-extent is radius1 + radius2, which is at
-	// least the true per-axis extent of the rotated ellipse's quad, so the texels tested always cover the quad.  And the
-	// test is skipped entirely for a quad spanning more than 2x2 texels, which is what keeps this to four fetches with
-	// no mip pyramid: a bigger quad simply draws, at no cost beyond the fetches.  How big "2x2 texels" is in pixels is
-	// the mask downscale, so that knob now also sets which splats are eligible to be culled.
+	// Conservative throughout, deliberately.  The quad's half-extent is bounded by radius1 + radius2, which is at least
+	// its true extent along either screen axis, so the texels tested always cover the quad; and every level of the mask
+	// holds the *minimum* of its children, so a coarse texel reads as marked only when every pixel under it is finished.
+	// A splat is therefore only ever dropped when it could not have changed a single pixel.
+	//
+	// The level is chosen so that the quad spans at most 2x2 texels there, which is what keeps this to four fetches
+	// whatever the splat's size - a fixed level would either miss the big splats or answer too coarsely for the small
+	// ones.
 	if(splat_saturation_mask_block > 0)
 	{
 		vec2 centre_px = ((clip_pos.xy / clip_pos.w) * 0.5 + 0.5) * viewport_dims_px;
 		float extent_px = radius1 + radius2;
 
 		float block = float(splat_saturation_mask_block);
-		ivec2 lo = ivec2(floor((centre_px - extent_px) / block));
-		ivec2 hi = ivec2(floor((centre_px + extent_px) / block));
 
-		if(all(lessThanEqual(hi - lo, ivec2(1))))
+		// Clamped to the mask before anything else, both because a right shift of a negative value is
+		// implementation-defined in GLSL and because it loses nothing: whatever falls outside the mask is off screen,
+		// and produces no fragments whether this splat is culled or not.
+		ivec2 mask_max = textureSize(splat_saturation_mask_texture, /*mip level=*/0) - ivec2(1);
+		ivec2 lo = clamp(ivec2(floor((centre_px - extent_px) / block)), ivec2(0), mask_max);
+		ivec2 hi = clamp(ivec2(floor((centre_px + extent_px) / block)), ivec2(0), mask_max);
+
+		int level = 0;
+		for(int i=0; i<16; ++i) // Bounded loop rather than a log2: the count is tiny, and this needs no float round-trip.
 		{
-			// Clamped to the mask, which loses nothing: whatever falls outside it is off screen, and produces no
-			// fragments whether this splat is culled or not.
-			ivec2 mask_max = textureSize(splat_saturation_mask_texture, /*mip level=*/0) - ivec2(1);
-			lo = clamp(lo, ivec2(0), mask_max);
-			hi = clamp(hi, ivec2(0), mask_max);
+			if((level >= splat_saturation_mask_max_level) || all(lessThanEqual((hi >> level) - (lo >> level), ivec2(1))))
+				break;
+			level++;
+		}
 
+		ivec2 lo_l = lo >> level;
+		ivec2 hi_l = hi >> level;
+
+		if(all(lessThanEqual(hi_l - lo_l, ivec2(1)))) // False only for a quad too big for even the coarsest level, which then just draws.
+		{
 			float marked = min(
-				min(texelFetch(splat_saturation_mask_texture, ivec2(lo.x, lo.y), 0).r, texelFetch(splat_saturation_mask_texture, ivec2(hi.x, lo.y), 0).r),
-				min(texelFetch(splat_saturation_mask_texture, ivec2(lo.x, hi.y), 0).r, texelFetch(splat_saturation_mask_texture, ivec2(hi.x, hi.y), 0).r));
+				min(texelFetch(splat_saturation_mask_texture, ivec2(lo_l.x, lo_l.y), level).r, texelFetch(splat_saturation_mask_texture, ivec2(hi_l.x, lo_l.y), level).r),
+				min(texelFetch(splat_saturation_mask_texture, ivec2(lo_l.x, hi_l.y), level).r, texelFetch(splat_saturation_mask_texture, ivec2(hi_l.x, hi_l.y), level).r));
 
 			if(marked > 0.5)
 			{

@@ -689,6 +689,7 @@ public:
 	// The saturation gate's mask of finished pixels, usually a fraction of the viewport's resolution - see
 	// OpenGLEngine::markSaturatedSplatPixels(), which writes it, and gaussian_splat_frag_shader.glsl, which reads it.
 	Reference<FrameBuffer> splat_saturation_mask_framebuffer;
+	Reference<FrameBuffer> splat_mask_reduce_framebuffer; // Re-attached to each mask level in turn while the pyramid is built.
 	OpenGLTextureRef splat_saturation_mask_texture;
 
 
@@ -1689,6 +1690,9 @@ private:
 	// Kept rather than recomputed from the two sizes: the mask's is a rounded-up division, so dividing them back gives
 	// the wrong answer whenever the viewport is not a multiple of the block (2786 / ceil(2786/4) is 3, not 4).
 	int splat_saturation_mask_block;
+
+	// How many levels of the mask's min-pyramid exist, level 0 included - see markSaturatedSplatPixels().
+	int splat_saturation_mask_num_levels;
 
 	std::vector<uint32> temp_counts;
 	uint32 num_prog_changes;

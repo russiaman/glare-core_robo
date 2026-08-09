@@ -642,6 +642,7 @@ void GaussianSplatRenderer::buildShadersIfNeeded()
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_alpha_cutoff");
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,  "splat_show_overdraw");
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int, "splat_saturation_mask_block"); // 0 disables the test - see setSplatMaskBlockSize().
+	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int, "splat_saturation_mask_max_level");
 
 
 	// Splats blend into an accumulation buffer of their own rather than straight onto the main colour buffer, so that
@@ -683,6 +684,18 @@ void GaussianSplatRenderer::buildShadersIfNeeded()
 	// what resolves the location once it completes.  Read back by setSaturationMaskUniforms().
 	saturation_mask_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_saturation_threshold");
 	saturation_mask_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "splat_mask_block_size");
+
+
+	// Halves the mask by minimum, once per level, so that the vertex shader can ask about a whole quad's worth of screen
+	// with one fetch - see gaussian_splat_mask_reduce_frag_shader.glsl.  Same full-viewport quad vertex shader again.
+	mask_reduce_prog = new OpenGLProgram(
+		"gaussian splat mask reduce prog",
+		new OpenGLShader(shader_dir + "/gaussian_splat_resolve_vert_shader.glsl", version_directive, key_defs + preprocessor_defines, GL_VERTEX_SHADER),
+		new OpenGLShader(shader_dir + "/gaussian_splat_mask_reduce_frag_shader.glsl", version_directive, key_defs + preprocessor_defines, GL_FRAGMENT_SHADER),
+		opengl_engine->getAndIncrNextProgramIndex(),
+		/*wait_for_build_to_complete=*/!opengl_engine->parallel_shader_compile_support
+	);
+	opengl_engine->addProgram(mask_reduce_prog);
 }
 
 
@@ -697,10 +710,13 @@ int GaussianSplatRenderer::getSplatMaskTexUniformLoc()
 }
 
 
-void GaussianSplatRenderer::setSplatMaskBlockSize(int block_size)
+void GaussianSplatRenderer::setSplatMaskBlockSize(int block_size, int max_level)
 {
 	for(size_t i=0; i<clouds.size(); ++i)
+	{
 		clouds[i]->ob->materials[0].user_uniform_vals[7].intval = block_size;
+		clouds[i]->ob->materials[0].user_uniform_vals[8].intval = max_level;
+	}
 }
 
 
@@ -887,16 +903,19 @@ std::string GaussianSplatRenderer::getDiagnostics() const
 		gate_state = "enabled, but idle - not used in the overdraw views, where accumulated alpha counts layers rather than coverage";
 	else if(!opengl_engine->splat_accum_gate_available)
 		gate_state = "enabled, but UNAVAILABLE - the saturation mask framebuffer could not be built";
-	else if(saturation_mask_prog.isNull() || !saturation_mask_prog->isBuilt())
-		gate_state = "enabled, but idle - mask shader not built yet";
+	else if(saturation_mask_prog.isNull() || !saturation_mask_prog->isBuilt() || mask_reduce_prog.isNull() || !mask_reduce_prog->isBuilt())
+		gate_state = "enabled, but idle - mask shaders not built yet";
 	else
 		gate_state = "on";
 
 	s += "Saturation gate: " + gate_state + ", threshold " + doubleToStringNDecimalPlaces(splat_saturation_threshold, 4) +
 		", mask 1/" + toString(splat_saturation_mask_downscale) + " res";
 	if(opengl_engine->getCurrentScene()->splat_saturation_mask_texture.nonNull())
+		// The pyramid level count is here because a mask with only one level silently stops the vertex-side test from
+		// culling anything bigger than 2x2 texels, which looks exactly like the gate being switched off.
 		s += " (" + toString(opengl_engine->getCurrentScene()->splat_saturation_mask_texture->xRes()) + " x " +
-			toString(opengl_engine->getCurrentScene()->splat_saturation_mask_texture->yRes()) + ")";
+			toString(opengl_engine->getCurrentScene()->splat_saturation_mask_texture->yRes()) + ", " +
+			toString(opengl_engine->getCurrentScene()->splat_saturation_mask_texture->getNumMipMapLevelsAllocated()) + " pyramid levels)";
 	s += "\n";
 
 	// Every live-tunable parameter, printed whether or not it is at its default.  Only the desktop client has a panel to
@@ -1008,7 +1027,7 @@ Reference<SplatCloud> GaussianSplatRenderer::allocCloud()
 	// MATERIAL_ALPHA_BLEND_BITFLAG on the batch, which is how the opaque pass, the depth pre-pass and the shadow passes
 	// know to skip it.  OpenGLEngine::addObject() keys off splat_cloud to put the object in exactly one of the two sets.
 	mat.alpha_blend = true;
-	mat.user_uniform_vals.resize(8); // All but splat_tex_width below are set by think().
+	mat.user_uniform_vals.resize(9); // All but splat_tex_width below are set by think(), or by the draw path for the saturation mask ones.
 	mat.user_uniform_vals[2].intval = (int)splat_tex_width;
 
 	// Build a real (if minimal) texture and VAO up front: adding the object to the engine before it has those would

@@ -9407,6 +9407,31 @@ static bool blitDepthBuffer(GLuint src_framebuffer_name, FrameBuffer& dest_frame
 
 
 /*
+Index of the first splat of draw slice 'slice', of 'num_slices' slices over a cloud of 'num_splats' depth-sorted
+splats, when each slice is 'growth' times the size of the one before it.  growth = 1 gives equal slices.
+
+Called for the start and the end of every slice, rather than returning a size, so that consecutive slices tile
+[0, num_splats) exactly by construction: one slice's end is literally the next one's start, computed by the same
+expression.  A splat that fell into two slices would be blended twice.
+
+The geometric case is written as (r^(i-N) - r^-N) / (1 - r^-N) rather than the equivalent (r^i - 1) / (r^N - 1),
+because only negative exponents appear: r^N overflows to infinity somewhere around N = 1000 with r = 2, which the
+slice count alone can reach, and the honest-looking form then returns inf/inf.  This form is exact at both ends -
+0 at i = 0, 1 at i = N - for any r and N.
+*/
+static int splatSliceBoundary(int num_splats, int slice, int num_slices, float growth)
+{
+	if(growth == 1.f)
+		return (int)(((int64)num_splats * slice) / num_slices); // Integer arithmetic, so the equal-slice case is bit-for-bit what it was before growth existed.
+
+	const double r = growth;
+	const double r_minus_N = std::pow(r, -(double)num_slices);
+	const double frac = (std::pow(r, (double)(slice - num_slices)) - r_minus_N) / (1.0 - r_minus_N);
+	return (int)((double)num_splats * frac + 0.5);
+}
+
+
+/*
 Draws Gaussian splat clouds, front-to-back, compositing them with the "under" operator.
 
 Front-to-back rather than the more usual back-to-front because it is the only order in which a pixel can be known to be
@@ -9509,6 +9534,10 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 	// order (clouds front-to-back, splats front-to-back within each) exactly what it was.
 	const int num_slices = myClamp(splat_renderer->getNumDrawSlices(), 1, 1024);
 
+	// Clamped from below at 1: growth < 1 would make the *first* slice the biggest, which is the opposite of what the
+	// saturation test wants.  The upper bound is where a first slice of one splat is already reached with few slices.
+	const float slice_growth = myClamp(splat_renderer->getSliceGrowth(), 1.f, 16.f);
+
 	// The framebuffer the rest of the frame is being drawn into.  It supplies the depth the splats test against, and the
 	// resolve pass has to composite onto it and leave it bound behind us.
 	const GLuint scene_target_framebuffer_name = (current_scene->render_to_main_render_framebuffer && current_scene->main_render_framebuffer.nonNull()) ? current_scene->main_render_framebuffer->buffer_name :
@@ -9590,11 +9619,10 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 		for(int slice=0; slice<num_slices; ++slice)
 		{
 			// Split by position in the buffer rather than by distance: the sort has already put it in depth order, so an
-			// index split is free, and it also bounds the work per slice, which a distance split would not.  Computed as
-			// two rounded fractions of the total so the slices tile [0, cloud_num_instances) exactly, with no gap or
-			// overlap at the boundaries - a splat drawn twice would be blended twice.
-			const int slice_begin = (int)(((int64)cloud_num_instances *  slice)      / num_slices);
-			const int slice_end   = (int)(((int64)cloud_num_instances * (slice + 1)) / num_slices);
+			// index split is free, and it also bounds the work per slice, which a distance split would not.  Slice sizes
+			// need not be equal - see GaussianSplatRenderer::getSliceGrowth().
+			const int slice_begin = splatSliceBoundary(cloud_num_instances, slice,     num_slices, slice_growth);
+			const int slice_end   = splatSliceBoundary(cloud_num_instances, slice + 1, num_slices, slice_growth);
 			if(slice_end == slice_begin)
 				continue; // Empty slice, i.e. fewer splats in this cloud than slices.
 

@@ -599,7 +599,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	num_traversals_in_flight(0), lod_pixel_scale_limit(1.0f), lod_max_splats_budget(10000000), lod_resort_move_threshold_ws(0.1f),
 	lod_max_layer_density(0.0f), lod_max_tree_depth(0),
 	splat_size_clamp_min(0.0f), splat_size_clamp_max(0.0f), splat_size_clamp_invert(false), splat_alpha_cutoff(1.0f / 255.0f),
-	splat_num_draw_slices(1), splat_saturation_gate_enabled(false), splat_saturation_threshold(1.0f - 1.0f / 255.0f),
+	splat_num_draw_slices(1), splat_slice_growth(1.0f), splat_saturation_gate_enabled(false), splat_saturation_threshold(1.0f - 1.0f / 255.0f),
 	splat_accum_buffer_8bit(false),
 	splat_show_overdraw_mode(0), splat_overdraw_range_min(2.0f), splat_overdraw_range_max(100.0f)
 {}
@@ -854,7 +854,8 @@ std::string GaussianSplatRenderer::getDiagnostics() const
 	s += "Splats drawn last frame: " + uInt64ToStringCommaSeparated(opengl_engine->last_num_splats_drawn) + "\n";
 	// Draw calls rather than slices: a cloud with fewer splats than slices leaves some empty, so the two only agree
 	// when there is something to draw in every one.
-	s += "Draw slices: " + toString(splat_num_draw_slices) + " (" + toString(opengl_engine->last_num_splat_draw_calls) + " draw calls last frame)\n";
+	s += "Draw slices: " + toString(splat_num_draw_slices) + " (" + toString(opengl_engine->last_num_splat_draw_calls) + " draw calls last frame)" +
+		((splat_slice_growth == 1.f) ? std::string(", equal sizes") : (", growth " + doubleToStringNDecimalPlaces(splat_slice_growth, 2) + "x per slice")) + "\n";
 	// Says why it isn't running, not just that it isn't: every reason below leaves the picture correct and the
 	// optimisation silently absent, which is the hardest kind of thing to notice.
 	std::string gate_state;

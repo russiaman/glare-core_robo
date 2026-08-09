@@ -213,6 +213,21 @@ public:
 	int getNumDrawSlices() const { return splat_num_draw_slices; }
 	void setNumDrawSlices(int v) { splat_num_draw_slices = v; }
 
+	// Ratio between the sizes of consecutive draw slices: each slice holds this many times as many splats as the one
+	// before it. 1 (default) makes them all equal, which is what slicing did before this existed.
+	//
+	// Equal slices put the boundaries in the wrong places. Coverage saturates within the first few percent of a
+	// depth-sorted cloud, but with N equal slices the first chance to notice is only after 1/N of it - at N=4, a
+	// quarter of the splats have already been blended before anything can be skipped. The only way to ask early was to
+	// slice finely everywhere and pay for a full-screen pass at every boundary, which is why the measured saving kept
+	// growing all the way to N=32.
+	//
+	// Growth > 1 puts the boundaries where the answer changes: a first slice of a few percent, then progressively
+	// coarser ones over the tail, where saturation is already settled and there is little left to learn. 2.0 with 5
+	// slices gives roughly 3%, 6%, 13%, 26%, 52%.
+	float getSliceGrowth() const { return splat_slice_growth; }
+	void setSliceGrowth(float v) { splat_slice_growth = v; }
+
 	// Whether to reject splats at pixels the composite has already finished with. false (default) draws every slice in
 	// full, so the slice count alone stays a no-op and the two can be compared directly. Needs more than one slice to do
 	// anything, and is ignored in the overdraw debug views, where the blend is additive and the accumulated alpha counts
@@ -356,6 +371,9 @@ private:
 
 	// See getNumDrawSlices() above. Default 1 = one draw per cloud, i.e. no slicing.
 	int splat_num_draw_slices;
+
+	// See getSliceGrowth() above. Default 1 = every slice the same size.
+	float splat_slice_growth;
 
 	// See getSaturationGateEnabled()/getSaturationThreshold() above. Off by default.
 	bool splat_saturation_gate_enabled;

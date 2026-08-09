@@ -17,6 +17,7 @@ Copyright Glare Technologies Limited 2026 -
 #include "VertexBufferAllocator.h"
 #include "../maths/Matrix4f.h"
 #include "../maths/mathstypes.h"
+#include "../maths/vec2.h" // For the screen-space ellipse axes in splatFootprint().
 #include "../utils/ArrayRef.h"
 #include "../utils/BitUtils.h"
 #include "../utils/ConPrint.h"
@@ -31,6 +32,7 @@ Copyright Glare Technologies Limited 2026 -
 #include "../utils/Vector.h"
 #include <algorithm>
 #include <assert.h>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <queue>
@@ -462,10 +464,10 @@ public:
 	// traversal, where the enqueued result is the whole point and nothing wants the per-node breakdown.
 	GaussianSplatLodTraversalTask(uint64 cloud_id_, uint64 topology_generation_, const Reference<GaussianSplatLodTraversalScratch>& scratch_,
 		const Vec4f& cam_pos_ws_, float pixel_scale_limit_, size_t max_splats_budget_, float max_layer_density_, int max_tree_depth_, float focal_px_, ThreadSafeQueue<Reference<ThreadMessage> >* result_queue_,
-		js::Vector<FrontierNodeRecord, 16>* frontier_record_ = NULL)
+		js::Vector<FrontierNodeRecord, 16>* frontier_record_ = NULL, js::Vector<float, 16>* expanded_density_record_ = NULL)
 	:	cloud_id(cloud_id_), topology_generation(topology_generation_), scratch(scratch_), cam_pos_ws(cam_pos_ws_),
 		pixel_scale_limit(pixel_scale_limit_), max_splats_budget(max_splats_budget_), max_layer_density(max_layer_density_), max_tree_depth(max_tree_depth_), focal_px(focal_px_), result_queue(result_queue_),
-		frontier_record(frontier_record_)
+		frontier_record(frontier_record_), expanded_density_record(expanded_density_record_)
 	{}
 
 	virtual void run(size_t /*thread_index*/) override
@@ -547,6 +549,9 @@ public:
 				hit_budget_cap = true;
 				break; // Leave this node, and the rest of the heap, to be drained as-is below - the budget, not convergence, is what stopped things here.
 			}
+
+			if(expanded_density_record != NULL)
+				expanded_density_record->push_back(node.layer_density); // Recorded here, and only here, because this is exactly the set of nodes max_layer_density gets a say over.
 
 			heap.pop();
 			for(uint32 c = node.child_start; c < (uint32)node.child_start + node.child_count; ++c)
@@ -661,6 +666,7 @@ private:
 	float focal_px;
 	ThreadSafeQueue<Reference<ThreadMessage> >* result_queue;
 	js::Vector<FrontierNodeRecord, 16>* frontier_record; // Null (the normal case) means don't record anything - see recordFrontierNode().
+	js::Vector<float, 16>* expanded_density_record; // Null in the normal case too; otherwise collects one layer_density per node the traversal expanded.
 };
 
 
@@ -969,6 +975,277 @@ static size_t childCountBucket(uint32 child_count)
 }
 
 
+// A column-major 3x3, so that the projection below can be a line-by-line transcription of
+// gaussian_splat_vert_shader.glsl rather than a translation into the engine's row-major Matrix3.  The maths here decides
+// how much fill cost the report attributes to each splat, and a silently transposed covariance would produce numbers that
+// look entirely plausible and are wrong - the exact failure mode the measurement rules exist to prevent.
+struct Mat3Cols
+{
+	Vec4f col[3]; // w components are 0 throughout and never read.
+};
+
+static inline Mat3Cols mat3Mul(const Mat3Cols& a, const Mat3Cols& b)
+{
+	Mat3Cols r;
+	for(int j=0; j<3; ++j)
+		r.col[j] = a.col[0] * b.col[j][0] + a.col[1] * b.col[j][1] + a.col[2] * b.col[j][2];
+	return r;
+}
+
+static inline Mat3Cols mat3Transpose(const Mat3Cols& a)
+{
+	Mat3Cols r;
+	for(int j=0; j<3; ++j)
+		r.col[j] = Vec4f(a.col[0][j], a.col[1][j], a.col[2][j], 0.f);
+	return r;
+}
+
+static inline Vec4f mat3MulVec(const Mat3Cols& a, const Vec4f& v)
+{
+	return a.col[0] * v[0] + a.col[1] * v[1] + a.col[2] * v[2];
+}
+
+
+// What one splat costs the rasteriser and the blender at the current camera, worked out the same way the vertex shader
+// does.  Everything is in pixels of the current viewport.
+struct SplatFootprint
+{
+	bool drawn;             // False where the vertex shader would push the quad out of the clip volume outright: behind the near plane, degenerate covariance, or opacity at or below the alpha cutoff.
+	float radius1_px;       // Screen-space semi-axes, after the same clamp the shader applies.
+	float radius2_px;
+	float quad_area_px;     // 4*r1*r2, clipped to the viewport - fragments the rasteriser produces.
+	float ellipse_area_px;  // pi*r1*r2, clipped the same way - the part inside the alpha cutoff, i.e. fragments that survive the fragment shader's discard and reach the blender.  The gap between the two is what an octagonal or otherwise tighter quad could remove.
+
+	// Screen-space ellipse, in the form the software rasteriser below needs: centre, unit axes, and the standard deviation
+	// along each of them (the radii are sigma_cutoff of these).
+	float centre_x_px, centre_y_px;
+	Vec2f axis1, axis2;
+	float sigma1_px, sigma2_px;
+	float opacity;
+
+	// Integral of this splat's alpha over its footprint - what it actually contributes to the composite, and the figure
+	// comparable to the overdraw view's mode 2.
+	//
+	// Not area * opacity: opacity is the value at the centre only, and alpha falls off as a Gaussian from there. Over an
+	// ellipse cut off at k sigma the mean alpha is opacity * 2*(1 - exp(-k^2/2)) / k^2, which at the fixed 3-sigma cap is
+	// 0.22 of the peak and at the k a typical low-opacity splat gets from the alpha cutoff (about 2.15) is 0.39. Using the
+	// peak would overstate the total by between two and five times - enough to make a comparison against the measured
+	// overdraw view agree only after an eyeballed correction, which is not a measurement.
+	float alpha_integral_px;
+};
+
+
+// view_matrix is the engine's OpenGL-convention view matrix (scene->last_view_matrix); the splat's data is already baked
+// into world space, so the shader's model_matrix is the identity here and drops out.
+static SplatFootprint splatFootprint(const Vec3f& pos_ws, const Vec3f& scale, const Vec4f& rotation, float opacity,
+	const Matrix4f& view_matrix, const Vec2f& focal_len_px, const Vec2i& viewport_dims, float alpha_cutoff)
+{
+	SplatFootprint fp;
+	fp.drawn = false;
+	fp.radius1_px = fp.radius2_px = fp.quad_area_px = fp.ellipse_area_px = fp.alpha_integral_px = 0.f;
+
+	const Vec4f pos_vs = view_matrix * Vec4f(pos_ws.x, pos_ws.y, pos_ws.z, 1.f);
+
+	const float depth = -pos_vs[2];
+	const float near_epsilon = 0.1f;
+	if(depth < near_epsilon)
+		return fp;
+
+	const float qx = rotation[0], qy = rotation[1], qz = rotation[2], qw = rotation[3];
+	const Vec4f r_col0(1.f - 2.f*(qy*qy + qz*qz),        2.f*(qx*qy + qz*qw),        2.f*(qx*qz - qy*qw), 0.f);
+	const Vec4f r_col1(       2.f*(qx*qy - qz*qw), 1.f - 2.f*(qx*qx + qz*qz),        2.f*(qy*qz + qx*qw), 0.f);
+	const Vec4f r_col2(       2.f*(qx*qz + qy*qw),        2.f*(qy*qz - qx*qw), 1.f - 2.f*(qx*qx + qy*qy), 0.f);
+
+	Mat3Cols R;   R.col[0] = r_col0; R.col[1] = r_col1; R.col[2] = r_col2;
+	Mat3Cols RS; RS.col[0] = r_col0 * (scale.x*scale.x); RS.col[1] = r_col1 * (scale.y*scale.y); RS.col[2] = r_col2 * (scale.z*scale.z);
+	const Mat3Cols cov_os = mat3Mul(RS, mat3Transpose(R));
+
+	Mat3Cols W;
+	for(int j=0; j<3; ++j)
+	{
+		const Vec4f c = view_matrix.getColumn(j);
+		W.col[j] = Vec4f(c[0], c[1], c[2], 0.f);
+	}
+	const Mat3Cols cov_vs = mat3Mul(mat3Mul(W, cov_os), mat3Transpose(W));
+
+	const float vx = pos_vs[0], vy = pos_vs[1];
+	const Vec4f j_row0(focal_len_px.x / depth, 0.f, focal_len_px.x * vx / (depth*depth), 0.f);
+	const Vec4f j_row1(0.f, focal_len_px.y / depth, focal_len_px.y * vy / (depth*depth), 0.f);
+
+	const Vec4f cov_vs_j0 = mat3MulVec(cov_vs, j_row0);
+	const Vec4f cov_vs_j1 = mat3MulVec(cov_vs, j_row1);
+
+	const float cov2d_a = (j_row0[0]*cov_vs_j0[0] + j_row0[1]*cov_vs_j0[1] + j_row0[2]*cov_vs_j0[2]) + 0.3f;
+	const float cov2d_b =  j_row0[0]*cov_vs_j1[0] + j_row0[1]*cov_vs_j1[1] + j_row0[2]*cov_vs_j1[2];
+	const float cov2d_c = (j_row1[0]*cov_vs_j1[0] + j_row1[1]*cov_vs_j1[1] + j_row1[2]*cov_vs_j1[2]) + 0.3f;
+
+	const float det = cov2d_a * cov2d_c - cov2d_b * cov2d_b;
+	if(det <= 0.f)
+		return fp;
+
+	const float mid = 0.5f * (cov2d_a + cov2d_c);
+	const float half_span = std::sqrt(myMax(mid*mid - det, 0.f));
+	const float lambda1 = mid + half_span;
+	const float lambda2 = myMax(mid - half_span, 0.f);
+
+	Vec2f axis1;
+	if(cov2d_b != 0.f)
+	{
+		axis1 = Vec2f(cov2d_b, lambda1 - cov2d_a);
+		axis1 = normalise(axis1);
+	}
+	else
+		axis1 = (cov2d_a >= cov2d_c) ? Vec2f(1.f, 0.f) : Vec2f(0.f, 1.f);
+	const Vec2f axis2(-axis1.y, axis1.x);
+
+	const float sigma_cutoff = (opacity > alpha_cutoff) ? myMin(std::sqrt(2.f * std::log(opacity / alpha_cutoff)), 3.f) : 0.f;
+	if(sigma_cutoff <= 0.f)
+		return fp; // Invisible even at its centre - the shader makes a degenerate zero-area quad of it.
+
+	const float max_radius_px = 2.f * (float)myMax(viewport_dims.x, viewport_dims.y);
+	const float radius1 = myMin(sigma_cutoff * std::sqrt(lambda1), max_radius_px);
+	const float radius2 = myMin(sigma_cutoff * std::sqrt(lambda2), max_radius_px);
+
+	// Clip to the viewport through the quad's axis-aligned bounding box, and scale the area by how much of that box is on
+	// screen.  Approximate for a rotated quad, but the alternative - a real polygon clip - would be a lot of code for a
+	// correction that only matters at the screen edge, whereas leaving it out entirely would let one near-camera splat
+	// with a quad several screens wide dominate the totals with area that never becomes a fragment.
+	// Screen position straight from view space - screen = focal * (x, y) / depth, centred - rather than through the
+	// projection matrix, which would only be divided back out again.
+	const float centre_x_px = ((focal_len_px.x * vx / depth) + (float)viewport_dims.x * 0.5f);
+	const float centre_y_px = ((focal_len_px.y * vy / depth) + (float)viewport_dims.y * 0.5f);
+	const float ext_x = std::fabs(radius1 * axis1.x) + std::fabs(radius2 * axis2.x);
+	const float ext_y = std::fabs(radius1 * axis1.y) + std::fabs(radius2 * axis2.y);
+
+	const float box_w = 2.f * ext_x, box_h = 2.f * ext_y;
+	const float vis_w = myMax(0.f, myMin(centre_x_px + ext_x, (float)viewport_dims.x) - myMax(centre_x_px - ext_x, 0.f));
+	const float vis_h = myMax(0.f, myMin(centre_y_px + ext_y, (float)viewport_dims.y) - myMax(centre_y_px - ext_y, 0.f));
+	const float visible_fraction = (box_w > 0.f && box_h > 0.f) ? ((vis_w / box_w) * (vis_h / box_h)) : 0.f;
+
+	fp.drawn = true;
+	fp.radius1_px = radius1;
+	fp.radius2_px = radius2;
+	fp.centre_x_px = centre_x_px;
+	fp.centre_y_px = centre_y_px;
+	fp.axis1 = axis1;
+	fp.axis2 = axis2;
+	fp.sigma1_px = radius1 / sigma_cutoff; // The shader builds its conic from the possibly-clamped radii the same way - see its inv_cutoff_sq.
+	fp.sigma2_px = radius2 / sigma_cutoff;
+	fp.opacity = opacity;
+	fp.quad_area_px    = 4.f * radius1 * radius2 * visible_fraction;
+	fp.ellipse_area_px = Maths::pi<float>() * radius1 * radius2 * visible_fraction;
+
+	// See alpha_integral_px's comment for the 2*(1 - exp(-k^2/2)) / k^2 factor.
+	const float k_sq = sigma_cutoff * sigma_cutoff;
+	const float mean_alpha_fraction = 2.f * (1.f - std::exp(-0.5f * k_sq)) / k_sq;
+	fp.alpha_integral_px = fp.ellipse_area_px * opacity * mean_alpha_fraction;
+	return fp;
+}
+
+
+// Bucket boundaries for the part of the report that asks not "how many splats" but "where does the fill actually come
+// from".  All geometric, because every one of these quantities spans orders of magnitude in a real capture.
+static const size_t num_area_buckets = 10;
+static const char* const area_bucket_labels[num_area_buckets] = { "< 16 px", "16 - 64", "64 - 256", "256 - 1K", "1K - 4K", "4K - 16K", "16K - 64K", "64K - 256K", "256K - 1M", "1M +" };
+static size_t areaBucket(float area_px)
+{
+	if(area_px < 16.f)      return 0;
+	if(area_px < 64.f)      return 1;
+	if(area_px < 256.f)     return 2;
+	if(area_px < 1024.f)    return 3;
+	if(area_px < 4096.f)    return 4;
+	if(area_px < 16384.f)   return 5;
+	if(area_px < 65536.f)   return 6;
+	if(area_px < 262144.f)  return 7;
+	if(area_px < 1048576.f) return 8;
+	return 9;
+}
+
+static const size_t num_opacity_buckets = 8;
+static const char* const opacity_bucket_labels[num_opacity_buckets] = { "0 - 0.02", "0.02 - 0.05", "0.05 - 0.1", "0.1 - 0.2", "0.2 - 0.4", "0.4 - 0.6", "0.6 - 0.8", "0.8 - 1.0" };
+static size_t opacityBucket(float opacity)
+{
+	if(opacity < 0.02f) return 0;
+	if(opacity < 0.05f) return 1;
+	if(opacity < 0.1f)  return 2;
+	if(opacity < 0.2f)  return 3;
+	if(opacity < 0.4f)  return 4;
+	if(opacity < 0.6f)  return 5;
+	if(opacity < 0.8f)  return 6;
+	return 7;
+}
+
+// Smallest scale axis over the largest.  Near 0 is a flat disc or a needle - which is what a 3DGS optimiser fits to a flat
+// surface, and what a coplanar merge would have to work with; near 1 is a blob.
+static const size_t num_flatness_buckets = 7;
+static const char* const flatness_bucket_labels[num_flatness_buckets] = { "< 0.02 (very flat)", "0.02 - 0.05", "0.05 - 0.1", "0.1 - 0.2", "0.2 - 0.4", "0.4 - 0.7", "0.7 - 1.0 (blob)" };
+static size_t flatnessBucket(float ratio)
+{
+	if(ratio < 0.02f) return 0;
+	if(ratio < 0.05f) return 1;
+	if(ratio < 0.1f)  return 2;
+	if(ratio < 0.2f)  return 3;
+	if(ratio < 0.4f)  return 4;
+	if(ratio < 0.7f)  return 5;
+	return 6;
+}
+
+// Distance from the camera, in metres.  Here to answer "is the fill coming from the wall in front of me or from
+// everything behind it", which is the question a single-room interior capture actually poses.
+static const size_t num_distance_buckets = 9;
+static const char* const distance_bucket_labels[num_distance_buckets] = { "< 1 m", "1 - 2", "2 - 4", "4 - 8", "8 - 16", "16 - 32", "32 - 64", "64 - 128", "128 m +" };
+static size_t distanceBucket(float dist)
+{
+	if(dist < 1.f)   return 0;
+	if(dist < 2.f)   return 1;
+	if(dist < 4.f)   return 2;
+	if(dist < 8.f)   return 3;
+	if(dist < 16.f)  return 4;
+	if(dist < 32.f)  return 5;
+	if(dist < 64.f)  return 6;
+	if(dist < 128.f) return 7;
+	return 8;
+}
+
+
+// As histogramLines(), but for the buckets where the count is the less interesting of the two numbers: a bucket holding
+// 1% of the splats and 60% of the fill is the whole point of this half of the report, and a count-only histogram hides
+// exactly that.  The bar tracks the area share, not the count.
+static std::string weightedHistogramLines(const std::string& indent, const std::vector<std::string>& labels, const std::vector<size_t>& counts, const std::vector<double>& areas)
+{
+	assert(labels.size() == counts.size() && labels.size() == areas.size());
+
+	size_t total_count = 0;
+	double total_area = 0, largest_area = 0;
+	for(size_t i=0; i<counts.size(); ++i)
+	{
+		total_count += counts[i];
+		total_area += areas[i];
+		largest_area = myMax(largest_area, areas[i]);
+	}
+	if(total_count == 0)
+		return indent + "(empty)\n";
+
+	size_t label_w = 0;
+	for(size_t i=0; i<labels.size(); ++i)
+		label_w = myMax(label_w, labels[i].size());
+
+	const size_t max_bar_chars = 40;
+
+	std::string s;
+	for(size_t i=0; i<counts.size(); ++i)
+	{
+		const size_t bar_len = (largest_area > 0) ? (size_t)((areas[i] * (double)max_bar_chars) / largest_area) : 0;
+		s += indent + rightSpacePad(labels[i], (unsigned int)label_w) + "  " +
+			leftPad(uInt64ToStringCommaSeparated(counts[i]), ' ', 13) + " splats " +
+			leftPad(doubleToStringNDecimalPlaces(100.0 * (double)counts[i] / (double)total_count, 1), ' ', 5) + "%   fill " +
+			leftPad(doubleToStringNDecimalPlaces((total_area > 0) ? (100.0 * areas[i] / total_area) : 0.0, 1), ' ', 5) + "%  " +
+			std::string(bar_len, '#') + "\n";
+	}
+	return s;
+}
+
+
 static const char* const stop_reason_labels[FrontierStop_NumReasons] =
 {
 	"leaf (finest detail there is)",
@@ -1026,6 +1303,7 @@ std::string GaussianSplatRenderer::getFrustumStructureReport()
 
 	// World-wide roll-up, accumulated across the clouds below.
 	size_t world_frontier = 0, world_frontier_in_frustum = 0, world_leaves_in_frustum = 0, world_frontier_leaves_in_frustum = 0;
+	double world_quad_area = 0, world_ellipse_area = 0;
 	size_t world_reason_counts[FrontierStop_NumReasons];
 	for(size_t i=0; i<FrontierStop_NumReasons; ++i)
 		world_reason_counts[i] = 0;
@@ -1080,13 +1358,15 @@ std::string GaussianSplatRenderer::getFrustumStructureReport()
 
 		js::Vector<FrontierNodeRecord, 16> frontier;
 		frontier.reserve(cloud.total_splats);
+		js::Vector<float, 16> expanded_density;
 
 		// Null result queue: this frontier is for reading, not for drawing - see the task's own comment there.
 		GaussianSplatLodTraversalTask task(cloud.cloud_id, cloud.topology_generation, scratch, cam_pos_ws,
-			lod_pixel_scale_limit, lod_max_splats_budget, lod_max_layer_density, lod_max_tree_depth, focal_px, /*result_queue=*/NULL, &frontier);
+			lod_pixel_scale_limit, lod_max_splats_budget, lod_max_layer_density, lod_max_tree_depth, focal_px, /*result_queue=*/NULL, &frontier, &expanded_density);
 		task.run(0);
 
-		free_traversal_scratch.push_back(scratch); // Back to the pool before anything below can early-out.
+		// Not returned to the pool yet: the pruning ceiling below walks scratch->selected_indices, which is the frontier in
+		// the front-to-back order the draw actually uses, and which the frontier records deliberately don't preserve.
 
 		//----------------------------- Structure of the trees themselves -----------------------------
 		// Independent of the camera: what the hierarchy offers, against which the frontier below says what was taken.
@@ -1243,6 +1523,294 @@ std::string GaussianSplatRenderer::getFrustumStructureReport()
 			s += histogramLines("    ", labels, density_hist);
 		}
 
+		// The frontier's own densities can't answer whether max_layer_density has anything to bite on, because a leaf's is
+		// 0 by definition and the frontier is mostly leaves.  What the cap acts on is the nodes the traversal chose to
+		// expand, so those are counted separately.
+		s += "\n  Nodes the traversal expanded, by layer_density (what max_layer_density would act on):\n";
+		{
+			std::vector<size_t> expanded_hist(num_density_buckets, 0);
+			for(size_t i=0; i<expanded_density.size(); ++i)
+				expanded_hist[densityBucket(expanded_density[i])]++;
+			std::vector<std::string> labels(num_density_buckets);
+			for(size_t i=0; i<num_density_buckets; ++i)
+				labels[i] = density_bucket_labels[i];
+			s += histogramLines("    ", labels, expanded_hist);
+		}
+
+		//----------------------------- Where the fill actually comes from -----------------------------
+		// The half of the report that matters once the hierarchy has been shown to be fully unfolded: the cost of this pass
+		// is bytes blended, which is area, not splat count.  Every figure below is the vertex shader's own projection,
+		// recomputed here - see splatFootprint().
+		{
+			const Vec2f focal_len_px((float)viewport_dims.x * scene->lens_sensor_dist / scene->use_sensor_width,
+				(float)viewport_dims.y * scene->lens_sensor_dist / scene->use_sensor_height);
+			const double viewport_px = (double)viewport_dims.x * (double)viewport_dims.y;
+
+			double total_quad_area = 0, total_ellipse_area = 0, total_alpha_area = 0;
+			size_t culled_by_shader = 0;
+
+			std::vector<size_t> area_counts(num_area_buckets, 0), opacity_counts(num_opacity_buckets, 0),
+				flatness_counts(num_flatness_buckets, 0), distance_counts(num_distance_buckets, 0);
+			std::vector<double> area_areas(num_area_buckets, 0), opacity_areas(num_opacity_buckets, 0),
+				flatness_areas(num_flatness_buckets, 0), distance_areas(num_distance_buckets, 0);
+
+			for(size_t i=0; i<frontier.size(); ++i)
+			{
+				const uint32 idx = frontier[i].cloud_idx;
+				const Vec3f& p = cloud.positions[idx];
+				if(!pointInFrustum(frustum_clip_planes, num_frustum_clip_planes, Vec4f(p.x, p.y, p.z, 1.f)))
+					continue;
+
+				const Vec3f& sc = cloud.scales[idx];
+				const float opacity = cloud.colours[idx][3];
+
+				const SplatFootprint fp = splatFootprint(p, sc, cloud.rotations[idx], opacity, scene->last_view_matrix,
+					focal_len_px, viewport_dims, splat_alpha_cutoff);
+				if(!fp.drawn)
+				{
+					culled_by_shader++;
+					continue;
+				}
+
+				total_quad_area    += fp.quad_area_px;
+				total_ellipse_area += fp.ellipse_area_px;
+				total_alpha_area   += fp.alpha_integral_px;
+
+				// Bucketed by the ellipse area, since that is the part that reaches the blender, and weighted by it too.
+				const size_t ab = areaBucket(fp.ellipse_area_px);
+				area_counts[ab]++; area_areas[ab] += fp.ellipse_area_px;
+
+				const size_t ob = opacityBucket(opacity);
+				opacity_counts[ob]++; opacity_areas[ob] += fp.ellipse_area_px;
+
+				const float s_max = myMax(sc.x, myMax(sc.y, sc.z));
+				const float s_min = myMin(sc.x, myMin(sc.y, sc.z));
+				const size_t fb = flatnessBucket((s_max > 0.f) ? (s_min / s_max) : 1.f);
+				flatness_counts[fb]++; flatness_areas[fb] += fp.ellipse_area_px;
+
+				const size_t db = distanceBucket(cam_pos_ws.getDist(Vec4f(p.x, p.y, p.z, 1.f)));
+				distance_counts[db]++; distance_areas[db] += fp.ellipse_area_px;
+			}
+
+			s += "\n  In-frustum frontier, screen coverage (vertex shader's own projection, clipped to the viewport):\n";
+			s += "    Quads rasterised:      " + leftPad(uInt64ToStringCommaSeparated((uint64)total_quad_area), ' ', 16) + " px = " +
+				leftPad(doubleToStringNDecimalPlaces(total_quad_area / viewport_px, 1), ' ', 8) + " layers per viewport pixel\n";
+			s += "    Of that, blended:      " + leftPad(uInt64ToStringCommaSeparated((uint64)total_ellipse_area), ' ', 16) + " px = " +
+				leftPad(doubleToStringNDecimalPlaces(total_ellipse_area / viewport_px, 1), ' ', 8) + " layers per viewport pixel  (the rest dies on the fragment shader's discard)\n";
+			s += "    Sum of alpha:          " + leftPad(uInt64ToStringCommaSeparated((uint64)total_alpha_area), ' ', 16) + "    = " +
+				leftPad(doubleToStringNDecimalPlaces(total_alpha_area / viewport_px, 2), ' ', 8) + " per viewport pixel       (compare the overdraw view's mode 2)\n";
+			// The quantity the whole saturation argument turns on: a pixel is finished after ln(1 - threshold)/ln(1 - a)
+			// layers, so this says how deep into a depth-sorted stack the composite stops being able to change.
+			const double mean_alpha = (total_ellipse_area > 0) ? (total_alpha_area / total_ellipse_area) : 0.0;
+			s += "    Mean alpha per blended fragment: " + doubleToStringNDecimalPlaces(mean_alpha, 4);
+			if(mean_alpha > 0 && mean_alpha < 1)
+				s += " - a pixel reaches coverage " + doubleToStringNDecimalPlaces(splat_saturation_threshold, 4) + " after " +
+					doubleToStringNDecimalPlaces(std::log(1.0 - splat_saturation_threshold) / std::log(1.0 - mean_alpha), 0) + " layers, against " +
+					doubleToStringNDecimalPlaces(total_ellipse_area / viewport_px, 0) + " drawn on an average pixel\n";
+			else
+				s += "\n";
+			s += "    Culled by the shader before rasterising: " + uInt64ToStringCommaSeparated(culled_by_shader) +
+				" (behind the near plane, degenerate, or opacity at or below alpha_cutoff " + doubleToStringNDecimalPlaces(splat_alpha_cutoff, 4) + ")\n";
+			s += "    Note these are viewport-wide averages: the splats occupy part of the screen, so the dense regions the\n";
+			s += "    overdraw view shows in red are several times these numbers.\n";
+
+			s += "\n  Fill by splat size (blended area of one splat):\n";
+			{
+				std::vector<std::string> labels(num_area_buckets);
+				for(size_t i=0; i<num_area_buckets; ++i) labels[i] = area_bucket_labels[i];
+				s += weightedHistogramLines("    ", labels, area_counts, area_areas);
+			}
+
+			s += "\n  Fill by opacity (the blur-splat signature is fill concentrated in the low buckets):\n";
+			{
+				std::vector<std::string> labels(num_opacity_buckets);
+				for(size_t i=0; i<num_opacity_buckets; ++i) labels[i] = opacity_bucket_labels[i];
+				s += weightedHistogramLines("    ", labels, opacity_counts, opacity_areas);
+			}
+
+			s += "\n  Fill by flatness (smallest scale axis over largest):\n";
+			{
+				std::vector<std::string> labels(num_flatness_buckets);
+				for(size_t i=0; i<num_flatness_buckets; ++i) labels[i] = flatness_bucket_labels[i];
+				s += weightedHistogramLines("    ", labels, flatness_counts, flatness_areas);
+			}
+
+			s += "\n  Fill by distance from the camera:\n";
+			{
+				std::vector<std::string> labels(num_distance_buckets);
+				for(size_t i=0; i<num_distance_buckets; ++i) labels[i] = distance_bucket_labels[i];
+				s += weightedHistogramLines("    ", labels, distance_counts, distance_areas);
+			}
+
+			world_quad_area += total_quad_area;
+			world_ellipse_area += total_ellipse_area;
+
+			//----------------------------- The ceiling on pruning by importance -----------------------------
+			// The histograms above say where the fill is; this says how much of it is doing nothing.
+			//
+			// Composites the frontier in the order it is actually drawn - scratch->selected_indices, nearest first - into a
+			// low-resolution transmittance buffer, and charges each splat with what it actually adds to the image:
+			// sum over the pixels it covers of alpha * (transmittance still remaining in front of it).  A splat behind a
+			// region the composite has already finished with scores zero however large and however opaque it is.
+			//
+			// This is the ceiling, not a plan: it is measured from one camera, and a splat invisible from here may be the
+			// front layer from somewhere else, which is exactly why the published methods sample many viewpoints.  What it
+			// answers is whether pruning by importance is worth building at all, before any of that machinery exists - and
+			// it produces the per-splat importance that machinery would need, so the measurement is also the first piece of
+			// it rather than scaffolding to be thrown away.
+			//
+			// A software rasteriser rather than a GPU pass because the numbers wanted are per splat, which on the GPU needs
+			// atomics that WebGL2 does not have; at an eighth of the resolution the whole thing is a few tens of millions of
+			// operations, and the answer wanted is a ratio, which the resolution does not move.
+			{
+				const int downscale = 8;
+				const int lo_w = myMax(1, (viewport_dims.x + downscale - 1) / downscale);
+				const int lo_h = myMax(1, (viewport_dims.y + downscale - 1) / downscale);
+				const float lo_scale = 1.f / (float)downscale;
+
+				js::Vector<float, 16> transmittance(lo_w * lo_h);
+				for(size_t i=0; i<transmittance.size(); ++i)
+					transmittance[i] = 1.f;
+
+				// One entry per in-frustum selected splat.  Splats outside the frustum are composited too - they occlude
+				// what is behind them - but are left out of the curve, since their score here says nothing about their
+				// worth from a camera that can see them.
+				struct PruneCandidate
+				{
+					float contribution; // Alpha it actually added to the image, in low-res pixel units.
+					float fill;         // Full-res pixels it blends, i.e. what dropping it would save.
+				};
+				js::Vector<PruneCandidate, 16> candidates;
+				candidates.reserve(frontier_in_frustum);
+
+				double total_contribution = 0, hidden_fill = 0;
+				size_t hidden_count = 0;
+
+				const js::Vector<uint32, 16>& draw_order = scratch->selected_indices;
+				for(size_t i=0; i<draw_order.size(); ++i)
+				{
+					const uint32 idx = draw_order[i];
+					const Vec3f& p = cloud.positions[idx];
+					const SplatFootprint fp = splatFootprint(p, cloud.scales[idx], cloud.rotations[idx], cloud.colours[idx][3],
+						scene->last_view_matrix, focal_len_px, viewport_dims, splat_alpha_cutoff);
+					if(!fp.drawn)
+						continue;
+
+					// Axis-aligned bound of the ellipse, in low-res pixels.
+					const float ext_x = std::fabs(fp.radius1_px * fp.axis1.x) + std::fabs(fp.radius2_px * fp.axis2.x);
+					const float ext_y = std::fabs(fp.radius1_px * fp.axis1.y) + std::fabs(fp.radius2_px * fp.axis2.y);
+					const int x0 = myMax(0, (int)std::floor((fp.centre_x_px - ext_x) * lo_scale));
+					const int x1 = myMin(lo_w - 1, (int)std::ceil((fp.centre_x_px + ext_x) * lo_scale));
+					const int y0 = myMax(0, (int)std::floor((fp.centre_y_px - ext_y) * lo_scale));
+					const int y1 = myMin(lo_h - 1, (int)std::ceil((fp.centre_y_px + ext_y) * lo_scale));
+
+					const float inv_s1_sq = 1.f / myMax(fp.sigma1_px * fp.sigma1_px, 1.0e-8f);
+					const float inv_s2_sq = 1.f / myMax(fp.sigma2_px * fp.sigma2_px, 1.0e-8f);
+
+					float contribution = 0;
+					for(int y=y0; y<=y1; ++y)
+					{
+						const float py = ((float)y + 0.5f) * (float)downscale;
+						for(int x=x0; x<=x1; ++x)
+						{
+							float& T = transmittance[y * lo_w + x];
+							if(T < 1.0e-3f)
+								continue; // Finished pixel - nothing here can change it, which is the whole point of the measurement.
+
+							const float px = ((float)x + 0.5f) * (float)downscale;
+							const float dx = px - fp.centre_x_px, dy = py - fp.centre_y_px;
+							const float u = dx * fp.axis1.x + dy * fp.axis1.y;
+							const float v = dx * fp.axis2.x + dy * fp.axis2.y;
+							const float exponent = 0.5f * (u*u*inv_s1_sq + v*v*inv_s2_sq);
+							if(exponent > 8.f)
+								continue; // Beyond about 4 sigma; also past the quad the shader would have drawn.
+
+							const float alpha = fp.opacity * std::exp(-exponent);
+							if(alpha < splat_alpha_cutoff)
+								continue; // The fragment shader discards these, so they cost no blend and add nothing.
+
+							contribution += alpha * T;
+							T *= (1.f - alpha);
+						}
+					}
+
+					if(!pointInFrustum(frustum_clip_planes, num_frustum_clip_planes, Vec4f(p.x, p.y, p.z, 1.f)))
+						continue;
+
+					PruneCandidate cand;
+					cand.contribution = contribution;
+					cand.fill = fp.ellipse_area_px;
+					candidates.push_back(cand);
+					total_contribution += contribution;
+					if(contribution <= 0.f)
+					{
+						hidden_count++;
+						hidden_fill += fp.ellipse_area_px;
+					}
+				}
+
+				s += "\n  Pruning ceiling, measured from this camera only (software composite at 1/" + toString(downscale) +
+					" resolution, " + toString(lo_w) + " x " + toString(lo_h) + "):\n";
+
+				// Self-check on the software rasteriser, without which none of the figures below may be believed.  Every
+				// unit of contribution is one unit of coverage taken from a pixel that had it, so the total is the covered
+				// area of the composite - which for a capture filling the view must come out near the pixel count.  A
+				// rasteriser that is silently missing its splats, or placing them off screen, reports a few percent here
+				// while every other number in this section still looks entirely reasonable.
+				{
+					double final_coverage = 0;
+					for(size_t i=0; i<transmittance.size(); ++i)
+						final_coverage += 1.0 - transmittance[i];
+					s += "    Self-check: composite covered " + doubleToStringNDecimalPlaces(100.0 * final_coverage / (double)(lo_w * lo_h), 1) +
+						"% of the low-res buffer (should be close to how much of the screen the cloud visibly fills; a few percent means this pass is broken)\n";
+				}
+
+				s += "    Splats that add nothing at all (entirely behind finished pixels): " + uInt64ToStringCommaSeparated(hidden_count) +
+					" = " + doubleToStringNDecimalPlaces(100.0 * (double)hidden_count / (double)myMax((size_t)1, candidates.size()), 1) + "% of them, carrying " +
+					doubleToStringNDecimalPlaces((total_ellipse_area > 0) ? (100.0 * hidden_fill / total_ellipse_area) : 0.0, 1) + "% of the fill\n";
+
+				// Ordered by contribution per pixel of fill, not by contribution: the question is what to drop for the least
+				// damage per unit of work saved, and a large faint splat and a small bright one are not comparable on
+				// contribution alone.
+				struct PruneCandidateLess
+				{
+					inline bool operator () (const PruneCandidate& a, const PruneCandidate& b) const
+					{
+						return (a.contribution * b.fill) < (b.contribution * a.fill); // a.contribution/a.fill < b.contribution/b.fill, without dividing by a fill that could be 0.
+					}
+				};
+				std::sort(candidates.data(), candidates.data() + candidates.size(), PruneCandidateLess());
+
+				const double energy_targets[] = { 0.001, 0.0025, 0.005, 0.01, 0.02, 0.05, 0.1 };
+				const size_t num_energy_targets = staticArrayNumElems(energy_targets);
+
+				s += "    Dropping the least useful splats first, by contribution per pixel of fill:\n";
+				s += "      image energy lost |   splats dropped   |  fill removed\n";
+				{
+					size_t ci = 0;
+					double lost = 0, fill_removed = 0;
+					for(size_t t=0; t<num_energy_targets; ++t)
+					{
+						const double budget = energy_targets[t] * total_contribution;
+						while(ci < candidates.size() && (lost + candidates[ci].contribution) <= budget)
+						{
+							lost += candidates[ci].contribution;
+							fill_removed += candidates[ci].fill;
+							ci++;
+						}
+						s += "      " + leftPad(doubleToStringNDecimalPlaces(energy_targets[t] * 100.0, 2), ' ', 16) + "% | " +
+							leftPad(uInt64ToStringCommaSeparated(ci), ' ', 11) + " " +
+							leftPad(doubleToStringNDecimalPlaces(100.0 * (double)ci / (double)myMax((size_t)1, candidates.size()), 1), ' ', 5) + "% | " +
+							leftPad(doubleToStringNDecimalPlaces((total_ellipse_area > 0) ? (100.0 * fill_removed / total_ellipse_area) : 0.0, 1), ' ', 8) + "%\n";
+					}
+				}
+				s += "    A splat scored here from one camera may be the front layer from another, so this bounds what\n";
+				s += "    pruning could win, and does not license dropping these particular splats.\n";
+			}
+		}
+
+		free_traversal_scratch.push_back(scratch); // Everything that needed the traversal's own buffers is done with them.
+
 		world_frontier += frontier.size();
 		world_frontier_in_frustum += frontier_in_frustum;
 		world_leaves_in_frustum += leaves_in_frustum;
@@ -1259,6 +1827,8 @@ std::string GaussianSplatRenderer::getFrustumStructureReport()
 			uInt64ToStringCommaSeparated(world_frontier_leaves_in_frustum) + " leaves\n";
 		s += "  Leaves in frustum " + uInt64ToStringCommaSeparated(world_leaves_in_frustum) + " = " +
 			doubleToStringNDecimalPlaces(100.0 * (double)world_frontier_in_frustum / (double)myMax((size_t)1, world_leaves_in_frustum), 1) + "% unfolded\n";
+		s += "  Fill: " + uInt64ToStringCommaSeparated((uint64)world_quad_area) + " px rasterised, " +
+			uInt64ToStringCommaSeparated((uint64)world_ellipse_area) + " px blended\n";
 		std::vector<std::string> labels(FrontierStop_NumReasons);
 		std::vector<size_t> counts(FrontierStop_NumReasons);
 		for(size_t i=0; i<FrontierStop_NumReasons; ++i)

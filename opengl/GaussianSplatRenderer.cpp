@@ -1234,99 +1234,8 @@ struct MergeLeaf
 };
 
 
-// Which of a fixed set of directions a normal points along, and the canonical direction of each bucket.  Bucketing the
-// direction first is what lets the position be measured in a frame the whole group agrees on: every splat facing roughly
-// the same way gets the same frame, so "how far apart along the surface" and "how far apart through it" mean the same
-// thing for all of them.  Cube-face parametrisation, dir_bins steps across each face.
-// How many steps across a cube face give roughly the wanted angular tolerance: a step of 2/bins in face coordinates
-// subtends about atan(2/bins) at the centre of the face.  Clamped so that a very loose tolerance still leaves the six
-// faces distinguishable, and a very tight one cannot explode the bucket count.
-static int dirBinsForAngle(float angle_deg)
-{
-	const float t = std::tan(myMax(angle_deg, 1.f) * Maths::pi<float>() / 180.f);
-	return myClamp((int)(2.f / myMax(t, 1.0e-4f) + 0.5f), 1, 16);
-}
-
-static int normalDirBucket(const Vec4f& n, int dir_bins)
-{
-	int a = 0;
-	float m = std::fabs(n[0]);
-	if(std::fabs(n[1]) > m) { a = 1; m = std::fabs(n[1]); }
-	if(std::fabs(n[2]) > m) { a = 2; m = std::fabs(n[2]); }
-	const int b1 = (a + 1) % 3, b2 = (a + 2) % 3;
-	const float u = n[b1] / myMax(m, 1.0e-8f), v = n[b2] / myMax(m, 1.0e-8f);
-	const int iu = myClamp((int)std::floor((u * 0.5f + 0.5f) * dir_bins), 0, dir_bins - 1);
-	const int iv = myClamp((int)std::floor((v * 0.5f + 0.5f) * dir_bins), 0, dir_bins - 1);
-	return (a * dir_bins + iu) * dir_bins + iv;
-}
-
-static Vec4f normaliseVec3(const Vec4f& v)
-{
-	const float len = std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
-	const float inv = (len > 1.0e-12f) ? (1.f / len) : 0.f;
-	return Vec4f(v[0]*inv, v[1]*inv, v[2]*inv, 0.f);
-}
-
-static Vec4f cross3(const Vec4f& a, const Vec4f& b)
-{
-	return Vec4f(a[1]*b[2] - a[2]*b[1], a[2]*b[0] - a[0]*b[2], a[0]*b[1] - a[1]*b[0], 0.f);
-}
-
-// The frame every splat in one direction bucket measures its position in: w through the surface, u and v across it.
-static void dirBucketFrame(int bucket, int dir_bins, Vec4f& w_out, Vec4f& u_out, Vec4f& v_out)
-{
-	const int iv = bucket % dir_bins; bucket /= dir_bins;
-	const int iu = bucket % dir_bins; bucket /= dir_bins;
-	const int a = bucket;
-	const int b1 = (a + 1) % 3, b2 = (a + 2) % 3;
-	float c[3];
-	c[a]  = 1.f;
-	c[b1] = (((float)iu + 0.5f) / (float)dir_bins) * 2.f - 1.f;
-	c[b2] = (((float)iv + 0.5f) / (float)dir_bins) * 2.f - 1.f;
-
-	const Vec4f w = normaliseVec3(Vec4f(c[0], c[1], c[2], 0.f));
-	// Helper axis chosen as the one w leans on least, so the cross product is never near-degenerate.
-	const float ax = std::fabs(w[0]), ay = std::fabs(w[1]), az = std::fabs(w[2]);
-	const Vec4f helper = (ax <= ay && ax <= az) ? Vec4f(1,0,0,0) : ((ay <= az) ? Vec4f(0,1,0,0) : Vec4f(0,0,1,0));
-	const Vec4f u = normaliseVec3(cross3(w, helper));
-	w_out = w;
-	u_out = u;
-	v_out = cross3(w, u);
-}
-
-
-// What identifies a group of splats as "the same surface, seen several times over": facing the same way, at the same
-// place along that facing, in the same patch of surface, and the same colour.  The cell is deliberately not a cube - a
-// stack of splats on a wall is thin through the wall and spread out along it, and a cube cannot say that.
-struct MergeKey
-{
-	int32 cx, cy, cz;  // cz is depth through the surface, cx and cy are across it - see dirBucketFrame().
-	int32 dir_bucket;  // Which way the surface faces, or 0 when facing is being ignored.
-	int32 r, g, b;     // Colour, quantised at the caller's tolerance.
-
-	inline bool operator == (const MergeKey& o) const
-	{
-		return cx == o.cx && cy == o.cy && cz == o.cz && dir_bucket == o.dir_bucket && r == o.r && g == o.g && b == o.b;
-	}
-};
-
-struct MergeKeyHash
-{
-	inline size_t operator () (const MergeKey& k) const
-	{
-		uint64 h = 1469598103934665603ull;
-		const int32 vals[7] = { k.cx, k.cy, k.cz, k.dir_bucket, k.r, k.g, k.b };
-		for(int i=0; i<7; ++i)
-		{
-			h ^= (uint64)(uint32)vals[i];
-			h *= 1099511628211ull;
-		}
-		return (size_t)h;
-	}
-};
-
-
-// What a group of near-duplicate splats becomes once collapsed.
+// What a group of near-duplicate splats becomes once collapsed.  The group is grown outwards from a seed splat (see the
+// grouping loop), so every quantity here is measured against that seed rather than against a cell it happened to land in.
 struct MergeGroup
 {
 	uint32 count;
@@ -1335,11 +1244,11 @@ struct MergeGroup
 	float nearest_dist;                 // Nearest member, so the group's on-screen size is taken at its largest.
 	float transmittance;                // Product of (1 - opacity) over the members, i.e. what the stack lets through.
 
-	// How far apart the members actually sit across the surface, which is what the replacement has to be widened by.
-	// Measured rather than taken as the cell width: a group whose members happen to sit almost on top of each other costs
-	// nothing to cover, and charging it the full cell width was what made the first version of this measurement report a
-	// loss at every setting.
-	float min_u, max_u, min_v, max_v;
+	// How far the furthest member sits from the seed across the surface, which is what the replacement has to be widened
+	// by.  Measured rather than taken as the reach: a group whose members happen to sit almost on top of each other costs
+	// nothing to cover, and charging it the full reach was what made the first version of this measurement report a loss
+	// at every setting.
+	float max_lateral_m;
 };
 
 
@@ -2065,120 +1974,170 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 					}
 				}
 
-				// Each leaf's direction bucket and its position in that bucket's shared frame, worked out once so the sweep
-				// only has to divide by the cell sizes.
-				const int dir_bins = dirBinsForAngle(merge_angle_tol_deg);
-				js::Vector<int32, 16> leaf_dir_bucket(leaves.size());
-				js::Vector<Vec3f, 16> leaf_frame_pos(leaves.size()); // (across, across, through the surface)
+				// Seed order: biggest splat first.  The replacement is sized to the largest member, so growing a group
+				// outwards from that member is what keeps the replacement as small as the group allows.  Seeding in
+				// arbitrary order instead lets a small splat claim a big neighbour and then have to grow to cover it.
+				js::Vector<uint32, 16> seed_order(leaves.size());
+				for(size_t i=0; i<leaves.size(); ++i)
+					seed_order[i] = (uint32)i;
 				{
-					const int num_dir_buckets = 3 * dir_bins * dir_bins;
-					std::vector<Vec4f> frame_w(num_dir_buckets), frame_u(num_dir_buckets), frame_v(num_dir_buckets);
-					for(int b=0; b<num_dir_buckets; ++b)
-						dirBucketFrame(b, dir_bins, frame_w[b], frame_u[b], frame_v[b]);
-
-					for(size_t i=0; i<leaves.size(); ++i)
+					struct FillDesc
 					{
-						const int b = normalDirBucket(leaves[i].normal_ws, dir_bins);
-						leaf_dir_bucket[i] = b;
-						const Vec3f& p = leaves[i].pos_ws;
-						leaf_frame_pos[i] = Vec3f(
-							p.x*frame_u[b][0] + p.y*frame_u[b][1] + p.z*frame_u[b][2],
-							p.x*frame_v[b][0] + p.y*frame_v[b][1] + p.z*frame_v[b][2],
-							p.x*frame_w[b][0] + p.y*frame_w[b][1] + p.z*frame_w[b][2]);
-					}
+						const MergeLeaf* leaves;
+						inline bool operator () (uint32 a, uint32 b) const { return leaves[a].fill_px > leaves[b].fill_px; }
+					};
+					FillDesc pred; pred.leaves = leaves.data();
+					std::sort(seed_order.data(), seed_order.data() + seed_order.size(), pred);
 				}
 
 				s += "\n  Merge ceiling for near-duplicate splats, over the " + uInt64ToStringCommaSeparated(leaves.size()) +
 					" original splats in frustum (" + uInt64ToStringCommaSeparated((uint64)leaves_fill) + " px of fill):\n";
-				s += "    A group is splats facing the same way (to " + doubleToStringNDecimalPlaces(merge_angle_tol_deg, 0) +
-					" degrees, giving " + toString(3 * dir_bins * dir_bins) + " facing buckets), within 'through' of\n";
-				s += "    each other along that facing, within 'across' of each other along the surface, and matching in\n";
-				s += "    colour to within " + doubleToStringNDecimalPlaces(merge_colour_tol, 3) + " per channel.\n";
-				s += "    The replacement is the largest member widened by the group's own measured spread across the\n";
-				s += "    surface - never by the cell width, and never by the group's depth, which is what it collapses.\n";
+				s += "    A group is grown outwards from a seed splat, largest first: every member is within 'through' of\n";
+				s += "    the seed along the seed's own facing, within 'across' of it along the surface, faces the same way\n";
+				s += "    to within " + doubleToStringNDecimalPlaces(merge_angle_tol_deg, 0) + " degrees, and matches its colour to within " +
+					doubleToStringNDecimalPlaces(merge_colour_tol, 3) + " per channel.\n";
+				s += "    Every test is an honest distance or angle against the seed.  An earlier version of this table\n";
+				s += "    quantised all six coordinates and grouped by equal keys instead, which split a real group\n";
+				s += "    whenever its members straddled any one of those edges - the diagnostic below is what caught it.\n";
+				s += "    The replacement is the largest member widened by how far the furthest member actually sits from\n";
+				s += "    the seed across the surface - never by the reach, and never by the group's depth, which is what\n";
+				s += "    it collapses.\n";
 				s += "      through across | appearance |        groups   per group |     fill after   saved | opaque groups\n";
 
 				const float through_m[] = { 0.01f, 0.02f, 0.02f, 0.02f, 0.05f, 0.02f };
 				const float across_m[]  = { 0.05f, 0.05f, 0.10f, 0.20f, 0.20f, 0.10f };
 				const bool respect_appearance[] = { true, true, true, true, true, false }; // Last row deliberately ignores colour and facing - an upper bound that merges things which do not look alike, to say what the safety conditions cost.
 				const size_t num_merge_settings = staticArrayNumElems(through_m);
-				const float inv_colour_tol = 1.f / myMax(merge_colour_tol, 1.0e-4f);
+
+				// One uniform grid per setting, as a per-cell singly linked list - compact, and no per-cell allocation.
+				// Reused storage across the settings sweep, since only the cell size changes.
+				std::unordered_map<uint64, uint32> group_cell_head;
+				js::Vector<uint32, 16> group_next_in_cell(leaves.size());
+				js::Vector<uint8, 16> assigned(leaves.size());
 
 				for(size_t setting=0; setting<num_merge_settings; ++setting)
 				{
 					const float through = through_m[setting], across = across_m[setting];
-					const float inv_through = 1.f / through, inv_across = 1.f / across;
 					const bool respect = respect_appearance[setting];
+					const float cos_tol = std::cos(merge_angle_tol_deg * Maths::pi<float>() / 180.f);
 
-					std::unordered_map<MergeKey, MergeGroup, MergeKeyHash> groups;
-					groups.reserve(leaves.size());
+					// The 27 cells around a seed cover everything within one cell side of it along each axis, so the cell
+					// has to be at least the longest the reach can be: the reach is a disc of radius 'across' with
+					// 'through' of thickness either side, whose furthest point is sqrt(across^2 + through^2) away.  Taking
+					// max(through, across) instead quietly loses the neighbours out at the rim of the thick settings.
+					const float cell = std::sqrt(across*across + through*through);
+					const float inv_cell = 1.f / cell;
 
+					group_cell_head.clear();
+					group_cell_head.reserve(leaves.size());
 					for(size_t i=0; i<leaves.size(); ++i)
 					{
-						const MergeLeaf& leaf = leaves[i];
-						const Vec3f& frame_pos = leaf_frame_pos[i];
-
-						MergeKey key;
-						key.cx = (int32)std::floor(frame_pos.x * inv_across);
-						key.cy = (int32)std::floor(frame_pos.y * inv_across);
-						key.cz = (int32)std::floor(frame_pos.z * inv_through);
-						if(respect)
-						{
-							key.dir_bucket = leaf_dir_bucket[i];
-							key.r = (int32)std::floor(leaf.r * inv_colour_tol);
-							key.g = (int32)std::floor(leaf.g * inv_colour_tol);
-							key.b = (int32)std::floor(leaf.b * inv_colour_tol);
-						}
-						else
-						{
-							key.dir_bucket = 0;
-							key.r = key.g = key.b = 0;
-						}
-
-						std::unordered_map<MergeKey, MergeGroup, MergeKeyHash>::iterator it = groups.find(key);
-						if(it == groups.end())
-						{
-							MergeGroup g;
-							g.count = 1;
-							g.sum_fill_px = leaf.fill_px;
-							g.max_radius1_px = leaf.radius1_px;
-							g.max_radius2_px = leaf.radius2_px;
-							g.nearest_dist = leaf.dist_to_cam;
-							g.transmittance = 1.f - myMin(leaf.opacity, 1.f);
-							g.min_u = g.max_u = frame_pos.x;
-							g.min_v = g.max_v = frame_pos.y;
-							groups.insert(std::make_pair(key, g));
-						}
-						else
-						{
-							MergeGroup& g = it->second;
-							g.count++;
-							g.sum_fill_px += leaf.fill_px;
-							g.max_radius1_px = myMax(g.max_radius1_px, leaf.radius1_px);
-							g.max_radius2_px = myMax(g.max_radius2_px, leaf.radius2_px);
-							g.nearest_dist = myMin(g.nearest_dist, leaf.dist_to_cam);
-							g.transmittance *= (1.f - myMin(leaf.opacity, 1.f));
-							g.min_u = myMin(g.min_u, frame_pos.x); g.max_u = myMax(g.max_u, frame_pos.x);
-							g.min_v = myMin(g.min_v, frame_pos.y); g.max_v = myMax(g.max_v, frame_pos.y);
-						}
+						assigned[i] = 0;
+						const int32 cx = (int32)std::floor(leaves[i].pos_ws.x * inv_cell);
+						const int32 cy = (int32)std::floor(leaves[i].pos_ws.y * inv_cell);
+						const int32 cz = (int32)std::floor(leaves[i].pos_ws.z * inv_cell);
+						const uint64 key = ((uint64)(uint32)cx * 73856093ull) ^ ((uint64)(uint32)cy * 19349663ull) ^ ((uint64)(uint32)cz * 83492791ull);
+						std::unordered_map<uint64, uint32>::iterator it = group_cell_head.find(key);
+						group_next_in_cell[i] = (it == group_cell_head.end()) ? 0xFFFFFFFFu : it->second;
+						group_cell_head[key] = (uint32)i;
 					}
 
 					double fill_after = 0;
-					size_t opaque_groups = 0;
-					for(std::unordered_map<MergeKey, MergeGroup, MergeKeyHash>::const_iterator it = groups.begin(); it != groups.end(); ++it)
+					size_t num_groups = 0, opaque_groups = 0;
+
+					for(size_t si=0; si<seed_order.size(); ++si)
 					{
-						const MergeGroup& g = it->second;
+						const uint32 seed_i = seed_order[si];
+						if(assigned[seed_i])
+							continue;
+						assigned[seed_i] = 1;
+
+						const MergeLeaf& seed = leaves[seed_i];
+
+						MergeGroup g;
+						g.count = 1;
+						g.sum_fill_px = seed.fill_px;
+						g.max_radius1_px = seed.radius1_px;
+						g.max_radius2_px = seed.radius2_px;
+						g.nearest_dist = seed.dist_to_cam;
+						g.transmittance = 1.f - myMin(seed.opacity, 1.f);
+						g.max_lateral_m = 0.f;
+
+						const int32 bx = (int32)std::floor(seed.pos_ws.x * inv_cell);
+						const int32 by = (int32)std::floor(seed.pos_ws.y * inv_cell);
+						const int32 bz = (int32)std::floor(seed.pos_ws.z * inv_cell);
+
+						for(int dz=-1; dz<=1; ++dz)
+						for(int dy=-1; dy<=1; ++dy)
+						for(int dx=-1; dx<=1; ++dx)
+						{
+							const uint64 key = ((uint64)(uint32)(bx+dx) * 73856093ull) ^ ((uint64)(uint32)(by+dy) * 19349663ull) ^ ((uint64)(uint32)(bz+dz) * 83492791ull);
+							std::unordered_map<uint64, uint32>::iterator it = group_cell_head.find(key);
+							if(it == group_cell_head.end())
+								continue;
+
+							// Walk the cell, unlinking members that have already been taken.  Without this the later
+							// seeds re-walk the whole cloud and the sweep goes quadratic on a dense capture.
+							uint32 prev = 0xFFFFFFFFu;
+							uint32 j = it->second;
+							while(j != 0xFFFFFFFFu)
+							{
+								const uint32 next = group_next_in_cell[j];
+								if(assigned[j])
+								{
+									if(prev == 0xFFFFFFFFu) it->second = next; else group_next_in_cell[prev] = next;
+									j = next;
+									continue;
+								}
+
+								const MergeLeaf& b = leaves[j];
+								const float dx_ws = b.pos_ws.x - seed.pos_ws.x, dy_ws = b.pos_ws.y - seed.pos_ws.y, dz_ws = b.pos_ws.z - seed.pos_ws.z;
+								const float along = dx_ws*seed.normal_ws[0] + dy_ws*seed.normal_ws[1] + dz_ws*seed.normal_ws[2];
+								const float lat_sq = myMax(0.f, (dx_ws*dx_ws + dy_ws*dy_ws + dz_ws*dz_ws) - along*along);
+
+								bool take = (std::fabs(along) <= through) && (lat_sq <= across * across);
+								if(take && respect)
+								{
+									// Absolute dot: a disc has no front and back, so opposite normals are the same facing.
+									if(std::fabs(seed.normal_ws[0]*b.normal_ws[0] + seed.normal_ws[1]*b.normal_ws[1] + seed.normal_ws[2]*b.normal_ws[2]) < cos_tol)
+										take = false;
+									else if(!(std::fabs(seed.r - b.r) <= merge_colour_tol && std::fabs(seed.g - b.g) <= merge_colour_tol && std::fabs(seed.b - b.b) <= merge_colour_tol))
+										take = false;
+								}
+
+								if(take)
+								{
+									assigned[j] = 1;
+									g.count++;
+									g.sum_fill_px += b.fill_px;
+									g.max_radius1_px = myMax(g.max_radius1_px, b.radius1_px);
+									g.max_radius2_px = myMax(g.max_radius2_px, b.radius2_px);
+									g.nearest_dist = myMin(g.nearest_dist, b.dist_to_cam);
+									g.transmittance *= (1.f - myMin(b.opacity, 1.f));
+									g.max_lateral_m = myMax(g.max_lateral_m, std::sqrt(lat_sq));
+
+									if(prev == 0xFFFFFFFFu) it->second = next; else group_next_in_cell[prev] = next;
+									j = next;
+									continue;
+								}
+
+								prev = j;
+								j = next;
+							}
+						}
+
+						num_groups++;
+
 						if(g.count == 1)
 						{
 							fill_after += g.sum_fill_px; // Nothing to merge with, so it is drawn exactly as before.
 							continue;
 						}
 
-						// The replacement covers the largest member, widened by how far apart the members actually sit
-						// across the surface - measured, not the cell width, and not their depth, which is the whole point
-						// of collapsing them. Taken at the nearest member's distance, where the spread looks biggest.
-						const float spread_m = 0.5f * myMax(g.max_u - g.min_u, g.max_v - g.min_v);
-						const float spread_px = spread_m * (focal_len_px.x + focal_len_px.y) * 0.5f / myMax(g.nearest_dist, 0.01f);
+						// The replacement covers the largest member, widened by how far the furthest member actually sits
+						// from the seed across the surface - measured, not the reach, and not their depth, which is the
+						// whole point of collapsing them. Taken at the nearest member's distance, where it looks biggest.
+						const float spread_px = g.max_lateral_m * (focal_len_px.x + focal_len_px.y) * 0.5f / myMax(g.nearest_dist, 0.01f);
 						const float r1 = g.max_radius1_px + spread_px;
 						const float r2 = g.max_radius2_px + spread_px;
 						fill_after += Maths::pi<float>() * r1 * r2;
@@ -2190,18 +2149,21 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 					s += "      " + leftPad(doubleToStringNDecimalPlaces(through * 100.0, 0), ' ', 4) + " cm " +
 						leftPad(doubleToStringNDecimalPlaces(across * 100.0, 0), ' ', 4) + " cm | " +
 						rightSpacePad(respect ? "respected" : "IGNORED", 10) + " | " +
-						leftPad(uInt64ToStringCommaSeparated(groups.size()), ' ', 13) + " " +
-						leftPad(doubleToStringNDecimalPlaces((double)leaves.size() / (double)myMax((size_t)1, groups.size()), 2), ' ', 9) + " | " +
+						leftPad(uInt64ToStringCommaSeparated(num_groups), ' ', 13) + " " +
+						leftPad(doubleToStringNDecimalPlaces((double)leaves.size() / (double)myMax((size_t)1, num_groups), 2), ' ', 9) + " | " +
 						leftPad(uInt64ToStringCommaSeparated((uint64)fill_after), ' ', 14) + " " +
 						leftPad(doubleToStringNDecimalPlaces((leaves_fill > 0) ? (100.0 * (1.0 - fill_after / leaves_fill)) : 0.0, 1), ' ', 5) + "% | " +
 						leftPad(uInt64ToStringCommaSeparated(opaque_groups), ' ', 12) + "\n";
 				}
 
 				//----------------------------- Why the groups come out the size they do -----------------------------
-				// Bucketing splits a real group whenever its members straddle a bucket edge, so a small group count cannot
-				// on its own tell "this cloud has no duplicates" from "my buckets cut them up".  This asks the same
-				// question without buckets: take a sample of splats, find their true neighbours by distance, and see how
-				// many survive each condition in turn.
+				// An independent count of the same neighbourhood, arrived at a different way: rather than clustering the
+				// whole cloud, take a sample of splats and count each one's true neighbours directly, seeing how many
+				// survive each condition in turn.  The grouping above consumes its members, so a group of N there needs
+				// about N-1 here; a large figure here beside small groups above means the grouping is losing them.
+				//
+				// This is what caught the version of the grouping that quantised six coordinates and matched equal keys:
+				// 28 neighbours here against groups of 1.19 there.  It stays as the standing cross-check.
 				{
 					const float diag_through = 0.02f, diag_across = 0.10f;
 					const float cos_tol = std::cos(merge_angle_tol_deg * Maths::pi<float>() / 180.f); // The same tolerance the buckets above use, applied honestly as an angle rather than as a bucket edge.
@@ -2282,8 +2244,9 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 						doubleToStringNDecimalPlaces((sum_near > 0) ? (100.0 * sum_facing / sum_near) : 0.0, 1) + "% of them)\n";
 					s += "      and colour matches too:    " + leftPad(doubleToStringNDecimalPlaces(sum_colour * inv_n, 2), ' ', 9) + "  (" +
 						doubleToStringNDecimalPlaces((sum_facing > 0) ? (100.0 * sum_colour / sum_facing) : 0.0, 1) + "% of those)\n";
-					s += "      A group of N in the table needs about N-1 here to be real. A large figure here beside small\n";
-					s += "      groups above would mean the bucketing is splitting them, not that the cloud lacks them.\n";
+					s += "      A group of N in the '2 cm 10 cm respected' row above needs about N-1 here to be real, and the\n";
+					s += "      'IGNORED' row's N-1 should track 'neighbours in reach'. A large figure here beside small\n";
+					s += "      groups above means the grouping is losing them, not that the cloud lacks them.\n";
 				}
 			}
 		}

@@ -164,14 +164,24 @@ public:
 	//
 	// Runs one full traversal per cloud synchronously, on the main thread, with the current camera and the current live
 	// parameters (the per-frame frontier isn't kept on the CPU to read back), so it costs a visible hitch on a large cloud
-	// - meant for a button click, never per frame. Changes no renderer state: the traversal's result is read and dropped,
-	// not applied.
+	// - meant for a button click, never per frame. The traversal's result is read and dropped, not applied.
+	//
+	// One deliberate exception to "changes no renderer state": each run folds its per-splat importance into a running
+	// record on the cloud, so that the pruning ceiling - a single-camera figure by construction, since a splat hidden from
+	// here may be the front layer from there - can also be reported over every viewpoint visited so far. Accumulating on
+	// the button press rather than continuously is what keeps the set of viewpoints a deliberate choice. Cleared by
+	// resetImportanceAccumulator(), and thrown away by itself if the cloud's node numbering changes underneath it.
 	// merge_colour_tol and merge_angle_tol_deg govern only the merge section: how alike two splats' colours and facings
 	// have to be before the report is willing to call them the same surface seen twice. They are arguments rather than
 	// renderer state because nothing outside the report reads them, and the point of them is to be swept - the honest
 	// tolerance and a deliberately reckless one, so the gap between the two says how much of the merge prize the safety
 	// conditions are costing. Defaults are a tenth per colour channel and 26 degrees.
 	std::string getFrustumStructureReport(float merge_colour_tol = 0.1f, float merge_angle_tol_deg = 26.f);
+
+	// Throws away the per-splat importance getFrustumStructureReport() has accumulated, so the next run starts a fresh set
+	// of viewpoints. Needed because the record is only meaningful for viewpoints chosen on purpose: a stray report taken
+	// while walking through a wall would mark a swathe of the cloud as mattering and quietly raise the floor for good.
+	void resetImportanceAccumulator();
 
 	// Forces every cloud's LoD frontier to be recomputed on the next think()/kickOffTraversals(), bypassing the normal
 	// camera-movement threshold - for GaussianSplatSettingsWidget's live traversal parameters (pixel_scale_limit,

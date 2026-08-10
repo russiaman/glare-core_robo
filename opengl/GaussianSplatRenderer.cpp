@@ -79,7 +79,8 @@ public:
 	:	cloud_id(0), gpu_capacity_splats(0), total_splats(0), structure_generation(0), sort_in_flight(false),
 		have_last_sort_cam_pos(false), last_sort_cam_pos_ws(0.f), aabb_ws(js::AABBox::emptyAABBox()), added_to_engine(false),
 		topology_generation(0), traversal_in_flight(false), have_last_traversal_cam_pos(false), last_traversal_cam_pos_ws(0.f),
-		last_traversal_kicked_topology_generation(0), last_traversal_hit_budget_cap(false), last_traversal_hit_density_cap(false), last_traversal_hit_depth_cap(false)
+		last_traversal_kicked_topology_generation(0), last_traversal_hit_budget_cap(false), last_traversal_hit_density_cap(false), last_traversal_hit_depth_cap(false),
+		importance_topology_generation(0), importance_num_views(0)
 	{}
 
 	uint64 cloud_id; // Stable, never reused.  Sort results carry it, so a result for a cloud that has since been merged away can be dropped.
@@ -117,6 +118,19 @@ public:
 	bool last_traversal_hit_budget_cap; // Copied from the most recently applied traversal result's GaussianSplatLodTraversalScratch::hit_budget_cap (which itself doesn't persist - the scratch goes back to the pool) - surfaced in getDiagnostics() as a "detail is being truncated by the budget" warning.
 	bool last_traversal_hit_density_cap; // As above, for GaussianSplatLodTraversalScratch::hit_density_cap.
 	bool last_traversal_hit_depth_cap; // As above, for GaussianSplatLodTraversalScratch::hit_depth_cap.
+
+	// Per-splat importance, accumulated across getFrustumStructureReport() runs so that "does this splat matter from
+	// anywhere?" can be asked of several viewpoints instead of one.  The pruning ceiling in that report is a single-camera
+	// figure by construction - a splat hidden from here is the front layer from there - and until these existed there was
+	// no way to tell the two apart.  Indexed by the same cloud-global splat index as positions/scales/colours.
+	//
+	// Allocated on the first report rather than with the cloud: 12 bytes a splat is 36 MB on a three-million-splat capture,
+	// and a session that never opens the report should not pay it.
+	js::Vector<float, 16> importance_best_contribution; // Most this splat ever added to an image, over the recorded views.
+	js::Vector<float, 16> importance_sum_fill;          // Summed fill over the views that drew it, so a mean can be taken.
+	js::Vector<uint32, 16> importance_views_drawn;      // How many recorded views drew it at all.
+	uint64 importance_topology_generation;              // topology_generation the arrays were sized for; a mismatch means the indices no longer mean the same splats, so they are thrown away.
+	size_t importance_num_views;                        // How many reports have been folded in.  0 = nothing accumulated yet.
 };
 
 
@@ -895,6 +909,20 @@ void GaussianSplatRenderer::forceTraversalRefresh()
 {
 	for(size_t i=0; i<clouds.size(); ++i)
 		clouds[i]->have_last_traversal_cam_pos = false; // Makes kickOffTraversals() treat every cloud as unconditionally overdue, the same way a cloud that has never been traversed is - see its ratio computation.
+}
+
+
+void GaussianSplatRenderer::resetImportanceAccumulator()
+{
+	for(size_t i=0; i<clouds.size(); ++i)
+	{
+		// Freed rather than zeroed: the arrays are tens of megabytes on a large capture, and the next report reallocates
+		// them anyway when it finds them the wrong size.
+		clouds[i]->importance_best_contribution.clearAndFreeMem();
+		clouds[i]->importance_sum_fill.clearAndFreeMem();
+		clouds[i]->importance_views_drawn.clearAndFreeMem();
+		clouds[i]->importance_num_views = 0;
+	}
 }
 
 
@@ -1795,6 +1823,25 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 				double total_contribution = 0, hidden_fill = 0;
 				size_t hidden_count = 0;
 
+				// Fold this view into the cloud's running per-view record - see SplatCloud::importance_best_contribution.
+				// Thrown away rather than reconciled when the cloud's node numbering has changed underneath it, since the
+				// indices would silently refer to different splats.
+				if(cloud.importance_best_contribution.size() != cloud.total_splats || cloud.importance_topology_generation != cloud.topology_generation)
+				{
+					cloud.importance_best_contribution.resizeNoCopy(cloud.total_splats);
+					cloud.importance_sum_fill.resizeNoCopy(cloud.total_splats);
+					cloud.importance_views_drawn.resizeNoCopy(cloud.total_splats);
+					for(size_t i=0; i<cloud.total_splats; ++i)
+					{
+						cloud.importance_best_contribution[i] = 0.f;
+						cloud.importance_sum_fill[i] = 0.f;
+						cloud.importance_views_drawn[i] = 0;
+					}
+					cloud.importance_topology_generation = cloud.topology_generation;
+					cloud.importance_num_views = 0;
+				}
+				cloud.importance_num_views++;
+
 				const js::Vector<uint32, 16>& draw_order = scratch->selected_indices;
 				for(size_t i=0; i<draw_order.size(); ++i)
 				{
@@ -1842,6 +1889,12 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 							T *= (1.f - alpha);
 						}
 					}
+
+					// Recorded before the in-frustum test below, not after: a splat whose centre is off screen can still
+					// paint pixels, and "did it ever matter" has to count that as mattering.
+					cloud.importance_best_contribution[idx] = myMax(cloud.importance_best_contribution[idx], contribution);
+					cloud.importance_sum_fill[idx] += fp.ellipse_area_px;
+					cloud.importance_views_drawn[idx]++;
 
 					if(!pointInFrustum(frustum_clip_planes, num_frustum_clip_planes, Vec4f(p.x, p.y, p.z, 1.f)))
 						continue;
@@ -1915,6 +1968,125 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 				}
 				s += "    A splat scored here from one camera may be the front layer from another, so this bounds what\n";
 				s += "    pruning could win, and does not license dropping these particular splats.\n";
+			}
+
+			//------------------------- The same ceiling, over every viewpoint recorded so far -------------------------
+			// What the section above cannot answer on its own.  Each run of this report folds its composite into the
+			// cloud's running record, so after visiting a handful of viewpoints the question becomes "which splats earned
+			// nothing from *any* of them", which is the figure an offline pruner would actually act on.
+			//
+			// Kept separate from the single-camera section rather than replacing it: the single-camera numbers are what
+			// the fill measurements above are consistent with, and they stay comparable between sessions.
+			{
+				s += "\n  Importance accumulated over " + toString(cloud.importance_num_views) +
+					((cloud.importance_num_views == 1) ? " report run" : " report runs") + " (this one included; \"Reset importance\" clears it):\n";
+
+				if(cloud.importance_num_views < 2)
+					s += "    One run only, so this says nothing the section above does not. Move the camera and run it again.\n";
+				else
+					s += "    Runs, not distinct viewpoints - the merge tolerances do not touch the composite, so a second run\n"
+						 "    from the same spot to sweep them adds nothing here but is counted. One run per viewpoint is enough.\n";
+
+				// Over leaves, not frontier nodes: merging is an operation on the cloud, and a merged stand-in is LoD
+				// scaffolding rather than something an offline pass would ever delete.
+				size_t num_leaves = 0, never_drawn = 0, drawn_but_dead = 0;
+				double dead_mean_fill = 0, total_mean_fill = 0, total_best = 0;
+
+				struct MultiViewCandidate
+				{
+					float best;      // Best contribution over the recorded views.
+					float mean_fill; // Mean fill over the views that drew it, i.e. what dropping it saves on a typical one.
+				};
+				js::Vector<MultiViewCandidate, 16> mv_candidates;
+				mv_candidates.reserve(cloud.total_splats);
+
+				for(size_t m=0; m<cloud.members.size(); ++m)
+				{
+					const std::vector<GaussianSplatLodNode>& tree = cloud.members[m].splat_data->lod_tree;
+					const size_t member_offset = cloud.members[m].offset;
+					const size_t n = tree.empty() ? cloud.members[m].count : tree.size();
+					for(size_t i=0; i<n; ++i)
+					{
+						if(!tree.empty() && tree[i].child_count != 0)
+							continue; // Merged stand-in, not an original splat.
+
+						const uint32 idx = (uint32)(member_offset + i);
+						num_leaves++;
+
+						const uint32 views = cloud.importance_views_drawn[idx];
+						if(views == 0)
+						{
+							never_drawn++;
+							continue; // No fill recorded either, so it contributes nothing to the mean-fill totals.
+						}
+
+						const float mean_fill = cloud.importance_sum_fill[idx] / (float)views;
+						const float best = cloud.importance_best_contribution[idx];
+						total_mean_fill += mean_fill;
+						total_best += best;
+						if(best <= 0.f)
+						{
+							drawn_but_dead++;
+							dead_mean_fill += mean_fill;
+						}
+
+						MultiViewCandidate cand;
+						cand.best = best;
+						cand.mean_fill = mean_fill;
+						mv_candidates.push_back(cand);
+					}
+				}
+
+				const double inv_leaves = 100.0 / (double)myMax((size_t)1, num_leaves);
+				s += "    Never selected by the traversal in any recorded view: " + leftPad(uInt64ToStringCommaSeparated(never_drawn), ' ', 11) +
+					" = " + doubleToStringNDecimalPlaces((double)never_drawn * inv_leaves, 1) + "% of leaves\n";
+				s += "    Drawn, but never added a pixel in any of them:        " + leftPad(uInt64ToStringCommaSeparated(drawn_but_dead), ' ', 11) +
+					" = " + doubleToStringNDecimalPlaces((double)drawn_but_dead * inv_leaves, 1) + "%\n";
+				s += "    Dead from every viewpoint recorded (the two above):   " + leftPad(uInt64ToStringCommaSeparated(never_drawn + drawn_but_dead), ' ', 11) +
+					" = " + doubleToStringNDecimalPlaces((double)(never_drawn + drawn_but_dead) * inv_leaves, 1) + "%, carrying " +
+					doubleToStringNDecimalPlaces((total_mean_fill > 0) ? (100.0 * dead_mean_fill / total_mean_fill) : 0.0, 1) + "% of the mean fill\n";
+				s += "    A leaf standing behind a merged LoD ancestor in some view counts as not drawn there, so the first\n";
+				s += "    line is an over-count by however much the tree substitutes - the frontier's leaf share above says\n";
+				s += "    how much that is. Lower pixel_scale_limit to take it out of the picture entirely.\n";
+
+				if(!mv_candidates.empty())
+				{
+					// Ordered by best contribution per mean pixel of fill, the multi-view form of the single-camera
+					// ordering above.
+					struct MultiViewLess
+					{
+						inline bool operator () (const MultiViewCandidate& a, const MultiViewCandidate& b) const
+						{
+							return (a.best * b.mean_fill) < (b.best * a.mean_fill);
+						}
+					};
+					std::sort(mv_candidates.data(), mv_candidates.data() + mv_candidates.size(), MultiViewLess());
+
+					const double energy_targets[] = { 0.001, 0.0025, 0.005, 0.01, 0.02, 0.05, 0.1 };
+					const size_t num_energy_targets = staticArrayNumElems(energy_targets);
+
+					s += "    Dropping the least useful splats first, by best contribution per mean pixel of fill:\n";
+					s += "      best-view energy lost |   splats dropped   |  mean fill removed\n";
+					size_t ci = 0;
+					double lost = 0, fill_removed = 0;
+					for(size_t t=0; t<num_energy_targets; ++t)
+					{
+						const double budget = energy_targets[t] * total_best;
+						while(ci < mv_candidates.size() && (lost + mv_candidates[ci].best) <= budget)
+						{
+							lost += mv_candidates[ci].best;
+							fill_removed += mv_candidates[ci].mean_fill;
+							ci++;
+						}
+						s += "      " + leftPad(doubleToStringNDecimalPlaces(energy_targets[t] * 100.0, 2), ' ', 20) + "% | " +
+							leftPad(uInt64ToStringCommaSeparated(ci), ' ', 11) + " " +
+							leftPad(doubleToStringNDecimalPlaces(100.0 * (double)ci / (double)myMax((size_t)1, mv_candidates.size()), 1), ' ', 5) + "% | " +
+							leftPad(doubleToStringNDecimalPlaces((total_mean_fill > 0) ? (100.0 * fill_removed / total_mean_fill) : 0.0, 1), ' ', 8) + "%\n";
+					}
+					s += "    \"Energy\" here is the sum over splats of their single best view, not any one image's energy:\n";
+					s += "    a splat is judged by its best showing, which is the conservative way round for deleting it.\n";
+					s += "    Still a lower bound on what matters - it only knows the viewpoints actually visited.\n";
+				}
 			}
 
 			//----------------------------- The ceiling on merging near-duplicate splats -----------------------------

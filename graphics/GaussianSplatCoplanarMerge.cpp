@@ -275,7 +275,26 @@ GaussianSplatCoplanarMergeStats coplanarMergeSplats(js::Vector<Vec3f, 16>& posit
 			transmittance *= (1.0 - opacity);
 		}
 
-		const GaussianSplatLodNode merged = mergeGaussianSplatLodNodes(group_nodes.data(), group_nodes.size());
+		GaussianSplatLodNode merged = mergeGaussianSplatLodNodes(group_nodes.data(), group_nodes.size());
+
+		if(params.flatten_onto_surface)
+		{
+			// Collapse the group's depth: project every member onto the plane through the merged centre, then fit again.
+			// Projecting along the normal leaves the weighted mean where it was (the mean of the projections is the
+			// projection of the mean, and the mean is already on the plane), so the replacement does not move - only the
+			// along-normal part of the spread term disappears from its covariance.
+			//
+			// Fitted twice rather than once with the weights worked out here: the weighting is mergeGaussianSplatLodNodes()'s
+			// business, and a second copy of it here would be a second thing to keep in step with it.
+			for(size_t k=0; k<group.size(); ++k)
+			{
+				const Vec3f d = group_nodes[k].centre_os - merged.centre_os;
+				const float along = d.x*seed_normal[0] + d.y*seed_normal[1] + d.z*seed_normal[2];
+				group_nodes[k].centre_os = group_nodes[k].centre_os - Vec3f(seed_normal[0], seed_normal[1], seed_normal[2]) * along;
+			}
+
+			merged = mergeGaussianSplatLodNodes(group_nodes.data(), group_nodes.size());
+		}
 
 		// Opacity, which mergeGaussianSplatLodNodes()'s own answer is not right for here.  That one derives an amplitude
 		// from weight over *volume*, which is the correct reading for a stand-in that will be looked at instead of a

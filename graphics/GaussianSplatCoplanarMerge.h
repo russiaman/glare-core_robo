@@ -61,6 +61,21 @@ struct GaussianSplatCoplanarMergeParams
 	float colour_tol; // Allowed difference per RGB channel, on the [0, 1] scale the colours are stored in.
 	float angle_tol_deg; // Allowed difference in facing.  Compared as an absolute dot product: a disc has no front and back, so opposite normals are the same facing.
 
+	// Whether the replacement is collapsed onto the surface the group lies on, instead of being fitted around where its
+	// members actually sat.
+	//
+	// A plain moment match puts the spread of the members' centres into the replacement's covariance, in every direction
+	// including along the normal - so a stack of flat discs 20 cm deep becomes one 20 cm thick lens.  That costs nothing
+	// face-on, which is why the area test below cannot see it, but it is not a surface any more: measured on a reference
+	// capture at through = 20 cm, the share of fill carried by near-flat splats fell from 22% to 6% and the picture went
+	// visibly soft.
+	//
+	// With this set, the members are projected onto the plane through the merged centre before the covariance is fitted,
+	// so the replacement keeps the members' own thinness and only their in-plane spread widens it.  The group's depth is
+	// what gets collapsed, which is the whole point of collapsing a stack.  The cost is geometric: a group spanning a
+	// genuinely curved surface is flattened onto one plane, so 'through' still has to be a real bound, not infinity.
+	bool flatten_onto_surface;
+
 	// The alpha the renderer cuts a splat's quad off at, not a merge tolerance: it is set from the renderer's own
 	// getAlphaCutoff() rather than by whoever is choosing the tolerances above.
 	//

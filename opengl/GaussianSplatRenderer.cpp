@@ -77,10 +77,11 @@ class SplatCloud : public RefCounted
 public:
 	SplatCloud()
 	:	cloud_id(0), gpu_capacity_splats(0), total_splats(0), structure_generation(0), sort_in_flight(false),
+		importance_layout_fingerprint(0),
 		have_last_sort_cam_pos(false), last_sort_cam_pos_ws(0.f), aabb_ws(js::AABBox::emptyAABBox()), added_to_engine(false),
 		topology_generation(0), traversal_in_flight(false), have_last_traversal_cam_pos(false), last_traversal_cam_pos_ws(0.f),
 		last_traversal_kicked_topology_generation(0), last_traversal_hit_budget_cap(false), last_traversal_hit_density_cap(false), last_traversal_hit_depth_cap(false),
-		importance_topology_generation(0), importance_num_views(0)
+		importance_num_views(0)
 	{}
 
 	uint64 cloud_id; // Stable, never reused.  Sort results carry it, so a result for a cloud that has since been merged away can be dropped.
@@ -129,9 +130,33 @@ public:
 	js::Vector<float, 16> importance_best_contribution; // Most this splat ever added to an image, over the recorded views.
 	js::Vector<float, 16> importance_sum_fill;          // Summed fill over the views that drew it, so a mean can be taken.
 	js::Vector<uint32, 16> importance_views_drawn;      // How many recorded views drew it at all.
-	uint64 importance_topology_generation;              // topology_generation the arrays were sized for; a mismatch means the indices no longer mean the same splats, so they are thrown away.
+	uint64 importance_layout_fingerprint;               // What the arrays were filled against - see cloudLayoutFingerprint().  A mismatch means the indices no longer mean the same splats, so the record has to be thrown away.
 	size_t importance_num_views;                        // How many reports have been folded in.  0 = nothing accumulated yet.
 };
+
+
+// Identifies which splat each index refers to, so that the importance record above can tell "the cloud was renumbered
+// underneath me" from "the cloud was rebuilt into exactly the same layout".
+//
+// topology_generation is not usable for this: it is bumped by any add or rebuild, and walking a world streams splat
+// objects in and out, so a tour of four viewpoints discarded the record between the first and the second - silently, and
+// without the layout having actually changed.  The member list is what the indices are actually derived from, so hashing
+// it answers the question directly.
+static uint64 cloudLayoutFingerprint(const SplatCloud& cloud)
+{
+	uint64 h = 1469598103934665603ull;
+	const uint64 vals[1] = { (uint64)cloud.total_splats };
+	for(int i=0; i<1; ++i) { h ^= vals[i]; h *= 1099511628211ull; }
+
+	for(size_t m=0; m<cloud.members.size(); ++m)
+	{
+		// The source data's identity, and where its splats were placed.  Two members cannot share a range, so this
+		// distinguishes any renumbering that moved anything.
+		const uint64 member_vals[3] = { (uint64)(uintptr_t)cloud.members[m].splat_data.ptr(), (uint64)cloud.members[m].offset, (uint64)cloud.members[m].count };
+		for(int i=0; i<3; ++i) { h ^= member_vals[i]; h *= 1099511628211ull; }
+	}
+	return h;
+}
 
 
 // Reusable working buffers for the background depth-sorts.  At large splat counts these run to hundreds of MB, so
@@ -1782,6 +1807,10 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 			world_quad_area += total_quad_area;
 			world_ellipse_area += total_ellipse_area;
 
+			// Set by the pruning block below if it found the accumulated importance no longer applicable, and printed by
+			// the multi-view section after it - the two are separate blocks, but this is the one thing that has to cross.
+			std::string importance_discard_note;
+
 			//----------------------------- The ceiling on pruning by importance -----------------------------
 			// The histograms above say where the fill is; this says how much of it is doing nothing.
 			//
@@ -1824,10 +1853,16 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 				size_t hidden_count = 0;
 
 				// Fold this view into the cloud's running per-view record - see SplatCloud::importance_best_contribution.
-				// Thrown away rather than reconciled when the cloud's node numbering has changed underneath it, since the
-				// indices would silently refer to different splats.
-				if(cloud.importance_best_contribution.size() != cloud.total_splats || cloud.importance_topology_generation != cloud.topology_generation)
+				// Thrown away rather than reconciled when the cloud has been renumbered underneath it, since the indices
+				// would silently refer to different splats.  Never silently, though: a discard costs the user however many
+				// viewpoints they had already visited, and the first version of this said nothing at all when it happened.
+				const uint64 layout = cloudLayoutFingerprint(cloud);
+				if(cloud.importance_best_contribution.size() != cloud.total_splats || cloud.importance_layout_fingerprint != layout)
 				{
+					if(cloud.importance_num_views > 0)
+						importance_discard_note = "    The cloud was renumbered since the last run, so the " + toString(cloud.importance_num_views) +
+							" run(s) recorded before it had to be discarded - their indices no longer mean the same splats.\n";
+
 					cloud.importance_best_contribution.resizeNoCopy(cloud.total_splats);
 					cloud.importance_sum_fill.resizeNoCopy(cloud.total_splats);
 					cloud.importance_views_drawn.resizeNoCopy(cloud.total_splats);
@@ -1837,7 +1872,7 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 						cloud.importance_sum_fill[i] = 0.f;
 						cloud.importance_views_drawn[i] = 0;
 					}
-					cloud.importance_topology_generation = cloud.topology_generation;
+					cloud.importance_layout_fingerprint = layout;
 					cloud.importance_num_views = 0;
 				}
 				cloud.importance_num_views++;
@@ -1980,6 +2015,7 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 			{
 				s += "\n  Importance accumulated over " + toString(cloud.importance_num_views) +
 					((cloud.importance_num_views == 1) ? " report run" : " report runs") + " (this one included; \"Reset importance\" clears it):\n";
+				s += importance_discard_note;
 
 				if(cloud.importance_num_views < 2)
 					s += "    One run only, so this says nothing the section above does not. Move the camera and run it again.\n";
@@ -2174,12 +2210,23 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 				s += "    The replacement is the largest member widened by how far the furthest member actually sits from\n";
 				s += "    the seed across the surface - never by the reach, and never by the group's depth, which is what\n";
 				s += "    it collapses.\n";
-				s += "      through across | appearance |        groups   per group |     fill after   saved | opaque groups\n";
+				s += "      through across | appearance |        groups   per group  largest |     fill after   saved | opaque groups\n";
 
-				const float through_m[] = { 0.01f, 0.02f, 0.02f, 0.02f, 0.05f, 0.02f };
-				const float across_m[]  = { 0.05f, 0.05f, 0.10f, 0.20f, 0.20f, 0.10f };
-				const bool respect_appearance[] = { true, true, true, true, true, false }; // Last row deliberately ignores colour and facing - an upper bound that merges things which do not look alike, to say what the safety conditions cost.
+				// Concentrated at the tight end.  Merging k splats spread over a radius d replaces k * pi*r^2 of fill with
+				// pi*(r+d)^2, so it only pays while d stays under about (sqrt(k)-1)*r - and with k itself growing only as
+				// d^2, that is a narrow window near d = 0.  The 20 cm settings measured earlier lost 80-140% of the fill
+				// and are dropped: they answered their question, and they cost most of the report's run time.
+				const float through_m[] = { 0.01f, 0.01f, 0.02f, 0.01f, 0.02f, 0.02f, 0.02f };
+				const float across_m[]  = { 0.01f, 0.02f, 0.02f, 0.05f, 0.05f, 0.10f, 0.10f };
+				const bool respect_appearance[] = { true, true, true, true, true, true, false }; // Last row deliberately ignores colour and facing - an upper bound that merges things which do not look alike, to say what the safety conditions cost.
 				const size_t num_merge_settings = staticArrayNumElems(through_m);
+
+				// Group sizes for the last row, kept so the section can print their distribution.  The mean alone cannot
+				// tell "the cloud is clumpy, so most seeds find little" from "the grouping is losing neighbours" - both
+				// give the same small mean beside a large neighbour count.  The largest group settles it: it belongs to a
+				// seed whose whole neighbourhood was still unclaimed, so it has to reach the neighbour count if the
+				// grouping is working.
+				js::Vector<uint32, 16> last_row_group_sizes;
 
 				// One uniform grid per setting, as a per-cell singly linked list - compact, and no per-cell allocation.
 				// Reused storage across the settings sweep, since only the cell size changes.
@@ -2215,7 +2262,14 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 					}
 
 					double fill_after = 0;
-					size_t num_groups = 0, opaque_groups = 0;
+					size_t num_groups = 0, opaque_groups = 0, largest_group = 0;
+
+					const bool record_sizes = (setting + 1 == num_merge_settings);
+					if(record_sizes)
+					{
+						last_row_group_sizes.clear();
+						last_row_group_sizes.reserve(leaves.size());
+					}
 
 					for(size_t si=0; si<seed_order.size(); ++si)
 					{
@@ -2299,6 +2353,9 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 						}
 
 						num_groups++;
+						largest_group = myMax(largest_group, (size_t)g.count);
+						if(record_sizes)
+							last_row_group_sizes.push_back(g.count);
 
 						if(g.count == 1)
 						{
@@ -2322,10 +2379,29 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 						leftPad(doubleToStringNDecimalPlaces(across * 100.0, 0), ' ', 4) + " cm | " +
 						rightSpacePad(respect ? "respected" : "IGNORED", 10) + " | " +
 						leftPad(uInt64ToStringCommaSeparated(num_groups), ' ', 13) + " " +
-						leftPad(doubleToStringNDecimalPlaces((double)leaves.size() / (double)myMax((size_t)1, num_groups), 2), ' ', 9) + " | " +
+						leftPad(doubleToStringNDecimalPlaces((double)leaves.size() / (double)myMax((size_t)1, num_groups), 2), ' ', 9) + " " +
+						leftPad(uInt64ToStringCommaSeparated(largest_group), ' ', 8) + " | " +
 						leftPad(uInt64ToStringCommaSeparated((uint64)fill_after), ' ', 14) + " " +
 						leftPad(doubleToStringNDecimalPlaces((leaves_fill > 0) ? (100.0 * (1.0 - fill_after / leaves_fill)) : 0.0, 1), ' ', 5) + "% | " +
 						leftPad(uInt64ToStringCommaSeparated(opaque_groups), ' ', 12) + "\n";
+				}
+
+				// Where the last row's groups actually sit.  A small mean beside a large neighbour count has two readings -
+				// a clumpy cloud whose typical splat has few neighbours, or a grouping that is losing them - and only the
+				// shape of the distribution tells them apart.
+				if(!last_row_group_sizes.empty())
+				{
+					std::sort(last_row_group_sizes.data(), last_row_group_sizes.data() + last_row_group_sizes.size());
+					const size_t n = last_row_group_sizes.size();
+					s += "    Group sizes on that last row - median " + toString(last_row_group_sizes[n/2]) +
+						", 90th pct " + toString(last_row_group_sizes[(n*9)/10]) +
+						", 99th pct " + toString(last_row_group_sizes[(n*99)/100]) +
+						", largest " + toString(last_row_group_sizes[n-1]) + ".\n";
+					size_t singletons = 0;
+					for(size_t i=0; i<n && last_row_group_sizes[i] == 1; ++i)
+						singletons++;
+					s += "    " + doubleToStringNDecimalPlaces(100.0 * (double)singletons / (double)n, 1) +
+						"% of them are single splats that found no partner at all.\n";
 				}
 
 				//----------------------------- Why the groups come out the size they do -----------------------------
@@ -2361,6 +2437,13 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 
 					double sum_near = 0, sum_facing = 0, sum_colour = 0;
 					size_t num_sampled = 0;
+
+					// Kept per sample, not just summed: on a real capture these counts span orders of magnitude between
+					// the dense regions and the sparse ones, and a mean of 100 can sit over a median of 5.  Which of the
+					// two it is decides whether small groups above are the cloud's doing or the grouping's.
+					js::Vector<uint32, 16> near_samples, colour_samples;
+					near_samples.reserve(leaves.size() / sample_stride + 1);
+					colour_samples.reserve(leaves.size() / sample_stride + 1);
 					for(size_t i=0; i<leaves.size(); i += sample_stride)
 					{
 						const MergeLeaf& a = leaves[i];
@@ -2403,6 +2486,8 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 						sum_near += (double)n_near;
 						sum_facing += (double)n_facing;
 						sum_colour += (double)n_colour;
+						near_samples.push_back((uint32)n_near);
+						colour_samples.push_back((uint32)n_colour);
 						num_sampled++;
 					}
 
@@ -2416,9 +2501,20 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 						doubleToStringNDecimalPlaces((sum_near > 0) ? (100.0 * sum_facing / sum_near) : 0.0, 1) + "% of them)\n";
 					s += "      and colour matches too:    " + leftPad(doubleToStringNDecimalPlaces(sum_colour * inv_n, 2), ' ', 9) + "  (" +
 						doubleToStringNDecimalPlaces((sum_facing > 0) ? (100.0 * sum_colour / sum_facing) : 0.0, 1) + "% of those)\n";
-					s += "      A group of N in the '2 cm 10 cm respected' row above needs about N-1 here to be real, and the\n";
-					s += "      'IGNORED' row's N-1 should track 'neighbours in reach'. A large figure here beside small\n";
-					s += "      groups above means the grouping is losing them, not that the cloud lacks them.\n";
+					if(!near_samples.empty())
+					{
+						std::sort(near_samples.data(), near_samples.data() + near_samples.size());
+						std::sort(colour_samples.data(), colour_samples.data() + colour_samples.size());
+						const size_t n = near_samples.size();
+						s += "      Medians, against the means above:  in reach " + toString(near_samples[n/2]) +
+							", colour-matching " + toString(colour_samples[n/2]) + "   (10th pct " + toString(near_samples[n/10]) +
+							", 90th pct " + toString(near_samples[(n*9)/10]) + " in reach)\n";
+						s += "      A mean far above the median means the neighbours are concentrated in a few dense pockets,\n";
+						s += "      and most splats genuinely have few - which caps the groups above without anything being wrong.\n";
+					}
+					s += "      The largest group in the 'IGNORED' row above belongs to a seed whose neighbourhood was still\n";
+					s += "      entirely unclaimed, so it should reach the mean 'neighbours in reach'. If it falls far short,\n";
+					s += "      the grouping is losing them rather than the cloud lacking them.\n";
 				}
 			}
 		}

@@ -7,6 +7,7 @@ Copyright Glare Technologies Limited 2026 -
 
 
 #include "../graphics/GaussianSplatData.h"
+#include "../maths/Matrix4f.h" // For the frozen hide-overdraw mask's view matrix.
 #include "../maths/Quat.h"
 #include "../maths/Vec4f.h"
 #include "../physics/jscol_aabbox.h"
@@ -165,7 +166,12 @@ public:
 	// parameters (the per-frame frontier isn't kept on the CPU to read back), so it costs a visible hitch on a large cloud
 	// - meant for a button click, never per frame. Changes no renderer state: the traversal's result is read and dropped,
 	// not applied.
-	std::string getFrustumStructureReport();
+	// merge_colour_tol and merge_angle_tol_deg govern only the merge section: how alike two splats' colours and facings
+	// have to be before the report is willing to call them the same surface seen twice. They are arguments rather than
+	// renderer state because nothing outside the report reads them, and the point of them is to be swept - the honest
+	// tolerance and a deliberately reckless one, so the gap between the two says how much of the merge prize the safety
+	// conditions are costing. Defaults are a tenth per colour channel and 26 degrees.
+	std::string getFrustumStructureReport(float merge_colour_tol = 0.1f, float merge_angle_tol_deg = 26.f);
 
 	// Forces every cloud's LoD frontier to be recomputed on the next think()/kickOffTraversals(), bypassing the normal
 	// camera-movement threshold - for GaussianSplatSettingsWidget's live traversal parameters (pixel_scale_limit,
@@ -212,6 +218,22 @@ public:
 	// (exclude a size range, leaving the rest of the cloud untouched). No effect while the clamp itself is disabled.
 	bool getSizeClampInvert() const { return splat_size_clamp_invert; }
 	void setSizeClampInvert(bool v) { splat_size_clamp_invert = v; }
+
+	// Diagnostic tool, not a LoD parameter: keeps only splats whose distance from the camera lies inside [min, max]
+	// metres, so a capture can be sliced open and inspected a shell at a time - the near wall taken away to see what is
+	// behind it, or one shell isolated to see what is in it. Applied in the vertex shader, so it costs nothing when the
+	// range is wide open and needs no re-traversal to change.
+	//
+	// Distance from the camera position, not depth along the view axis: a spherical shell keeps the same splats when the
+	// camera turns on the spot, which is what makes it usable for looking around inside a slice. Default (0, 1000) keeps
+	// everything at any sane scene size, so unlike the size clamp there is no "0 = unlimited" case to encode.
+	float getDistClampMin() const { return splat_dist_clamp_min; }
+	void setDistClampMin(float v) { splat_dist_clamp_min = v; }
+	float getDistClampMax() const { return splat_dist_clamp_max; }
+	void setDistClampMax(float v) { splat_dist_clamp_max = v; }
+	// false (default) = keep what is inside the range; true = keep what is outside it, i.e. cut that shell away.
+	bool getDistClampInvert() const { return splat_dist_clamp_invert; }
+	void setDistClampInvert(bool v) { splat_dist_clamp_invert = v; }
 
 	// Per-splat quad radius is cut to exactly where alpha decays to this value (opacity * exp(-0.5*k^2) = alpha_cutoff),
 	// instead of a fixed 3-sigma bound - see the derivation in gaussian_splat_vert_shader.glsl. Default 1/255 matches
@@ -314,13 +336,67 @@ public:
 	// texel - which is not conservative, and so shows. Set by the draw path each frame rather than by think(), because
 	// whether the gate actually runs is the draw path's decision - and a splat shader that tests a mask nobody wrote
 	// would be reading stale texels.
-	void setSplatMaskBlockSize(int block_size, int max_level);
+	//
+	// centre_test picks which of two tests the shader applies. false is the conservative one the saturation gate needs: a
+	// splat goes only if every mask texel its quad can touch is marked, so it is never dropped where it could still have
+	// changed a pixel. true is the opposite, and is for the hide-overdraw diagnostic: the splat goes if the texel under
+	// its centre is marked, which cuts straight through a marked region and leaves a visible hole in it. That hole is the
+	// point there - it is what shows how much of the picture the marked region was carrying - and it is also why the
+	// conservative test cannot serve: quads are larger than the connected marked patches, so almost every splat overlaps
+	// the edge of one and survives.
+	void setSplatMaskBlockSize(int block_size, int max_level, bool centre_test = false);
 
-	// Sets that program's uniforms from the current getSaturationThreshold(), plus how many accumulation-buffer pixels
-	// across one mask texel covers, which is the caller's since it depends on the size the mask was actually allocated
-	// at. Called once the mask program is bound, for the same reason setResolveOverdrawUniforms() exists: the pass is
-	// one manual full-viewport quad with no material, so it bypasses the generic per-object uniform path.
-	void setSaturationMaskUniforms(int block_size) const;
+	// Sets that program's uniforms, plus how many accumulation-buffer pixels across one mask texel covers, which is the
+	// caller's since it depends on the size the mask was actually allocated at. Called once the mask program is bound,
+	// for the same reason setResolveOverdrawUniforms() exists: the pass is one manual full-viewport quad with no
+	// material, so it bypasses the generic per-object uniform path.
+	//
+	// from_layer_count picks which of the two things the mask is marking: false is the saturation gate, marking where the
+	// composite has finished, thresholded at getSaturationThreshold(); true is the "hide overdraw" diagnostic, marking
+	// where the layer count has reached getOverdrawRangeMax(). Both come out as the same one-bit mask, so everything
+	// downstream - the pyramid, the vertex shader - is shared.
+	void setSaturationMaskUniforms(int block_size, bool from_layer_count) const;
+
+	// Diagnostic, not an optimisation: draws a counting pass first, then throws away every splat that lands where the
+	// layer count reached getOverdrawRangeMax() - that is, exactly the region the overdraw view paints solid red - and
+	// draws what is left. Answers "are the red regions really where the time goes" directly, by removing them and looking
+	// at the clock, rather than by inference from the histograms.
+	//
+	// The splats are dropped in the vertex shader, before rasterisation, which is the earliest point available. Costs an
+	// extra full pass over the splats to build the mask, so the frame total is meaningless while this is on - read the
+	// "draw splats" GPU timer, which is started after the counting pass and so measures the same thing in both states.
+	//
+	// Mutually exclusive with the saturation gate, which owns the same mask texture; the gate is switched off while this
+	// is on.
+	bool getHideOverdrawEnabled() const { return splat_hide_overdraw_enabled; }
+	void setHideOverdrawEnabled(bool v) { splat_hide_overdraw_enabled = v; }
+
+	// The same diagnostic against the other overdraw measure: the counting pass sums each fragment's alpha instead of
+	// counting fragments, so what gets thrown away is the splats standing where a lot of alpha has piled up rather than
+	// where a lot of layers have. The two answer different questions - many faint layers show up in the first and not the
+	// second - and the threshold is the same range maximum, read in whichever units the counting pass is accumulating.
+	bool getHideAlphaEnabled() const { return splat_hide_alpha_enabled; }
+	void setHideAlphaEnabled(bool v) { splat_hide_alpha_enabled = v; }
+
+	// 0 = neither, 1 = hide by layer count, 2 = hide by summed alpha. Only one mask exists, so the two cannot both run;
+	// layers win, being the coarser and more usual question.
+	int getHideMode() const { return splat_hide_overdraw_enabled ? 1 : (splat_hide_alpha_enabled ? 2 : 0); }
+
+	// The counting pass is only redone when something it depends on has changed, so a still camera pays for it once and
+	// then not at all. That is what makes the frame total comparable: with the mask frozen, the frame contains exactly
+	// the work a cloud with those splats removed would do, and nothing else.
+	//
+	// The cost is that the mask is a screen-space thing pinned to the camera that built it, so while the camera moves it
+	// describes where the crowded regions used to be. That is acceptable here and nowhere else: this is a measurement
+	// taken standing still.
+	//
+	// Everything the mask depends on is compared, not just the camera: the viewport it was built at, the threshold, the
+	// mask resolution, and how many splats were drawn - the last of which is what catches a LoD parameter changing the
+	// drawn set without the camera moving at all.
+	bool hideOverdrawMaskNeedsRebuild(const Matrix4f& view_matrix, int viewport_w, int viewport_h, int mask_block, uint64 num_splats_drawn) const;
+	void noteHideOverdrawMaskBuilt(const Matrix4f& view_matrix, int viewport_w, int viewport_h, int mask_block, uint64 num_splats_drawn);
+	void invalidateHideOverdrawMask() { splat_hide_overdraw_mask_valid = false; }
+	uint64 getHideOverdrawMaskRebuilds() const { return splat_hide_overdraw_mask_rebuilds; }
 
 	// Overdraw debug view: 0 (default) = normal rendering. Non-zero = every splat writes a flat additive increment
 	// instead of its real colour, into the same accumulation buffer as normal, which the resolve pass then colour-ramps
@@ -424,6 +500,11 @@ private:
 	float splat_size_clamp_max;
 	bool splat_size_clamp_invert;
 
+	// See getDistClampMin()/getDistClampMax()/getDistClampInvert() above. Default (0, 1000) keeps every splat.
+	float splat_dist_clamp_min;
+	float splat_dist_clamp_max;
+	bool splat_dist_clamp_invert;
+
 	// See getAlphaCutoff() above. Default 1/255 is lossless (matches the fragment shader's fixed discard threshold).
 	float splat_alpha_cutoff;
 
@@ -447,6 +528,20 @@ private:
 
 	// See getShowOverdrawMode() above. 0 = off.
 	int splat_show_overdraw_mode;
+
+	// See getHideOverdrawEnabled()/getHideAlphaEnabled() above. Both off by default.
+	bool splat_hide_overdraw_enabled;
+	bool splat_hide_alpha_enabled;
+
+	// State of the frozen hide-overdraw mask - see hideOverdrawMaskNeedsRebuild().
+	bool splat_hide_overdraw_mask_valid;
+	Matrix4f splat_hide_overdraw_mask_view;
+	int splat_hide_overdraw_mask_viewport_w, splat_hide_overdraw_mask_viewport_h;
+	int splat_hide_overdraw_mask_block;
+	float splat_hide_overdraw_mask_threshold;
+	int splat_hide_overdraw_mask_mode; // Which of the two measures built it - switching between them has to recount.
+	uint64 splat_hide_overdraw_mask_splats_drawn;
+	uint64 splat_hide_overdraw_mask_rebuilds; // Surfaced in the diagnostics: while this is still, the frame carries no counting pass and the total means something.
 
 	// See getOverdrawRangeMin()/getOverdrawRangeMax() above.
 	float splat_overdraw_range_min;

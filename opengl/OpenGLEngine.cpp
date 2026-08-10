@@ -9569,9 +9569,6 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 			splat_depth_blit_gpu_timer->endTimerQuery();
 	}
 
-	if(time_splat_draw && draw_splats_gpu_timer->isIdle())
-		draw_splats_gpu_timer->beginTimerQuery();
-
 	current_scene->splat_accum_framebuffer->bindForDrawing();
 	setSingleDrawBuffer(GL_COLOR_ATTACHMENT0);
 
@@ -9579,18 +9576,104 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 	const float col_zero[4] = { 0, 0, 0, 0 };
 	glClearBufferfv(GL_COLOR, /*drawBuffer=*/0, col_zero);
 
+	// The hide-overdraw diagnostic - see GaussianSplatRenderer::getHideOverdrawEnabled().  Owns the same mask texture the
+	// saturation gate does, so the two cannot run together; this one wins while it is on, since it is only ever switched
+	// on deliberately for a measurement.
+	const int hide_mode = splat_renderer->getHideMode(); // 1 = by layer count, 2 = by summed alpha - the counting pass below accumulates whichever one was asked for.
+	const bool hide_overdraw = (hide_mode != 0) && splat_accum_gate_available &&
+		splat_renderer->getSaturationMaskProgram().nonNull() && splat_renderer->getSaturationMaskProgram()->isBuilt() &&
+		splat_renderer->getMaskReduceProgram().nonNull() && splat_renderer->getMaskReduceProgram()->isBuilt();
+
+	if(!hide_overdraw)
+		splat_renderer->invalidateHideOverdrawMask(); // So switching it back on always counts afresh rather than reusing a mask from an older camera.
+
+	// Only when something the mask depends on has changed - see hideOverdrawMaskNeedsRebuild().  A still camera therefore
+	// pays for the counting pass once, and the frames after it contain exactly the work a cloud with those splats removed
+	// would do, which is what makes the frame total a fair comparison against the checkbox being off.
+	if(hide_overdraw && splat_renderer->hideOverdrawMaskNeedsRebuild(view_matrix, current_scene->viewport_w, current_scene->viewport_h,
+		splat_saturation_mask_block, last_num_splats_drawn))
+	{
+		DebugGroup count_debug_group("splat overdraw counting pre-pass");
+
+		// Count first, with the same shader the overdraw view uses: every surviving fragment adds either a flat one or its
+		// own alpha, blended additively, so the accumulation buffer ends up holding the per-pixel layer count or alpha sum.
+		// No slices and no mask test - this pass has to see every splat, or what it counts would depend on what it had
+		// already culled.
+		splat_renderer->setSplatMaskBlockSize(0, 0);
+
+		// Set explicitly rather than inherited: this pass runs before the block below that establishes the state the slice
+		// draws use, so whatever the previous pass of the frame happened to leave is what would apply.  Blending in
+		// particular is off at this point, and without it each fragment overwrites instead of adding - the buffer then
+		// holds 1 wherever any splat landed rather than a layer count, no texel ever reaches the threshold, and the whole
+		// diagnostic silently does nothing.
+		glEnable(GL_BLEND);
+		glBlendFunc(GL_ONE, GL_ONE);
+		glEnable(GL_DEPTH_TEST); // Splats occluded by opaque geometry must not be counted - they are not drawn in the real pass either.
+		glDepthMask(GL_FALSE);
+
+		for(size_t i=num_visible; i-- > 0; )
+		{
+			GLObject* const ob = const_cast<GLObject*>(visible_splat_clouds[i]);
+			ob->materials[0].user_uniform_vals[6].intval = hide_mode; // Overdraw mode 1 (layer count) or 2 (summed alpha). Put back below.
+		}
+
+		for(size_t i=num_visible; i-- > 0; )
+		{
+			GLObject* const ob = const_cast<GLObject*>(visible_splat_clouds[i]);
+			const uint32 batch_i = 0;
+			if(checkUseProgram(ob->batch_draw_info[batch_i].getProgramIndex()))
+			{
+				setSharedUniformsForProg(*prog_vector[ob->batch_draw_info[batch_i].getProgramIndex()].ptr(), view_matrix, proj_matrix);
+				const int mask_tex_loc = splat_renderer->getSplatMaskTexUniformLoc();
+				if(mask_tex_loc >= 0)
+					bindTextureUnitToSampler(*current_scene->splat_saturation_mask_texture, /*texture_unit_index=*/SPLAT_SATURATION_MASK_TEXTURE_UNIT_INDEX,
+						/*sampler_uniform_location=*/mask_tex_loc);
+			}
+			bindMeshData(*ob);
+#if DO_INDIVIDUAL_VAO_ALLOC
+			setInstanceAttribPointerOffset(*ob);
+#endif
+			drawBatchWithDenormalisedData(*ob, ob->batch_draw_info[batch_i], batch_i);
+		}
+
+		// Turn the count into the mask, thresholded at the same value the overdraw ramp paints red at.
+		markSaturatedSplatPixels(/*from_layer_count=*/true);
+
+		for(size_t i=num_visible; i-- > 0; )
+		{
+			GLObject* const ob = const_cast<GLObject*>(visible_splat_clouds[i]);
+			ob->materials[0].user_uniform_vals[6].intval = splat_renderer->getShowOverdrawMode(); // Back to whatever the panel asked for.
+		}
+
+		splat_renderer->noteHideOverdrawMaskBuilt(view_matrix, current_scene->viewport_w, current_scene->viewport_h,
+			splat_saturation_mask_block, last_num_splats_drawn);
+
+		// Start the real pass from an empty buffer, exactly as if the counting pass had never run.
+		glClearBufferfv(GL_COLOR, /*drawBuffer=*/0, col_zero);
+	}
+
+	// Started after the counting pass above, deliberately: this timer is the number the diagnostic is read from, and it
+	// has to mean the same thing with the checkbox on as with it off.  The frame total does not - it carries the extra
+	// pass - which is said out loud in the diagnostics display.
+	if(time_splat_draw && draw_splats_gpu_timer->isIdle())
+		draw_splats_gpu_timer->beginTimerQuery();
+
 	// The saturation gate rejects splats at pixels the composite has already finished with - see
 	// markSaturatedSplatPixels().  It needs a depth buffer of its own to mark them in, and more than one slice to have
 	// somewhere to do the marking between.  Not used in the overdraw debug views: those blend additively, so the
 	// accumulated alpha there is a layer count rather than a coverage and the threshold would mean nothing.
-	const bool use_saturation_gate = splat_renderer->getSaturationGateEnabled() && (num_slices > 1) && !show_overdraw && splat_accum_gate_available &&
+	const bool use_saturation_gate = splat_renderer->getSaturationGateEnabled() && (num_slices > 1) && !show_overdraw && !hide_overdraw && splat_accum_gate_available &&
 		splat_renderer->getSaturationMaskProgram().nonNull() && splat_renderer->getSaturationMaskProgram()->isBuilt() &&
 		splat_renderer->getMaskReduceProgram().nonNull() && splat_renderer->getMaskReduceProgram()->isBuilt();
 
 	// Tells the splat shader whether to test the mask at all, and how many pixels a texel of it covers.  Set here rather
-	// than in the renderer's think(), since whether the gate runs this frame is decided just above: a shader testing a
-	// mask nobody wrote would be reading whatever the last frame left there.
-	splat_renderer->setSplatMaskBlockSize(use_saturation_gate ? splat_saturation_mask_block : 0, splat_saturation_mask_num_levels - 1);
+	// than in the renderer's think(), since whether anything wrote the mask this frame is decided just above: a shader
+	// testing a mask nobody wrote would be reading whatever the last frame left there.
+	// The diagnostic wants the non-conservative centre test, which is what actually opens a hole where the marked region
+	// was; the gate wants the conservative one, which never drops a splat that could still have shown - see
+	// GaussianSplatRenderer::setSplatMaskBlockSize().
+	splat_renderer->setSplatMaskBlockSize((use_saturation_gate || hide_overdraw) ? splat_saturation_mask_block : 0, splat_saturation_mask_num_levels - 1,
+		/*centre_test=*/hide_overdraw);
 
 	if(use_saturation_gate)
 	{
@@ -9808,7 +9891,15 @@ void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffe
 	// the accumulated coverage as well as the accumulated colour.  Half or 8-bit per channel is a live choice, since it
 	// trades most of the splat pass's blend bandwidth against precision in the sparsely covered parts of the image -
 	// see GaussianSplatRenderer::getAccumBuffer8Bit().
-	const OpenGLTextureFormat splat_accum_format = splat_renderer->getAccumBuffer8Bit() ? OpenGLTextureFormat::Format_RGBA_Linear_Uint8 :
+	//
+	// Except in the overdraw views, which are always half float whatever the switch says.  Those accumulate a layer count
+	// (or a sum of alpha) additively, and an 8-bit buffer is normalised to [0, 1]: it saturates on the very first layer,
+	// so every pixel the splats touch reads as 1 and the whole ramp collapses to its bottom colour.  Overriding rather
+	// than disabling the view is the honest choice here, because the thing being displayed - how many fragments were
+	// blended - is identical in both formats, the format only changing what each blend costs.  The gate, whose behaviour
+	// does differ between the two, is already switched off in these views.
+	const bool want_8bit_accum = splat_renderer->getAccumBuffer8Bit() && !splat_renderer->getShowOverdraw();
+	const OpenGLTextureFormat splat_accum_format = want_8bit_accum ? OpenGLTextureFormat::Format_RGBA_Linear_Uint8 :
 		OpenGLTextureFormat::Format_RGBA_Linear_Half;
 
 	// The gate's mask, at 1/downscale of the accumulation buffer, rounded up so that the blocks cover it - see
@@ -9948,7 +10039,7 @@ With MSAA the copy resolves the samples, so the threshold is tested against a pi
 a saturated region that is slightly wrong in both directions; the region interiors, which is where the work being
 skipped actually is, are unaffected.
 */
-void OpenGLEngine::markSaturatedSplatPixels()
+void OpenGLEngine::markSaturatedSplatPixels(bool from_layer_count)
 {
 	DebugGroup debug_group("markSaturatedSplatPixels()");
 	TracyGpuZone("markSaturatedSplatPixels");
@@ -9978,7 +10069,7 @@ void OpenGLEngine::markSaturatedSplatPixels()
 	glDisable(GL_DEPTH_TEST); // The mask framebuffer has no depth attachment, and every texel of it is rewritten regardless.
 
 	mask_prog->useProgram();
-	splat_renderer->setSaturationMaskUniforms(splat_saturation_mask_block);
+	splat_renderer->setSaturationMaskUniforms(splat_saturation_mask_block, from_layer_count);
 	bindMeshData(*unit_quad_meshdata);
 	bindTextureUnitToSampler(*current_scene->splat_accum_copy_texture, /*texture_unit_index=*/0, /*sampler_uniform_location=*/mask_prog->albedo_texture_loc);
 

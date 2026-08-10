@@ -36,6 +36,7 @@ Copyright Glare Technologies Limited 2026 -
 #include <cstring>
 #include <limits>
 #include <queue>
+#include <unordered_map> // For grouping near-duplicate splats in getFrustumStructureReport().
 
 
 // How far the camera has to move before a cloud's depth order is worth recomputing.  Camera rotation is deliberately
@@ -677,11 +678,16 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 :	opengl_engine(&opengl_engine_), next_handle(1), next_cloud_id(1), num_sorts_in_flight(0),
 	num_traversals_in_flight(0), lod_pixel_scale_limit(1.0f), lod_max_splats_budget(10000000), lod_resort_move_threshold_ws(0.1f),
 	lod_max_layer_density(0.0f), lod_max_tree_depth(0),
-	splat_size_clamp_min(0.0f), splat_size_clamp_max(0.0f), splat_size_clamp_invert(false), splat_alpha_cutoff(1.0f / 255.0f),
+	splat_size_clamp_min(0.0f), splat_size_clamp_max(0.0f), splat_size_clamp_invert(false),
+	splat_dist_clamp_min(0.0f), splat_dist_clamp_max(1000.0f), splat_dist_clamp_invert(false), splat_alpha_cutoff(1.0f / 255.0f),
 	splat_num_draw_slices(1), splat_slice_growth(1.0f), splat_saturation_gate_enabled(false), splat_saturation_threshold(1.0f - 1.0f / 255.0f),
 	splat_saturation_mask_downscale(4), splat_mask_tex_uniform_loc(-2),
 	splat_accum_buffer_8bit(false),
-	splat_show_overdraw_mode(0), splat_overdraw_range_min(2.0f), splat_overdraw_range_max(100.0f)
+	splat_show_overdraw_mode(0), splat_hide_overdraw_enabled(false), splat_hide_alpha_enabled(false),
+	splat_hide_overdraw_mask_valid(false), splat_hide_overdraw_mask_view(Matrix4f::identity()),
+	splat_hide_overdraw_mask_viewport_w(0), splat_hide_overdraw_mask_viewport_h(0), splat_hide_overdraw_mask_block(0),
+	splat_hide_overdraw_mask_threshold(0.f), splat_hide_overdraw_mask_mode(0), splat_hide_overdraw_mask_splats_drawn(0), splat_hide_overdraw_mask_rebuilds(0),
+	splat_overdraw_range_min(2.0f), splat_overdraw_range_max(100.0f)
 {}
 
 
@@ -722,6 +728,9 @@ void GaussianSplatRenderer::buildShadersIfNeeded()
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,  "splat_show_overdraw");
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int, "splat_saturation_mask_block"); // 0 disables the test - see setSplatMaskBlockSize().
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int, "splat_saturation_mask_max_level");
+	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Vec2, "splat_dist_clamp_min_max");
+	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,  "splat_dist_clamp_invert");
+	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,  "splat_mask_centre_test"); // See setSplatMaskBlockSize().
 
 
 	// Splats blend into an accumulation buffer of their own rather than straight onto the main colour buffer, so that
@@ -763,6 +772,7 @@ void GaussianSplatRenderer::buildShadersIfNeeded()
 	// what resolves the location once it completes.  Read back by setSaturationMaskUniforms().
 	saturation_mask_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_saturation_threshold");
 	saturation_mask_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "splat_mask_block_size");
+	saturation_mask_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "splat_mask_from_layer_count");
 
 
 	// Halves the mask by minimum, once per level, so that the vertex shader can ask about a whole quad's worth of screen
@@ -789,20 +799,63 @@ int GaussianSplatRenderer::getSplatMaskTexUniformLoc()
 }
 
 
-void GaussianSplatRenderer::setSplatMaskBlockSize(int block_size, int max_level)
+void GaussianSplatRenderer::setSplatMaskBlockSize(int block_size, int max_level, bool centre_test)
 {
 	for(size_t i=0; i<clouds.size(); ++i)
 	{
 		clouds[i]->ob->materials[0].user_uniform_vals[7].intval = block_size;
 		clouds[i]->ob->materials[0].user_uniform_vals[8].intval = max_level;
+		clouds[i]->ob->materials[0].user_uniform_vals[11].intval = centre_test ? 1 : 0;
 	}
 }
 
 
-void GaussianSplatRenderer::setSaturationMaskUniforms(int block_size) const
+bool GaussianSplatRenderer::hideOverdrawMaskNeedsRebuild(const Matrix4f& view_matrix, int viewport_w, int viewport_h, int mask_block, uint64 num_splats_drawn) const
 {
-	glUniform1f(saturation_mask_prog->user_uniform_info[0].loc, splat_saturation_threshold);
+	if(!splat_hide_overdraw_mask_valid)
+		return true;
+	if(viewport_w != splat_hide_overdraw_mask_viewport_w || viewport_h != splat_hide_overdraw_mask_viewport_h ||
+		mask_block != splat_hide_overdraw_mask_block || splat_overdraw_range_max != splat_hide_overdraw_mask_threshold ||
+		getHideMode() != splat_hide_overdraw_mask_mode || num_splats_drawn != splat_hide_overdraw_mask_splats_drawn)
+		return true;
+
+	// Compared with a tolerance rather than exactly: the camera transform is rebuilt from the player's state every frame,
+	// and a standing player can still jitter it in the last bits.  Exact comparison would rebuild every frame and give
+	// back the extra pass this exists to avoid, silently.
+	const float tolerance = 1.0e-5f;
+	for(int i=0; i<4; ++i)
+	{
+		const Vec4f a = view_matrix.getColumn(i), b = splat_hide_overdraw_mask_view.getColumn(i);
+		for(int c=0; c<4; ++c)
+			if(std::fabs(a[c] - b[c]) > tolerance)
+				return true;
+	}
+	return false;
+}
+
+
+void GaussianSplatRenderer::noteHideOverdrawMaskBuilt(const Matrix4f& view_matrix, int viewport_w, int viewport_h, int mask_block, uint64 num_splats_drawn)
+{
+	splat_hide_overdraw_mask_valid = true;
+	splat_hide_overdraw_mask_view = view_matrix;
+	splat_hide_overdraw_mask_viewport_w = viewport_w;
+	splat_hide_overdraw_mask_viewport_h = viewport_h;
+	splat_hide_overdraw_mask_block = mask_block;
+	splat_hide_overdraw_mask_threshold = splat_overdraw_range_max;
+	splat_hide_overdraw_mask_mode = getHideMode();
+	splat_hide_overdraw_mask_splats_drawn = num_splats_drawn;
+	splat_hide_overdraw_mask_rebuilds++;
+}
+
+
+void GaussianSplatRenderer::setSaturationMaskUniforms(int block_size, bool from_layer_count) const
+{
+	// One threshold uniform serves both modes, since only one of them is ever running: coverage for the gate, a layer
+	// count for the hide-overdraw diagnostic.  Reusing getOverdrawRangeMax() as that layer count is deliberate - it is
+	// the value the overdraw ramp paints solid red at, so what the diagnostic removes is exactly what was red on screen.
+	glUniform1f(saturation_mask_prog->user_uniform_info[0].loc, from_layer_count ? splat_overdraw_range_max : splat_saturation_threshold);
 	glUniform1i(saturation_mask_prog->user_uniform_info[1].loc, block_size);
+	glUniform1i(saturation_mask_prog->user_uniform_info[2].loc, from_layer_count ? 1 : 0);
 }
 
 
@@ -1143,6 +1196,153 @@ static SplatFootprint splatFootprint(const Vec3f& pos_ws, const Vec3f& scale, co
 }
 
 
+// The direction a splat's flat face points: its smallest scale axis, rotated into world space.  A 3DGS optimiser fits
+// near-flat discs to surfaces, so this is the surface normal wherever the fit is behaving, and it is what decides whether
+// two splats in the same place are two views of one surface or two different surfaces meeting at an edge.
+static Vec4f splatNormalWS(const Vec3f& scale, const Vec4f& rotation)
+{
+	const float qx = rotation[0], qy = rotation[1], qz = rotation[2], qw = rotation[3];
+	const Vec4f r_col0(1.f - 2.f*(qy*qy + qz*qz),        2.f*(qx*qy + qz*qw),        2.f*(qx*qz - qy*qw), 0.f);
+	const Vec4f r_col1(       2.f*(qx*qy - qz*qw), 1.f - 2.f*(qx*qx + qz*qz),        2.f*(qy*qz + qx*qw), 0.f);
+	const Vec4f r_col2(       2.f*(qx*qz + qy*qw),        2.f*(qy*qz - qx*qw), 1.f - 2.f*(qx*qx + qy*qy), 0.f);
+
+	Vec4f n;
+	if(scale.x <= scale.y && scale.x <= scale.z)      n = r_col0;
+	else if(scale.y <= scale.x && scale.y <= scale.z) n = r_col1;
+	else                                              n = r_col2;
+
+	// A disc has no front and back, so n and -n describe the same orientation.  Pinning the sign by the largest component
+	// keeps two splats facing opposite ways from being told apart by nothing but a sign.
+	const float ax = std::fabs(n[0]), ay = std::fabs(n[1]), az = std::fabs(n[2]);
+	const float dominant = (ax >= ay && ax >= az) ? n[0] : ((ay >= az) ? n[1] : n[2]);
+	if(dominant < 0.f)
+		n = Vec4f(-n[0], -n[1], -n[2], 0.f);
+	return n;
+}
+
+
+// One leaf splat, with everything the merge analysis needs, worked out once so the tolerance sweep can run over it
+// repeatedly without recomputing the projection.
+struct MergeLeaf
+{
+	Vec3f pos_ws;
+	Vec4f normal_ws;
+	float r, g, b;
+	float opacity;
+	float radius1_px, radius2_px, fill_px;
+	float dist_to_cam;
+};
+
+
+// Which of a fixed set of directions a normal points along, and the canonical direction of each bucket.  Bucketing the
+// direction first is what lets the position be measured in a frame the whole group agrees on: every splat facing roughly
+// the same way gets the same frame, so "how far apart along the surface" and "how far apart through it" mean the same
+// thing for all of them.  Cube-face parametrisation, dir_bins steps across each face.
+// How many steps across a cube face give roughly the wanted angular tolerance: a step of 2/bins in face coordinates
+// subtends about atan(2/bins) at the centre of the face.  Clamped so that a very loose tolerance still leaves the six
+// faces distinguishable, and a very tight one cannot explode the bucket count.
+static int dirBinsForAngle(float angle_deg)
+{
+	const float t = std::tan(myMax(angle_deg, 1.f) * Maths::pi<float>() / 180.f);
+	return myClamp((int)(2.f / myMax(t, 1.0e-4f) + 0.5f), 1, 16);
+}
+
+static int normalDirBucket(const Vec4f& n, int dir_bins)
+{
+	int a = 0;
+	float m = std::fabs(n[0]);
+	if(std::fabs(n[1]) > m) { a = 1; m = std::fabs(n[1]); }
+	if(std::fabs(n[2]) > m) { a = 2; m = std::fabs(n[2]); }
+	const int b1 = (a + 1) % 3, b2 = (a + 2) % 3;
+	const float u = n[b1] / myMax(m, 1.0e-8f), v = n[b2] / myMax(m, 1.0e-8f);
+	const int iu = myClamp((int)std::floor((u * 0.5f + 0.5f) * dir_bins), 0, dir_bins - 1);
+	const int iv = myClamp((int)std::floor((v * 0.5f + 0.5f) * dir_bins), 0, dir_bins - 1);
+	return (a * dir_bins + iu) * dir_bins + iv;
+}
+
+static Vec4f normaliseVec3(const Vec4f& v)
+{
+	const float len = std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+	const float inv = (len > 1.0e-12f) ? (1.f / len) : 0.f;
+	return Vec4f(v[0]*inv, v[1]*inv, v[2]*inv, 0.f);
+}
+
+static Vec4f cross3(const Vec4f& a, const Vec4f& b)
+{
+	return Vec4f(a[1]*b[2] - a[2]*b[1], a[2]*b[0] - a[0]*b[2], a[0]*b[1] - a[1]*b[0], 0.f);
+}
+
+// The frame every splat in one direction bucket measures its position in: w through the surface, u and v across it.
+static void dirBucketFrame(int bucket, int dir_bins, Vec4f& w_out, Vec4f& u_out, Vec4f& v_out)
+{
+	const int iv = bucket % dir_bins; bucket /= dir_bins;
+	const int iu = bucket % dir_bins; bucket /= dir_bins;
+	const int a = bucket;
+	const int b1 = (a + 1) % 3, b2 = (a + 2) % 3;
+	float c[3];
+	c[a]  = 1.f;
+	c[b1] = (((float)iu + 0.5f) / (float)dir_bins) * 2.f - 1.f;
+	c[b2] = (((float)iv + 0.5f) / (float)dir_bins) * 2.f - 1.f;
+
+	const Vec4f w = normaliseVec3(Vec4f(c[0], c[1], c[2], 0.f));
+	// Helper axis chosen as the one w leans on least, so the cross product is never near-degenerate.
+	const float ax = std::fabs(w[0]), ay = std::fabs(w[1]), az = std::fabs(w[2]);
+	const Vec4f helper = (ax <= ay && ax <= az) ? Vec4f(1,0,0,0) : ((ay <= az) ? Vec4f(0,1,0,0) : Vec4f(0,0,1,0));
+	const Vec4f u = normaliseVec3(cross3(w, helper));
+	w_out = w;
+	u_out = u;
+	v_out = cross3(w, u);
+}
+
+
+// What identifies a group of splats as "the same surface, seen several times over": facing the same way, at the same
+// place along that facing, in the same patch of surface, and the same colour.  The cell is deliberately not a cube - a
+// stack of splats on a wall is thin through the wall and spread out along it, and a cube cannot say that.
+struct MergeKey
+{
+	int32 cx, cy, cz;  // cz is depth through the surface, cx and cy are across it - see dirBucketFrame().
+	int32 dir_bucket;  // Which way the surface faces, or 0 when facing is being ignored.
+	int32 r, g, b;     // Colour, quantised at the caller's tolerance.
+
+	inline bool operator == (const MergeKey& o) const
+	{
+		return cx == o.cx && cy == o.cy && cz == o.cz && dir_bucket == o.dir_bucket && r == o.r && g == o.g && b == o.b;
+	}
+};
+
+struct MergeKeyHash
+{
+	inline size_t operator () (const MergeKey& k) const
+	{
+		uint64 h = 1469598103934665603ull;
+		const int32 vals[7] = { k.cx, k.cy, k.cz, k.dir_bucket, k.r, k.g, k.b };
+		for(int i=0; i<7; ++i)
+		{
+			h ^= (uint64)(uint32)vals[i];
+			h *= 1099511628211ull;
+		}
+		return (size_t)h;
+	}
+};
+
+
+// What a group of near-duplicate splats becomes once collapsed.
+struct MergeGroup
+{
+	uint32 count;
+	float sum_fill_px;                  // What the members cost as they are.
+	float max_radius1_px, max_radius2_px; // The replacement has to cover the largest member, not the average one.
+	float nearest_dist;                 // Nearest member, so the group's on-screen size is taken at its largest.
+	float transmittance;                // Product of (1 - opacity) over the members, i.e. what the stack lets through.
+
+	// How far apart the members actually sit across the surface, which is what the replacement has to be widened by.
+	// Measured rather than taken as the cell width: a group whose members happen to sit almost on top of each other costs
+	// nothing to cover, and charging it the full cell width was what made the first version of this measurement report a
+	// loss at every setting.
+	float min_u, max_u, min_v, max_v;
+};
+
+
 // Bucket boundaries for the part of the report that asks not "how many splats" but "where does the fill actually come
 // from".  All geometric, because every one of these quantities spans orders of magnitude in a real capture.
 static const size_t num_area_buckets = 10;
@@ -1276,7 +1476,7 @@ void GaussianSplatRenderer::fillTraversalScratch(const SplatCloud& cloud, Gaussi
 }
 
 
-std::string GaussianSplatRenderer::getFrustumStructureReport()
+std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_tol, float merge_angle_tol_deg)
 {
 	if(clouds.empty())
 		return "No splat clouds registered.\n";
@@ -1807,6 +2007,285 @@ std::string GaussianSplatRenderer::getFrustumStructureReport()
 				s += "    A splat scored here from one camera may be the front layer from another, so this bounds what\n";
 				s += "    pruning could win, and does not license dropping these particular splats.\n";
 			}
+
+			//----------------------------- The ceiling on merging near-duplicate splats -----------------------------
+			// A different lever from pruning, and the one that survives a change of viewpoint: where several splats sit in
+			// the same place, face the same way and are the same colour, one denser splat of the same size looks the same
+			// from everywhere and costs a fraction as much to draw.
+			//
+			// This is not what the LoD tree's merge does.  That one takes whatever falls in a grid cell and fits a single
+			// splat over the whole group, so the replacement is as big as the group's spread - which reduces the splat
+			// count without reducing the area painted, and is why coarsening the tree cuts six times the splats for thirty
+			// per cent of the fill.  The rule here is the opposite one: never grow anything.  The replacement is sized to
+			// the largest member plus the width of the cell it came from, and nothing else.
+			//
+			// Measured over the leaves in frustum rather than the LoD frontier, because merging is an operation on the
+			// cloud itself and its answer must not move when pixel_scale_limit does.
+			{
+				js::Vector<MergeLeaf, 16> leaves;
+				leaves.reserve(myMin(cloud.total_splats, (size_t)4000000));
+
+				double leaves_fill = 0;
+				for(size_t m=0; m<cloud.members.size(); ++m)
+				{
+					const std::vector<GaussianSplatLodNode>& tree = cloud.members[m].splat_data->lod_tree;
+					const size_t member_offset = cloud.members[m].offset;
+					const size_t member_count = cloud.members[m].count;
+
+					// A member without a tree has no leaves as such - every one of its splats is an original, so all of them count.
+					const size_t n = tree.empty() ? member_count : tree.size();
+					for(size_t i=0; i<n; ++i)
+					{
+						if(!tree.empty() && tree[i].child_count != 0)
+							continue; // Merged stand-in, not an original splat.
+
+						const uint32 idx = (uint32)(member_offset + i);
+						const Vec3f& p = cloud.positions[idx];
+						if(!pointInFrustum(frustum_clip_planes, num_frustum_clip_planes, Vec4f(p.x, p.y, p.z, 1.f)))
+							continue;
+
+						const Vec3f& sc = cloud.scales[idx];
+						const Vec4f& col = cloud.colours[idx];
+						const SplatFootprint fp = splatFootprint(p, sc, cloud.rotations[idx], col[3], scene->last_view_matrix,
+							focal_len_px, viewport_dims, splat_alpha_cutoff);
+						if(!fp.drawn)
+							continue;
+
+						MergeLeaf leaf;
+						leaf.pos_ws = p;
+						leaf.normal_ws = splatNormalWS(sc, cloud.rotations[idx]);
+						leaf.r = col[0]; leaf.g = col[1]; leaf.b = col[2];
+						leaf.opacity = col[3];
+						leaf.radius1_px = fp.radius1_px;
+						leaf.radius2_px = fp.radius2_px;
+						leaf.fill_px = fp.ellipse_area_px;
+						leaf.dist_to_cam = cam_pos_ws.getDist(Vec4f(p.x, p.y, p.z, 1.f));
+						leaves.push_back(leaf);
+						leaves_fill += fp.ellipse_area_px;
+					}
+				}
+
+				// Each leaf's direction bucket and its position in that bucket's shared frame, worked out once so the sweep
+				// only has to divide by the cell sizes.
+				const int dir_bins = dirBinsForAngle(merge_angle_tol_deg);
+				js::Vector<int32, 16> leaf_dir_bucket(leaves.size());
+				js::Vector<Vec3f, 16> leaf_frame_pos(leaves.size()); // (across, across, through the surface)
+				{
+					const int num_dir_buckets = 3 * dir_bins * dir_bins;
+					std::vector<Vec4f> frame_w(num_dir_buckets), frame_u(num_dir_buckets), frame_v(num_dir_buckets);
+					for(int b=0; b<num_dir_buckets; ++b)
+						dirBucketFrame(b, dir_bins, frame_w[b], frame_u[b], frame_v[b]);
+
+					for(size_t i=0; i<leaves.size(); ++i)
+					{
+						const int b = normalDirBucket(leaves[i].normal_ws, dir_bins);
+						leaf_dir_bucket[i] = b;
+						const Vec3f& p = leaves[i].pos_ws;
+						leaf_frame_pos[i] = Vec3f(
+							p.x*frame_u[b][0] + p.y*frame_u[b][1] + p.z*frame_u[b][2],
+							p.x*frame_v[b][0] + p.y*frame_v[b][1] + p.z*frame_v[b][2],
+							p.x*frame_w[b][0] + p.y*frame_w[b][1] + p.z*frame_w[b][2]);
+					}
+				}
+
+				s += "\n  Merge ceiling for near-duplicate splats, over the " + uInt64ToStringCommaSeparated(leaves.size()) +
+					" original splats in frustum (" + uInt64ToStringCommaSeparated((uint64)leaves_fill) + " px of fill):\n";
+				s += "    A group is splats facing the same way (to " + doubleToStringNDecimalPlaces(merge_angle_tol_deg, 0) +
+					" degrees, giving " + toString(3 * dir_bins * dir_bins) + " facing buckets), within 'through' of\n";
+				s += "    each other along that facing, within 'across' of each other along the surface, and matching in\n";
+				s += "    colour to within " + doubleToStringNDecimalPlaces(merge_colour_tol, 3) + " per channel.\n";
+				s += "    The replacement is the largest member widened by the group's own measured spread across the\n";
+				s += "    surface - never by the cell width, and never by the group's depth, which is what it collapses.\n";
+				s += "      through across | appearance |        groups   per group |     fill after   saved | opaque groups\n";
+
+				const float through_m[] = { 0.01f, 0.02f, 0.02f, 0.02f, 0.05f, 0.02f };
+				const float across_m[]  = { 0.05f, 0.05f, 0.10f, 0.20f, 0.20f, 0.10f };
+				const bool respect_appearance[] = { true, true, true, true, true, false }; // Last row deliberately ignores colour and facing - an upper bound that merges things which do not look alike, to say what the safety conditions cost.
+				const size_t num_merge_settings = staticArrayNumElems(through_m);
+				const float inv_colour_tol = 1.f / myMax(merge_colour_tol, 1.0e-4f);
+
+				for(size_t setting=0; setting<num_merge_settings; ++setting)
+				{
+					const float through = through_m[setting], across = across_m[setting];
+					const float inv_through = 1.f / through, inv_across = 1.f / across;
+					const bool respect = respect_appearance[setting];
+
+					std::unordered_map<MergeKey, MergeGroup, MergeKeyHash> groups;
+					groups.reserve(leaves.size());
+
+					for(size_t i=0; i<leaves.size(); ++i)
+					{
+						const MergeLeaf& leaf = leaves[i];
+						const Vec3f& frame_pos = leaf_frame_pos[i];
+
+						MergeKey key;
+						key.cx = (int32)std::floor(frame_pos.x * inv_across);
+						key.cy = (int32)std::floor(frame_pos.y * inv_across);
+						key.cz = (int32)std::floor(frame_pos.z * inv_through);
+						if(respect)
+						{
+							key.dir_bucket = leaf_dir_bucket[i];
+							key.r = (int32)std::floor(leaf.r * inv_colour_tol);
+							key.g = (int32)std::floor(leaf.g * inv_colour_tol);
+							key.b = (int32)std::floor(leaf.b * inv_colour_tol);
+						}
+						else
+						{
+							key.dir_bucket = 0;
+							key.r = key.g = key.b = 0;
+						}
+
+						std::unordered_map<MergeKey, MergeGroup, MergeKeyHash>::iterator it = groups.find(key);
+						if(it == groups.end())
+						{
+							MergeGroup g;
+							g.count = 1;
+							g.sum_fill_px = leaf.fill_px;
+							g.max_radius1_px = leaf.radius1_px;
+							g.max_radius2_px = leaf.radius2_px;
+							g.nearest_dist = leaf.dist_to_cam;
+							g.transmittance = 1.f - myMin(leaf.opacity, 1.f);
+							g.min_u = g.max_u = frame_pos.x;
+							g.min_v = g.max_v = frame_pos.y;
+							groups.insert(std::make_pair(key, g));
+						}
+						else
+						{
+							MergeGroup& g = it->second;
+							g.count++;
+							g.sum_fill_px += leaf.fill_px;
+							g.max_radius1_px = myMax(g.max_radius1_px, leaf.radius1_px);
+							g.max_radius2_px = myMax(g.max_radius2_px, leaf.radius2_px);
+							g.nearest_dist = myMin(g.nearest_dist, leaf.dist_to_cam);
+							g.transmittance *= (1.f - myMin(leaf.opacity, 1.f));
+							g.min_u = myMin(g.min_u, frame_pos.x); g.max_u = myMax(g.max_u, frame_pos.x);
+							g.min_v = myMin(g.min_v, frame_pos.y); g.max_v = myMax(g.max_v, frame_pos.y);
+						}
+					}
+
+					double fill_after = 0;
+					size_t opaque_groups = 0;
+					for(std::unordered_map<MergeKey, MergeGroup, MergeKeyHash>::const_iterator it = groups.begin(); it != groups.end(); ++it)
+					{
+						const MergeGroup& g = it->second;
+						if(g.count == 1)
+						{
+							fill_after += g.sum_fill_px; // Nothing to merge with, so it is drawn exactly as before.
+							continue;
+						}
+
+						// The replacement covers the largest member, widened by how far apart the members actually sit
+						// across the surface - measured, not the cell width, and not their depth, which is the whole point
+						// of collapsing them. Taken at the nearest member's distance, where the spread looks biggest.
+						const float spread_m = 0.5f * myMax(g.max_u - g.min_u, g.max_v - g.min_v);
+						const float spread_px = spread_m * (focal_len_px.x + focal_len_px.y) * 0.5f / myMax(g.nearest_dist, 0.01f);
+						const float r1 = g.max_radius1_px + spread_px;
+						const float r2 = g.max_radius2_px + spread_px;
+						fill_after += Maths::pi<float>() * r1 * r2;
+
+						if(g.transmittance < 0.01f)
+							opaque_groups++; // The stack was already solid, so one opaque splat replaces it with nothing lost at all.
+					}
+
+					s += "      " + leftPad(doubleToStringNDecimalPlaces(through * 100.0, 0), ' ', 4) + " cm " +
+						leftPad(doubleToStringNDecimalPlaces(across * 100.0, 0), ' ', 4) + " cm | " +
+						rightSpacePad(respect ? "respected" : "IGNORED", 10) + " | " +
+						leftPad(uInt64ToStringCommaSeparated(groups.size()), ' ', 13) + " " +
+						leftPad(doubleToStringNDecimalPlaces((double)leaves.size() / (double)myMax((size_t)1, groups.size()), 2), ' ', 9) + " | " +
+						leftPad(uInt64ToStringCommaSeparated((uint64)fill_after), ' ', 14) + " " +
+						leftPad(doubleToStringNDecimalPlaces((leaves_fill > 0) ? (100.0 * (1.0 - fill_after / leaves_fill)) : 0.0, 1), ' ', 5) + "% | " +
+						leftPad(uInt64ToStringCommaSeparated(opaque_groups), ' ', 12) + "\n";
+				}
+
+				//----------------------------- Why the groups come out the size they do -----------------------------
+				// Bucketing splits a real group whenever its members straddle a bucket edge, so a small group count cannot
+				// on its own tell "this cloud has no duplicates" from "my buckets cut them up".  This asks the same
+				// question without buckets: take a sample of splats, find their true neighbours by distance, and see how
+				// many survive each condition in turn.
+				{
+					const float diag_through = 0.02f, diag_across = 0.10f;
+					const float cos_tol = std::cos(merge_angle_tol_deg * Maths::pi<float>() / 180.f); // The same tolerance the buckets above use, applied honestly as an angle rather than as a bucket edge.
+					const float colour_tol = merge_colour_tol;
+					const size_t sample_stride = 64;
+
+					// Uniform grid over the leaves as a per-cell linked list - compact, and no per-cell allocation.
+					const float inv_grid_cell = 1.f / diag_across;
+					std::unordered_map<uint64, uint32> cell_head;
+					cell_head.reserve(leaves.size());
+					js::Vector<uint32, 16> next_in_cell(leaves.size());
+
+					for(size_t i=0; i<leaves.size(); ++i)
+					{
+						const int32 cx = (int32)std::floor(leaves[i].pos_ws.x * inv_grid_cell);
+						const int32 cy = (int32)std::floor(leaves[i].pos_ws.y * inv_grid_cell);
+						const int32 cz = (int32)std::floor(leaves[i].pos_ws.z * inv_grid_cell);
+						const uint64 key = ((uint64)(uint32)cx * 73856093ull) ^ ((uint64)(uint32)cy * 19349663ull) ^ ((uint64)(uint32)cz * 83492791ull);
+						std::unordered_map<uint64, uint32>::iterator it = cell_head.find(key);
+						next_in_cell[i] = (it == cell_head.end()) ? 0xFFFFFFFFu : it->second;
+						cell_head[key] = (uint32)i;
+					}
+
+					double sum_near = 0, sum_facing = 0, sum_colour = 0;
+					size_t num_sampled = 0;
+					for(size_t i=0; i<leaves.size(); i += sample_stride)
+					{
+						const MergeLeaf& a = leaves[i];
+						const int32 bx = (int32)std::floor(a.pos_ws.x * inv_grid_cell);
+						const int32 by = (int32)std::floor(a.pos_ws.y * inv_grid_cell);
+						const int32 bz = (int32)std::floor(a.pos_ws.z * inv_grid_cell);
+
+						size_t n_near = 0, n_facing = 0, n_colour = 0;
+						for(int dz=-1; dz<=1; ++dz)
+						for(int dy=-1; dy<=1; ++dy)
+						for(int dx=-1; dx<=1; ++dx)
+						{
+							const uint64 key = ((uint64)(uint32)(bx+dx) * 73856093ull) ^ ((uint64)(uint32)(by+dy) * 19349663ull) ^ ((uint64)(uint32)(bz+dz) * 83492791ull);
+							std::unordered_map<uint64, uint32>::const_iterator it = cell_head.find(key);
+							if(it == cell_head.end())
+								continue;
+							for(uint32 j = it->second; j != 0xFFFFFFFFu; j = next_in_cell[j])
+							{
+								if((size_t)j == i)
+									continue;
+								const MergeLeaf& b = leaves[j];
+								const float dx_ws = b.pos_ws.x - a.pos_ws.x, dy_ws = b.pos_ws.y - a.pos_ws.y, dz_ws = b.pos_ws.z - a.pos_ws.z;
+								const float along = dx_ws*a.normal_ws[0] + dy_ws*a.normal_ws[1] + dz_ws*a.normal_ws[2];
+								if(std::fabs(along) > diag_through)
+									continue;
+								const float lat_sq = (dx_ws*dx_ws + dy_ws*dy_ws + dz_ws*dz_ws) - along*along;
+								if(lat_sq > diag_across * diag_across)
+									continue;
+								n_near++;
+
+								if(std::fabs(a.normal_ws[0]*b.normal_ws[0] + a.normal_ws[1]*b.normal_ws[1] + a.normal_ws[2]*b.normal_ws[2]) < cos_tol)
+									continue;
+								n_facing++;
+
+								if(std::fabs(a.r - b.r) <= colour_tol && std::fabs(a.g - b.g) <= colour_tol && std::fabs(a.b - b.b) <= colour_tol)
+									n_colour++;
+							}
+						}
+
+						sum_near += (double)n_near;
+						sum_facing += (double)n_facing;
+						sum_colour += (double)n_colour;
+						num_sampled++;
+					}
+
+					const double inv_n = 1.0 / (double)myMax((size_t)1, num_sampled);
+					s += "    Why the groups are the size they are - true neighbours of a sampled splat, within " +
+						doubleToStringNDecimalPlaces(diag_through * 100.0, 0) + " cm through the surface and " +
+						doubleToStringNDecimalPlaces(diag_across * 100.0, 0) + " cm across it (no buckets, " +
+						uInt64ToStringCommaSeparated(num_sampled) + " sampled):\n";
+					s += "      neighbours in reach:       " + leftPad(doubleToStringNDecimalPlaces(sum_near * inv_n, 2), ' ', 9) + "\n";
+					s += "      of those, facing matches:  " + leftPad(doubleToStringNDecimalPlaces(sum_facing * inv_n, 2), ' ', 9) + "  (" +
+						doubleToStringNDecimalPlaces((sum_near > 0) ? (100.0 * sum_facing / sum_near) : 0.0, 1) + "% of them)\n";
+					s += "      and colour matches too:    " + leftPad(doubleToStringNDecimalPlaces(sum_colour * inv_n, 2), ' ', 9) + "  (" +
+						doubleToStringNDecimalPlaces((sum_facing > 0) ? (100.0 * sum_colour / sum_facing) : 0.0, 1) + "% of those)\n";
+					s += "      A group of N in the table needs about N-1 here to be real. A large figure here beside small\n";
+					s += "      groups above would mean the bucketing is splitting them, not that the cloud lacks them.\n";
+				}
+			}
 		}
 
 		free_traversal_scratch.push_back(scratch); // Everything that needed the traversal's own buffers is done with them.
@@ -1927,6 +2406,8 @@ std::string GaussianSplatRenderer::getDiagnostics() const
 	std::string gate_state;
 	if(!splat_saturation_gate_enabled)
 		gate_state = "off";
+	else if(getHideMode() != 0)
+		gate_state = "enabled, but switched off by the hide-overdraw diagnostic, which owns the same mask";
 	else if(splat_num_draw_slices <= 1)
 		gate_state = "enabled, but idle - needs more than one draw slice";
 	else if(splat_show_overdraw_mode != 0)
@@ -1937,6 +2418,20 @@ std::string GaussianSplatRenderer::getDiagnostics() const
 		gate_state = "enabled, but idle - mask shaders not built yet";
 	else
 		gate_state = "on";
+
+	if(getHideMode() != 0)
+	{
+		s += std::string("!! ") + ((getHideMode() == 1) ? "HIDE OVERDRAW" : "HIDE ALPHA") + " is on: splats whose centre lands where the " +
+			((getHideMode() == 1) ? "layer count" : "summed alpha") + " reaches " + doubleToStringNDecimalPlaces(splat_overdraw_range_max, 2) +
+			" are being thrown away in the vertex shader.\n";
+		if(splat_hide_overdraw_enabled && splat_hide_alpha_enabled)
+			s += "   Both boxes are ticked; there is only one mask, so layers win and 'Hide alpha' is doing nothing.\n";
+		// The rebuild count is what says whether the total may be read: it only holds still once the counting pass has
+		// stopped running, and it stops running only while nothing the mask depends on is changing.
+		s += "   Mask rebuilds so far: " + uInt64ToStringCommaSeparated(splat_hide_overdraw_mask_rebuilds) +
+			". While that number is holding still the frame carries no counting pass and the total is comparable;\n"
+			"   while it is climbing (the camera is moving, or a setting just changed) the total carries a whole extra pass over the splats and 'draw splats' is the only fair number.\n";
+	}
 
 	s += "Saturation gate: " + gate_state + ", threshold " + doubleToStringNDecimalPlaces(splat_saturation_threshold, 4) +
 		", mask 1/" + toString(splat_saturation_mask_downscale) + " res";
@@ -1961,7 +2456,13 @@ std::string GaussianSplatRenderer::getDiagnostics() const
 	s += "             size_clamp [" + doubleToStringNDecimalPlaces(splat_size_clamp_min, 3) + ", " + doubleToStringNDecimalPlaces(splat_size_clamp_max, 3) + "]" +
 		((splat_size_clamp_min == 0 && splat_size_clamp_max == 0) ? " (disabled)" : (splat_size_clamp_invert ? " inverted" : "")) +
 		", alpha_cutoff " + doubleToStringNDecimalPlaces(splat_alpha_cutoff, 4) + "\n";
-	s += "             accumulation buffer " + std::string(splat_accum_buffer_8bit ? "RGBA8" : "RGBA16F") + "\n";
+	// Printed whether or not it is doing anything, because a forgotten distance slice looks exactly like a broken scene.
+	s += "             dist_clamp [" + doubleToStringNDecimalPlaces(splat_dist_clamp_min, 2) + ", " + doubleToStringNDecimalPlaces(splat_dist_clamp_max, 2) + "] m" +
+		((splat_dist_clamp_min <= 0.f && splat_dist_clamp_max >= 1000.f && !splat_dist_clamp_invert) ? " (keeps everything)" : (splat_dist_clamp_invert ? " INVERTED - this shell is hidden" : " - only this shell is shown")) + "\n";
+	// Says when the request and the reality differ, rather than only what was asked for: the overdraw views force half
+	// float whatever this switch says, and a line reading RGBA8 next to a working overdraw ramp would be a puzzle.
+	s += "             accumulation buffer " + std::string(splat_accum_buffer_8bit ? "RGBA8" : "RGBA16F") +
+		((splat_accum_buffer_8bit && getShowOverdraw()) ? " requested, but RGBA16F in use - an 8-bit buffer saturates at one layer and cannot show overdraw" : "") + "\n";
 	s += "Sorts in flight: " + toString(num_sorts_in_flight) + " / " + toString(max_concurrent_sorts) + "\n";
 	s += "GPU mem: " + getMBSizeString((size_t)tex_bytes) + " data textures, " + getMBSizeString((size_t)index_vbo_bytes) + " index VBOs\n";
 	s += "Sort scratch pooled: " + toString(free_scratch.size()) + " buffers, " + getMBSizeString((size_t)scratch_bytes) + "\n";
@@ -2057,7 +2558,11 @@ Reference<SplatCloud> GaussianSplatRenderer::allocCloud()
 	// MATERIAL_ALPHA_BLEND_BITFLAG on the batch, which is how the opaque pass, the depth pre-pass and the shadow passes
 	// know to skip it.  OpenGLEngine::addObject() keys off splat_cloud to put the object in exactly one of the two sets.
 	mat.alpha_blend = true;
-	mat.user_uniform_vals.resize(9); // All but splat_tex_width below are set by think(), or by the draw path for the saturation mask ones.
+	// One slot per uniform appended in buildShadersIfNeeded(), and it has to stay in step with that list: the draw path
+	// walks the program's uniforms and indexes this array by the same i, so a slot short is an out-of-bounds read there
+	// and an out-of-bounds write in think(). All but splat_tex_width below are set by think(), or by the draw path for the
+	// saturation mask ones.
+	mat.user_uniform_vals.resize(12);
 	mat.user_uniform_vals[2].intval = (int)splat_tex_width;
 
 	// Build a real (if minimal) texture and VAO up front: adding the object to the engine before it has those would
@@ -2848,6 +3353,10 @@ void GaussianSplatRenderer::think()
 		mat.user_uniform_vals[4].intval = splat_size_clamp_invert ? 1 : 0;
 		mat.user_uniform_vals[5].floatval = splat_alpha_cutoff;
 		mat.user_uniform_vals[6].intval = splat_show_overdraw_mode;
+		// 7 and 8 (splat_saturation_mask_block / _max_level) belong to the draw path, which decides per frame whether the
+		// gate actually runs - see setSplatMaskBlockSize().
+		mat.user_uniform_vals[9].vec2 = Vec2f(splat_dist_clamp_min, splat_dist_clamp_max);
+		mat.user_uniform_vals[10].intval = splat_dist_clamp_invert ? 1 : 0;
 	}
 
 	kickOffSorts();

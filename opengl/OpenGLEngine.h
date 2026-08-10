@@ -1449,7 +1449,10 @@ private:
 	void drawAlphaBlendedObjects(const Matrix4f& view_matrix, const Matrix4f& proj_matrix);
 	void drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& proj_matrix);
 	void allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffer_name); // Allocates the framebuffer splat clouds blend into, and the depth buffer they test against.
-	void markSaturatedSplatPixels(); // Stencils the pixels whose accumulated coverage has reached the saturation threshold, so later draw slices skip them.
+	// Builds the one-bit screen-space mask the splat vertex shader culls whole splats against. from_layer_count = false
+	// marks the pixels whose accumulated coverage has reached the saturation threshold, so later draw slices skip them;
+	// true marks the pixels whose layer count has reached the overdraw ramp's red end, for the hide-overdraw diagnostic.
+	void markSaturatedSplatPixels(bool from_layer_count = false);
 	void resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name); // Composites the splat accumulation buffer onto the buffer the frame is being drawn into, undoing the engine's display transform once.
 public:
 	// Renders Gaussian splat clouds.  Owned by the engine, and cheap until the first cloud is registered with it: it

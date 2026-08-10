@@ -20,6 +20,13 @@ uniform vec2 focal_len_px;
 uniform int splat_tex_width;
 uniform vec2 splat_size_clamp_min_max; // Diagnostic tool (GaussianSplatSettingsWidget, Qt only): culls any splat whose feature_size (2 * max scale axis, matching GaussianSplatLodNode::feature_size) falls outside [x, y]. 0 disables the respective bound (matches the "0 = unlimited" convention used by the Splats list search radius) - (0, 0), the default, disables the filter entirely.
 uniform int splat_size_clamp_invert; // 0 (default) = cull outside [min, max] (isolate a size range); non-zero = cull inside [min, max] instead (exclude a size range, leaving the rest of the cloud untouched). No effect while the clamp itself is disabled.
+
+// Diagnostic tool (GaussianSplatSettingsWidget, Qt only): keeps only splats whose distance from the camera falls inside
+// [x, y] metres, so the cloud can be sliced open and looked into a shell at a time.  Tested against distance from the
+// camera position rather than depth along the view axis, so the slice is a spherical shell centred on the viewer and
+// turning on the spot does not change which splats survive.  Default (0, 1000) keeps everything at any sane scene size.
+uniform vec2 splat_dist_clamp_min_max;
+uniform int splat_dist_clamp_invert; // 0 (default) = keep what is inside the range; non-zero = keep what is outside it, i.e. cut the shell away and see through it.
 // The saturation gate: a mask of the pixels the composite has already finished with, rebuilt between draw slices - see
 // gaussian_splat_saturation_mask_frag_shader.glsl.  splat_saturation_mask_block is how many screen pixels across one
 // mask texel covers, or 0 when the gate is not running, which is also the only state in which the texture may hold
@@ -32,6 +39,14 @@ uniform int splat_size_clamp_invert; // 0 (default) = cull outside [min, max] (i
 uniform sampler2D splat_saturation_mask_texture;
 uniform int splat_saturation_mask_block;
 uniform int splat_saturation_mask_max_level; // Coarsest level of the mask's min-pyramid, so that a big quad can be answered with one fetch rather than many.
+
+// 0: the conservative test the gate needs - drop the splat only if every texel its quad can touch is marked, so it is
+// never dropped where it could still have changed a pixel.
+// 1: the hide-overdraw diagnostic - drop it if the texel under its centre is marked. Not conservative, and deliberately
+// so: it cuts through a marked region and leaves a hole, which is what shows how much of the picture that region was
+// carrying. The conservative test cannot do that, because quads are bigger than the connected marked patches and so
+// nearly all of them overlap an unmarked edge and survive.
+uniform int splat_mask_centre_test;
 
 uniform float splat_alpha_cutoff; // GaussianSplatSettingsWidget, Qt only. Sets the per-splat quad radius to exactly where alpha decays to this value, instead of the fixed 3-sigma bound below - see the derivation where it's used. Default 1/255 matches the fragment shader's own discard threshold exactly (lossless); raising it trims low-opacity splats' quads further, trading a sliver of their faint edge for less overdraw.
 
@@ -82,6 +97,19 @@ void main()
 	// -z = forwards), not the engine's own raw (y = forwards, z = up) convention: OpenGLEngine builds it as
 	// indigo_to_opengl_cam_matrix * world_to_camera_space_matrix before it reaches any shader.  So depth is -pos_vs.z,
 	// and the Jacobian below is the textbook z-forward perspective derivative, with no engine-specific adaptation.
+	// The distance slice - see splat_dist_clamp_min_max above.  Here rather than beside the size clamp because it needs
+	// the view-space position, and before the covariance maths because that is the expensive part.
+	float dist_to_cam = length(pos_vs.xyz);
+	bool inside_dist_range = (dist_to_cam >= splat_dist_clamp_min_max.x) && (dist_to_cam <= splat_dist_clamp_min_max.y);
+	bool cull_for_dist = (splat_dist_clamp_invert != 0) ? inside_dist_range : !inside_dist_range;
+	if(cull_for_dist)
+	{
+		gl_Position = vec4(2.0, 2.0, 2.0, 1.0); // Push outside the clip volume.
+		frag_conic = vec3(0.0);
+		frag_screen_offset_px = vec2(0.0);
+		return;
+	}
+
 	float depth = -pos_vs.z;
 	const float near_epsilon = 0.1; // Splats closer than this blow the 1/d and 1/d^2 terms in the Jacobian up to numerically extreme values, so cull them rather than relying on the radius clamp alone.
 	if(depth < near_epsilon)
@@ -181,6 +209,22 @@ void main()
 		// implementation-defined in GLSL and because it loses nothing: whatever falls outside the mask is off screen,
 		// and produces no fragments whether this splat is culled or not.
 		ivec2 mask_max = textureSize(splat_saturation_mask_texture, /*mip level=*/0) - ivec2(1);
+
+		if(splat_mask_centre_test != 0)
+		{
+			// One fetch at the finest level, under the splat's centre.  Deliberately not conservative - see the uniform.
+			ivec2 c = clamp(ivec2(floor(centre_px / block)), ivec2(0), mask_max);
+			if(texelFetch(splat_saturation_mask_texture, c, /*mip level=*/0).r > 0.5)
+			{
+				gl_Position = vec4(2.0, 2.0, 2.0, 1.0); // Push outside the clip volume.
+				frag_conic = vec3(0.0);
+				frag_screen_offset_px = vec2(0.0);
+				return;
+			}
+		}
+		else
+		{
+
 		ivec2 lo = clamp(ivec2(floor((centre_px - extent_px) / block)), ivec2(0), mask_max);
 		ivec2 hi = clamp(ivec2(floor((centre_px + extent_px) / block)), ivec2(0), mask_max);
 
@@ -209,6 +253,8 @@ void main()
 				return;
 			}
 		}
+
+		} // end of the conservative branch
 	}
 
 	// Note that the mask test above used clip_pos as the splat's *centre*, before this offset moves it to this vertex's

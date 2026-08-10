@@ -36,6 +36,12 @@ uniform float splat_saturation_threshold;
 // below a single fetch.
 uniform int splat_mask_block_size;
 
+// 0: the normal gate above - mark where the composite has finished, reading accumulated coverage from alpha.
+// 1: the "hide overdraw" diagnostic - mark where the *layer count* is at or above the threshold, reading it from red,
+// which is where the overdraw counting pass puts it.  Same conservative rule and same output either way, so the pyramid
+// built on top of this and the vertex shader that reads it need to know nothing about which one produced the mask.
+uniform int splat_mask_from_layer_count;
+
 out vec4 colour_out;
 
 
@@ -46,7 +52,9 @@ void main()
 	ivec2 block_begin = ivec2(gl_FragCoord.xy) * splat_mask_block_size;
 	ivec2 accum_size  = textureSize(albedo_texture, /*mip level=*/0);
 
-	float min_coverage = 1.0;
+	// Starts above anything either channel can hold, so the first fetch always wins: coverage tops out at 1, and a layer
+	// count in a half-float accumulation buffer cannot reach this.
+	float min_val = (splat_mask_from_layer_count != 0) ? 1.0e20 : 1.0;
 	for(int y=0; y<splat_mask_block_size; ++y)
 		for(int x=0; x<splat_mask_block_size; ++x)
 		{
@@ -54,10 +62,14 @@ void main()
 			// an in-range pixel is harmless here (it only ever makes the minimum smaller, i.e. keeps drawing), whereas
 			// an out-of-range texelFetch is undefined.
 			ivec2 coord = min(block_begin + ivec2(x, y), accum_size - ivec2(1));
-			min_coverage = min(min_coverage, texelFetch(albedo_texture, coord, /*mip level=*/0).a);
+			vec4 accum = texelFetch(albedo_texture, coord, /*mip level=*/0);
+			min_val = min(min_val, (splat_mask_from_layer_count != 0) ? accum.r : accum.a);
 		}
 
+	// The minimum, in both modes, so a texel is marked only when *every* pixel under it qualifies.  That is what the
+	// min-pyramid built on this assumes, and what lets the vertex shader answer a big quad with one coarse fetch.
+	//
 	// Written for every texel, not discarded: the mask is rebuilt in place each time, so an unmarked texel has to be
 	// actively cleared rather than left holding what the previous pass put there.
-	colour_out = vec4((min_coverage >= splat_saturation_threshold) ? 1.0 : 0.0);
+	colour_out = vec4((min_val >= splat_saturation_threshold) ? 1.0 : 0.0);
 }

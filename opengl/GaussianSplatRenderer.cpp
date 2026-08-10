@@ -496,6 +496,41 @@ struct FrontierNodeRecord
 // members with intersecting bounds share a cloud, so scoping the shared heap to "this cloud" (rather than "the whole
 // world", which an earlier, pre-partitioning version of this renderer needed) protects exactly the members where it's
 // load-bearing, and no more.  See GaussianSplatRenderer.h's Partitioning section.
+//
+// No frustum culling here, deliberately - the selection covers the whole cloud, including what is behind the camera.
+// Nodes are prioritised by pixel_scale, which is size over distance; the direction the camera is facing is not an input
+// to this task at all.  Two reasons, and they compound:
+//
+//  - Rotation stays free.  The selection, and the sort at the end of it, are both by distance from the camera rather
+//    than by anything view-dependent, so turning on the spot changes neither and costs nothing whatsoever.  A
+//    frustum-culled frontier would have to be recomputed every time the camera turned, which in a first-person client
+//    is the most common camera motion by a wide margin - trading "three times the work, rarely" for "a third of the
+//    work, constantly".
+//  - A stale answer stays correct.  This runs asynchronously and lands a frame or two later, so whatever it produces is
+//    always slightly behind the live camera.  A stale *complete* frontier is stale only in its choice of LoD level,
+//    which is invisible; a stale *frustum-culled* one is missing the nodes that entered view while it was in flight,
+//    which is a hole along the screen edge that grows with how fast the camera is turning.  Recovering from that needs
+//    either a dilated frustum (giving back most of the saving) or a synchronous traversal (giving back the reason this
+//    is a background task in the first place).
+//
+// The prize would be small in any case.  An off-screen node costs one index in the VBO, one instance, and four vertex
+// shader invocations before clipping discards it - and no fill at all, which is where two thirds of this pass's time
+// goes.  Vertex work does not show up in the measured profile even with the covariance recomputed per quad vertex.
+//
+// Frustum culling does happen, one level up: drawSplatClouds() tests each cloud's AABB once per frame, which is the
+// right granularity for a world of many separate capture objects.  It rejects nothing in the degenerate case of a
+// single cloud with the camera standing inside it - which is exactly what the scene this was tuned against is, so the
+// off-screen share looks worse here than it will in a populated world.
+//
+// One consequence is not benign, and is called out at max_splats_budget's own accessor: the budget is spent on nodes
+// behind the camera as readily as on ones in front of it.
+//
+// The intended fix is not a frustum test in this function.  It is the planned move to cluster-based LoD (a Nanite-style
+// cluster DAG replacing this per-splat voxel tree - see the roadmap's "axis 3"), where the unit of selection is a
+// cluster rather than a single splat.  A cluster can be rejected whole, for the cost of one AABB test, at a granularity
+// coarse enough that a frame-late answer does not show as a hole - so the problem this comment describes disappears as
+// a side effect of that change rather than needing its own mechanism.  That rewrite renumbers everything this task
+// walks, which is the other half of why a per-node frustum test added now would be work thrown away.
 class GaussianSplatLodTraversalTask : public glare::Task
 {
 public:

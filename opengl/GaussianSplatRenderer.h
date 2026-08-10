@@ -198,6 +198,15 @@ public:
 	// traversal kick-off, no reload needed.  See kickOffTraversals()/GaussianSplatLodTraversalTask for how each is used.
 	float getPixelScaleLimit() const { return lod_pixel_scale_limit; }
 	void setPixelScaleLimit(float v) { lod_pixel_scale_limit = v; }
+
+	// Note what this budget is counting: selected nodes, wherever they are, including the ones behind the camera - the
+	// traversal has no frustum test, on purpose, for reasons set out at GaussianSplatLodTraversalTask.  At the default
+	// (10M against a tree of under 4M nodes) it never binds, so that costs nothing today.  Where it does bind, though, it
+	// truncates detail in view in order to pay for nodes out of it, which is not merely suboptimal - it is the wrong thing
+	// to spend the last of a budget on.  getDiagnostics() prints "budget cap is limiting detail on this cloud" whenever
+	// this has stopped a traversal, which is the signal that this paragraph has become relevant.  The planned cluster-based
+	// LoD (see the same comment) removes the interaction rather than reweighting it, since an off-screen cluster is
+	// rejected before it can ask for budget at all.
 	size_t getMaxSplatsBudget() const { return lod_max_splats_budget; }
 	void setMaxSplatsBudget(size_t v) { lod_max_splats_budget = v; }
 	float getResortMoveThresholdWS() const { return lod_resort_move_threshold_ws; }

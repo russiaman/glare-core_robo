@@ -59,6 +59,13 @@ struct CloudMember
 	GaussianSplatRenderer::Handle handle;
 	GaussianSplatDataRef splat_data; // The original object-space data.  Kept so that a move, or a re-bake into a different cloud after a merge, starts from the source rather than accumulating error over repeated re-bakes.
 
+	// Null unless GaussianSplatRenderer::applyCoplanarMerge() has replaced splat_data above with a merged copy, in which
+	// case this holds what was loaded.  Two things need it: restoreUnmergedSplats(), and the merge itself, which always
+	// starts from the loaded splats rather than from whatever the last press left behind - otherwise a second press at
+	// the same tolerances would merge an already-merged cloud again, and the tolerances would mean a different thing
+	// every time.
+	GaussianSplatDataRef unmerged_splat_data;
+
 	size_t offset, count; // This member's range within its cloud's arrays, and within its GPU texture and index VBO.
 
 	js::AABBox aabb_ws; // Padded by the splat extent, not just bounding the splat centres - see bakeMember().
@@ -2705,6 +2712,202 @@ void GaussianSplatRenderer::mergeIntersectingClouds(SplatCloud& seed_cloud)
 	// One rebuild for the whole merge, rather than one per absorbed cloud.
 	if(merged_any)
 		rebuildCloud(seed_cloud);
+}
+
+
+// Builds the merged copy of one member's loaded splats, LoD tree and all.  Object space throughout: the tolerances have
+// already been converted by the caller, and the tree is built in the same space the source's was, so the result bakes to
+// world space by exactly the path an unmerged member takes (see bakeMember()).
+static GaussianSplatDataRef mergedSplatData(const GaussianSplatData& src, const GaussianSplatCoplanarMergeParams& params_os, float lod_base,
+	GaussianSplatCoplanarMergeStats& stats_out)
+{
+	Reference<GaussianSplatData> merged = new GaussianSplatData();
+	merged->positions = src.positions;
+	merged->scales    = src.scales;
+	merged->rotations = src.rotations;
+	merged->colours   = src.colours;
+
+	stats_out = coplanarMergeSplats(merged->positions, merged->scales, merged->rotations, merged->colours, params_os);
+
+	// Recomputed rather than copied: merging moves centres, so the source's bounds are no longer this cloud's.  Same
+	// convention as the decoder's - the splat centres only, not their extent (see GaussianSplatData::aabb_os).
+	merged->aabb_os = js::AABBox::emptyAABBox();
+	for(size_t i=0; i<merged->positions.size(); ++i)
+		merged->aabb_os.enlargeToHoldPoint(Vec4f(merged->positions[i].x, merged->positions[i].y, merged->positions[i].z, 1.f));
+
+	// The tree describes the splats it was built from, so a merged cloud needs a new one - keeping the old tree would
+	// leave its leaves pointing at splats that no longer exist.
+	try
+	{
+		if(merged->numSplats() > 0)
+			merged->lod_tree = buildGaussianSplatLodTree(merged->positions.data(), merged->scales.data(), merged->rotations.data(), merged->colours.data(),
+				merged->numSplats(), lod_base);
+	}
+	catch(std::exception&)
+	{
+		// As at load time: the tree is a nice-to-have, and an empty one means "no LoD, draw every splat" rather than a
+		// broken cloud (see GaussianSplatData::lod_tree).
+		merged->lod_tree.clear();
+	}
+
+	return merged;
+}
+
+
+std::string GaussianSplatRenderer::applyCoplanarMerge(const GaussianSplatCoplanarMergeParams& params_ws, float lod_base)
+{
+	Timer timer;
+
+	// One source cloud can be registered several times over (GUIClient's splat_data_cache serves repeat loads of a URL to
+	// every object using it), and the merge is object-space work that doesn't depend on where the object stands - so it is
+	// done once per (source, scale) pair and the result shared.  The scale is part of the key because it is what converts
+	// the world-space tolerances into object space: two objects at different scales are genuinely different merges.
+	struct MergedSource
+	{
+		GaussianSplatDataRef data;
+		GaussianSplatCoplanarMergeStats stats;
+	};
+	std::map<std::pair<const GaussianSplatData*, float>, MergedSource> merged_for_source;
+
+	size_t total_in = 0, total_out = 0, groups_merged = 0, groups_refused = 0, groups_total = 0, largest_merged = 0, largest_found = 0, members_merged = 0;
+	double area_in = 0, area_out = 0;
+
+	for(size_t c=0; c<clouds.size(); ++c)
+	{
+		SplatCloud& cloud = *clouds[c];
+
+		size_t merged_here = 0;
+		for(size_t m=0; m<cloud.members.size(); ++m)
+		{
+			CloudMember& member = cloud.members[m];
+			const GaussianSplatDataRef src = member.unmerged_splat_data.nonNull() ? member.unmerged_splat_data : member.splat_data;
+			if(src->numSplats() < 2)
+				continue;
+
+			const float scale = myMax(member.uniform_scale_ws, 1.0e-6f); // A zero-scaled object would divide by zero below; it draws as nothing anyway.
+
+			const std::pair<const GaussianSplatData*, float> key(src.ptr(), scale);
+			std::map<std::pair<const GaussianSplatData*, float>, MergedSource>::iterator res = merged_for_source.find(key);
+			if(res == merged_for_source.end())
+			{
+				GaussianSplatCoplanarMergeParams params_os = params_ws;
+				params_os.across  = params_ws.across  / scale;
+				params_os.through = params_ws.through / scale;
+				params_os.alpha_cutoff = splat_alpha_cutoff; // Not the caller's to choose: it is where this renderer cuts a quad off, and the merge's "does this group pay?" test has to use the same one - see the field's comment.
+
+				MergedSource entry;
+				entry.data = mergedSplatData(*src, params_os, lod_base, entry.stats);
+				res = merged_for_source.insert(std::make_pair(key, entry)).first;
+			}
+
+			// Accumulated per member rather than per distinct source: two objects sharing one decoded cloud are two
+			// clouds' worth of splats on the screen, and these figures are about the world, not about the file.
+			const GaussianSplatCoplanarMergeStats& stats = res->second.stats;
+			total_in += stats.splats_in;
+			total_out += stats.splats_out;
+			groups_merged += stats.groups_merged;
+			groups_refused += stats.groups_refused;
+			groups_total += stats.groups_total;
+			largest_merged = myMax(largest_merged, stats.largest_group_merged);
+			largest_found = myMax(largest_found, stats.largest_group_found);
+			area_in += stats.area_in * (double)scale * (double)scale; // Object-space areas, reported in world units so that a world of differently-scaled objects sums to something meaningful.
+			area_out += stats.area_out * (double)scale * (double)scale;
+
+			member.unmerged_splat_data = src;
+			member.splat_data = res->second.data;
+			member.count = res->second.data->numNodes();
+			merged_here++;
+		}
+
+		// Member counts have changed, so every offset in this cloud has moved: the full rebuild is the path that already
+		// handles that (re-bake, re-upload, generation bumps, placeholder frontier).  The importance record is dropped by
+		// its own layout fingerprint, which is the right outcome - it was accumulated against splats that no longer exist.
+		if(merged_here > 0)
+		{
+			rebuildCloud(cloud);
+			members_merged += merged_here;
+		}
+	}
+
+	if(members_merged == 0)
+		return "Coplanar merge: no splat cloud registered, nothing done.";
+
+	// A replacement is a moment match over its group, so it can reach a little past the members it stood in for - which
+	// means a cloud's bounds can grow by a few centimetres, and two clouds that were disjoint before might now touch.
+	// Under-merging is the direction that breaks the cross-cloud draw order (see the Partitioning note in the header), so
+	// the test is re-run rather than assumed.  Restarting on any change because absorbing a cloud shifts clouds[] under
+	// the index; the list is a handful of entries, so the cost of being crude here is nil.
+	for(size_t i=0; i<clouds.size(); )
+	{
+		const size_t num_before = clouds.size();
+		mergeIntersectingClouds(*clouds[i]);
+		if(clouds.size() == num_before)
+			++i;
+		else
+			i = 0;
+	}
+
+	std::string s = "Coplanar merge at across " + doubleToStringNDecimalPlaces(params_ws.across * 100.0, 1) + " cm, through " +
+		doubleToStringNDecimalPlaces(params_ws.through * 100.0, 1) + " cm, colour " + doubleToStringNDecimalPlaces(params_ws.colour_tol, 3) +
+		", angle " + doubleToStringNDecimalPlaces(params_ws.angle_tol_deg, 0) + " deg:\n";
+	s += "  Splats:  " + uInt64ToStringCommaSeparated(total_in) + " -> " + uInt64ToStringCommaSeparated(total_out) + "  (" +
+		doubleToStringNDecimalPlaces((total_in > 0) ? (100.0 * (1.0 - (double)total_out / (double)total_in)) : 0.0, 1) + "% removed)\n";
+	s += "  Area drawn, face-on: " + doubleToStringNDecimalPlaces(area_in, 1) + " -> " + doubleToStringNDecimalPlaces(area_out, 1) + " m^2  (" +
+		doubleToStringNDecimalPlaces((area_in > 0) ? (100.0 * (1.0 - area_out / area_in)) : 0.0, 1) + "% saved)\n";
+	s += "    The ellipse the shader really rasterises, cutoff radius and all, but seen face-on and at unit distance - so\n";
+	s += "    it is the view-independent half of the answer, weighting a wall the camera never looks at as heavily as the\n";
+	s += "    one in front of it.  What the pass is bound by is on-screen fill: read the frustum report's \"blended\" line\n";
+	s += "    and its layers-to-saturation figure, from the same spot, before and after.\n";
+	s += "  Groups collapsed: " + uInt64ToStringCommaSeparated(groups_merged) + ", largest " + uInt64ToStringCommaSeparated(largest_merged) +
+		"; refused for painting more than they replaced: " + uInt64ToStringCommaSeparated(groups_refused) + "\n";
+	// Without this line, "nothing was merged" has two readings that want opposite next steps - the grouping reached
+	// nothing, or it reached plenty and the area test threw it out.  Session 42 spent itself on that ambiguity.
+	s += "  What the grouping found before judging any of it: " + uInt64ToStringCommaSeparated(groups_total) + " groups, " +
+		doubleToStringNDecimalPlaces((groups_total > 0) ? ((double)total_in / (double)groups_total) : 0.0, 2) + " splats each on average, largest " +
+		uInt64ToStringCommaSeparated(largest_found) + ".\n";
+	s += "    A largest of 1 there means the reach or the tolerances found nothing to consider; a large one beside few\n";
+	s += "    collapses means it found plenty and the area test refused it, which is the arithmetic, not a bug.\n";
+	s += "  Took " + doubleToStringNDecimalPlaces(timer.elapsed(), 2) + " s, LoD trees rebuilt.";
+	return s;
+}
+
+
+std::string GaussianSplatRenderer::restoreUnmergedSplats()
+{
+	Timer timer;
+
+	size_t members_restored = 0, total_splats = 0;
+
+	for(size_t c=0; c<clouds.size(); ++c)
+	{
+		SplatCloud& cloud = *clouds[c];
+
+		size_t restored_here = 0;
+		for(size_t m=0; m<cloud.members.size(); ++m)
+		{
+			CloudMember& member = cloud.members[m];
+			if(member.unmerged_splat_data.isNull())
+				continue;
+
+			member.splat_data = member.unmerged_splat_data;
+			member.unmerged_splat_data = GaussianSplatDataRef();
+			member.count = member.splat_data->numNodes();
+			total_splats += member.splat_data->numSplats();
+			restored_here++;
+		}
+
+		if(restored_here > 0)
+		{
+			rebuildCloud(cloud);
+			members_restored += restored_here;
+		}
+	}
+
+	if(members_restored == 0)
+		return "Nothing to restore: no cloud is merged.";
+
+	return "Restored " + uInt64ToStringCommaSeparated(members_restored) + " splat object(s) to their loaded splats (" +
+		uInt64ToStringCommaSeparated(total_splats) + " splats), in " + doubleToStringNDecimalPlaces(timer.elapsed(), 2) + " s.";
 }
 
 

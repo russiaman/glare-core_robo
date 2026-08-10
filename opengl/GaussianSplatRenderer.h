@@ -6,6 +6,7 @@ Copyright Glare Technologies Limited 2026 -
 #pragma once
 
 
+#include "../graphics/GaussianSplatCoplanarMerge.h" // For the parameters applyCoplanarMerge() takes.
 #include "../graphics/GaussianSplatData.h"
 #include "../maths/Matrix4f.h" // For the frozen hide-overdraw mask's view matrix.
 #include "../maths/Quat.h"
@@ -177,6 +178,29 @@ public:
 	// tolerance and a deliberately reckless one, so the gap between the two says how much of the merge prize the safety
 	// conditions are costing. Defaults are a tenth per colour channel and 26 degrees.
 	std::string getFrustumStructureReport(float merge_colour_tol = 0.1f, float merge_angle_tol_deg = 26.f);
+
+	// Collapses near-duplicate splats in every registered cloud - see GaussianSplatCoplanarMerge.h for what that means and
+	// what it is for - and rebuilds each affected member's LoD tree from the merged splats, since the tree describes the
+	// cloud it was built from and nothing else. Returns a one-line-per-figure summary for the log.
+	//
+	// params_ws.alpha_cutoff is filled in here from getAlphaCutoff() and need not be set by the caller; the rest of the
+	// struct is the tolerances, which are the caller's.
+	//
+	// The tolerances are in world metres and are converted to each member's own object space here, using the member's
+	// uniform scale - so a capture placed in the world at half size is merged to the same world-space tolerance as one
+	// placed at full size, which is what makes the setting mean something across a world of differently-scaled objects.
+	//
+	// Synchronous, on the main thread, and it re-runs the LoD tree build - which is a load-time-scale cost, seconds on a
+	// multi-million-splat capture. Meant for a button press while standing still, exactly like getFrustumStructureReport().
+	//
+	// The pre-merge data is kept (see CloudMember::unmerged_splat_data) rather than being reloaded from the source file,
+	// which is what makes restoreUnmergedSplats() possible and what keeps a second press from merging an already-merged
+	// cloud again: every press starts from the original splats, so the tolerances mean the same thing every time.
+	std::string applyCoplanarMerge(const GaussianSplatCoplanarMergeParams& params_ws, float lod_base);
+
+	// Puts every merged cloud back to the splats it was loaded with, rebuilding the trees again. The point of it is
+	// eyes-on A/B at a fixed camera: a merge that changes the picture is only visible against the picture it changed.
+	std::string restoreUnmergedSplats();
 
 	// Throws away the per-splat importance getFrustumStructureReport() has accumulated, so the next run starts a fresh set
 	// of viewpoints. Needed because the record is only meaningful for viewpoints chosen on purpose: a stray report taken

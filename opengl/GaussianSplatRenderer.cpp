@@ -499,15 +499,15 @@ struct FrontierNodeRecord
 class GaussianSplatLodTraversalTask : public glare::Task
 {
 public:
-	// result_queue_ may be null, and frontier_record_ may be non-null, for a synchronous run made purely to inspect the
-	// frontier - see GaussianSplatRenderer::getFrustumStructureReport().  Both are null/absent for the normal per-frame
-	// traversal, where the enqueued result is the whole point and nothing wants the per-node breakdown.
+	// result_queue_ may be null, and frontier_record_ non-null, for a synchronous run made purely to inspect the frontier -
+	// see GaussianSplatRenderer::getFrustumStructureReport().  Both are null/absent for the normal per-frame traversal,
+	// where the enqueued result is the whole point and nothing wants the per-node breakdown.
 	GaussianSplatLodTraversalTask(uint64 cloud_id_, uint64 topology_generation_, const Reference<GaussianSplatLodTraversalScratch>& scratch_,
 		const Vec4f& cam_pos_ws_, float pixel_scale_limit_, size_t max_splats_budget_, float max_layer_density_, int max_tree_depth_, float focal_px_, ThreadSafeQueue<Reference<ThreadMessage> >* result_queue_,
-		js::Vector<FrontierNodeRecord, 16>* frontier_record_ = NULL, js::Vector<float, 16>* expanded_density_record_ = NULL)
+		js::Vector<FrontierNodeRecord, 16>* frontier_record_ = NULL)
 	:	cloud_id(cloud_id_), topology_generation(topology_generation_), scratch(scratch_), cam_pos_ws(cam_pos_ws_),
 		pixel_scale_limit(pixel_scale_limit_), max_splats_budget(max_splats_budget_), max_layer_density(max_layer_density_), max_tree_depth(max_tree_depth_), focal_px(focal_px_), result_queue(result_queue_),
-		frontier_record(frontier_record_), expanded_density_record(expanded_density_record_)
+		frontier_record(frontier_record_)
 	{}
 
 	virtual void run(size_t /*thread_index*/) override
@@ -589,9 +589,6 @@ public:
 				hit_budget_cap = true;
 				break; // Leave this node, and the rest of the heap, to be drained as-is below - the budget, not convergence, is what stopped things here.
 			}
-
-			if(expanded_density_record != NULL)
-				expanded_density_record->push_back(node.layer_density); // Recorded here, and only here, because this is exactly the set of nodes max_layer_density gets a say over.
 
 			heap.pop();
 			for(uint32 c = node.child_start; c < (uint32)node.child_start + node.child_count; ++c)
@@ -706,7 +703,6 @@ private:
 	float focal_px;
 	ThreadSafeQueue<Reference<ThreadMessage> >* result_queue;
 	js::Vector<FrontierNodeRecord, 16>* frontier_record; // Null (the normal case) means don't record anything - see recordFrontierNode().
-	js::Vector<float, 16>* expanded_density_record; // Null in the normal case too; otherwise collects one layer_density per node the traversal expanded.
 };
 
 
@@ -1043,41 +1039,6 @@ static std::string histogramLines(const std::string& indent, const std::vector<s
 			std::string(bar_len, '#') + "\n";
 	}
 	return s;
-}
-
-
-// Which layer_density bucket a value falls in, and the labels for all of them.  Bucketed geometrically because the
-// interesting range spans three orders of magnitude: a node over an empty wall and a node over the measured "blur splat"
-// region differ by a factor of hundreds, not by a few units.
-static const size_t num_density_buckets = 11;
-static const char* const density_bucket_labels[num_density_buckets] = { "0 (leaf)", "0 - 1", "1 - 2", "2 - 4", "4 - 8", "8 - 16", "16 - 32", "32 - 64", "64 - 128", "128 - 256", "256 +" };
-static size_t densityBucket(float density)
-{
-	if(density <= 0.f)  return 0;
-	if(density < 1.f)   return 1;
-	if(density < 2.f)   return 2;
-	if(density < 4.f)   return 3;
-	if(density < 8.f)   return 4;
-	if(density < 16.f)  return 5;
-	if(density < 32.f)  return 6;
-	if(density < 64.f)  return 7;
-	if(density < 128.f) return 8;
-	if(density < 256.f) return 9;
-	return 10;
-}
-
-
-// Same idea for a node's child count, which is small and dense at the low end (the voxel-grid merge produces mostly
-// 2-8 children) and has a long thin tail worth seeing as one bucket rather than a hundred empty lines.
-static const size_t num_child_count_buckets = 12;
-static const char* const child_count_bucket_labels[num_child_count_buckets] = { "1", "2", "3", "4", "5", "6", "7", "8", "9 - 12", "13 - 16", "17 - 32", "33 +" };
-static size_t childCountBucket(uint32 child_count)
-{
-	if(child_count <= 8)  return child_count - 1; // Only called for internal nodes, so child_count >= 1.
-	if(child_count <= 12) return 8;
-	if(child_count <= 16) return 9;
-	if(child_count <= 32) return 10;
-	return 11;
 }
 
 
@@ -1464,11 +1425,10 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 
 		js::Vector<FrontierNodeRecord, 16> frontier;
 		frontier.reserve(cloud.total_splats);
-		js::Vector<float, 16> expanded_density;
 
 		// Null result queue: this frontier is for reading, not for drawing - see the task's own comment there.
 		GaussianSplatLodTraversalTask task(cloud.cloud_id, cloud.topology_generation, scratch, cam_pos_ws,
-			lod_pixel_scale_limit, lod_max_splats_budget, lod_max_layer_density, lod_max_tree_depth, focal_px, /*result_queue=*/NULL, &frontier, &expanded_density);
+			lod_pixel_scale_limit, lod_max_splats_budget, lod_max_layer_density, lod_max_tree_depth, focal_px, /*result_queue=*/NULL, &frontier);
 		task.run(0);
 
 		// Not returned to the pool yet: the pruning ceiling below walks scratch->selected_indices, which is the frontier in
@@ -1477,8 +1437,6 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 		//----------------------------- Structure of the trees themselves -----------------------------
 		// Independent of the camera: what the hierarchy offers, against which the frontier below says what was taken.
 		size_t tree_nodes = 0, tree_leaves = 0, tree_max_depth = 0, leaves_in_frustum = 0;
-		std::vector<size_t> child_count_hist(num_child_count_buckets, 0);
-		std::vector<size_t> level_hist; // Nodes per level, grown as deeper levels turn up.
 		js::Vector<uint16, 16> node_depth;
 
 		for(size_t m=0; m<cloud.members.size(); ++m)
@@ -1496,9 +1454,6 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 			{
 				const GaussianSplatLodNode& node = tree[i];
 				const uint16 depth = node_depth[i];
-				if(level_hist.size() <= (size_t)depth)
-					level_hist.resize((size_t)depth + 1, 0);
-				level_hist[depth]++;
 				tree_max_depth = myMax(tree_max_depth, (size_t)depth);
 
 				if(node.child_count == 0)
@@ -1510,7 +1465,6 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 				}
 				else
 				{
-					child_count_hist[childCountBucket(node.child_count)]++;
 					for(uint32 ch = node.child_start; ch < (uint32)node.child_start + node.child_count; ++ch)
 						node_depth[ch] = (uint16)(depth + 1);
 				}
@@ -1526,8 +1480,6 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 		for(size_t i=0; i<FrontierStop_NumReasons; ++i)
 			reason_counts[i] = 0;
 
-		std::vector<size_t> frontier_depth_hist(tree_max_depth + 1, 0);
-		std::vector<size_t> density_hist(num_density_buckets, 0);
 		size_t frontier_in_frustum = 0, frontier_leaves_in_frustum = 0;
 		double depth_sum = 0;
 
@@ -1541,13 +1493,10 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 			frontier_in_frustum++;
 			reason_counts[myMin((size_t)rec.stop_reason, (size_t)FrontierStop_NumReasons - 1)]++;
 			depth_sum += rec.depth;
-			if((size_t)rec.depth < frontier_depth_hist.size())
-				frontier_depth_hist[rec.depth]++;
 
 			if(rec.stop_reason != FrontierStop_NoTree)
 			{
 				const GaussianSplatLodNode& node = cloud.members[rec.member_idx].splat_data->lod_tree[rec.tree_local_idx];
-				density_hist[densityBucket(node.layer_density)]++;
 				if(node.child_count == 0)
 					frontier_leaves_in_frustum++;
 			}
@@ -1596,52 +1545,22 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 			s += histogramLines("    ", labels, counts);
 		}
 
-		s += "\n  In-frustum frontier, by depth below the tree root (mean " +
-			doubleToStringNDecimalPlaces(depth_sum / (double)myMax((size_t)1, frontier_in_frustum), 2) + "):\n";
-		{
-			std::vector<std::string> labels(frontier_depth_hist.size());
-			for(size_t i=0; i<labels.size(); ++i)
-				labels[i] = "level " + toString(i);
-			s += histogramLines("    ", labels, frontier_depth_hist);
-		}
+		s += "  Mean frontier depth below the tree root: " +
+			doubleToStringNDecimalPlaces(depth_sum / (double)myMax((size_t)1, frontier_in_frustum), 2) + "\n";
 
-		s += "\n  Whole tree, nodes per level:\n";
-		{
-			std::vector<std::string> labels(level_hist.size());
-			for(size_t i=0; i<labels.size(); ++i)
-				labels[i] = "level " + toString(i);
-			s += histogramLines("    ", labels, level_hist);
-		}
-
-		s += "\n  Whole tree, children per merged node (branching factor):\n";
-		{
-			std::vector<std::string> labels(num_child_count_buckets);
-			for(size_t i=0; i<num_child_count_buckets; ++i)
-				labels[i] = child_count_bucket_labels[i];
-			s += histogramLines("    ", labels, child_count_hist);
-		}
-
-		s += "\n  In-frustum frontier, by layer_density (estimated overdraw if the node were unfolded to leaves):\n";
-		{
-			std::vector<std::string> labels(num_density_buckets);
-			for(size_t i=0; i<num_density_buckets; ++i)
-				labels[i] = density_bucket_labels[i];
-			s += histogramLines("    ", labels, density_hist);
-		}
-
-		// The frontier's own densities can't answer whether max_layer_density has anything to bite on, because a leaf's is
-		// 0 by definition and the frontier is mostly leaves.  What the cap acts on is the nodes the traversal chose to
-		// expand, so those are counted separately.
-		s += "\n  Nodes the traversal expanded, by layer_density (what max_layer_density would act on):\n";
-		{
-			std::vector<size_t> expanded_hist(num_density_buckets, 0);
-			for(size_t i=0; i<expanded_density.size(); ++i)
-				expanded_hist[densityBucket(expanded_density[i])]++;
-			std::vector<std::string> labels(num_density_buckets);
-			for(size_t i=0; i<num_density_buckets; ++i)
-				labels[i] = density_bucket_labels[i];
-			s += histogramLines("    ", labels, expanded_hist);
-		}
+		// Four histograms used to stand here - frontier depth, whole-tree levels, branching factor, and layer_density both
+		// of the frontier and of the nodes the traversal expanded.  All four have been read and answered, and none of them
+		// moves any decision now:
+		//
+		// The depth, level and branching histograms described a tree that turns out to be almost entirely unfolded in
+		// view (97-98% of drawn nodes are leaves on every viewpoint measured), so its shape above the leaves is not what
+		// the cost depends on.  The stop-reason histogram above still says that in one line, which is all that is needed.
+		//
+		// layer_density answered a question that is now closed: whether max_layer_density has anything to bite on.  It
+		// does not - 87.5% of expanded nodes sit in the 1-2 bucket and 0.3% above 16, so the metric does not separate the
+		// crowded regions from the ordinary ones and the knob cannot work by construction rather than by tuning.
+		//
+		// Both are recoverable from history if the cloud or the tree builder changes enough to reopen them.
 
 		//----------------------------- Where the fill actually comes from -----------------------------
 		// The half of the report that matters once the hierarchy has been shown to be fully unfolded: the cost of this pass

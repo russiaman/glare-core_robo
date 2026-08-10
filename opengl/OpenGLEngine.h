@@ -1322,6 +1322,16 @@ public:
 	// Try and enable profiling.  May not work on some platforms that don't support queries.
 	void setProfilingEnabled(bool enabled);
 
+	// The splat pass's own GPU times from the last frame, and whether the queries behind them are running at all.  Read by
+	// GaussianSplatRenderer::getFrustumStructureReport(), so that what the splat pass cost and the report explaining that
+	// cost land in the log as one record rather than needing to be paired up by hand afterwards.  Zero when profiling is
+	// off, which is why isProfilingEnabled() is here beside them: a zero has to be readable as "not measured" rather than
+	// as "free".  All in seconds, like the members behind them.
+	double getLastDrawSplatsGPUTime() const { return last_draw_splats_GPU_time; }
+	double getLastSplatDepthBlitGPUTime() const { return last_splat_depth_blit_GPU_time; }
+	double getLastMarkSaturatedSplatsGPUTime() const { return last_mark_saturated_splats_GPU_time; }
+	bool isProfilingEnabled() const { return query_profiling_enabled; }
+
 	bool runningInRenderDoc() const { return running_in_renderdoc; }
 	//----------------------------------------------------------------------------------------
 

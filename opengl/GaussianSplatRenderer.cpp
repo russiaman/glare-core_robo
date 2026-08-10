@@ -1410,6 +1410,41 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 	s += "Frustum test is on a node's centre: a node whose centre is just outside still rasterises, so the in-frustum\n"
 		 "figures below slightly understate what is actually being shaded.\n";
 
+	// What the pass actually cost on the frame before this button was pressed, and what state the cloud was in when it did.
+	//
+	// Both are here because a report without them is only half a record: everything below this line is a prediction of cost
+	// from geometry, and the prediction is worth nothing unless the measured cost sits beside it, taken at the same camera,
+	// on the same cloud.  Pairing the two up afterwards from a separately-copied diagnostics panel is exactly the step that
+	// goes wrong - or gets skipped.
+	//
+	// Read the splat line, not the total: the total carries an extra full pass over the splats whenever the hide-overdraw
+	// mask is being rebuilt, and it includes everything else in the frame besides.
+	s += "\nSplat pass, GPU times measured on the last frame drawn:\n";
+	if(opengl_engine->isProfilingEnabled())
+	{
+		s += "  draw splats      : " + doubleToStringNSigFigs(opengl_engine->getLastDrawSplatsGPUTime() * 1.0e3, 4) + " ms\n";
+		s += "  splat depth blit : " + doubleToStringNSigFigs(opengl_engine->getLastSplatDepthBlitGPUTime() * 1.0e3, 4) + " ms\n";
+		s += "  splat sat. mark  : " + doubleToStringNSigFigs(opengl_engine->getLastMarkSaturatedSplatsGPUTime() * 1.0e3, 4) + " ms\n";
+		s += "  whole frame      : " + doubleToStringNSigFigs(opengl_engine->last_total_draw_GPU_time * 1.0e3, 4) + " ms\n";
+		s += "  Splats drawn last frame: " + uInt64ToStringCommaSeparated(opengl_engine->last_num_splats_drawn) +
+			" (before the vertex shader's own culling, which this count does not see)\n";
+	}
+	else
+		s += "  Not measured - GPU profiling is off.  Tick \"Show frame time graphs\" before starting the client, and take\n"
+			 "  this report again; the CPU-side frame time is vsync-bound and is not a substitute.\n";
+
+	s += "Cloud state: " + (last_merge_description.empty() ? std::string("as loaded, not merged") : last_merge_description) + "\n";
+
+	// Live draw-path settings that change what the numbers above mean.  Not the whole panel - only the ones that alter the
+	// cost of the splat pass without altering the frontier the report describes, which are the ones that would otherwise
+	// make two reports disagree for no visible reason.
+	s += "Draw settings: alpha_cutoff " + doubleToStringNDecimalPlaces(splat_alpha_cutoff, 4) +
+		", draw slices " + toString(splat_num_draw_slices) + (splat_slice_growth != 1.f ? (" (growth " + doubleToStringNDecimalPlaces(splat_slice_growth, 2) + ")") : "") +
+		", saturation gate " + (splat_saturation_gate_enabled ? ("on at " + doubleToStringNDecimalPlaces(splat_saturation_threshold, 4) + ", mask 1/" + toString(splat_saturation_mask_downscale)) : std::string("off")) +
+		", accum buffer " + (splat_accum_buffer_8bit ? "RGBA8" : "RGBA16F") +
+		(getShowOverdraw() ? (", OVERDRAW VIEW " + toString(splat_show_overdraw_mode) + " (blend is additive, times are not comparable)") : std::string()) +
+		(getHideMode() != 0 ? (", HIDE MODE " + toString(getHideMode()) + " (a counting pass is in the frame)") : std::string()) + "\n";
+
 	// World-wide roll-up, accumulated across the clouds below.
 	size_t world_frontier = 0, world_frontier_in_frustum = 0, world_leaves_in_frustum = 0, world_frontier_leaves_in_frustum = 0;
 	double world_quad_area = 0, world_ellipse_area = 0;
@@ -2847,9 +2882,18 @@ std::string GaussianSplatRenderer::applyCoplanarMerge(const GaussianSplatCoplana
 			i = 0;
 	}
 
+	// Kept as well as returned: the frustum report prints it, so every report taken from here on says which merge it is
+	// describing without that having to be remembered from further up the log.
+	last_merge_description = "merged at across " + doubleToStringNDecimalPlaces(params_ws.across * 100.0, 1) + " cm, through " +
+		doubleToStringNDecimalPlaces(params_ws.through * 100.0, 1) + " cm, colour " + doubleToStringNDecimalPlaces(params_ws.colour_tol, 3) +
+		", angle " + doubleToStringNDecimalPlaces(params_ws.angle_tol_deg, 0) + " deg, " +
+		(params_ws.flatten_onto_surface ? "flattened onto the surface" : "NOT flattened (replacement fitted around the group's depth)") + " - " +
+		uInt64ToStringCommaSeparated(total_in) + " splats -> " + uInt64ToStringCommaSeparated(total_out);
+
 	std::string s = "Coplanar merge at across " + doubleToStringNDecimalPlaces(params_ws.across * 100.0, 1) + " cm, through " +
 		doubleToStringNDecimalPlaces(params_ws.through * 100.0, 1) + " cm, colour " + doubleToStringNDecimalPlaces(params_ws.colour_tol, 3) +
-		", angle " + doubleToStringNDecimalPlaces(params_ws.angle_tol_deg, 0) + " deg:\n";
+		", angle " + doubleToStringNDecimalPlaces(params_ws.angle_tol_deg, 0) + " deg, " +
+		(params_ws.flatten_onto_surface ? "flattened" : "not flattened") + ":\n";
 	s += "  Splats:  " + uInt64ToStringCommaSeparated(total_in) + " -> " + uInt64ToStringCommaSeparated(total_out) + "  (" +
 		doubleToStringNDecimalPlaces((total_in > 0) ? (100.0 * (1.0 - (double)total_out / (double)total_in)) : 0.0, 1) + "% removed)\n";
 	s += "  Area drawn, face-on: " + doubleToStringNDecimalPlaces(area_in, 1) + " -> " + doubleToStringNDecimalPlaces(area_out, 1) + " m^2  (" +
@@ -2902,6 +2946,9 @@ std::string GaussianSplatRenderer::restoreUnmergedSplats()
 			members_restored += restored_here;
 		}
 	}
+
+	if(members_restored > 0)
+		last_merge_description.clear(); // So the next report describes itself as taken on the loaded cloud.
 
 	if(members_restored == 0)
 		return "Nothing to restore: no cloud is merged.";

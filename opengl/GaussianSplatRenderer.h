@@ -589,4 +589,10 @@ private:
 	// See getOverdrawRangeMin()/getOverdrawRangeMax() above.
 	float splat_overdraw_range_min;
 	float splat_overdraw_range_max;
+
+	// One line describing the coplanar merge the clouds are currently carrying, or empty if they are as they were loaded.
+	// Printed by getFrustumStructureReport(), so that a report taken after a merge says so in its own text - a log full of
+	// reports whose state has to be reconstructed from what was pressed before them is a log that will eventually be read
+	// wrong.  Set by applyCoplanarMerge(), cleared by restoreUnmergedSplats().
+	std::string last_merge_description;
 };

@@ -263,16 +263,18 @@ GaussianSplatCoplanarMergeStats coplanarMergeSplats(js::Vector<Vec3f, 16>& posit
 		// group.  Sharing that function rather than writing a second version of the same maths also means a group that
 		// happens to be a stack collapses to the same shape either code path would give it.
 		group_nodes.resize(group.size());
-		double sum_drawn_area = 0, sum_alpha_geo_area = 0, transmittance = 1.0;
+		double sum_drawn_area = 0, sum_geo_area = 0, sum_alpha_geo_area = 0, sum_log_transmittance = 0;
 		for(size_t k=0; k<group.size(); ++k)
 		{
 			const uint32 idx = group[k];
 			group_nodes[k] = makeGaussianSplatLodLeafNode(positions[idx], scales[idx], rotations[idx], colours[idx]);
 
-			const float opacity = myClamp(colours[idx][3], 0.f, 1.f);
+			const float opacity = myClamp(colours[idx][3], 0.f, 1.f - 1.0e-6f); // Held below 1 so the log below stays finite; a splat at opacity 1 is opaque either way.
+			const double geo_area = geometricArea(scales[idx]);
 			sum_drawn_area += areas[idx];
-			sum_alpha_geo_area += (double)geometricArea(scales[idx]) * opacity; // The ink the member lays down, which is a property of the Gaussian itself - unlike the drawn area above, it doesn't move with where the quad is cut off.
-			transmittance *= (1.0 - opacity);
+			sum_geo_area += geo_area;
+			sum_alpha_geo_area += geo_area * opacity; // The ink the member lays down, which is a property of the Gaussian itself - unlike the drawn area above, it doesn't move with where the quad is cut off.
+			sum_log_transmittance += std::log(1.0 - opacity);
 		}
 
 		GaussianSplatLodNode merged = mergeGaussianSplatLodNodes(group_nodes.data(), group_nodes.size());
@@ -301,19 +303,27 @@ GaussianSplatCoplanarMergeStats coplanarMergeSplats(js::Vector<Vec3f, 16>& posit
 		// subtree; what this replacement has to preserve is what the group put on the screen.  Two bounds say what that
 		// is, and the answer is the smaller:
 		//
-		//  - Conserving alpha over area, sum(alpha_i * area_i) / area_replacement.  For a group spread out across the
-		//    surface this is the right one: the replacement covers more area than any one member did, so it has to be
-		//    correspondingly fainter to put the same amount of ink down.
-		//  - The stack composite, 1 - prod(1 - alpha_i).  For a group stacked exactly on top of itself the first bound
-		//    gives sum(alpha_i), which overshoots - five layers of alpha 0.1 show 0.41, not 0.5 - and would leave the
-		//    merged surface visibly harder than the stack it replaced.
+		//  - Conserving ink: sum(alpha_i * area_i) / area_replacement.  A replacement covering more area than one member
+		//    did has to be correspondingly fainter to lay the same amount down.
+		//  - What compositing can actually reach.  Ink adds linearly, alpha does not: five layers of 0.1 show 0.41, not
+		//    0.5, so past a point the first bound asks for an opacity that no arrangement of these members ever showed,
+		//    and the replacement comes out harder than what it replaced.
 		//
-		// Where the group is a real stack the second binds, and this is the mechanism by which merging cuts the number of
-		// layers a pixel has to blend before it saturates, which is a separate saving from the area one below.
+		// The second bound is over the layers the areas imply, not over the whole group.  How many members overlap at a
+		// typical point is sum(their areas) / the replacement's area - k for a group stacked exactly on itself, 1 for one
+		// spread out until its members no longer touch - so the cap is 1 - t^n at the members' geometric-mean
+		// transmittance t.  Using the whole group's product instead assumes total overlap, which is only true of a true
+		// stack: measured on the reference capture it cost about a tenth of the cloud's ink once the replacements got
+		// small enough for it to bind, visible directly as a drop in the report's "Sum of alpha".
+		//
+		// Where the group really is a stack this reduces to 1 - prod(1 - alpha_i) exactly, and that is the mechanism by
+		// which merging cuts the number of layers a pixel blends before it saturates - a saving separate from the area one
+		// below.
 		const double merged_geo_area = geometricArea(merged.scale);
 		const double alpha_over_area = (merged_geo_area > 1.0e-20) ? (sum_alpha_geo_area / merged_geo_area) : 1.0;
-		const double alpha_stack = 1.0 - transmittance;
-		const float merged_alpha = (float)myClamp(myMin(alpha_over_area, alpha_stack), 0.0, 1.0);
+		const double effective_layers = (merged_geo_area > 1.0e-20) ? myMax(sum_geo_area / merged_geo_area, 0.0) : (double)group.size();
+		const double alpha_composite = 1.0 - std::exp(sum_log_transmittance * effective_layers / (double)group.size());
+		const float merged_alpha = (float)myClamp(myMin(alpha_over_area, alpha_composite), 0.0, 1.0);
 
 		// The rule this whole operation turns on: a group is only collapsed if what replaces it paints less than what it
 		// replaced.  The LoD tree's merge has no such test - it is trading splat count, not area - and that is exactly why

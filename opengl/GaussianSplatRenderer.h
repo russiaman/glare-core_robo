@@ -333,10 +333,83 @@ public:
 	// What a pixel that reached the cap is composited as.  true: fully covered, keeping the colour its kept layers
 	// averaged to, so the cut shows as a colour error.  false: as covered as those layers made it, so the background
 	// shows through wherever the cap bit - which is the quickest way to see where it bit at all.
+	// Shared with the coverage cap below, which cuts a pixel short in exactly the same way and wants the same choice about
+	// how to show it.
 	bool getLayerCapOpaque() const { return splat_layer_cap_opaque; }
 	void setLayerCapOpaque(bool v) { splat_layer_cap_opaque = v; }
 
+	// DIAGNOSTIC ONLY - the same per-fragment cut as getLayerCap(), but decided by accumulated coverage rather than by a
+	// layer count.  0 (default) = off; otherwise the coverage at or above which a pixel stops being composited.
+	//
+	// The missing third combination of the two axes the mask machinery has.  The saturation gate marks by coverage and
+	// kills whole splats in the vertex shader, conservatively - which is why it finds so little: a quad is dropped only
+	// when every pixel it can touch is finished, and quads are larger than the connected finished patches.  The layer cap
+	// marks by a count and kills fragments.  This marks by coverage and kills fragments, which is the aggressive reading
+	// of the gate's own criterion.
+	//
+	// Why coverage rather than the layer count the owner measured "20 layers" with: a count says how many times a pixel
+	// was painted, coverage says how much of it is already opaque, and only the second is a statement about what is still
+	// visible.  Front-to-back compositing is what makes it sound - once accumulated coverage is at the threshold, nothing
+	// drawn behind can change the pixel by more than what still gets through.  Twenty layers was a proxy for reaching that
+	// point in the measured scene, not the criterion itself.
+	//
+	// The practical difference from the layer cap is that no per-pixel counter buffer is needed - see
+	// wantsLayerCountBuffer().  That counter is a second full-screen attachment every splat fragment writes to, and the
+	// pass is bound by blend bandwidth, so the measurement tool was paying a share of the very cost it was measuring.
+	//
+	// Its own threshold rather than getSaturationThreshold(): the gate and the cap want that number in different places
+	// (the gate stops when nothing can be seen at all, this stops when little enough can), and sharing one field would
+	// mean every switch between them retunes the other.  Only one of the three can run - there is one mask - so the draw
+	// path stands the gate down while this is on and yields to the layer cap when both are set.
+	float getCoverageCap() const { return splat_coverage_cap; }
+	void setCoverageCap(float v) { splat_coverage_cap = v; }
+
+	// DIAGNOSTIC ONLY - the ablation ladder.  0 (default) = off, i.e. the pass exactly as it is.  Higher values switch
+	// progressively more of it back on, lightest first, so that reading the splat pass timer at each step and taking the
+	// difference attributes cost to the one thing that step added.
+	//
+	//   1  CPU only: traversal, sort and instance buffer are all done, and the draw call is not issued.
+	//   2  Instances emitted.  One texel fetched per vertex (the position), one-pixel quad, flat white, no blending.
+	//   3  All four texels fetched and unpacked.  Still a one-pixel quad.
+	//   4  The splat's own colour on those points.
+	//   5  All of the projection maths - covariance, Jacobian, eigen-decomposition, radii - and still a one-pixel quad.
+	//   6  The real quad size.  Flat opaque fill, still no blending.
+	//   7  Blending on, with a flat alpha across the quad.
+	//   8  The Gaussian falloff, but no discard.
+	//
+	// Stage 9 is this switched off - the full shader - and stage 10 is that with the alpha saturation cap on, so neither
+	// needs a value here: the existing knobs already say it.  9 minus 8 is the cost of 'discard' itself, which is the
+	// number this ladder exists for, and it should agree with what the draw slice limit says independently.
+	//
+	// 5 exists because 4 -> 6 moves two things at once, the vertex maths and the fill; splitting them is what makes each
+	// readable on its own.  Bisecting the fill further is getQuadRadiusScale()'s job, not another stage's.
+	//
+	// Two things the readings cannot be asked: GPU cost is not a sum of its stages but a maximum over the units that
+	// saturate, so a step reads as "the cost of this given everything below it" and the order is part of the answer; and
+	// stage 1 leaves the splat pass timer at nothing, so the number to read there is the CPU frame time instead.
+	//
+	// The quad stays a quad throughout, shrunk to a pixel rather than swapped for GL_POINTS: a different primitive type
+	// would change the rasterisation path as well as the area, and the step would then answer about both at once.
+	int getAblationStage() const { return splat_ablation_stage; }
+	void setAblationStage(int v) { splat_ablation_stage = v; }
+
+	// DIAGNOSTIC ONLY - multiplies every splat's screen-space quad radius.  1 (default) is the real size.
+	//
+	// Bisects the fill by area rather than by stage: the splat count, all of the vertex work and the length of the blend
+	// chain are untouched, and only rasterised area changes - as the square of this. So a cost that halves when this is
+	// set to 0.7 is area-proportional (rasterisation, shading, blend bandwidth), and one that does not is per-splat
+	// (instance emission, primitive setup) whatever the stage ladder says about it.
+	//
+	// Not the same as raising getAlphaCutoff(), which also shrinks quads: that trims each splat by its own opacity, so it
+	// changes which splats shrink and by how much. This is a uniform scale, which is what an area law needs. The conic is
+	// built from the scaled radii, so the Gaussian shrinks with the quad instead of being cut off by it - smaller splats,
+	// not hard-edged ones.
+	float getQuadRadiusScale() const { return splat_quad_radius_scale; }
+	void setQuadRadiusScale(float v) { splat_quad_radius_scale = v; }
+
 	// Whether the splat pass needs its per-pixel layer counter this frame - see OpenGLScene::splat_layer_count_renderbuffer.
+	// Deliberately not getCoverageCap(): that cap reads the coverage the accumulation buffer already holds, and being able
+	// to leave this attachment off is most of the reason it exists.
 	bool wantsLayerCountBuffer() const { return (splat_layer_cap > 0) || splat_layer_estimate_requested; }
 
 	// Asks the next frame to measure how much fill a per-pixel cap would remove, and report it - see
@@ -482,7 +555,9 @@ public:
 	// downstream - the pyramid, the vertex shader - is shared.
 	// layer_count_threshold: the count being thresholded is the per-pixel layer cap's rather than the overdraw ramp's red
 	// end - the two share this pass and differ only in what number they compare against.
-	void setSaturationMaskUniforms(int block_size, bool from_layer_count, bool layer_count_threshold = false) const;
+	// coverage_cap_threshold: same idea on the coverage side - the coverage being thresholded is getCoverageCap()'s rather
+	// than the gate's, the two being the same measure read at different places.  Ignored when from_layer_count is true.
+	void setSaturationMaskUniforms(int block_size, bool from_layer_count, bool layer_count_threshold = false, bool coverage_cap_threshold = false) const;
 
 	// Diagnostic, not an optimisation: draws a counting pass first, then throws away every splat that lands where the
 	// layer count reached getOverdrawRangeMax() - that is, exactly the region the overdraw view paints solid red - and
@@ -651,6 +726,15 @@ private:
 	// See getLayerCap()/getHideTestConservative() above. Default 0 = uncapped, conservative test.
 	int splat_layer_cap;
 	bool splat_layer_cap_opaque;
+
+	// See getCoverageCap() above. Default 0 = off.
+	float splat_coverage_cap;
+
+	// See getAblationStage() above. Default 0 = off, i.e. the full pass.
+	int splat_ablation_stage;
+
+	// See getQuadRadiusScale() above. Default 1 = the real size.
+	float splat_quad_radius_scale;
 	bool splat_hide_test_conservative;
 
 	// See requestLayerCapEstimate() above.

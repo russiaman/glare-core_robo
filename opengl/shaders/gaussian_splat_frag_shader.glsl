@@ -43,12 +43,47 @@ layout(location = 0) out vec4 colour_out;
 // cannot express it - a splat is either drawn everywhere or nowhere.  The cost is accepted here because what is being
 // looked at is the picture, not the frame time.
 uniform int splat_frag_mask_block; // Accumulation-buffer pixels per mask texel, or 0 to skip the test entirely.
+
+// DIAGNOSTIC ONLY - see the ladder in main(), and GaussianSplatRenderer::getAblationStage().  0 = off, i.e. the full
+// shader.  Shared with the vertex shader, which owns stages 2-4.
+uniform int splat_ablation_stage;
 uniform sampler2D splat_saturation_mask_texture; // The same mask the vertex shader tests; a sampler uniform is program-wide, so this is the same one, bound once by the draw path.
 layout(location = 1) out vec4 layer_count_out; // A flat 1 per surviving fragment, blended additively into the layer counter - see OpenGLScene::splat_layer_count_renderbuffer.
 
 
 void main()
 {
+	// DIAGNOSTIC ONLY - the ablation ladder, see GaussianSplatRenderer::getAblationStage().  Each stage adds one thing to
+	// the one below it, so the step between two readings attributes cost to that one thing.  Handled by returning early
+	// rather than by branching inside the code below, which leaves stage 0 - the only value that is not a measurement -
+	// compiling to exactly what it did before this existed.
+	//
+	// Blending is switched on by the draw path from stage 7 up, so stages 2-6 write opaque and the step into 7 is the
+	// blend bandwidth on its own.  Stages above 8 are not values of this uniform: stage 9 is the ladder switched off, and
+	// stage 10 is the ladder off with the alpha saturation cap on, both of which the existing knobs already express.
+	if(splat_ablation_stage != 0)
+	{
+		layer_count_out = vec4(1.0, 0.0, 0.0, 0.0);
+
+		vec3 flat_col = (splat_ablation_stage <= 3) ? vec3(1.0) : clamp(frag_colour.rgb, 0.0, 1.0); // 2 and 3 are white; the splat's own colour is what 4 adds.
+
+		if(splat_ablation_stage <= 6)
+			colour_out = vec4(flat_col, 1.0); // 2-6: opaque, no alpha, and the draw path has blending off - so this measures pure rasterised area.  Stages 4 and 5 differ only in the vertex shader.
+		else if(splat_ablation_stage == 7)
+			colour_out = vec4(flat_col * frag_colour.a, frag_colour.a); // Alpha and blending, but a flat alpha across the quad - the Gaussian is what 8 adds.
+		else
+		{
+			// 8: the Gaussian, but no discard.  min() replaces the discard that would otherwise have thrown out the
+			// fragments with a positive exponent, which are outside the ellipse and would blow alpha up past 1.
+			float power7 = -0.5 * (frag_conic.x * frag_screen_offset_px.x * frag_screen_offset_px.x
+			                      + 2.0 * frag_conic.y * frag_screen_offset_px.x * frag_screen_offset_px.y
+			                      + frag_conic.z * frag_screen_offset_px.y * frag_screen_offset_px.y);
+			float alpha7 = frag_colour.a * exp(min(power7, 0.0));
+			colour_out = vec4(clamp(frag_colour.rgb, 0.0, 1.0) * alpha7, alpha7);
+		}
+		return;
+	}
+
 	// Evaluate the 2D Gaussian at this pixel: exponent = -0.5 * offset^T * conic * offset, where conic is the inverse 2D
 	// covariance (see gaussian_splat_vert_shader.glsl).
 	float power = -0.5 * (frag_conic.x * frag_screen_offset_px.x * frag_screen_offset_px.x

@@ -759,7 +759,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	splat_dist_clamp_min(0.0f), splat_dist_clamp_max(1000.0f), splat_dist_clamp_invert(false), splat_alpha_cutoff(1.0f / 255.0f),
 	splat_alpha_gain(1.0f), splat_alpha_gamma(1.0f), // Identity: the cloud as captured - see getAlphaGain().
 	last_report_reached_rasteriser(0), last_report_in_frustum(0),
-	splat_num_draw_slices(1), splat_draw_slice_limit(0), splat_layer_cap(0), splat_layer_cap_opaque(true), cap_fill_mask_tex_uniform_loc(-2), splat_hide_test_conservative(true), splat_layer_estimate_requested(false), splat_slice_growth(1.0f), splat_saturation_gate_enabled(false), splat_saturation_threshold(1.0f - 1.0f / 255.0f),
+	splat_num_draw_slices(1), splat_draw_slice_limit(0), splat_layer_cap(0), splat_layer_cap_opaque(true), splat_coverage_cap(0.f), splat_ablation_stage(0), splat_quad_radius_scale(1.f), cap_fill_mask_tex_uniform_loc(-2), splat_hide_test_conservative(true), splat_layer_estimate_requested(false), splat_slice_growth(1.0f), splat_saturation_gate_enabled(false), splat_saturation_threshold(1.0f - 1.0f / 255.0f),
 	splat_saturation_mask_downscale(4), splat_mask_tex_uniform_loc(-2),
 	splat_accum_buffer_8bit(false),
 	splat_show_overdraw_mode(0), splat_hide_overdraw_enabled(false), splat_hide_alpha_enabled(false),
@@ -812,6 +812,8 @@ void GaussianSplatRenderer::buildShadersIfNeeded()
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,  "splat_mask_centre_test"); // See setSplatMaskBlockSize().
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Vec2, "splat_alpha_gain_gamma"); // See getAlphaGain(). NOTE: user_uniform_vals is sized to match this list in allocCloud().
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,  "splat_frag_mask_block"); // DIAGNOSTIC ONLY - the per-pixel layer cap's test, see getLayerCap().  Set by the draw path, like the mask uniforms above.
+	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "splat_ablation_stage"); // DIAGNOSTIC ONLY - see getAblationStage().
+	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_quad_radius_scale"); // DIAGNOSTIC ONLY - see getQuadRadiusScale().  NOTE: user_uniform_vals is sized to match this list in allocCloud().
 
 
 	// Splats blend into an accumulation buffer of their own rather than straight onto the main colour buffer, so that
@@ -966,12 +968,13 @@ void GaussianSplatRenderer::setSplatFragMaskBlockSize(int block_size)
 }
 
 
-void GaussianSplatRenderer::setSaturationMaskUniforms(int block_size, bool from_layer_count, bool layer_count_threshold) const
+void GaussianSplatRenderer::setSaturationMaskUniforms(int block_size, bool from_layer_count, bool layer_count_threshold, bool coverage_cap_threshold) const
 {
 	// One threshold uniform serves both modes, since only one of them is ever running: coverage for the gate, a layer
 	// count for the hide-overdraw diagnostic.  Reusing getOverdrawRangeMax() as that layer count is deliberate - it is
 	// the value the overdraw ramp paints solid red at, so what the diagnostic removes is exactly what was red on screen.
-	glUniform1f(saturation_mask_prog->user_uniform_info[0].loc, from_layer_count ? (layer_count_threshold ? (float)splat_layer_cap : splat_overdraw_range_max) : splat_saturation_threshold);
+	glUniform1f(saturation_mask_prog->user_uniform_info[0].loc, from_layer_count ? (layer_count_threshold ? (float)splat_layer_cap : splat_overdraw_range_max) :
+		(coverage_cap_threshold ? splat_coverage_cap : splat_saturation_threshold));
 	glUniform1i(saturation_mask_prog->user_uniform_info[1].loc, block_size);
 	glUniform1i(saturation_mask_prog->user_uniform_info[2].loc, from_layer_count ? 1 : 0);
 }
@@ -1489,10 +1492,15 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 		// picture is a statement about the scene.
 		((splat_draw_slice_limit > 0) ? (", DRAW LIMIT " + toString(splat_draw_slice_limit) + " of " + toString(splat_num_draw_slices) + " slices (frame is incomplete)") : std::string()) +
 		", saturation gate " + (splat_saturation_gate_enabled ? ("on at " + doubleToStringNDecimalPlaces(splat_saturation_threshold, 4) + ", mask 1/" + toString(splat_saturation_mask_downscale)) : std::string("off")) +
+		// Loud for the same reason the layer cap is: it changes what the picture is allowed to contain, so a time taken
+		// under it is not comparable with one taken without it.
+		((splat_coverage_cap > 0.f) ? (", COVERAGE CAP at " + doubleToStringNDecimalPlaces(splat_coverage_cap, 4)) : std::string()) +
 		", accum buffer " + (splat_accum_buffer_8bit ? "RGBA8" : "RGBA16F") +
 		// Printed only when set, but loudly: it is the one setting here that changes what the picture is allowed to
 		// contain, so a time taken under it is not comparable with one taken without it.
-		((getHideMode() == 3) ? (", LAYER CAP " + toString(splat_layer_cap) + (splat_hide_test_conservative ? " (conservative)" : " (centre test)")) : std::string()) +
+		// getHideMode() == 0, i.e. Clip is not running: there is one mask, and Clip owns it when it is on, which leaves a
+		// set cap doing nothing.  (This read == 3, a value getHideMode() cannot return, so the line never printed at all.)
+		(((splat_layer_cap > 0) && (getHideMode() == 0)) ? (", LAYER CAP " + toString(splat_layer_cap) + (splat_hide_test_conservative ? " (conservative)" : " (centre test)")) : std::string()) +
 		(getShowOverdraw() ? (", OVERDRAW VIEW " + toString(splat_show_overdraw_mode) + " (blend is additive, times are not comparable)") : std::string()) +
 		(getHideMode() != 0 ? (", HIDE MODE " + toString(getHideMode()) + " (a counting pass is in the frame)") : std::string()) + "\n";
 
@@ -2290,7 +2298,9 @@ std::string GaussianSplatRenderer::getDiagnostics() const
 	// Clip is ticked is doing nothing, and there is no way to tell that from the cap's own value.
 	s += "Layer cap: " + ((splat_layer_cap > 0) ?
 		(toString(splat_layer_cap) + " layers, " + (splat_hide_test_conservative ? "conservative test" : "centre test") +
-			((getHideMode() == 3) ? std::string() : std::string(" - NOT RUNNING: Clip owns the mask"))) :
+			// getHideMode() == 0 is "Clip is off", i.e. the cap has the mask to itself.  (This read == 3, which getHideMode()
+			// never returns, so every set cap was reported as not running - same slip as in getFrustumStructureReport().)
+			((getHideMode() == 0) ? std::string() : std::string(" - NOT RUNNING: Clip owns the mask"))) :
 		std::string("off")) + "\n";
 	if(!splat_layer_estimate_result.empty())
 		s += "Layer cap estimate: " + splat_layer_estimate_result + "\n"; // DIAGNOSTIC ONLY - what the last "Estimate" press measured, see OpenGLEngine::estimateSplatLayerCapSaving().
@@ -2303,9 +2313,41 @@ std::string GaussianSplatRenderer::getDiagnostics() const
 		((splat_slice_growth == 1.f) ? std::string(", equal sizes") : (", growth " + doubleToStringNDecimalPlaces(splat_slice_growth, 2) + "x per slice")) + "\n";
 	// Says why it isn't running, not just that it isn't: every reason below leaves the picture correct and the
 	// optimisation silently absent, which is the hardest kind of thing to notice.
+	// DIAGNOSTIC ONLY - see getCoverageCap().  Same "say why it is not running" treatment as the gate below, and for the
+	// same reason: every way it can fail to run leaves a correct picture and a silently absent cut.
+	std::string cov_cap_state;
+	if(splat_coverage_cap <= 0.f)
+		cov_cap_state = "off";
+	else if(splat_layer_cap > 0)
+		cov_cap_state = "set, but switched off by the layer cap above, which owns the same mask";
+	else if(getHideMode() != 0)
+		cov_cap_state = "set, but switched off by the hide-overdraw diagnostic, which owns the same mask";
+	else if(splat_num_draw_slices <= 1)
+		cov_cap_state = "set, but idle - needs more than one draw slice to cut between";
+	else if(splat_show_overdraw_mode != 0)
+		cov_cap_state = "set, but idle - not used in the overdraw views, where accumulated alpha counts layers rather than coverage";
+	else if(!opengl_engine->splat_accum_gate_available)
+		cov_cap_state = "set, but UNAVAILABLE - the saturation mask framebuffer could not be built";
+	else if(saturation_mask_prog.isNull() || !saturation_mask_prog->isBuilt() || mask_reduce_prog.isNull() || !mask_reduce_prog->isBuilt())
+		cov_cap_state = "set, but idle - mask shaders not built yet";
+	else
+		cov_cap_state = "on, cutting fragments where coverage has reached " + doubleToStringNDecimalPlaces(splat_coverage_cap, 4) +
+			(splat_layer_cap_opaque ? " (capped pixels filled opaque)" : " (capped pixels left partly covered)");
+	s += "Alpha saturation cap: " + cov_cap_state + "\n";
+	// DIAGNOSTIC ONLY - loud, because every stage but 0 draws a deliberately incomplete picture, and a time read under one
+	// of them is a statement about that stage rather than about the pass.
+	if(splat_ablation_stage != 0)
+		s += "!! ABLATION STAGE " + toString(splat_ablation_stage) +
+			" is selected: the picture is deliberately incomplete and the frame time is that stage's, not the pass's.\n";
+	if(splat_quad_radius_scale != 1.f)
+		s += "!! QUAD RADIUS SCALE " + doubleToStringNDecimalPlaces(splat_quad_radius_scale, 2) + ": splats are drawn at " +
+			doubleToStringNDecimalPlaces(splat_quad_radius_scale * splat_quad_radius_scale * 100.0, 0) + "% of their real area.\n";
+
 	std::string gate_state;
 	if(!splat_saturation_gate_enabled)
 		gate_state = "off";
+	else if(splat_coverage_cap > 0.f)
+		gate_state = "enabled, but stood down by the alpha saturation cap, which owns the same mask";
 	else if(getHideMode() != 0)
 		gate_state = "enabled, but switched off by the hide-overdraw diagnostic, which owns the same mask";
 	else if(splat_num_draw_slices <= 1)
@@ -2462,7 +2504,7 @@ Reference<SplatCloud> GaussianSplatRenderer::allocCloud()
 	// walks the program's uniforms and indexes this array by the same i, so a slot short is an out-of-bounds read there
 	// and an out-of-bounds write in think(). All but splat_tex_width below are set by think(), or by the draw path for the
 	// saturation mask ones.
-	mat.user_uniform_vals.resize(14);
+	mat.user_uniform_vals.resize(16);
 	mat.user_uniform_vals[2].intval = (int)splat_tex_width;
 
 	// Build a real (if minimal) texture and VAO up front: adding the object to the engine before it has those would
@@ -3469,6 +3511,9 @@ void GaussianSplatRenderer::think()
 		mat.user_uniform_vals[10].intval = splat_dist_clamp_invert ? 1 : 0;
 		// 11 (splat_mask_centre_test) also belongs to the draw path - see setSplatMaskBlockSize().
 		mat.user_uniform_vals[12].vec2 = Vec2f(splat_alpha_gain, splat_alpha_gamma); // See getAlphaGain().
+		// 13 (splat_frag_mask_block) belongs to the draw path - see setSplatFragMaskBlockSize().
+		mat.user_uniform_vals[14].intval = splat_ablation_stage; // DIAGNOSTIC ONLY - see getAblationStage().
+		mat.user_uniform_vals[15].floatval = splat_quad_radius_scale; // DIAGNOSTIC ONLY - see getQuadRadiusScale().
 	}
 
 	kickOffSorts();

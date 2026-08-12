@@ -56,6 +56,19 @@ uniform float splat_alpha_cutoff; // GaussianSplatSettingsWidget, Qt only. Sets 
 // (1, 1) is the identity, and is what the renderer sends unless the panel says otherwise.
 uniform vec2 splat_alpha_gain_gamma;
 
+// DIAGNOSTIC ONLY - the ablation ladder, see GaussianSplatRenderer::getAblationStage().  0 (default) = the full shader
+// below, i.e. every frame that is not measuring.  Higher stages switch progressively more of the pass back on, so that
+// the frame time can be read at each step and the jump between two steps attributes cost to the one thing that changed.
+// Stage 1 (CPU only) never reaches a shader - the draw path skips the draw call - so the lowest value seen here is 2.
+// The quad is kept a quad at every stage, shrunk to a pixel rather than swapped for GL_POINTS: changing the primitive
+// type would change the rasterisation path as well as the area, and then the step would answer about both.
+uniform int splat_ablation_stage;
+
+// DIAGNOSTIC ONLY - multiplies every splat's screen-space quad radius, see GaussianSplatRenderer::getQuadRadiusScale().
+// 1 (default) is the real size.  Rasterised area goes as the square of it, with the splat count, the vertex work and the
+// blend chain all untouched - which is what makes it a way to ask whether a cost is area-proportional at all.
+uniform float splat_quad_radius_scale;
+
 out vec2 frag_screen_offset_px; // Pixel-space offset of this vertex from the splat's projected centre.
 out vec3 frag_conic; // Inverse 2D covariance (A, B, C) of [[A, B], [B, C]], for the per-pixel Gaussian evaluation.
 out vec4 frag_colour; // (r, g, b, opacity)
@@ -67,11 +80,35 @@ ivec2 splatTexelCoord(int texel_index)
 }
 
 
+// DIAGNOSTIC ONLY - a one-pixel quad at this splat's position, used by ablation stages 2-4 to show where the splats are
+// while rasterising as close to nothing as a quad can.  Everything the full path does between the projection and the
+// quad offset - covariance, eigen-decomposition, radii - is skipped, which is the point: these stages measure what it
+// costs to emit and place the instances, with the fill taken out.
+void emitSplatPoint(vec3 pos_os)
+{
+	vec4 clip_pos = proj_matrix * (view_matrix * (model_matrix * vec4(pos_os, 1.0)));
+	clip_pos.xy += (position_in.xy / viewport_dims_px) * clip_pos.w; // One pixel across, in the same clip-space form the full path below uses.
+	gl_Position = clip_pos;
+	frag_conic = vec3(0.0);
+	frag_screen_offset_px = vec2(0.0);
+}
+
+
 void main()
 {
 	int base_texel = int(splat_index_in) * 4;
 
 	vec4 t0 = texelFetch(albedo_texture, splatTexelCoord(base_texel + 0), 0);
+
+	// DIAGNOSTIC ONLY - stage 2: the one texel a position needs, and nothing else.  The three fetches below are what
+	// stage 3 adds, so the step between them is the cost of the extra vertex texture reads - open question 8.2.
+	if(splat_ablation_stage == 2)
+	{
+		emitSplatPoint(t0.xyz);
+		frag_colour = vec4(1.0);
+		return;
+	}
+
 	vec4 t1 = texelFetch(albedo_texture, splatTexelCoord(base_texel + 1), 0);
 	vec4 t2 = texelFetch(albedo_texture, splatTexelCoord(base_texel + 2), 0);
 	vec4 t3 = texelFetch(albedo_texture, splatTexelCoord(base_texel + 3), 0);
@@ -86,6 +123,24 @@ void main()
 	// this splat is rasterised, the alpha the fragment shader blends, and through those the coverage the saturation gate
 	// thresholds and the layer counts the overdraw views show.  See splat_alpha_gain_gamma above.
 	frag_colour.a = min(splat_alpha_gain_gamma.x * pow(frag_colour.a, splat_alpha_gain_gamma.y), 1.0);
+
+	// DIAGNOSTIC ONLY - stages 3 and 4: all four texels read and unpacked, still a one-pixel quad.  The degenerate-scale
+	// test is here so that t1's fetch is genuinely consumed: a fetch the optimiser can prove unused is a fetch that did
+	// not happen, and measuring that it happened is the whole of stage 3.  Stage 4 differs only in the fragment shader,
+	// which outputs the splat's colour instead of flat white - that step should read near zero, and is a check on the
+	// instrument as much as a measurement.
+	if((splat_ablation_stage == 3) || (splat_ablation_stage == 4))
+	{
+		if(2.0 * max(scale.x, max(scale.y, scale.z)) <= 0.0)
+		{
+			gl_Position = vec4(2.0, 2.0, 2.0, 1.0); // Push outside the clip volume.
+			frag_conic = vec3(0.0);
+			frag_screen_offset_px = vec2(0.0);
+			return;
+		}
+		emitSplatPoint(pos_os);
+		return;
+	}
 
 	// Diagnostic size filter - see splat_size_clamp_min_max above.  Checked before any of the projection maths below,
 	// since it needs only the raw world-space scale, not the view-dependent covariance.
@@ -192,12 +247,36 @@ void main()
 	// projected size, which without a cap turns a single nearby splat into a screen-covering quad.  Twice the viewport's
 	// larger dimension is generous enough never to visibly clip a real splat while still bounding the worst case.
 	float max_radius_px = 2.0 * max(viewport_dims_px.x, viewport_dims_px.y);
-	float radius1 = min(sigma_cutoff * sqrt(lambda1), max_radius_px);
-	float radius2 = min(sigma_cutoff * sqrt(lambda2), max_radius_px);
+	// DIAGNOSTIC ONLY - splat_quad_radius_scale, see GaussianSplatRenderer::getQuadRadiusScale().  1 (default) is the real
+	// size.  Applied here, before the conic is built from these radii below, so the Gaussian shrinks with the quad instead
+	// of being cut off by it: the picture then has smaller splats rather than hard-edged ones, and the only thing that
+	// changed is rasterised area.  Area goes as the square of this, which is what makes it a bisection of the fill.
+	float radius1 = min(sigma_cutoff * sqrt(lambda1), max_radius_px) * splat_quad_radius_scale;
+	float radius2 = min(sigma_cutoff * sqrt(lambda2), max_radius_px) * splat_quad_radius_scale;
 
 	vec2 screen_offset_px = position_in.x * radius1 * axis1 + position_in.y * radius2 * axis2;
 
 	vec4 clip_pos = proj_matrix * pos_vs;
+
+	// DIAGNOSTIC ONLY - stage 5: every bit of the projection maths above has run - covariance, Jacobian,
+	// eigen-decomposition, radii - and the quad is still one pixel.  It exists because the step from points to full quads
+	// moves two things at once, the vertex maths and the fill; this splits them, so 5 minus 4 is the vertex ALU alone and
+	// 6 minus 5 is the fill alone.  The radii are tested rather than ignored so that none of that maths is dead code.
+	if(splat_ablation_stage == 5)
+	{
+		if((radius1 <= 0.0) && (radius2 <= 0.0))
+		{
+			gl_Position = vec4(2.0, 2.0, 2.0, 1.0); // Push outside the clip volume.
+			frag_conic = vec3(0.0);
+			frag_screen_offset_px = vec2(0.0);
+			return;
+		}
+		clip_pos.xy += (position_in.xy / viewport_dims_px) * clip_pos.w; // One pixel across, as in emitSplatPoint().
+		gl_Position = clip_pos;
+		frag_conic = vec3(0.0);
+		frag_screen_offset_px = vec2(0.0);
+		return;
+	}
 
 	// The saturation gate.  Drop the whole splat if every mask texel its quad can touch is already marked finished:
 	// nothing it could contribute would survive the composite.

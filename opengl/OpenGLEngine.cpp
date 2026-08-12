@@ -9688,7 +9688,13 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 	// markSaturatedSplatPixels().  It needs a depth buffer of its own to mark them in, and more than one slice to have
 	// somewhere to do the marking between.  Not used in the overdraw debug views: those blend additively, so the
 	// accumulated alpha there is a layer count rather than a coverage and the threshold would mean nothing.
-	const bool use_saturation_gate = splat_renderer->getSaturationGateEnabled() && (num_slices > 1) && !show_overdraw && !hide_overdraw && splat_accum_gate_available &&
+	// DIAGNOSTIC ONLY - the coverage cap marks the same mask from the same measure as the gate, only with its own threshold
+	// and killing fragments instead of splats, so the two cannot both run.  Tested as "requested" rather than as "running"
+	// so that the gate stands down whenever the owner has asked for the cap, rather than quietly coming back on whenever
+	// the cap happens to be idle - a gate that switches itself on is exactly the kind of thing a measurement cannot have.
+	const bool coverage_cap_requested = splat_renderer->getCoverageCap() > 0.f;
+
+	const bool use_saturation_gate = splat_renderer->getSaturationGateEnabled() && !coverage_cap_requested && (num_slices > 1) && !show_overdraw && !hide_overdraw && splat_accum_gate_available &&
 		splat_renderer->getSaturationMaskProgram().nonNull() && splat_renderer->getSaturationMaskProgram()->isBuilt() &&
 		splat_renderer->getMaskReduceProgram().nonNull() && splat_renderer->getMaskReduceProgram()->isBuilt();
 
@@ -9737,10 +9743,18 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 		splat_renderer->getSaturationMaskProgram().nonNull() && splat_renderer->getSaturationMaskProgram()->isBuilt() &&
 		splat_renderer->getMaskReduceProgram().nonNull() && splat_renderer->getMaskReduceProgram()->isBuilt();
 
-	// The cap rejects fragments, not splats: the vertex test would drop a splat everywhere or nowhere, which is not what
-	// "stop compositing this pixel" means.  Off unless the cap is running, and then the two tests are mutually exclusive
-	// anyway, since the gate and the cap both own the one mask.
-	splat_renderer->setSplatFragMaskBlockSize(use_layer_cap ? splat_saturation_mask_block : 0);
+	// DIAGNOSTIC ONLY - the coverage cap, see GaussianSplatRenderer::getCoverageCap().  Same conditions as the layer cap
+	// minus the layer counter, which is the point of it: it thresholds the coverage the accumulation buffer already
+	// carries, so the frame needs no second attachment.  Yields to the layer cap when both are set - one mask.
+	const bool use_coverage_cap = coverage_cap_requested && !use_layer_cap && (num_slices > 1) && !estimating_layer_cap &&
+		!show_overdraw && !hide_overdraw && splat_accum_gate_available &&
+		splat_renderer->getSaturationMaskProgram().nonNull() && splat_renderer->getSaturationMaskProgram()->isBuilt() &&
+		splat_renderer->getMaskReduceProgram().nonNull() && splat_renderer->getMaskReduceProgram()->isBuilt();
+
+	// The caps reject fragments, not splats: the vertex test would drop a splat everywhere or nowhere, which is not what
+	// "stop compositing this pixel" means.  Off unless a cap is running, and then the two tests are mutually exclusive
+	// anyway, since the gate and the caps all own the one mask.
+	splat_renderer->setSplatFragMaskBlockSize((use_layer_cap || use_coverage_cap) ? splat_saturation_mask_block : 0);
 
 	// Tells the splat shader whether to test the mask at all, and how many pixels a texel of it covers.  Set here rather
 	// than in the renderer's think(), since whether anything wrote the mask this frame is decided just above: a shader
@@ -9755,7 +9769,7 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 		// carrying - see GaussianSplatRenderer::getHideTestConservative().
 		/*centre_test=*/hide_overdraw && !splat_renderer->getHideTestConservative());
 
-	if(use_saturation_gate || use_layer_cap)
+	if(use_saturation_gate || use_layer_cap || use_coverage_cap)
 	{
 		// Nothing is finished before the first slice of the frame has been drawn, and the mask still holds the last
 		// frame's answer, which was computed for a different camera.  Cheap - it is a fraction of the viewport.
@@ -9780,7 +9794,16 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 		glClearBufferfv(GL_DEPTH, /*drawBuffer=*/0, &far_depth);
 	}
 
-	glEnable(GL_BLEND);
+	// DIAGNOSTIC ONLY - the ablation ladder, see GaussianSplatRenderer::getAblationStage().  Stage 1 does all the CPU work
+	// and issues no draw call; stages 2-6 draw opaque, so blending - which is exactly what stage 7 adds - stays off.
+	const int ablation_stage = splat_renderer->getAblationStage();
+	const bool ablation_skip_draws = (ablation_stage == 1);
+	const bool ablation_no_blend = (ablation_stage >= 2) && (ablation_stage <= 6);
+
+	if(ablation_no_blend)
+		glDisable(GL_BLEND);
+	else
+		glEnable(GL_BLEND);
 	// Normal mode: the "under" operator, dst += src * (1 - dst.a), which is what composites a front-to-back sequence.
 	// The source factor reads the *destination's* accumulated alpha, i.e. how much of this pixel earlier (nearer) splats
 	// have already covered, so each splat contributes only through what light still gets past them.  Algebraically this
@@ -9819,11 +9842,12 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 			// Before every slice but the first, take stock of what the slices already drawn have covered.  Doing it here
 			// rather than after each draw means an empty trailing slice, or the last slice of the last cloud, doesn't pay
 			// for a census whose result nothing would read.
-			if((use_saturation_gate || use_layer_cap) && (last_num_splat_draw_calls > 0))
+			if((use_saturation_gate || use_layer_cap || use_coverage_cap) && (last_num_splat_draw_calls > 0))
 			{
-				// The cap thresholds the layer counter at its own value; the gate thresholds accumulated coverage.  Same
-				// pass, same mask, different source and threshold - and only one of them can be running.
-				markSaturatedSplatPixels(/*from_layer_count=*/use_layer_cap, /*from_layer_count_buffer=*/use_layer_cap);
+				// The layer cap thresholds the layer counter at its own value; the gate and the coverage cap threshold
+				// accumulated coverage, at theirs.  Same pass, same mask, different source and threshold - and only one of
+				// the three can be running.
+				markSaturatedSplatPixels(/*from_layer_count=*/use_layer_cap, /*from_layer_count_buffer=*/use_layer_cap, /*coverage_cap_threshold=*/use_coverage_cap);
 
 				// DIAGNOSTIC ONLY - see requestSplatSaturationSnapshots().  Numbered by the slice the census followed,
 				// which is the slice whose coverage it is a statement about; the slice drawn just below is the first one
@@ -9857,7 +9881,11 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 #if DO_INDIVIDUAL_VAO_ALLOC
 			setInstanceAttribPointerOffset(*ob); // bindMeshData() has nowhere to apply instance_vbo_offset_B on this path - see the function.
 #endif
-			drawBatchWithDenormalisedData(*ob, ob->batch_draw_info[batch_i], batch_i);
+			// DIAGNOSTIC ONLY - ablation stage 1 stops exactly here: everything above it has run, including the traversal,
+			// the sort and the instance buffer this slice would have drawn from.  The counters below still advance, so the
+			// diagnostics keep saying what the CPU selected.
+			if(!ablation_skip_draws)
+				drawBatchWithDenormalisedData(*ob, ob->batch_draw_info[batch_i], batch_i);
 			last_num_splat_draw_calls++;
 			last_num_splats_drawn += (uint64)(slice_end - slice_begin); // Counted here so that a draw slice limit, which simply stops this loop early, is reflected in it.
 
@@ -9875,8 +9903,9 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 
 	flushDrawCommandsAndUnbindPrograms();
 
-	// DIAGNOSTIC ONLY - see GaussianSplatRenderer::getLayerCap().
-	if(use_layer_cap && splat_renderer->getLayerCapOpaque())
+	// DIAGNOSTIC ONLY - see GaussianSplatRenderer::getLayerCap() and getCoverageCap(): both cut a pixel short in the same
+	// way, so both want the same choice about whether the cut shows as a colour error or as background showing through.
+	if((use_layer_cap || use_coverage_cap) && splat_renderer->getLayerCapOpaque())
 		fillCappedSplatPixels();
 
 	if(estimating_layer_cap)
@@ -10179,7 +10208,7 @@ With MSAA the copy resolves the samples, so the threshold is tested against a pi
 a saturated region that is slightly wrong in both directions; the region interiors, which is where the work being
 skipped actually is, are unaffected.
 */
-void OpenGLEngine::markSaturatedSplatPixels(bool from_layer_count, bool from_layer_count_buffer)
+void OpenGLEngine::markSaturatedSplatPixels(bool from_layer_count, bool from_layer_count_buffer, bool coverage_cap_threshold)
 {
 	DebugGroup debug_group("markSaturatedSplatPixels()");
 	TracyGpuZone("markSaturatedSplatPixels");
@@ -10223,7 +10252,7 @@ void OpenGLEngine::markSaturatedSplatPixels(bool from_layer_count, bool from_lay
 	glDisable(GL_DEPTH_TEST); // The mask framebuffer has no depth attachment, and every texel of it is rewritten regardless.
 
 	mask_prog->useProgram();
-	splat_renderer->setSaturationMaskUniforms(splat_saturation_mask_block, from_layer_count, /*layer_count_threshold=*/from_layer_count_buffer);
+	splat_renderer->setSaturationMaskUniforms(splat_saturation_mask_block, from_layer_count, /*layer_count_threshold=*/from_layer_count_buffer, coverage_cap_threshold);
 	bindMeshData(*unit_quad_meshdata);
 	OpenGLTexture& mask_source_tex = from_layer_count_buffer ? *current_scene->splat_layer_count_copy_texture : *current_scene->splat_accum_copy_texture;
 	bindTextureUnitToSampler(mask_source_tex, /*texture_unit_index=*/0, /*sampler_uniform_location=*/mask_prog->albedo_texture_loc);

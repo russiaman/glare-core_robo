@@ -1474,7 +1474,9 @@ private:
 	// from_layer_count marks by a count rather than by coverage; from_layer_count_buffer takes that count from the splat
 	// pass's own per-pixel layer counter (the second colour attachment) and thresholds it at the layer cap, which is what
 	// the per-pixel cap runs on - see GaussianSplatRenderer::getLayerCap().
-	void markSaturatedSplatPixels(bool from_layer_count = false, bool from_layer_count_buffer = false);
+	// coverage_cap_threshold thresholds the coverage at GaussianSplatRenderer::getCoverageCap() instead of at the gate's
+	// own threshold; ignored when from_layer_count is true.
+	void markSaturatedSplatPixels(bool from_layer_count = false, bool from_layer_count_buffer = false, bool coverage_cap_threshold = false);
 	void fillCappedSplatPixels(); // DIAGNOSTIC ONLY - rewrites the pixels the layer cap cut short as fully covered, see GaussianSplatRenderer::getLayerCapOpaque().
 	void estimateSplatLayerCapSaving(); // DIAGNOSTIC ONLY - reads the layer counter back and reports how much fill a per-pixel cap would remove.
 	void resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name); // Composites the splat accumulation buffer onto the buffer the frame is being drawn into, undoing the engine's display transform once.

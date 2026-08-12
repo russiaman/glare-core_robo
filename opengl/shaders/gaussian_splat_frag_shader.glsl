@@ -35,6 +35,17 @@ uniform int splat_show_overdraw;
 // through the OIT path - see the material setup in GaussianSplatRenderer::addObject() for why.
 layout(location = 0) out vec4 colour_out;
 
+// DIAGNOSTIC ONLY - the per-pixel layer cap, see GaussianSplatRenderer::getLayerCap().  Zero disables both of the
+// things below, which is every frame that is not measuring.
+//
+// This is the per-fragment mask test the note above says was removed for costing what it saved.  It is back only as a
+// diagnostic: a cap on how deep the composite goes is a statement about pixels, and the conservative per-splat test
+// cannot express it - a splat is either drawn everywhere or nowhere.  The cost is accepted here because what is being
+// looked at is the picture, not the frame time.
+uniform int splat_frag_mask_block; // Accumulation-buffer pixels per mask texel, or 0 to skip the test entirely.
+uniform sampler2D splat_saturation_mask_texture; // The same mask the vertex shader tests; a sampler uniform is program-wide, so this is the same one, bound once by the draw path.
+layout(location = 1) out vec4 layer_count_out; // A flat 1 per surviving fragment, blended additively into the layer counter - see OpenGLScene::splat_layer_count_renderbuffer.
+
 
 void main()
 {
@@ -49,6 +60,17 @@ void main()
 	float alpha = frag_colour.a * exp(power);
 	if(alpha < (1.0 / 255.0))
 		discard;
+
+	// The layer cap: this pixel has already had its layers, so nothing further is composited into it.  Tested after the
+	// two discards above so that the count the mask was built from and the fragments this rejects are the same
+	// population - a fragment that contributes nothing was never counted, and must not be capped either.
+	if(splat_frag_mask_block > 0)
+	{
+		if(texelFetch(splat_saturation_mask_texture, ivec2(gl_FragCoord.xy) / splat_frag_mask_block, 0).r > 0.0)
+			discard;
+	}
+
+	layer_count_out = vec4(1.0, 0.0, 0.0, 0.0); // Alpha zero: the pass blends with (GL_ONE_MINUS_DST_ALPHA, GL_ONE), so a destination alpha that stays at zero makes this plain addition.
 
 	// Clamp the colour to a displayable range.  Evaluating the spherical harmonics can land outside [0, 1] - the DC term
 	// alone reaches slightly negative values in real files - and out-of-range values here are not just wrong but

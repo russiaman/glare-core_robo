@@ -757,7 +757,9 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	lod_max_layer_density(0.0f), lod_max_tree_depth(0),
 	splat_size_clamp_min(0.0f), splat_size_clamp_max(0.0f), splat_size_clamp_invert(false),
 	splat_dist_clamp_min(0.0f), splat_dist_clamp_max(1000.0f), splat_dist_clamp_invert(false), splat_alpha_cutoff(1.0f / 255.0f),
-	splat_num_draw_slices(1), splat_slice_growth(1.0f), splat_saturation_gate_enabled(false), splat_saturation_threshold(1.0f - 1.0f / 255.0f),
+	splat_alpha_gain(1.0f), splat_alpha_gamma(1.0f), // Identity: the cloud as captured - see getAlphaGain().
+	last_report_reached_rasteriser(0), last_report_in_frustum(0),
+	splat_num_draw_slices(1), splat_draw_slice_limit(0), splat_layer_cap(0), splat_layer_cap_opaque(true), cap_fill_mask_tex_uniform_loc(-2), splat_hide_test_conservative(true), splat_layer_estimate_requested(false), splat_slice_growth(1.0f), splat_saturation_gate_enabled(false), splat_saturation_threshold(1.0f - 1.0f / 255.0f),
 	splat_saturation_mask_downscale(4), splat_mask_tex_uniform_loc(-2),
 	splat_accum_buffer_8bit(false),
 	splat_show_overdraw_mode(0), splat_hide_overdraw_enabled(false), splat_hide_alpha_enabled(false),
@@ -808,6 +810,8 @@ void GaussianSplatRenderer::buildShadersIfNeeded()
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Vec2, "splat_dist_clamp_min_max");
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,  "splat_dist_clamp_invert");
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,  "splat_mask_centre_test"); // See setSplatMaskBlockSize().
+	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Vec2, "splat_alpha_gain_gamma"); // See getAlphaGain(). NOTE: user_uniform_vals is sized to match this list in allocCloud().
+	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,  "splat_frag_mask_block"); // DIAGNOSTIC ONLY - the per-pixel layer cap's test, see getLayerCap().  Set by the draw path, like the mask uniforms above.
 
 
 	// Splats blend into an accumulation buffer of their own rather than straight onto the main colour buffer, so that
@@ -852,6 +856,19 @@ void GaussianSplatRenderer::buildShadersIfNeeded()
 	saturation_mask_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "splat_mask_from_layer_count");
 
 
+	// DIAGNOSTIC ONLY - fills the pixels the layer cap cut short out to full coverage, see OpenGLEngine::fillCappedSplatPixels().
+	// Same full-viewport quad vertex shader as the passes above.
+	cap_fill_prog = new OpenGLProgram(
+		"gaussian splat cap fill prog",
+		new OpenGLShader(shader_dir + "/gaussian_splat_resolve_vert_shader.glsl", version_directive, key_defs + preprocessor_defines, GL_VERTEX_SHADER),
+		new OpenGLShader(shader_dir + "/gaussian_splat_cap_fill_frag_shader.glsl", version_directive, key_defs + preprocessor_defines, GL_FRAGMENT_SHADER),
+		opengl_engine->getAndIncrNextProgramIndex(),
+		/*wait_for_build_to_complete=*/!opengl_engine->parallel_shader_compile_support
+	);
+	opengl_engine->addProgram(cap_fill_prog);
+	cap_fill_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int, "splat_mask_block_size"); // Read back by setCapFillUniforms(), for the same reason the uniforms above are registered rather than looked up here.
+
+
 	// Halves the mask by minimum, once per level, so that the vertex shader can ask about a whole quad's worth of screen
 	// with one fetch - see gaussian_splat_mask_reduce_frag_shader.glsl.  Same full-viewport quad vertex shader again.
 	mask_reduce_prog = new OpenGLProgram(
@@ -862,6 +879,23 @@ void GaussianSplatRenderer::buildShadersIfNeeded()
 		/*wait_for_build_to_complete=*/!opengl_engine->parallel_shader_compile_support
 	);
 	opengl_engine->addProgram(mask_reduce_prog);
+}
+
+
+int GaussianSplatRenderer::getCapFillMaskTexUniformLoc()
+{
+	if(cap_fill_mask_tex_uniform_loc == -2)
+	{
+		assert(cap_fill_prog.nonNull() && cap_fill_prog->isBuilt());
+		cap_fill_mask_tex_uniform_loc = cap_fill_prog->getUniformLocation("splat_saturation_mask_texture");
+	}
+	return cap_fill_mask_tex_uniform_loc;
+}
+
+
+void GaussianSplatRenderer::setCapFillUniforms(int block_size) const
+{
+	glUniform1i(cap_fill_prog->user_uniform_info[0].loc, block_size);
 }
 
 
@@ -925,12 +959,19 @@ void GaussianSplatRenderer::noteHideOverdrawMaskBuilt(const Matrix4f& view_matri
 }
 
 
-void GaussianSplatRenderer::setSaturationMaskUniforms(int block_size, bool from_layer_count) const
+void GaussianSplatRenderer::setSplatFragMaskBlockSize(int block_size)
+{
+	for(size_t i=0; i<clouds.size(); ++i)
+		clouds[i]->ob->materials[0].user_uniform_vals[13].intval = block_size;
+}
+
+
+void GaussianSplatRenderer::setSaturationMaskUniforms(int block_size, bool from_layer_count, bool layer_count_threshold) const
 {
 	// One threshold uniform serves both modes, since only one of them is ever running: coverage for the gate, a layer
 	// count for the hide-overdraw diagnostic.  Reusing getOverdrawRangeMax() as that layer count is deliberate - it is
 	// the value the overdraw ramp paints solid red at, so what the diagnostic removes is exactly what was red on screen.
-	glUniform1f(saturation_mask_prog->user_uniform_info[0].loc, from_layer_count ? splat_overdraw_range_max : splat_saturation_threshold);
+	glUniform1f(saturation_mask_prog->user_uniform_info[0].loc, from_layer_count ? (layer_count_threshold ? (float)splat_layer_cap : splat_overdraw_range_max) : splat_saturation_threshold);
 	glUniform1i(saturation_mask_prog->user_uniform_info[1].loc, block_size);
 	glUniform1i(saturation_mask_prog->user_uniform_info[2].loc, from_layer_count ? 1 : 0);
 }
@@ -1439,15 +1480,26 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 	// cost of the splat pass without altering the frontier the report describes, which are the ones that would otherwise
 	// make two reports disagree for no visible reason.
 	s += "Draw settings: alpha_cutoff " + doubleToStringNDecimalPlaces(splat_alpha_cutoff, 4) +
+		// Said out loud whenever it is not the identity: every area and opacity figure below is of the adjusted cloud, so
+		// two reports taken at different settings are not otherwise comparable.
+		(((splat_alpha_gain != 1.f) || (splat_alpha_gamma != 1.f)) ?
+			(", ALPHA ADJUSTED gain " + doubleToStringNDecimalPlaces(splat_alpha_gain, 2) + " gamma " + doubleToStringNDecimalPlaces(splat_alpha_gamma, 2)) : std::string()) +
 		", draw slices " + toString(splat_num_draw_slices) + (splat_slice_growth != 1.f ? (" (growth " + doubleToStringNDecimalPlaces(splat_slice_growth, 2) + ")") : "") +
+		// Loud, like the debug views below: the frame is incomplete, so neither the times nor anything read off the
+		// picture is a statement about the scene.
+		((splat_draw_slice_limit > 0) ? (", DRAW LIMIT " + toString(splat_draw_slice_limit) + " of " + toString(splat_num_draw_slices) + " slices (frame is incomplete)") : std::string()) +
 		", saturation gate " + (splat_saturation_gate_enabled ? ("on at " + doubleToStringNDecimalPlaces(splat_saturation_threshold, 4) + ", mask 1/" + toString(splat_saturation_mask_downscale)) : std::string("off")) +
 		", accum buffer " + (splat_accum_buffer_8bit ? "RGBA8" : "RGBA16F") +
+		// Printed only when set, but loudly: it is the one setting here that changes what the picture is allowed to
+		// contain, so a time taken under it is not comparable with one taken without it.
+		((getHideMode() == 3) ? (", LAYER CAP " + toString(splat_layer_cap) + (splat_hide_test_conservative ? " (conservative)" : " (centre test)")) : std::string()) +
 		(getShowOverdraw() ? (", OVERDRAW VIEW " + toString(splat_show_overdraw_mode) + " (blend is additive, times are not comparable)") : std::string()) +
 		(getHideMode() != 0 ? (", HIDE MODE " + toString(getHideMode()) + " (a counting pass is in the frame)") : std::string()) + "\n";
 
 	// World-wide roll-up, accumulated across the clouds below.
 	size_t world_frontier = 0, world_frontier_in_frustum = 0, world_leaves_in_frustum = 0, world_frontier_leaves_in_frustum = 0;
 	double world_quad_area = 0, world_ellipse_area = 0;
+	size_t world_reached_rasteriser = 0, world_in_frustum_before_shader = 0; // Kept on the renderer afterwards, so the diagnostics panel can show what this press measured - see getDiagnostics().
 	size_t world_reason_counts[FrontierStop_NumReasons];
 	for(size_t i=0; i<FrontierStop_NumReasons; ++i)
 		world_reason_counts[i] = 0;
@@ -1649,7 +1701,7 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 			const double viewport_px = (double)viewport_dims.x * (double)viewport_dims.y;
 
 			double total_quad_area = 0, total_ellipse_area = 0, total_alpha_area = 0;
-			size_t culled_by_shader = 0;
+			size_t culled_by_shader = 0, culled_by_size_slice = 0, culled_by_dist_slice = 0, reached_rasteriser = 0;
 
 			std::vector<size_t> area_counts(num_area_buckets, 0), opacity_counts(num_opacity_buckets, 0),
 				flatness_counts(num_flatness_buckets, 0), distance_counts(num_distance_buckets, 0);
@@ -1664,7 +1716,33 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 					continue;
 
 				const Vec3f& sc = cloud.scales[idx];
-				const float opacity = cloud.colours[idx][3];
+				// Adjusted, not stored: the report describes the splats the shader actually draws, and the shader applies
+				// this same transform before it sizes the quad - see getAlphaGain(). Feeds the opacity histogram below too,
+				// which is the place the effect of the gamma is meant to be read.
+				const float opacity = adjustSplatAlpha(cloud.colours[idx][3], splat_alpha_gain, splat_alpha_gamma);
+
+				// The two diagnostic slices, mirrored from gaussian_splat_vert_shader.glsl.  They are the only culls the
+				// shader does that splatFootprint() below does not already reproduce, and without them this pass would
+				// describe a cloud nobody is looking at whenever either slice is set - which is exactly when someone is
+				// looking hardest.  Applied in the order the shader applies them, so the counts attribute the same way.
+				const float feature_size = 2.f * myMax(sc.x, myMax(sc.y, sc.z));
+				const bool size_clamp_active = (splat_size_clamp_min > 0.f) || (splat_size_clamp_max > 0.f);
+				const bool outside_size_range = ((splat_size_clamp_min > 0.f) && (feature_size < splat_size_clamp_min)) ||
+					((splat_size_clamp_max > 0.f) && (feature_size > splat_size_clamp_max));
+				if(splat_size_clamp_invert ? (size_clamp_active && !outside_size_range) : outside_size_range)
+				{
+					culled_by_size_slice++;
+					continue;
+				}
+
+				const Vec4f pos_vs = scene->last_view_matrix * Vec4f(p.x, p.y, p.z, 1.f);
+				const float dist_to_cam = Vec4f(pos_vs[0], pos_vs[1], pos_vs[2], 0.f).length(); // The shader takes length(pos_vs.xyz), so the w the transform leaves must not be in it.
+				const bool inside_dist_range = (dist_to_cam >= splat_dist_clamp_min) && (dist_to_cam <= splat_dist_clamp_max);
+				if(splat_dist_clamp_invert ? inside_dist_range : !inside_dist_range)
+				{
+					culled_by_dist_slice++;
+					continue;
+				}
 
 				const SplatFootprint fp = splatFootprint(p, sc, cloud.rotations[idx], opacity, scene->last_view_matrix,
 					focal_len_px, viewport_dims, splat_alpha_cutoff);
@@ -1674,6 +1752,7 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 					continue;
 				}
 
+				reached_rasteriser++;
 				total_quad_area    += fp.quad_area_px;
 				total_ellipse_area += fp.ellipse_area_px;
 				total_alpha_area   += fp.alpha_integral_px;
@@ -1711,6 +1790,14 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 					doubleToStringNDecimalPlaces(total_ellipse_area / viewport_px, 0) + " drawn on an average pixel\n";
 			else
 				s += "\n";
+			// What the panel's per-frame counters cannot say.  They are taken on the CPU, before the draw call, so they count
+			// instances issued; everything below happens inside the vertex shader, where nothing on this side can observe
+			// it.  This pass reproduces those tests splat by splat for the camera the report was taken at, which is the
+			// only exact answer available - and the reason it lives on a button rather than in the frame.
+			s += "    Reached the rasteriser: " + uInt64ToStringCommaSeparated(reached_rasteriser) + " of " +
+				uInt64ToStringCommaSeparated(reached_rasteriser + culled_by_shader + culled_by_size_slice + culled_by_dist_slice) + " in frustum" +
+				", size slice cut " + uInt64ToStringCommaSeparated(culled_by_size_slice) +
+				", distance slice cut " + uInt64ToStringCommaSeparated(culled_by_dist_slice) + "\n";
 			s += "    Culled by the shader before rasterising: " + uInt64ToStringCommaSeparated(culled_by_shader) +
 				" (behind the near plane, degenerate, or opacity at or below alpha_cutoff " + doubleToStringNDecimalPlaces(splat_alpha_cutoff, 4) + ")\n";
 			s += "    Note these are viewport-wide averages: the splats occupy part of the screen, so the dense regions the\n";
@@ -1746,6 +1833,8 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 
 			world_quad_area += total_quad_area;
 			world_ellipse_area += total_ellipse_area;
+			world_reached_rasteriser += reached_rasteriser;
+			world_in_frustum_before_shader += reached_rasteriser + culled_by_shader + culled_by_size_slice + culled_by_dist_slice;
 
 			// Set by the pruning block below and printed by the multi-view section after it - the two are separate blocks,
 			// but this is what has to cross between them.
@@ -1832,7 +1921,8 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 				{
 					const uint32 idx = draw_order[i];
 					const Vec3f& p = cloud.positions[idx];
-					const SplatFootprint fp = splatFootprint(p, cloud.scales[idx], cloud.rotations[idx], cloud.colours[idx][3],
+					const SplatFootprint fp = splatFootprint(p, cloud.scales[idx], cloud.rotations[idx],
+						adjustSplatAlpha(cloud.colours[idx][3], splat_alpha_gain, splat_alpha_gamma), // As drawn, not as stored - see getAlphaGain().
 						scene->last_view_matrix, focal_len_px, viewport_dims, splat_alpha_cutoff);
 					if(!fp.drawn)
 						continue;
@@ -2109,6 +2199,11 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 	}
 
 	s += "\nReport took " + doubleToStringNDecimalPlaces(timer.elapsed() * 1.0e3, 1) + " ms (one full traversal per cloud, on the main thread).\n";
+	// Kept for the diagnostics panel - see the members' comment.  Set from the world-wide roll-up whether or not the
+	// per-world section above was printed, since that one is only printed when there is more than one cloud.
+	last_report_reached_rasteriser = world_reached_rasteriser;
+	last_report_in_frustum = world_in_frustum_before_shader;
+
 	return s;
 }
 
@@ -2186,7 +2281,22 @@ std::string GaussianSplatRenderer::getDiagnostics() const
 	s += "Drawable clouds: " + toString(clouds.size()) + " (" + toString(num_merged_clouds) + " merged)\n";
 	s += "Clouds drawn last frame: " + toString(opengl_engine->last_num_splat_clouds_drawn) + "\n";
 	s += "Splats: " + uInt64ToStringCommaSeparated(total_splats) + " total, " + uInt64ToStringCommaSeparated(largest_cloud_splats) + " in largest cloud\n";
-	s += "Splats drawn last frame: " + uInt64ToStringCommaSeparated(opengl_engine->last_num_splats_drawn) + "\n";
+	s += "Splats drawn last frame: " + uInt64ToStringCommaSeparated(opengl_engine->last_num_splats_drawn) +
+		" (counted before the vertex shader, so culling that happens on GPU-side is not subtracted)\n";
+	// The number the line above cannot give: what survived the shader's own culls - the distance and size slices, the near
+	// plane, the alpha cutoff.  Nothing on the CPU can observe those while they happen, so this is what the last Frustum
+	// report measured by repeating them splat by splat, and it describes the camera that report was taken at, not now.
+	// Says which of the three things sharing the mask is actually using it, since only one can: a cap that is set while
+	// Clip is ticked is doing nothing, and there is no way to tell that from the cap's own value.
+	s += "Layer cap: " + ((splat_layer_cap > 0) ?
+		(toString(splat_layer_cap) + " layers, " + (splat_hide_test_conservative ? "conservative test" : "centre test") +
+			((getHideMode() == 3) ? std::string() : std::string(" - NOT RUNNING: Clip owns the mask"))) :
+		std::string("off")) + "\n";
+	if(!splat_layer_estimate_result.empty())
+		s += "Layer cap estimate: " + splat_layer_estimate_result + "\n"; // DIAGNOSTIC ONLY - what the last "Estimate" press measured, see OpenGLEngine::estimateSplatLayerCapSaving().
+	s += "Reached the rasteriser: " + ((last_report_in_frustum == 0) ? std::string("not measured - press \"Frustum report\"") :
+		(uInt64ToStringCommaSeparated(last_report_reached_rasteriser) + " of " + uInt64ToStringCommaSeparated(last_report_in_frustum) +
+		" in frustum, as of the last Frustum report")) + "\n";
 	// Draw calls rather than slices: a cloud with fewer splats than slices leaves some empty, so the two only agree
 	// when there is something to draw in every one.
 	s += "Draw slices: " + toString(splat_num_draw_slices) + " (" + toString(opengl_engine->last_num_splat_draw_calls) + " draw calls last frame)" +
@@ -2352,7 +2462,7 @@ Reference<SplatCloud> GaussianSplatRenderer::allocCloud()
 	// walks the program's uniforms and indexes this array by the same i, so a slot short is an out-of-bounds read there
 	// and an out-of-bounds write in think(). All but splat_tex_width below are set by think(), or by the draw path for the
 	// saturation mask ones.
-	mat.user_uniform_vals.resize(12);
+	mat.user_uniform_vals.resize(14);
 	mat.user_uniform_vals[2].intval = (int)splat_tex_width;
 
 	// Build a real (if minimal) texture and VAO up front: adding the object to the engine before it has those would
@@ -2829,6 +2939,8 @@ std::string GaussianSplatRenderer::applyCoplanarMerge(const GaussianSplatCoplana
 				params_os.across  = params_ws.across  / scale;
 				params_os.through = params_ws.through / scale;
 				params_os.alpha_cutoff = splat_alpha_cutoff; // Not the caller's to choose: it is where this renderer cuts a quad off, and the merge's "does this group pay?" test has to use the same one - see the field's comment.
+				params_os.alpha_gain  = splat_alpha_gain;   // Same reason: the quad is sized from the adjusted alpha, so the areas the test compares have to be too - see getAlphaGain().
+				params_os.alpha_gamma = splat_alpha_gamma;
 
 				MergedSource entry;
 				entry.data = mergedSplatData(*src, params_os, lod_base, entry.stats);
@@ -3355,6 +3467,8 @@ void GaussianSplatRenderer::think()
 		// gate actually runs - see setSplatMaskBlockSize().
 		mat.user_uniform_vals[9].vec2 = Vec2f(splat_dist_clamp_min, splat_dist_clamp_max);
 		mat.user_uniform_vals[10].intval = splat_dist_clamp_invert ? 1 : 0;
+		// 11 (splat_mask_centre_test) also belongs to the draw path - see setSplatMaskBlockSize().
+		mat.user_uniform_vals[12].vec2 = Vec2f(splat_alpha_gain, splat_alpha_gamma); // See getAlphaGain().
 	}
 
 	kickOffSorts();

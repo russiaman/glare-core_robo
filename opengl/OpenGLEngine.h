@@ -686,6 +686,15 @@ public:
 	Reference<FrameBuffer> splat_accum_copy_framebuffer;
 	OpenGLTextureRef splat_accum_copy_texture;
 
+	// DIAGNOSTIC ONLY - a running count of how many splat fragments have blended into each pixel this frame, as a second
+	// colour attachment on the accumulation framebuffer.  Only allocated while the per-pixel layer cap or its estimate
+	// asks for it - see GaussianSplatRenderer::getLayerCap().  RGBA rather than a single channel because the splat
+	// blend func reads the destination alpha, and a format without one reads it as 1, which would make every increment
+	// zero; with alpha kept at 0 here the same blend func is plain addition.
+	Reference<RenderBuffer> splat_layer_count_renderbuffer;
+	OpenGLTextureRef splat_layer_count_copy_texture;
+	Reference<FrameBuffer> splat_layer_count_copy_framebuffer;
+
 	// The saturation gate's mask of finished pixels, usually a fraction of the viewport's resolution - see
 	// OpenGLEngine::markSaturatedSplatPixels(), which writes it, and gaussian_splat_frag_shader.glsl, which reads it.
 	Reference<FrameBuffer> splat_saturation_mask_framebuffer;
@@ -1462,12 +1471,32 @@ private:
 	// Builds the one-bit screen-space mask the splat vertex shader culls whole splats against. from_layer_count = false
 	// marks the pixels whose accumulated coverage has reached the saturation threshold, so later draw slices skip them;
 	// true marks the pixels whose layer count has reached the overdraw ramp's red end, for the hide-overdraw diagnostic.
-	void markSaturatedSplatPixels(bool from_layer_count = false);
+	// from_layer_count marks by a count rather than by coverage; from_layer_count_buffer takes that count from the splat
+	// pass's own per-pixel layer counter (the second colour attachment) and thresholds it at the layer cap, which is what
+	// the per-pixel cap runs on - see GaussianSplatRenderer::getLayerCap().
+	void markSaturatedSplatPixels(bool from_layer_count = false, bool from_layer_count_buffer = false);
+	void fillCappedSplatPixels(); // DIAGNOSTIC ONLY - rewrites the pixels the layer cap cut short as fully covered, see GaussianSplatRenderer::getLayerCapOpaque().
+	void estimateSplatLayerCapSaving(); // DIAGNOSTIC ONLY - reads the layer counter back and reports how much fill a per-pixel cap would remove.
 	void resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name); // Composites the splat accumulation buffer onto the buffer the frame is being drawn into, undoing the engine's display transform once.
+
+	//----------------------------------------------------------------------------------------------------------------
+	// DIAGNOSTIC ONLY - the saturation-snapshot dump.  No part of the splat render path: nothing below is read by any
+	// draw, and removing it (together with its call sites in drawSplatClouds(), each marked the same way) leaves the
+	// rendering exactly as it was.
+	//----------------------------------------------------------------------------------------------------------------
+	void captureSplatAccumSnapshot(int slice_index); // Writes the accumulation buffer as it stands after draw slice 'slice_index', plus its alpha and what this slice added.
+	void captureSplatMaskSnapshot(int slice_index);  // Writes every level of the saturation mask as it stands after the census that followed draw slice 'slice_index'.
 public:
 	// Renders Gaussian splat clouds.  Owned by the engine, and cheap until the first cloud is registered with it: it
 	// doesn't build its shaders until then.  draw() drives it, so callers only need addObject()/removeObject().
 	GaussianSplatRenderer& getSplatRenderer() { return *splat_renderer.ptr(); }
+
+	// DIAGNOSTIC ONLY - see above.  Asks the next frame that actually runs the saturation gate to dump each draw slice
+	// and each mask it builds into 'output_dir' as PNGs.  The request is consumed by that frame whether or not it wrote
+	// anything, so it never leaks into a later one.  Ignored outright when the gate is not running: without it there are
+	// no censuses, and the slice boundaries are the only thing the dump would be showing.
+	// That frame is far slower than a normal one (a full-screen readback per slice), so its timings mean nothing.
+	void requestSplatSaturationSnapshots(const std::string& output_dir) { splat_snapshot_output_dir = output_dir; splat_snapshot_requested = true; }
 private:
 	void drawBackgroundEnvMap(const Matrix4f& view_matrix, const Matrix4f& proj_matrix);
 	void drawAuroraTex();
@@ -1675,7 +1704,16 @@ public:
 	// GaussianSplatRenderer::getDiagnostics(); comparing these against the totals is how you tell whether culling is
 	// doing anything for the current view.
 	uint64 last_num_splat_clouds_drawn;
+
+	// How many splats were actually issued as instances, i.e. after the draw slice limit but before anything the vertex
+	// shader culls (the distance and size slices, the saturation gate) - those happen on the GPU and no CPU counter can
+	// see them.
 	uint64 last_num_splats_drawn;
+
+	// How many the LoD traversal picked for those clouds, before the slice loop got to decide how many of them to issue.
+	// Separate from the count above because the two answer different questions, and because the hide-overdraw mask's
+	// change fingerprint is taken before any slice is drawn - see hideOverdrawMaskNeedsRebuild().
+	uint64 last_num_splats_selected;
 	uint64 last_num_splat_draw_calls; // How many draws those splats took, i.e. how many non-empty slices - see getNumDrawSlices().
 
 	// Whether the splat accumulation framebuffer has a depth buffer of its own, which the saturation gate needs: the gate
@@ -1706,6 +1744,11 @@ private:
 
 	// How many levels of the mask's min-pyramid exist, level 0 included - see markSaturatedSplatPixels().
 	int splat_saturation_mask_num_levels;
+
+	// DIAGNOSTIC ONLY - state of the saturation-snapshot dump, see requestSplatSaturationSnapshots().
+	bool splat_snapshot_requested;
+	std::string splat_snapshot_output_dir;
+	js::Vector<uint8, 16> splat_snapshot_prev_accum; // The previous slice's readback, so each slice can also be shown as what it alone added.
 
 	std::vector<uint32> temp_counts;
 	uint32 num_prog_changes;

@@ -28,6 +28,7 @@ Copyright Glare Technologies Limited 2023 -
 //#include "../utils/IncludeHalf.h"
 #ifndef NO_EXR_SUPPORT
 #include "../graphics/EXRDecoder.h"
+#include "../graphics/PNGDecoder.h" // DIAGNOSTIC ONLY - the saturation-snapshot dump, see requestSplatSaturationSnapshots().
 #endif
 #include "../graphics/imformatdecoder.h"
 #include "../graphics/CompressedImage.h"
@@ -460,12 +461,14 @@ OpenGLEngine::OpenGLEngine(const OpenGLEngineSettings& settings_)
 	last_num_obs_in_frustum(0),
 	last_num_splat_clouds_drawn(0),
 	last_num_splats_drawn(0),
+	last_num_splats_selected(0),
 	last_num_splat_draw_calls(0),
 	splat_depth_copy_works(false),
 	splat_accum_buffer_format(OpenGLTextureFormat::Format_RGBA_Linear_Half),
 	splat_accum_gate_available(false),
 	splat_saturation_mask_block(1),
 	splat_saturation_mask_num_levels(1),
+	splat_snapshot_requested(false), // DIAGNOSTIC ONLY - see requestSplatSaturationSnapshots().
 	print_output(NULL),
 	tex_CPU_mem_usage(0),
 	tex_GPU_mem_usage(0),
@@ -9465,6 +9468,7 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 
 	last_num_splat_clouds_drawn = 0;
 	last_num_splats_drawn = 0;
+	last_num_splats_selected = 0;
 	last_num_splat_draw_calls = 0;
 
 	if(current_scene->splat_cloud_objects.empty())
@@ -9499,8 +9503,11 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 		return;
 
 	last_num_splat_clouds_drawn = num_visible;
+	// What the traversal picked.  last_num_splats_drawn is accumulated in the slice loop instead, from the ranges
+	// actually issued: with a draw slice limit set the two differ, and it is the issued count that the times in the
+	// diagnostics are the cost of.
 	for(size_t i=0; i<num_visible; ++i)
-		last_num_splats_drawn += (uint64)visible_splat_clouds[i]->num_instances_to_draw;
+		last_num_splats_selected += (uint64)visible_splat_clouds[i]->num_instances_to_draw;
 
 	const Vec4f campos_ws = this->getCameraPositionWS();
 
@@ -9538,6 +9545,12 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 	// order (clouds front-to-back, splats front-to-back within each) exactly what it was.
 	const int num_slices = myClamp(splat_renderer->getNumDrawSlices(), 1, 1024);
 
+	// DIAGNOSTIC ONLY - see GaussianSplatRenderer::getDrawSliceLimit().  Stops the frame after this many slices, so the
+	// picture is deliberately missing everything behind them.  Only the loop below is affected: the boundaries are still
+	// computed from num_slices, so raising the limit adds the next depth range without moving the ones already drawn,
+	// which is what makes the times comparable step to step.
+	const int slice_draw_limit = (splat_renderer->getDrawSliceLimit() > 0) ? myMin(num_slices, splat_renderer->getDrawSliceLimit()) : num_slices;
+
 	// Below 1 the first slice is the biggest and the tail is finely sliced, which is the useful direction when nothing
 	// saturates early - see GaussianSplatRenderer::getSliceGrowth().  Bounded either side only to keep the extremes,
 	// where the first or last slice rounds to a single splat, from being reachable by accident.
@@ -9570,16 +9583,29 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 	}
 
 	current_scene->splat_accum_framebuffer->bindForDrawing();
-	setSingleDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+	// DIAGNOSTIC ONLY - the per-pixel layer cap and its estimate both need the layer counter written alongside the
+	// colour, so those frames draw into two attachments instead of one - see GaussianSplatRenderer::getLayerCap().
+	const bool have_layer_count = current_scene->splat_layer_count_renderbuffer.nonNull();
+	if(have_layer_count)
+		setTwoDrawBuffers(GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1);
+	else
+		setSingleDrawBuffer(GL_COLOR_ATTACHMENT0);
 
 	// NOTE that glClearBufferfv uses draw buffer indices, so glDrawBuffers() needs to be called first.
 	const float col_zero[4] = { 0, 0, 0, 0 };
 	glClearBufferfv(GL_COLOR, /*drawBuffer=*/0, col_zero);
+	if(have_layer_count)
+		glClearBufferfv(GL_COLOR, /*drawBuffer=*/1, col_zero);
 
 	// The hide-overdraw diagnostic - see GaussianSplatRenderer::getHideOverdrawEnabled().  Owns the same mask texture the
 	// saturation gate does, so the two cannot run together; this one wins while it is on, since it is only ever switched
 	// on deliberately for a measurement.
-	const int hide_mode = splat_renderer->getHideMode(); // 1 = by layer count, 2 = by summed alpha - the counting pass below accumulates whichever one was asked for.
+	// 1 = by layer count, 2 = by summed alpha, 3 = the layer cap, which counts layers like mode 1 and only differs in the
+	// threshold the mask is written at - see GaussianSplatRenderer::getLayerCap().  The counting pass below accumulates
+	// whichever measure was asked for, and only knows the first two.
+	const int hide_mode = splat_renderer->getHideMode();
+	const int hide_count_mode = (hide_mode == 3) ? 1 : hide_mode;
 	const bool hide_overdraw = (hide_mode != 0) && splat_accum_gate_available &&
 		splat_renderer->getSaturationMaskProgram().nonNull() && splat_renderer->getSaturationMaskProgram()->isBuilt() &&
 		splat_renderer->getMaskReduceProgram().nonNull() && splat_renderer->getMaskReduceProgram()->isBuilt();
@@ -9591,7 +9617,7 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 	// pays for the counting pass once, and the frames after it contain exactly the work a cloud with those splats removed
 	// would do, which is what makes the frame total a fair comparison against the checkbox being off.
 	if(hide_overdraw && splat_renderer->hideOverdrawMaskNeedsRebuild(view_matrix, current_scene->viewport_w, current_scene->viewport_h,
-		splat_saturation_mask_block, last_num_splats_drawn))
+		splat_saturation_mask_block, last_num_splats_selected)) // Selected rather than drawn: this runs before the slice loop, which is what fills in the drawn count.
 	{
 		DebugGroup count_debug_group("splat overdraw counting pre-pass");
 
@@ -9614,7 +9640,7 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 		for(size_t i=num_visible; i-- > 0; )
 		{
 			GLObject* const ob = const_cast<GLObject*>(visible_splat_clouds[i]);
-			ob->materials[0].user_uniform_vals[6].intval = hide_mode; // Overdraw mode 1 (layer count) or 2 (summed alpha). Put back below.
+			ob->materials[0].user_uniform_vals[6].intval = hide_count_mode; // Overdraw mode 1 (layer count) or 2 (summed alpha). Put back below.
 		}
 
 		for(size_t i=num_visible; i-- > 0; )
@@ -9646,7 +9672,7 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 		}
 
 		splat_renderer->noteHideOverdrawMaskBuilt(view_matrix, current_scene->viewport_w, current_scene->viewport_h,
-			splat_saturation_mask_block, last_num_splats_drawn);
+			splat_saturation_mask_block, last_num_splats_selected);
 
 		// Start the real pass from an empty buffer, exactly as if the counting pass had never run.
 		glClearBufferfv(GL_COLOR, /*drawBuffer=*/0, col_zero);
@@ -9666,6 +9692,56 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 		splat_renderer->getSaturationMaskProgram().nonNull() && splat_renderer->getSaturationMaskProgram()->isBuilt() &&
 		splat_renderer->getMaskReduceProgram().nonNull() && splat_renderer->getMaskReduceProgram()->isBuilt();
 
+	// DIAGNOSTIC ONLY - see requestSplatSaturationSnapshots().  Consumed here whether or not it results in anything, so a
+	// press made with the gate off does not fire on some later frame the owner didn't mean.  Only the gate's own frames
+	// are dumped: with no gate there are no censuses, and the slices are then boundaries in a picture that would have
+	// come out the same without them.
+	const bool capture_snapshots = splat_snapshot_requested && use_saturation_gate;
+	splat_snapshot_requested = false;
+	int snapshot_slice_index = 0; // Counts slices across all clouds, so each dumped image has a distinct name.
+	if(capture_snapshots)
+	{
+		splat_snapshot_prev_accum.clear(); // No previous slice yet, so the first delta is the first slice itself.
+		conPrint("Writing splat saturation snapshots to " + splat_snapshot_output_dir + " - this frame's timings are not comparable.");
+
+		// The settings the images are of, written beside them: a dump with nothing to say what produced it is
+		// unreadable a day later, and these are exactly the knobs a session spends its time moving.
+		try
+		{
+			FileUtils::writeEntireFileTextMode(splat_snapshot_output_dir + "/capture_info.txt",
+				"Splat saturation snapshots\n"
+				"viewport: " + toString(current_scene->viewport_w) + " x " + toString(current_scene->viewport_h) + "\n"
+				// Selected rather than drawn: this is written before the slice loop, which is where the drawn count is filled in.
+				"clouds drawn: " + toString(last_num_splat_clouds_drawn) + ", splats selected: " + toString(last_num_splats_selected) + "\n"
+				"slices: " + toString(num_slices) + ", growth: " + toString(slice_growth) + "\n"
+				"saturation threshold: " + toString(splat_renderer->getSaturationThreshold()) + "\n"
+				"mask: " + toString(current_scene->splat_saturation_mask_texture->xRes()) + " x " + toString(current_scene->splat_saturation_mask_texture->yRes()) +
+					", block " + toString(splat_saturation_mask_block) + " px, " + toString(splat_saturation_mask_num_levels) + " levels\n"
+				"alpha cutoff: " + toString(splat_renderer->getAlphaCutoff()) + "\n"
+				"accum buffer: " + std::string(textureFormatString(splat_accum_buffer_format)) + "\n");
+		}
+		catch(glare::Exception& e)
+		{
+			conPrint("Error writing splat snapshot capture info: " + e.what());
+		}
+	}
+
+	// DIAGNOSTIC ONLY - the per-pixel layer cap, see GaussianSplatRenderer::getLayerCap().  Needs the layer counter, more
+	// than one slice to update the mask between, and the normal composite: the debug views blend additively, so their
+	// "layers" are the thing being displayed rather than a count to cut against.
+	//
+	// The estimating frame deliberately draws uncapped - it is measuring what the scene has, not what a cap left of it.
+	const bool estimating_layer_cap = splat_renderer->layerEstimateRequested() && have_layer_count && !show_overdraw && !hide_overdraw;
+	const bool use_layer_cap = (splat_renderer->getLayerCap() > 0) && have_layer_count && (num_slices > 1) && !estimating_layer_cap &&
+		!show_overdraw && !hide_overdraw && splat_accum_gate_available &&
+		splat_renderer->getSaturationMaskProgram().nonNull() && splat_renderer->getSaturationMaskProgram()->isBuilt() &&
+		splat_renderer->getMaskReduceProgram().nonNull() && splat_renderer->getMaskReduceProgram()->isBuilt();
+
+	// The cap rejects fragments, not splats: the vertex test would drop a splat everywhere or nowhere, which is not what
+	// "stop compositing this pixel" means.  Off unless the cap is running, and then the two tests are mutually exclusive
+	// anyway, since the gate and the cap both own the one mask.
+	splat_renderer->setSplatFragMaskBlockSize(use_layer_cap ? splat_saturation_mask_block : 0);
+
 	// Tells the splat shader whether to test the mask at all, and how many pixels a texel of it covers.  Set here rather
 	// than in the renderer's think(), since whether anything wrote the mask this frame is decided just above: a shader
 	// testing a mask nobody wrote would be reading whatever the last frame left there.
@@ -9673,9 +9749,13 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 	// was; the gate wants the conservative one, which never drops a splat that could still have shown - see
 	// GaussianSplatRenderer::setSplatMaskBlockSize().
 	splat_renderer->setSplatMaskBlockSize((use_saturation_gate || hide_overdraw) ? splat_saturation_mask_block : 0, splat_saturation_mask_num_levels - 1,
-		/*centre_test=*/hide_overdraw);
+		// The conservative test is the gate's, and is also what the layer cap wants: a splat is dropped only where every
+		// pixel it could touch has already had its layers, so nothing it would still have shown is lost and no hole can
+		// open.  The centre test is the other reading, which cuts through the marked region and shows what it was
+		// carrying - see GaussianSplatRenderer::getHideTestConservative().
+		/*centre_test=*/hide_overdraw && !splat_renderer->getHideTestConservative());
 
-	if(use_saturation_gate)
+	if(use_saturation_gate || use_layer_cap)
 	{
 		// Nothing is finished before the first slice of the frame has been drawn, and the mask still holds the last
 		// frame's answer, which was computed for a different camera.  Cheap - it is a fraction of the viewport.
@@ -9726,7 +9806,7 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 		const uint32 batch_i = 0;
 		const int cloud_num_instances = ob->num_instances_to_draw;
 
-		for(int slice=0; slice<num_slices; ++slice)
+		for(int slice=0; slice<slice_draw_limit; ++slice) // slice_draw_limit == num_slices unless the diagnostic limit is set - see above.
 		{
 			// Split by position in the buffer rather than by distance: the sort has already put it in depth order, so an
 			// index split is free, and it also bounds the work per slice, which a distance split would not.  Slice sizes
@@ -9739,8 +9819,18 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 			// Before every slice but the first, take stock of what the slices already drawn have covered.  Doing it here
 			// rather than after each draw means an empty trailing slice, or the last slice of the last cloud, doesn't pay
 			// for a census whose result nothing would read.
-			if(use_saturation_gate && (last_num_splat_draw_calls > 0))
-				markSaturatedSplatPixels();
+			if((use_saturation_gate || use_layer_cap) && (last_num_splat_draw_calls > 0))
+			{
+				// The cap thresholds the layer counter at its own value; the gate thresholds accumulated coverage.  Same
+				// pass, same mask, different source and threshold - and only one of them can be running.
+				markSaturatedSplatPixels(/*from_layer_count=*/use_layer_cap, /*from_layer_count_buffer=*/use_layer_cap);
+
+				// DIAGNOSTIC ONLY - see requestSplatSaturationSnapshots().  Numbered by the slice the census followed,
+				// which is the slice whose coverage it is a statement about; the slice drawn just below is the first one
+				// culled against it.
+				if(capture_snapshots)
+					captureSplatMaskSnapshot(snapshot_slice_index - 1);
+			}
 
 			// Inside the slice loop, not outside it: the marking pass above binds a program of its own and leaves none
 			// bound, so the splat program has to be re-established after every one of them.  checkUseProgram() is a no-op
@@ -9769,6 +9859,12 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 #endif
 			drawBatchWithDenormalisedData(*ob, ob->batch_draw_info[batch_i], batch_i);
 			last_num_splat_draw_calls++;
+			last_num_splats_drawn += (uint64)(slice_end - slice_begin); // Counted here so that a draw slice limit, which simply stops this loop early, is reflected in it.
+
+			// DIAGNOSTIC ONLY - see requestSplatSaturationSnapshots().  After the draw rather than before it, so slice
+			// NNN's image is the composite with slice NNN in it.
+			if(capture_snapshots)
+				captureSplatAccumSnapshot(snapshot_slice_index++);
 		}
 
 		// Put back what the LoD traversal left, so everything outside this pass - the diagnostics display, the next
@@ -9779,8 +9875,20 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 
 	flushDrawCommandsAndUnbindPrograms();
 
+	// DIAGNOSTIC ONLY - see GaussianSplatRenderer::getLayerCap().
+	if(use_layer_cap && splat_renderer->getLayerCapOpaque())
+		fillCappedSplatPixels();
+
+	if(estimating_layer_cap)
+		estimateSplatLayerCapSaving();
+
 	glDepthMask(GL_TRUE); // Re-enable writing to depth buffer.
 	glDisable(GL_BLEND);
+
+	// Back to one attachment before the resolve, which draws to the scene's framebuffer and has nothing to say about the
+	// layer counter.
+	if(have_layer_count)
+		setSingleDrawBuffer(GL_COLOR_ATTACHMENT0);
 
 	resolveSplatAccumBuffer(scene_target_framebuffer_name);
 
@@ -9869,6 +9977,11 @@ void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffe
 	// pixels in a colour mask of its own now, and touches depth not at all.  It used to mark them in depth, which meant
 	// it needed a private copy of the scene's, and that copy cost 3.5-8.7 ms in depth tests - see
 	// gaussian_splat_saturation_mask_frag_shader.glsl.
+	// DIAGNOSTIC ONLY - the per-pixel layer cap and its estimate both need a running per-pixel layer count, which is a
+	// second colour attachment; nothing else does, so it is allocated only while one of them is asking - see
+	// GaussianSplatRenderer::getLayerCap().
+	const bool want_layer_count = splat_renderer->wantsLayerCountBuffer();
+
 	const bool share_scene_depth = current_scene->render_to_main_render_framebuffer && current_scene->main_depth_renderbuffer.nonNull();
 
 	size_t xres, yres;
@@ -9918,13 +10031,17 @@ void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffe
 		current_scene->splat_saturation_mask_texture.nonNull() &&
 		current_scene->splat_saturation_mask_texture->xRes() == mask_xres && // Changing the mask downscale rebuilds too.
 		current_scene->splat_saturation_mask_texture->yRes() == mask_yres &&
-		current_scene->splat_accum_depth_renderbuffer.isNull() == share_scene_depth) // Also reallocate if the scene gained or lost a depth buffer we can share.
+		current_scene->splat_accum_depth_renderbuffer.isNull() == share_scene_depth && // Also reallocate if the scene gained or lost a depth buffer we can share.
+		current_scene->splat_layer_count_renderbuffer.nonNull() == want_layer_count) // Switching the layer cap or its estimate on adds a second colour attachment, so it rebuilds.
 		return; // Already allocated, in the right size and configuration.
 
 	splat_accum_buffer_format = splat_accum_format;
 
 	// Free any existing buffers first, to reduce max mem usage.  Framebuffers last, after what was attached to them.
 	current_scene->splat_accum_copy_texture         = NULL;
+	current_scene->splat_layer_count_renderbuffer   = NULL;
+	current_scene->splat_layer_count_copy_texture   = NULL;
+	current_scene->splat_layer_count_copy_framebuffer = NULL;
 	current_scene->splat_accum_renderbuffer         = NULL;
 	current_scene->splat_accum_depth_renderbuffer   = NULL;
 	current_scene->splat_accum_framebuffer          = NULL;
@@ -10018,6 +10135,29 @@ void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffe
 
 	current_scene->splat_accum_copy_framebuffer = new FrameBuffer();
 	current_scene->splat_accum_copy_framebuffer->attachTexture(*current_scene->splat_accum_copy_texture, GL_COLOR_ATTACHMENT0);
+
+	// DIAGNOSTIC ONLY - see the members' comment.  Half float rather than 8-bit: this counts layers, and a dense pixel of
+	// this scene reaches several hundred of them, which an 8-bit buffer normalised to [0, 1] cannot represent at all.
+	if(want_layer_count)
+	{
+		current_scene->splat_layer_count_renderbuffer = new RenderBuffer(xres, yres, msaa_samples, OpenGLTextureFormat::Format_RGBA_Linear_Half);
+		current_scene->splat_accum_framebuffer->attachRenderBuffer(*current_scene->splat_layer_count_renderbuffer, GL_COLOR_ATTACHMENT1);
+
+		current_scene->splat_layer_count_copy_texture = new OpenGLTexture(xres, yres, this,
+			ArrayRef<uint8>(), // data
+			OpenGLTextureFormat::Format_RGBA_Linear_Half,
+			OpenGLTexture::Filtering_Nearest,
+			OpenGLTexture::Wrapping_Clamp,
+			false, // has_mipmaps
+			/*MSAA_samples=*/1
+		);
+
+		current_scene->splat_layer_count_copy_framebuffer = new FrameBuffer();
+		current_scene->splat_layer_count_copy_framebuffer->attachTexture(*current_scene->splat_layer_count_copy_texture, GL_COLOR_ATTACHMENT0);
+
+		if(!current_scene->splat_accum_framebuffer->isComplete())
+			conPrint("Error: splat accumulation framebuffer is not complete with the layer count attachment.");
+	}
 }
 
 
@@ -10039,7 +10179,7 @@ With MSAA the copy resolves the samples, so the threshold is tested against a pi
 a saturated region that is slightly wrong in both directions; the region interiors, which is where the work being
 skipped actually is, are unaffected.
 */
-void OpenGLEngine::markSaturatedSplatPixels(bool from_layer_count)
+void OpenGLEngine::markSaturatedSplatPixels(bool from_layer_count, bool from_layer_count_buffer)
 {
 	DebugGroup debug_group("markSaturatedSplatPixels()");
 	TracyGpuZone("markSaturatedSplatPixels");
@@ -10057,9 +10197,23 @@ void OpenGLEngine::markSaturatedSplatPixels(bool from_layer_count)
 	if(time_this_mark)
 		mark_saturated_splats_gpu_timer->beginTimerQuery();
 
-	//----------------------- Copy the accumulation buffer so it can be read -----------------------
-	blitFrameBuffer(/*src_framebuffer=*/*current_scene->splat_accum_framebuffer, /*dest_framebuffer=*/*current_scene->splat_accum_copy_framebuffer,
-		/*num_buffers_to_copy=*/1, /*copy_buf0_colour=*/true, /*copy_buf0_depth=*/false);
+	//----------------------- Copy the buffer being thresholded, so it can be read -----------------------
+	// The layer counter lives on colour attachment 1 and its copy on attachment 0 of a framebuffer of its own, which
+	// blitFrameBuffer() has no shape for - it pairs attachment i with attachment i - so that one blit is written out.
+	if(from_layer_count_buffer)
+	{
+		current_scene->splat_accum_framebuffer->bindForReading();
+		current_scene->splat_layer_count_copy_framebuffer->bindForDrawing();
+		glReadBuffer(GL_COLOR_ATTACHMENT1);
+		setSingleDrawBuffer(GL_COLOR_ATTACHMENT0);
+		glBlitFramebuffer(0, 0, (int)current_scene->splat_accum_renderbuffer->xRes(), (int)current_scene->splat_accum_renderbuffer->yRes(),
+			0, 0, (int)current_scene->splat_accum_renderbuffer->xRes(), (int)current_scene->splat_accum_renderbuffer->yRes(),
+			GL_COLOR_BUFFER_BIT, GL_NEAREST);
+		glReadBuffer(GL_COLOR_ATTACHMENT0);
+	}
+	else
+		blitFrameBuffer(/*src_framebuffer=*/*current_scene->splat_accum_framebuffer, /*dest_framebuffer=*/*current_scene->splat_accum_copy_framebuffer,
+			/*num_buffers_to_copy=*/1, /*copy_buf0_colour=*/true, /*copy_buf0_depth=*/false);
 
 	//----------------------- Write the mask -----------------------
 	current_scene->splat_saturation_mask_framebuffer->bindForDrawing();
@@ -10069,14 +10223,15 @@ void OpenGLEngine::markSaturatedSplatPixels(bool from_layer_count)
 	glDisable(GL_DEPTH_TEST); // The mask framebuffer has no depth attachment, and every texel of it is rewritten regardless.
 
 	mask_prog->useProgram();
-	splat_renderer->setSaturationMaskUniforms(splat_saturation_mask_block, from_layer_count);
+	splat_renderer->setSaturationMaskUniforms(splat_saturation_mask_block, from_layer_count, /*layer_count_threshold=*/from_layer_count_buffer);
 	bindMeshData(*unit_quad_meshdata);
-	bindTextureUnitToSampler(*current_scene->splat_accum_copy_texture, /*texture_unit_index=*/0, /*sampler_uniform_location=*/mask_prog->albedo_texture_loc);
+	OpenGLTexture& mask_source_tex = from_layer_count_buffer ? *current_scene->splat_layer_count_copy_texture : *current_scene->splat_accum_copy_texture;
+	bindTextureUnitToSampler(mask_source_tex, /*texture_unit_index=*/0, /*sampler_uniform_location=*/mask_prog->albedo_texture_loc);
 
 	drawElementsBaseVertex(GL_TRIANGLES, (GLsizei)unit_quad_meshdata->batches[0].num_indices, unit_quad_meshdata->getIndexType(),
 		(void*)unit_quad_meshdata->getBatch0IndicesTotalBufferOffset(), unit_quad_meshdata->vbo_handle.base_vertex);
 
-	unbindTextureFromTextureUnit(*current_scene->splat_accum_copy_texture, /*texture_unit_index=*/0); // Otherwise Chrome reports a feedback loop between the framebuffer and the active texture.
+	unbindTextureFromTextureUnit(mask_source_tex, /*texture_unit_index=*/0); // Otherwise Chrome reports a feedback loop between the framebuffer and the active texture.
 
 	//----------------------- Reduce it up the pyramid, by minimum -----------------------
 	// Each pass reads one level and writes the next, which is only defined if the level being read is the only one the
@@ -10117,6 +10272,253 @@ void OpenGLEngine::markSaturatedSplatPixels(bool from_layer_count)
 
 	if(time_this_mark)
 		mark_saturated_splats_gpu_timer->endTimerQuery();
+}
+
+
+/*
+DIAGNOSTIC ONLY - not part of the splat render path.  See OpenGLEngine::requestSplatSaturationSnapshots().
+
+Writes what the accumulation buffer holds after draw slice 'slice_index', as three PNGs:
+
+  slice_NNN_accum.png - the running composite, i.e. what the finished frame would look like if the splats stopped here;
+  slice_NNN_alpha.png - the coverage the composite has reached, which is the quantity the saturation gate thresholds;
+  slice_NNN_delta.png - the difference from the previous slice, i.e. what this slice alone added.
+
+The delta is the point of the set.  The composite converges after a few slices and the later ones look identical to the
+eye, while the delta keeps saying where the work still being done actually lands - which is the question the whole
+localisation line is asking of the television.
+
+Read back as 8-bit regardless of the buffer's own format: the images are for looking at, and the accumulated colour is
+already display-referred (see resolveSplatAccumBuffer()), so the conversion GL does on the way out is the right one.
+*/
+void OpenGLEngine::captureSplatAccumSnapshot(int slice_index)
+{
+	// The slice just drawn may still be sitting in the buffered draw commands, in which case the copy below would be of
+	// the frame without it - the same reason markSaturatedSplatPixels() starts this way.  Also drops the cached program
+	// binding, so the next slice re-establishes its own.
+	flushDrawCommandsAndUnbindPrograms();
+
+	// The buffer being drawn into cannot be read from, and may be multisampled besides - the same copy the census does.
+	blitFrameBuffer(/*src_framebuffer=*/*current_scene->splat_accum_framebuffer, /*dest_framebuffer=*/*current_scene->splat_accum_copy_framebuffer,
+		/*num_buffers_to_copy=*/1, /*copy_buf0_colour=*/true, /*copy_buf0_depth=*/false);
+
+	const size_t w = current_scene->splat_accum_copy_texture->xRes();
+	const size_t h = current_scene->splat_accum_copy_texture->yRes();
+
+	js::Vector<uint8, 16> data(w * h * 4); // RGBA rows are a multiple of 4 bytes wide, so the default pack alignment needs no adjusting.
+	current_scene->splat_accum_copy_framebuffer->bindForReading();
+	glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, data.data());
+
+	ImageMapUInt8 composite(w, h, 3);
+	ImageMapUInt8 alpha(w, h, 1);
+	ImageMapUInt8 delta(w, h, 3);
+	const bool have_prev = splat_snapshot_prev_accum.size() == data.size();
+
+	for(size_t dy=0; dy<h; ++dy)
+	{
+		const uint8* const src = &data[(h - dy - 1) * w * 4]; // Flipped: GL's origin is bottom-left, the image's is top-left.
+		const uint8* const prev = have_prev ? &splat_snapshot_prev_accum[(h - dy - 1) * w * 4] : NULL;
+		uint8* const composite_row = composite.getPixel(0, dy);
+		uint8* const alpha_row     = alpha.getPixel(0, dy);
+		uint8* const delta_row     = delta.getPixel(0, dy);
+
+		for(size_t x=0; x<w; ++x)
+		{
+			for(int c=0; c<3; ++c)
+			{
+				composite_row[x*3 + c] = src[x*4 + c];
+				// The front-to-back composite only ever adds, so this subtraction cannot go negative in exact
+				// arithmetic; it still can by a bit or two from rounding in an 8-bit readback, hence the clamp.
+				delta_row[x*3 + c] = prev ? (uint8)myMax(0, (int)src[x*4 + c] - (int)prev[x*4 + c]) : src[x*4 + c];
+			}
+			alpha_row[x] = src[x*4 + 3];
+		}
+	}
+
+	try
+	{
+		const std::string prefix = splat_snapshot_output_dir + "/slice_" + leftPad(toString(slice_index), '0', 3);
+		PNGDecoder::write(composite, prefix + "_accum.png");
+		PNGDecoder::write(alpha,     prefix + "_alpha.png");
+		PNGDecoder::write(delta,     prefix + "_delta.png");
+	}
+	catch(glare::Exception& e)
+	{
+		conPrint("Error writing splat saturation snapshot: " + e.what());
+	}
+
+	splat_snapshot_prev_accum = data;
+
+	// Back to the framebuffer and viewport the slice draws run in - bindForReading() above changed the read binding only,
+	// but the caller is entitled to assume nothing about it either way.
+	current_scene->splat_accum_framebuffer->bindForDrawing();
+	glViewport(0, 0, (GLsizei)current_scene->splat_accum_renderbuffer->xRes(), (GLsizei)current_scene->splat_accum_renderbuffer->yRes());
+}
+
+
+/*
+DIAGNOSTIC ONLY - not part of the splat render path.  See OpenGLEngine::requestSplatSaturationSnapshots().
+
+Writes every level of the saturation mask as it stands after the census that followed draw slice 'slice_index', so
+mask_NNN_L0.png is what the slice after NNN was culled against.
+
+Every level, not just level 0, because level 0 is not what culls: the splat shader picks a level from the size of the
+splat's quad and takes that texel, and a level of the min-pyramid only marks a texel where every texel under it was
+marked.  So the coarse levels are the ones that say how much of a mask that looks well filled at full resolution
+survives being asked about conservatively, which is exactly where a gate that measures as doing nothing would be losing
+it.
+*/
+void OpenGLEngine::captureSplatMaskSnapshot(int slice_index)
+{
+	OpenGLTexture& mask_tex = *current_scene->splat_saturation_mask_texture;
+
+	for(int level=0; level<splat_saturation_mask_num_levels; ++level)
+	{
+		const size_t w = myMax<size_t>(1, mask_tex.xRes() >> level);
+		const size_t h = myMax<size_t>(1, mask_tex.yRes() >> level);
+
+		// Read through the same framebuffer the reduction writes through.  Reading the level as RGBA rather than as the
+		// single channel it is: RGBA/UNSIGNED_BYTE is the one readback format a colour attachment is always required to
+		// accept, and the rows are then a multiple of 4 bytes wide for free.
+		current_scene->splat_mask_reduce_framebuffer->attachTextureMipLevel(mask_tex, GL_COLOR_ATTACHMENT0, level);
+		current_scene->splat_mask_reduce_framebuffer->bindForReading();
+
+		js::Vector<uint8, 16> data(w * h * 4);
+		glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, data.data());
+
+		ImageMapUInt8 mask_image(w, h, 1);
+		for(size_t dy=0; dy<h; ++dy)
+		{
+			const uint8* const src = &data[(h - dy - 1) * w * 4]; // Flipped, as in captureSplatAccumSnapshot().
+			uint8* const dest = mask_image.getPixel(0, dy);
+			for(size_t x=0; x<w; ++x)
+				dest[x] = src[x*4]; // The mask is single-channel; white = marked as finished.
+		}
+
+		try
+		{
+			PNGDecoder::write(mask_image, splat_snapshot_output_dir + "/mask_" + leftPad(toString(slice_index), '0', 3) + "_L" + toString(level) + ".png");
+		}
+		catch(glare::Exception& e)
+		{
+			conPrint("Error writing splat saturation mask snapshot: " + e.what());
+		}
+	}
+
+	// attachTextureMipLevel() binds its framebuffer for drawing, so the slice draws would otherwise carry on into the
+	// mask's last level.
+	current_scene->splat_accum_framebuffer->bindForDrawing();
+	glViewport(0, 0, (GLsizei)current_scene->splat_accum_renderbuffer->xRes(), (GLsizei)current_scene->splat_accum_renderbuffer->yRes());
+}
+
+
+/*
+DIAGNOSTIC ONLY - see GaussianSplatRenderer::getLayerCapOpaque().
+
+A pixel the layer cap cut short stopped accumulating before its stack was finished, so it is left partly covered and the
+resolve would composite the background through the rest of it - a wall goes translucent exactly where the cap saved the
+most work.  This rewrites those pixels as fully covered, keeping the colour their kept layers produced, so the cut shows
+as a colour error instead.
+
+Which pixels those are is the mask, which at this point holds the last census of the frame: the pixels that reached the
+cap.  Read through a copy of the accumulation buffer, since a buffer attached to the framebuffer being drawn to cannot
+also be sampled.
+*/
+void OpenGLEngine::fillCappedSplatPixels()
+{
+	DebugGroup debug_group("fillCappedSplatPixels()");
+
+	const Reference<OpenGLProgram>& cap_fill_prog = splat_renderer->getCapFillProgram();
+	if(cap_fill_prog.isNull() || !cap_fill_prog->isBuilt())
+		return; // Still compiling, or failed to; the frame then shows the capped pixels partly covered, which is the other reading rather than an error.
+
+	blitFrameBuffer(/*src_framebuffer=*/*current_scene->splat_accum_framebuffer, /*dest_framebuffer=*/*current_scene->splat_accum_copy_framebuffer,
+		/*num_buffers_to_copy=*/1, /*copy_buf0_colour=*/true, /*copy_buf0_depth=*/false);
+
+	current_scene->splat_accum_framebuffer->bindForDrawing();
+	setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // The layer counter is finished with; writing it here would count this pass as a layer.
+	glViewport(0, 0, (GLsizei)current_scene->splat_accum_renderbuffer->xRes(), (GLsizei)current_scene->splat_accum_renderbuffer->yRes());
+
+	glDisable(GL_BLEND); // The point is to overwrite the coverage, not to add to it.
+	glDisable(GL_DEPTH_TEST); // These pixels were reached by splats that already passed the depth test.
+
+	cap_fill_prog->useProgram();
+	splat_renderer->setCapFillUniforms(splat_saturation_mask_block);
+	bindMeshData(*unit_quad_meshdata);
+	bindTextureUnitToSampler(*current_scene->splat_accum_copy_texture, /*texture_unit_index=*/0, /*sampler_uniform_location=*/cap_fill_prog->albedo_texture_loc);
+	bindTextureUnitToSampler(*current_scene->splat_saturation_mask_texture, /*texture_unit_index=*/SPLAT_SATURATION_MASK_TEXTURE_UNIT_INDEX,
+		/*sampler_uniform_location=*/splat_renderer->getCapFillMaskTexUniformLoc());
+
+	drawElementsBaseVertex(GL_TRIANGLES, (GLsizei)unit_quad_meshdata->batches[0].num_indices, unit_quad_meshdata->getIndexType(),
+		(void*)unit_quad_meshdata->getBatch0IndicesTotalBufferOffset(), unit_quad_meshdata->vbo_handle.base_vertex);
+
+	unbindTextureFromTextureUnit(*current_scene->splat_accum_copy_texture, /*texture_unit_index=*/0);
+	OpenGLProgram::useNoPrograms();
+
+	glEnable(GL_DEPTH_TEST);
+	glEnable(GL_BLEND);
+	setTwoDrawBuffers(GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1); // As the caller left it.
+}
+
+
+/*
+DIAGNOSTIC ONLY - see GaussianSplatRenderer::requestLayerCapEstimate().
+
+Answers "how much of the fill would a per-pixel cap remove?" without capping anything: the frame this runs in draws
+uncapped, so the layer counter holds what the scene actually lays down, and the answer is the share of those layers that
+sit deeper than the cap.  That is the ceiling of what any mechanism cutting at that depth could save, free of whatever
+the mechanism itself would cost - which is the only honest way to size one, since every per-pixel mechanism available
+here costs something per fragment.
+
+Reads the whole counter back, which stalls the pipeline hard.  Once, on a button.
+*/
+void OpenGLEngine::estimateSplatLayerCapSaving()
+{
+	splat_renderer->clearLayerEstimateRequest(); // Consumed whether or not it produces anything, so it never fires on a later frame.
+
+	const size_t w = current_scene->splat_layer_count_copy_texture->xRes();
+	const size_t h = current_scene->splat_layer_count_copy_texture->yRes();
+
+	// Resolve and copy first: the counter is a renderbuffer, possibly multisampled, and neither can be read directly.
+	current_scene->splat_accum_framebuffer->bindForReading();
+	current_scene->splat_layer_count_copy_framebuffer->bindForDrawing();
+	glReadBuffer(GL_COLOR_ATTACHMENT1);
+	setSingleDrawBuffer(GL_COLOR_ATTACHMENT0);
+	glBlitFramebuffer(0, 0, (int)w, (int)h, 0, 0, (int)w, (int)h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	glReadBuffer(GL_COLOR_ATTACHMENT0);
+
+	js::Vector<float, 16> data(w * h * 4);
+	current_scene->splat_layer_count_copy_framebuffer->bindForReading();
+	glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_FLOAT, data.data());
+
+	const int cap = myMax(1, splat_renderer->getLayerCap());
+	double total_layers = 0, cut_layers = 0, deepest = 0;
+	size_t pixels_touched = 0, pixels_over_cap = 0;
+	for(size_t i=0; i<w*h; ++i)
+	{
+		const double layers = data[i*4];
+		if(layers <= 0)
+			continue;
+		pixels_touched++;
+		total_layers += layers;
+		deepest = myMax(deepest, layers);
+		if(layers > cap)
+		{
+			pixels_over_cap++;
+			cut_layers += layers - cap;
+		}
+	}
+
+	const double saved_pct = (total_layers > 0) ? (100.0 * cut_layers / total_layers) : 0.0;
+	splat_renderer->setLayerEstimateResult(
+		"cap " + toString(cap) + ": " + doubleToStringNDecimalPlaces(saved_pct, 1) + "% of blended fragments cut, " +
+		doubleToStringNDecimalPlaces(pixels_touched ? (100.0 * (double)pixels_over_cap / (double)pixels_touched) : 0.0, 1) + "% of covered pixels reach it, deepest " +
+		doubleToStringNDecimalPlaces(deepest, 0) + " layers, mean " + doubleToStringNDecimalPlaces(pixels_touched ? total_layers / (double)pixels_touched : 0.0, 1));
+	conPrint("Splat layer cap estimate: " + splat_renderer->getLayerEstimateResult());
+
+	current_scene->splat_accum_framebuffer->bindForDrawing();
+	setTwoDrawBuffers(GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1);
+	glViewport(0, 0, (GLsizei)current_scene->splat_accum_renderbuffer->xRes(), (GLsizei)current_scene->splat_accum_renderbuffer->yRes());
 }
 
 

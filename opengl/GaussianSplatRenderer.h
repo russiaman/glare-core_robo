@@ -285,6 +285,21 @@ public:
 	float getAlphaCutoff() const { return splat_alpha_cutoff; }
 	void setAlphaCutoff(float v) { splat_alpha_cutoff = v; }
 
+	// Live rescaling of every splat's stored opacity: alpha' = gain * alpha^gamma, clamped to 1 - see adjustSplatAlpha()
+	// in graphics/GaussianSplatData.h for the transform itself and for why it is defined there.
+	//
+	// Applied in the vertex shader before the quad is sized, which is the earliest point that can still be live, so it
+	// moves how wide each splat is rasterised as well as how much it contributes per pixel. Everything downstream is
+	// therefore of the adjusted cloud: the saturation gate's coverage, the overdraw views, and the cost predictions in
+	// getFrustumStructureReport(), which apply the same transform on the CPU.
+	//
+	// What it does not reach is the LoD tree, whose merged splats were built from the stored alpha when the cloud was
+	// loaded - a tree rebuild is what folds a setting in permanently. 1 and 1 is the cloud as captured.
+	float getAlphaGain() const { return splat_alpha_gain; }
+	void setAlphaGain(float v) { splat_alpha_gain = v; }
+	float getAlphaGamma() const { return splat_alpha_gamma; }
+	void setAlphaGamma(float v) { splat_alpha_gamma = v; }
+
 	// How many consecutive sub-ranges each cloud's depth-sorted splats are drawn in, nearest range first. 1 (default) is
 	// one draw per cloud, exactly as before this existed. Higher values change nothing on their own - the ranges are
 	// drawn back to back in the same order, so the blend is identical - and exist to give the front-to-back saturation
@@ -294,6 +309,64 @@ public:
 	// constant.
 	int getNumDrawSlices() const { return splat_num_draw_slices; }
 	void setNumDrawSlices(int v) { splat_num_draw_slices = v; }
+
+	// DIAGNOSTIC ONLY - stop drawing into a pixel once this many splats have blended into it.  0 (default) = no cap.
+	//
+	// Shares the hide-overdraw machinery entirely: a counting pass measures layers per pixel for the current camera, the
+	// pixels at or above the cap are marked in the mask, and the splat vertex shader drops splats standing there.  So it
+	// costs one counting pass when the camera or the settings move, and nothing at all on the frames after that - which
+	// is what makes it usable as a measurement.  The frames after the rebuild contain exactly the work a cloud without
+	// those splats would do.
+	//
+	// Not a per-pixel cut: the grain is a whole splat.  With the conservative test (see getHideTestConservative()) a
+	// splat is only dropped when every pixel its quad can touch has already had 'cap' layers, so nothing can open a hole
+	// - each pixel keeps at least 'cap' layers of paint, and the pixels near the edge of a dense region keep more.  That
+	// is the reading of "stop compositing this pixel past depth N" that this machinery can actually express.
+	//
+	// A stencil buffer would express the exact per-pixel version, and was tried: the test is defeated by the fragment
+	// shader's discard (which switches off the driver's early per-fragment tests, so the shading is paid anyway), and a
+	// stencil can only be had here inside a packed depth buffer of our own, which costs 3.5-8.7 ms in lost Hi-Z plus
+	// about 3.4 ms of tax on every depth test against it.  Measured; the net was negative.  Do not go back to it.
+	int getLayerCap() const { return splat_layer_cap; }
+	void setLayerCap(int v) { splat_layer_cap = v; }
+
+	// What a pixel that reached the cap is composited as.  true: fully covered, keeping the colour its kept layers
+	// averaged to, so the cut shows as a colour error.  false: as covered as those layers made it, so the background
+	// shows through wherever the cap bit - which is the quickest way to see where it bit at all.
+	bool getLayerCapOpaque() const { return splat_layer_cap_opaque; }
+	void setLayerCapOpaque(bool v) { splat_layer_cap_opaque = v; }
+
+	// Whether the splat pass needs its per-pixel layer counter this frame - see OpenGLScene::splat_layer_count_renderbuffer.
+	bool wantsLayerCountBuffer() const { return (splat_layer_cap > 0) || splat_layer_estimate_requested; }
+
+	// Asks the next frame to measure how much fill a per-pixel cap would remove, and report it - see
+	// OpenGLEngine::estimateSplatLayerCapSaving().  The frame that does it draws uncapped, so the counts it reads are
+	// what the scene has rather than what the cap left.
+	void requestLayerCapEstimate() { splat_layer_estimate_requested = true; }
+	bool layerEstimateRequested() const { return splat_layer_estimate_requested; }
+	void clearLayerEstimateRequest() { splat_layer_estimate_requested = false; }
+	void setLayerEstimateResult(const std::string& s) { splat_layer_estimate_result = s; }
+	const std::string& getLayerEstimateResult() const { return splat_layer_estimate_result; }
+
+	// Which test the splat vertex shader uses against the mask, for the layer cap and for the hide-overdraw diagnostic
+	// alike.  true (default): conservative - drop the splat only when its whole quad is inside the marked region, so
+	// nothing that could still have shown is lost and no hole can open.  false: the centre test - drop it when the texel
+	// under its centre is marked, which cuts through a marked region and leaves a hole, and is what shows how much of
+	// the picture that region was carrying.  Quads are bigger than the connected marked patches, so the conservative
+	// test removes far fewer splats; the two answer different questions and both are worth having.
+	bool getHideTestConservative() const { return splat_hide_test_conservative; }
+	void setHideTestConservative(bool v) { splat_hide_test_conservative = v; }
+
+	// DIAGNOSTIC ONLY - draws only the first this-many slices of every cloud and stops, leaving the frame deliberately
+	// incomplete. 0 (default) draws them all, which is the only value the picture is correct at.
+	//
+	// It exists to locate the fill in depth rather than on the screen. Slicing already splits each cloud into
+	// consecutive depth ranges; raising the limit one step at a time and reading the splat pass time attributes the cost
+	// to a range, which no screen-space diagnostic can do - the overdraw views say where the layers pile up, not which
+	// of them is paying for it. The slice sizes are the ones getSliceGrowth() describes, so the steps are equal in splat
+	// count, not in depth.
+	int getDrawSliceLimit() const { return splat_draw_slice_limit; }
+	void setDrawSliceLimit(int v) { splat_draw_slice_limit = v; }
 
 	// Ratio between the sizes of consecutive draw slices: each slice holds this many times as many splats as the one
 	// before it. 1 (default) makes them all equal, which is what slicing did before this existed. Values below 1 make
@@ -365,6 +438,11 @@ public:
 
 	// The program that halves the mask, taking the minimum of each 2x2 block, to build the pyramid the vertex shader
 	// picks a level from. Null until the first addObject(), like the programs above.
+	// DIAGNOSTIC ONLY - see OpenGLEngine::fillCappedSplatPixels().  Null until the first addObject(), like the rest.
+	const Reference<OpenGLProgram>& getCapFillProgram() const { return cap_fill_prog; }
+	int getCapFillMaskTexUniformLoc(); // Resolved on first use, like getSplatMaskTexUniformLoc(): a sampler uniform is not something the material path can carry.
+	void setCapFillUniforms(int block_size) const;
+
 	const Reference<OpenGLProgram>& getMaskReduceProgram() const { return mask_reduce_prog; }
 
 	// Location of the splat program's saturation-mask sampler, or -1 if the program has no such uniform. Resolved on
@@ -387,6 +465,10 @@ public:
 	// point there - it is what shows how much of the picture the marked region was carrying - and it is also why the
 	// conservative test cannot serve: quads are larger than the connected marked patches, so almost every splat overlaps
 	// the edge of one and survives.
+	// DIAGNOSTIC ONLY - block size for the per-fragment mask test the layer cap uses, 0 to switch it off.  Separate from
+	// the vertex test's: the cap wants the pixels rejected and the splats left alone, which is the opposite of the gate.
+	void setSplatFragMaskBlockSize(int block_size);
+
 	void setSplatMaskBlockSize(int block_size, int max_level, bool centre_test = false);
 
 	// Sets that program's uniforms, plus how many accumulation-buffer pixels across one mask texel covers, which is the
@@ -398,7 +480,9 @@ public:
 	// composite has finished, thresholded at getSaturationThreshold(); true is the "hide overdraw" diagnostic, marking
 	// where the layer count has reached getOverdrawRangeMax(). Both come out as the same one-bit mask, so everything
 	// downstream - the pyramid, the vertex shader - is shared.
-	void setSaturationMaskUniforms(int block_size, bool from_layer_count) const;
+	// layer_count_threshold: the count being thresholded is the per-pixel layer cap's rather than the overdraw ramp's red
+	// end - the two share this pass and differ only in what number they compare against.
+	void setSaturationMaskUniforms(int block_size, bool from_layer_count, bool layer_count_threshold = false) const;
 
 	// Diagnostic, not an optimisation: draws a counting pass first, then throws away every splat that lands where the
 	// layer count reached getOverdrawRangeMax() - that is, exactly the region the overdraw view paints solid red - and
@@ -497,6 +581,9 @@ private:
 	Reference<OpenGLProgram> shader_prog; // Shared by every cloud.  Null until the first addObject().
 	Reference<OpenGLProgram> resolve_prog; // Resolves the splat accumulation buffer onto the main colour buffer.  Built alongside shader_prog.
 	Reference<OpenGLProgram> saturation_mask_prog; // Marks finished pixels between draw slices.  Built alongside shader_prog.
+	Reference<OpenGLProgram> cap_fill_prog; // DIAGNOSTIC ONLY - fills capped pixels out to full coverage, see getLayerCapOpaque().  Built alongside shader_prog.
+	int cap_fill_mask_tex_uniform_loc;
+
 	Reference<OpenGLProgram> mask_reduce_prog; // Halves the mask, by minimum, to build its pyramid.  Built alongside shader_prog.
 
 	OpenGLEngine* opengl_engine;
@@ -551,8 +638,24 @@ private:
 	// See getAlphaCutoff() above. Default 1/255 is lossless (matches the fragment shader's fixed discard threshold).
 	float splat_alpha_cutoff;
 
+	// See getAlphaGain()/getAlphaGamma() above. Both 1 = the stored alpha untouched.
+	float splat_alpha_gain;
+	float splat_alpha_gamma;
+
 	// See getNumDrawSlices() above. Default 1 = one draw per cloud, i.e. no slicing.
 	int splat_num_draw_slices;
+
+	// DIAGNOSTIC ONLY - see getDrawSliceLimit() above. Default 0 = draw every slice, i.e. a complete frame.
+	int splat_draw_slice_limit;
+
+	// See getLayerCap()/getHideTestConservative() above. Default 0 = uncapped, conservative test.
+	int splat_layer_cap;
+	bool splat_layer_cap_opaque;
+	bool splat_hide_test_conservative;
+
+	// See requestLayerCapEstimate() above.
+	bool splat_layer_estimate_requested;
+	std::string splat_layer_estimate_result;
 
 	// See getSliceGrowth() above. Default 1 = every slice the same size.
 	float splat_slice_growth;
@@ -595,4 +698,10 @@ private:
 	// reports whose state has to be reconstructed from what was pressed before them is a log that will eventually be read
 	// wrong.  Set by applyCoplanarMerge(), cleared by restoreUnmergedSplats().
 	std::string last_merge_description;
+
+	// What the last getFrustumStructureReport() press measured about the vertex shader's own culling: how many splats
+	// reached the rasteriser, out of how many were in the frustum before it.  Kept so getDiagnostics() can show it in the
+	// panel, where the per-frame counters next to it cannot answer that question at all - the culls happen on the GPU,
+	// and the only exact answer available is the CPU pass the report runs.  Zero until a report has been taken.
+	uint64 last_report_reached_rasteriser, last_report_in_frustum;
 };

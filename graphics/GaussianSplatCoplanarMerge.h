@@ -84,6 +84,15 @@ struct GaussianSplatCoplanarMergeParams
 	// opaque than its members were, which means the replacement is drawn wider than its scale alone would say, and
 	// leaving that out of the "does this group pay?" test below would flatter every merge by up to a factor of 1.5.
 	float alpha_cutoff;
+
+	// The renderer's live opacity adjustment (see adjustSplatAlpha() in GaussianSplatData.h), set from its
+	// getAlphaGain()/getAlphaGamma() for the same reason alpha_cutoff is: it decides how wide a splat is actually drawn,
+	// and so belongs in the same "does this group pay?" test.  1 and 1 leave every area exactly as it was.
+	//
+	// It reaches the areas only.  The replacement's own opacity is derived in the stored alpha's space - the ink and
+	// transmittance arguments that produce it are statements about the cloud as it is held, and the adjustment is then
+	// applied to the result at draw time like it is to every other splat.
+	float alpha_gain, alpha_gamma;
 };
 
 

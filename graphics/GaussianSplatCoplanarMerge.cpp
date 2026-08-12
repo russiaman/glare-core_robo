@@ -7,6 +7,7 @@ Copyright Glare Technologies Limited 2026 -
 
 
 #include "GaussianSplatLodTree.h" // For makeGaussianSplatLodLeafNode()/mergeGaussianSplatLodNodes() - the replacement splat is fitted with exactly the maths the LoD tree's own merge uses.
+#include "GaussianSplatData.h" // For adjustSplatAlpha() - the renderer's live alpha adjustment, which the drawn areas below have to account for.
 #include "../maths/mathstypes.h"
 #include <algorithm>
 #include <assert.h>
@@ -60,12 +61,15 @@ float geometricArea(const Vec3f& scale) // pi * the two largest scale axes: one 
 	return Maths::pi<float>() * s_max * s_mid;
 }
 
-float drawnArea(const Vec3f& scale, float opacity, float alpha_cutoff)
+float drawnArea(const Vec3f& scale, float stored_opacity, const GaussianSplatCoplanarMergeParams& params)
 {
-	if(opacity <= alpha_cutoff)
+	// The renderer's live alpha adjustment applies before it sizes the quad, so the width being compared here is the
+	// width of the adjusted splat - see the params field.
+	const float opacity = adjustSplatAlpha(stored_opacity, params.alpha_gain, params.alpha_gamma);
+	if(opacity <= params.alpha_cutoff)
 		return 0.f; // Invisible even at its centre; the shader makes a degenerate zero-area quad of it.
 
-	const float sigma_cutoff = myMin(std::sqrt(2.f * std::log(opacity / alpha_cutoff)), 3.f);
+	const float sigma_cutoff = myMin(std::sqrt(2.f * std::log(opacity / params.alpha_cutoff)), 3.f);
 	return geometricArea(scale) * sigma_cutoff * sigma_cutoff;
 }
 
@@ -129,7 +133,7 @@ GaussianSplatCoplanarMergeStats coplanarMergeSplats(js::Vector<Vec3f, 16>& posit
 	for(size_t i=0; i<num_splats; ++i)
 	{
 		normals[i] = splatNormal(scales[i], rotations[i]);
-		areas[i] = drawnArea(scales[i], colours[i][3], params.alpha_cutoff);
+		areas[i] = drawnArea(scales[i], colours[i][3], params);
 		stats.area_in += areas[i];
 	}
 
@@ -333,7 +337,7 @@ GaussianSplatCoplanarMergeStats coplanarMergeSplats(js::Vector<Vec3f, 16>& posit
 		//
 		// Note this is decided after the opacity above, not before: the replacement's opacity is what decides how far out
 		// its quad is drawn, so the two cannot be settled in the other order.
-		const double merged_drawn_area = drawnArea(merged.scale, merged_alpha, params.alpha_cutoff);
+		const double merged_drawn_area = drawnArea(merged.scale, merged_alpha, params);
 
 		if(!(merged_drawn_area < sum_drawn_area))
 		{

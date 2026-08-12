@@ -50,6 +50,12 @@ uniform int splat_mask_centre_test;
 
 uniform float splat_alpha_cutoff; // GaussianSplatSettingsWidget, Qt only. Sets the per-splat quad radius to exactly where alpha decays to this value, instead of the fixed 3-sigma bound below - see the derivation where it's used. Default 1/255 matches the fragment shader's own discard threshold exactly (lossless); raising it trims low-opacity splats' quads further, trading a sliver of their faint edge for less overdraw.
 
+// (gain, gamma) of the live opacity adjustment alpha' = gain * alpha^gamma - see adjustSplatAlpha() in
+// graphics/GaussianSplatData.h, which is where this transform is defined and which the CPU-side cost predictions use.
+// Duplicated here rather than shared because GLSL has no way to include it: keep the two in step.
+// (1, 1) is the identity, and is what the renderer sends unless the panel says otherwise.
+uniform vec2 splat_alpha_gain_gamma;
+
 out vec2 frag_screen_offset_px; // Pixel-space offset of this vertex from the splat's projected centre.
 out vec3 frag_conic; // Inverse 2D covariance (A, B, C) of [[A, B], [B, C]], for the per-pixel Gaussian evaluation.
 out vec4 frag_colour; // (r, g, b, opacity)
@@ -74,6 +80,12 @@ void main()
 	vec3 scale  = vec3(t0.w, t1.x, t1.y);
 	vec4 rot    = vec4(t1.z, t1.w, t2.x, t2.y); // (x, y, z, w)
 	frag_colour = vec4(t2.z, t2.w, t3.x, t3.y); // (r, g, b, opacity)
+
+	// The live opacity adjustment, applied here - the first thing done with the splat's own data, and before the quad is
+	// sized from it below - so that everything downstream is of the adjusted splat: the sigma cutoff that sets how wide
+	// this splat is rasterised, the alpha the fragment shader blends, and through those the coverage the saturation gate
+	// thresholds and the layer counts the overdraw views show.  See splat_alpha_gain_gamma above.
+	frag_colour.a = min(splat_alpha_gain_gamma.x * pow(frag_colour.a, splat_alpha_gain_gamma.y), 1.0);
 
 	// Diagnostic size filter - see splat_size_clamp_min_max above.  Checked before any of the projection maths below,
 	// since it needs only the raw world-space scale, not the view-dependent covariance.

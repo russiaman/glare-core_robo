@@ -13,7 +13,9 @@ Copyright Glare Technologies Limited 2026 -
 #include "../utils/Vector.h"
 #include "../utils/Reference.h"
 #include "../utils/ThreadSafeRefCounted.h"
+#include "../maths/mathstypes.h"
 #include <vector>
+#include <cmath>
 
 
 /*=====================================================================
@@ -55,3 +57,26 @@ public:
 
 
 typedef Reference<GaussianSplatData> GaussianSplatDataRef;
+
+
+/*
+The live opacity adjustment: alpha' = gain * alpha^gamma, clamped to the [0, 1] the stored alpha lives in.
+
+Kept here, next to the data it applies to, because it has to be applied in more than one place and they have to agree:
+gaussian_splat_vert_shader.glsl applies it to what is drawn, and the CPU-side cost predictions (see splatFootprint() and
+drawnArea()) have to describe the same splats.  The shader carries its own copy of these two lines - GLSL cannot include
+this - so a change here is a change there.
+
+Applied as early as anything reads the alpha, i.e. before the quad radius is derived from it, so it moves the area a
+splat is rasterised over and not just the colour of the pixels under it.  gain = gamma = 1 is the identity, and is what
+the renderer holds unless the panel says otherwise.
+
+The gamma goes first: it reshapes the distribution (it is the one that can lift the low-opacity bulk the fill sits in
+relative to the rest), and the gain then scales the result.  The other order is the same family of curves with a
+different meaning per knob, but this way gain stays a plain "how much denser", independent of gamma.
+*/
+inline float adjustSplatAlpha(float alpha, float gain, float gamma)
+{
+	const float adjusted = (gamma == 1.f) ? alpha : std::pow(alpha, gamma); // Skip the pow() in the default case: this runs per splat over millions of them in the report paths.
+	return myMin(gain * adjusted, 1.f);
+}

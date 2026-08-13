@@ -698,8 +698,15 @@ public:
 	// The saturation gate's mask of finished pixels, usually a fraction of the viewport's resolution - see
 	// OpenGLEngine::markSaturatedSplatPixels(), which writes it, and gaussian_splat_frag_shader.glsl, which reads it.
 	Reference<FrameBuffer> splat_saturation_mask_framebuffer;
-	Reference<FrameBuffer> splat_mask_reduce_framebuffer; // Re-attached to each mask level in turn while the pyramid is built.
+	Reference<FrameBuffer> splat_mask_reduce_framebuffer; // Re-attached to each mask level in turn while the pyramid is built, for both pyramids below in turn.
 	OpenGLTextureRef splat_saturation_mask_texture;
+
+	// The coverage-shrink diagnostic's mean pyramid, built alongside the mask above at GL_COLOR_ATTACHMENT1 of
+	// splat_saturation_mask_framebuffer (same base level write, see gaussian_splat_saturation_mask_frag_shader.glsl) and
+	// reduced with splat_mask_reduce_framebuffer the same way, just by mean instead of minimum - see
+	// GaussianSplatRenderer::getCoverageShrinkStrength(). Same resolution and level count as splat_saturation_mask_texture,
+	// always allocated alongside it so the two framebuffers stay attachment-complete together.
+	OpenGLTextureRef splat_coverage_mask_texture;
 
 
 	Reference<FrameBuffer> pre_dof_framebuffer;
@@ -1476,7 +1483,7 @@ private:
 	// the per-pixel cap runs on - see GaussianSplatRenderer::getLayerCap().
 	// coverage_cap_threshold thresholds the coverage at GaussianSplatRenderer::getCoverageCap() instead of at the gate's
 	// own threshold; ignored when from_layer_count is true.
-	void markSaturatedSplatPixels(bool from_layer_count = false, bool from_layer_count_buffer = false, bool coverage_cap_threshold = false);
+	void markSaturatedSplatPixels(bool from_layer_count = false, bool from_layer_count_buffer = false, bool coverage_cap_threshold = false, bool build_coverage_pyramid = false);
 	void fillCappedSplatPixels(); // DIAGNOSTIC ONLY - rewrites the pixels the layer cap cut short as fully covered, see GaussianSplatRenderer::getLayerCapOpaque().
 	void estimateSplatLayerCapSaving(); // DIAGNOSTIC ONLY - reads the layer counter back and reports how much fill a per-pixel cap would remove.
 	void resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name); // Composites the splat accumulation buffer onto the buffer the frame is being drawn into, undoing the engine's display transform once.

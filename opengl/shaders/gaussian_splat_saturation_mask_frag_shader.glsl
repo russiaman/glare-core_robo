@@ -42,7 +42,14 @@ uniform int splat_mask_block_size;
 // built on top of this and the vertex shader that reads it need to know nothing about which one produced the mask.
 uniform int splat_mask_from_layer_count;
 
-out vec4 colour_out;
+// Second output for the coverage pyramid's base level - see GaussianSplatRenderer::getCoverageShrinkStrength() and
+// gaussian_splat_mask_reduce_mean_frag_shader.glsl, which reduces it further. Only meaningful in the plain gate mode
+// (splat_mask_from_layer_count == 0): the coverage shrink reads accumulated alpha, the same quantity the gate itself
+// thresholds, so the two share this one pass rather than each paying for their own. Written every call regardless,
+// since a second framebuffer attachment costs nothing to fill when unused and the caller decides whether the mean
+// pyramid built from it is worth reducing further.
+layout(location = 0) out vec4 colour_out;
+layout(location = 1) out vec4 coverage_out;
 
 
 void main()
@@ -55,6 +62,7 @@ void main()
 	// Starts above anything either channel can hold, so the first fetch always wins: coverage tops out at 1, and a layer
 	// count in a half-float accumulation buffer cannot reach this.
 	float min_val = (splat_mask_from_layer_count != 0) ? 1.0e20 : 1.0;
+	float alpha_sum = 0.0;
 	for(int y=0; y<splat_mask_block_size; ++y)
 		for(int x=0; x<splat_mask_block_size; ++x)
 		{
@@ -64,6 +72,7 @@ void main()
 			ivec2 coord = min(block_begin + ivec2(x, y), accum_size - ivec2(1));
 			vec4 accum = texelFetch(albedo_texture, coord, /*mip level=*/0);
 			min_val = min(min_val, (splat_mask_from_layer_count != 0) ? accum.r : accum.a);
+			alpha_sum += accum.a; // Always the coverage channel, regardless of mode - see coverage_out's own comment.
 		}
 
 	// The minimum, in both modes, so a texel is marked only when *every* pixel under it qualifies.  That is what the
@@ -72,4 +81,8 @@ void main()
 	// Written for every texel, not discarded: the mask is rebuilt in place each time, so an unmarked texel has to be
 	// actively cleared rather than left holding what the previous pass put there.
 	colour_out = vec4((min_val >= splat_saturation_threshold) ? 1.0 : 0.0);
+
+	// The mean, not the minimum: this is a continuous "how covered is this block on average" estimate, not a pass/fail.
+	float block_area = float(splat_mask_block_size * splat_mask_block_size);
+	coverage_out = vec4(alpha_sum / block_area);
 }

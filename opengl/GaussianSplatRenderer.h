@@ -24,6 +24,7 @@ Copyright Glare Technologies Limited 2026 -
 
 class OpenGLEngine;
 class OpenGLProgram;
+struct GLObject; // Only ever passed through by pointer here - see visibleFractionToDrawIndex().  Declared the same way MeshPrimitiveBuilding.h and TransformGizmo.h do it.
 namespace glare { class TaskManager; }
 class SplatCloud; // Defined in GaussianSplatRenderer.cpp - one drawable cloud, holding one or more splat objects.
 struct CloudMember; // Defined in GaussianSplatRenderer.cpp - one registered splat object within a cloud.
@@ -407,6 +408,55 @@ public:
 	float getQuadRadiusScale() const { return splat_quad_radius_scale; }
 	void setQuadRadiusScale(float v) { splat_quad_radius_scale = v; }
 
+	// DIAGNOSTIC ONLY - makes getQuadRadiusScale()'s reduction area-dependent rather than flat. Both inert (reduction
+	// stays flat, exactly as before these existed) while getQuadRadiusScale() is 1.
+	//
+	// Each splat gets a weight in [0, 1] from its own screen-space area (proportional to radius1*radius2, before either
+	// scale is applied) against getAreaScaleRefPx()^2: 0 at zero area, 1 at or above the reference area. gamma is the
+	// exponent on that ratio - 1 (default) makes the weight linear in the splat's own area; raising it concentrates
+	// getQuadRadiusScale()'s reduction on splats bigger than the reference (smaller ones increasingly spared); lowering
+	// it below 1 spreads a partial reduction onto smaller splats too. The splat's effective scale is then
+	// mix(1, getQuadRadiusScale(), weight) - the reference-and-above splats get the full reduction, everything below it
+	// a fraction of it, nothing gets more than the flat tool would.
+	//
+	// Exists to test session046 open question (2)/(5)'s premise directly: the ablation ladder found the pass's cost to
+	// be rasterised area, and a handful of large splats (background, near-flat, low-parallax) can hold a disproportionate
+	// share of it - so a reduction weighted toward them should buy more of the same saving at a smaller cost to visible
+	// detail than the flat tool, which cuts foreground and background alike. Not yet measured; this is the toggle to do
+	// that with.
+	float getAreaScaleGamma() const { return splat_area_scale_gamma; }
+	void setAreaScaleGamma(float v) { splat_area_scale_gamma = v; }
+	// Radius (px, before either scale) at which a splat's own area reaches the reference area (ref^2) and so gets the
+	// full getQuadRadiusScale() reduction - see getAreaScaleGamma() above for the rest of the formula.
+	float getAreaScaleRefPx() const { return splat_area_scale_ref_px; }
+	void setAreaScaleRefPx(float v) { splat_area_scale_ref_px = v; }
+
+	// DIAGNOSTIC ONLY - session046 open question (3): shrinks a splat's quad continuously by how covered the composite
+	// already is under it, instead of the saturation gate's binary keep/drop (which needs every texel the quad touches
+	// marked finished before it drops anything, and so rarely fires - see getSaturationGateEnabled()). 0 (default) is
+	// off, and the only value that changes nothing: OpenGLEngine::markSaturatedSplatPixels() then still builds the
+	// coverage pyramid's base level alongside the gate's mask (that part is unconditional, since it costs nothing beyond
+	// a second framebuffer attachment on a pass already running) but never reduces or samples it. Above 0, a splat's
+	// radii are multiplied by (1 - coverage_estimate * this), clamped to [0, 1], where coverage_estimate is the mean of
+	// the accumulated coverage the composite already holds under the splat's quad, read from a *mean* pyramid built
+	// alongside the gate's own *min* one - see gaussian_splat_saturation_mask_frag_shader.glsl and
+	// gaussian_splat_mask_reduce_mean_frag_shader.glsl. 1 shrinks a splat over an already-fully-covered pixel to
+	// nothing; 0.5 shrinks it by at most half.
+	//
+	// Requires the saturation gate to be on (more than one draw slice, gate enabled): it reads the coverage the gate's
+	// own mark pass already computed rather than paying for a pass of its own, so it can only see what the gate sees.
+	// Not yet measured - this is the toggle to do that with.
+	float getCoverageShrinkStrength() const { return splat_coverage_shrink_strength; }
+	void setCoverageShrinkStrength(float v) { splat_coverage_shrink_strength = v; }
+
+	// The program that halves the coverage pyramid by mean, once per level - see getMaskReduceProgram(), whose min
+	// pyramid this sits beside. Null until the first addObject(), like the rest.
+	const Reference<OpenGLProgram>& getMeanMaskReduceProgram() const { return mean_reduce_prog; }
+
+	// Location of the splat program's coverage-mask sampler, or -1 if the program has no such uniform - see
+	// getSplatMaskTexUniformLoc(), which this mirrors. Resolved on first use for the same reason that is.
+	int getCoverageMaskTexUniformLoc();
+
 	// Whether the splat pass needs its per-pixel layer counter this frame - see OpenGLScene::splat_layer_count_renderbuffer.
 	// Deliberately not getCoverageCap(): that cap reads the coverage the accumulation buffer already holds, and being able
 	// to leave this attachment off is most of the reason it exists.
@@ -465,6 +515,41 @@ public:
 	// pruning, merging near-coplanar splats - moves it earlier and makes growth above 1 worth re-testing.
 	float getSliceGrowth() const { return splat_slice_growth; }
 	void setSliceGrowth(float v) { splat_slice_growth = v; }
+
+	// Whether draw slice boundaries are placed by how many *visible* splats each slice holds, rather than by raw
+	// position in the draw order. false (default) is the plain index split, i.e. slicing exactly as it was.
+	//
+	// The problem it addresses: the draw order is sorted by distance from the camera and covers the whole cloud,
+	// including everything behind the viewer (deliberately - see GaussianSplatLodTraversalTask's comment on why the
+	// traversal has no frustum test). So the nearest splats by distance are a sphere around the camera, of which only
+	// the part inside the frustum is drawn to any pixels. Standing above a forest looking into the distance, the first
+	// slices are almost entirely the ground below and behind, and the saturation census taken after each of them
+	// photographs a mask that is still completely black - a full-screen pass that could not have found anything. The
+	// same happens in reverse in a room: what is behind the viewer is a large share of the near end of the order.
+	//
+	// The fix is not to cull the order, which would have to be redone on every rotation and, being a frame or two late,
+	// would show as holes along the screen edge. It is to keep drawing the whole order and move only where it is cut:
+	// a fixed-size sample of the order is tested against the frustum each frame, and the boundaries are placed so each
+	// slice holds an equal share of what is actually visible. Slicing provably cannot change the picture - the slices
+	// tile the same order either way - so a sample that is coarse, stale or simply wrong can misplace a census and can
+	// do nothing else. That asymmetry is the whole reason this is the affordable version of the idea.
+	//
+	// It also handles the second half of the problem for free: a near frustum that is empty of geometry (air above the
+	// forest) contributes no samples either, so the boundaries move past it for the same reason.
+	//
+	// Not yet measured - this is the switch to A/B it against a fixed camera with.
+	bool getVisibleSlicingEnabled() const { return splat_visible_slicing; }
+	void setVisibleSlicingEnabled(bool v) { splat_visible_slicing = v; }
+
+	// Draw index at which the given fraction of everything visible in 'ob's cloud has been passed, for placing one draw
+	// slice boundary - see getVisibleSlicingEnabled(). draw_count is how many instances the caller is slicing, which is
+	// also what a fraction of 1 maps to.
+	//
+	// Returns -1 when the question cannot be answered - the feature is off, the cloud is not one of ours, the sample
+	// does not describe the order being drawn, or nothing of the cloud is in view - in which case the caller falls back
+	// to the plain index split. Deliberately a per-boundary query rather than a precomputed list, so that the geometric
+	// slice spacing (see getSliceGrowth()) stays owned by the draw path that already implements it.
+	int visibleFractionToDrawIndex(const GLObject* ob, double fraction, int draw_count) const;
 
 	// Whether to reject splats at pixels the composite has already finished with. false (default) draws every slice in
 	// full, so the slice count alone stays a no-op and the two can be compared directly. Needs more than one slice to do
@@ -651,6 +736,9 @@ private:
 	void writePlaceholderSelection(SplatCloud& cloud); // Synchronous stand-in frontier (root-only per member with a tree, everything for a member without one), written after any structural change, until the next background traversal's result supersedes it.
 	void drainTraversalResults();
 	void kickOffTraversals();
+
+	void noteDrawOrderForSlicing(SplatCloud& cloud, const uint32* draw_indices, size_t count); // Refreshes the sample of a cloud's draw order the frustum-aware slicing works from - see getVisibleSlicingEnabled().  Called from every place that writes the instance index VBO.
+	void buildVisibleSliceCDFs(); // Per-frame, from think(): re-tests each cloud's sample against the current frustum.  The one part of the draw order that depends on where the camera is looking rather than where it is.
 	void fillTraversalScratch(const SplatCloud& cloud, GaussianSplatLodTraversalScratch& scratch) const; // Freezes a cloud's world-space node data and member layout into a scratch, ready for a traversal to read without touching the live arrays.
 
 	Reference<OpenGLProgram> shader_prog; // Shared by every cloud.  Null until the first addObject().
@@ -737,12 +825,25 @@ private:
 	float splat_quad_radius_scale;
 	bool splat_hide_test_conservative;
 
+	// See getAreaScaleGamma()/getAreaScaleRefPx() above. Default gamma 1 = linear in area; ref_px is inert while
+	// splat_quad_radius_scale is 1, so its default value only matters once that is lowered.
+	float splat_area_scale_gamma;
+	float splat_area_scale_ref_px;
+
+	// See getCoverageShrinkStrength() above. Default 0 = off.
+	float splat_coverage_shrink_strength;
+	Reference<OpenGLProgram> mean_reduce_prog; // See getMeanMaskReduceProgram() above. Built alongside mask_reduce_prog.
+	int coverage_mask_tex_uniform_loc; // See getCoverageMaskTexUniformLoc() above. -2 means "not looked up yet", as with splat_mask_tex_uniform_loc.
+
 	// See requestLayerCapEstimate() above.
 	bool splat_layer_estimate_requested;
 	std::string splat_layer_estimate_result;
 
 	// See getSliceGrowth() above. Default 1 = every slice the same size.
 	float splat_slice_growth;
+
+	// See getVisibleSlicingEnabled() above. Off by default, i.e. the plain index split slicing has always used.
+	bool splat_visible_slicing;
 
 	// See getSaturationGateEnabled()/getSaturationThreshold()/getSaturationMaskDownscale() above. Off by default.
 	bool splat_saturation_gate_enabled;

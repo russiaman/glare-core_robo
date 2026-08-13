@@ -173,7 +173,8 @@ enum TextureUnitIndices
 	PREPASS_NORMAL_COPY_TEXTURE_UNIT_INDEX,
 	PREPASS_DEPTH_COPY_TEXTURE_UNIT_INDEX,
 
-	SPLAT_SATURATION_MASK_TEXTURE_UNIT_INDEX // The splat program's second texture, after the packed splat data - see drawSplatClouds().
+	SPLAT_SATURATION_MASK_TEXTURE_UNIT_INDEX, // The splat program's second texture, after the packed splat data - see drawSplatClouds().
+	SPLAT_COVERAGE_MASK_TEXTURE_UNIT_INDEX // The splat program's third texture - see GaussianSplatRenderer::getCoverageShrinkStrength().
 };
 
 
@@ -9426,15 +9427,28 @@ because only negative exponents appear: r^N overflows to infinity somewhere arou
 slice count alone can reach, and the honest-looking form then returns inf/inf.  This form is exact at both ends -
 0 at i = 0, 1 at i = N - for any r and N.
 */
+// The same boundary as a fraction of the way through, which is what the frustum-aware slicing needs: it places the
+// boundary at that fraction of the *visible* splats instead of that fraction of the draw order - see
+// GaussianSplatRenderer::getVisibleSlicingEnabled().  Split out rather than duplicated so the geometric spacing has one
+// definition; splatSliceBoundary() below keeps its own integer path for growth = 1, which is exact where scaling a
+// double fraction would not be.
+static double splatSliceFraction(int slice, int num_slices, float growth)
+{
+	if(growth == 1.f)
+		return (double)slice / (double)num_slices;
+
+	const double r = growth;
+	const double r_minus_N = std::pow(r, -(double)num_slices);
+	return (std::pow(r, (double)(slice - num_slices)) - r_minus_N) / (1.0 - r_minus_N);
+}
+
+
 static int splatSliceBoundary(int num_splats, int slice, int num_slices, float growth)
 {
 	if(growth == 1.f)
 		return (int)(((int64)num_splats * slice) / num_slices); // Integer arithmetic, so the equal-slice case is bit-for-bit what it was before growth existed.
 
-	const double r = growth;
-	const double r_minus_N = std::pow(r, -(double)num_slices);
-	const double frac = (std::pow(r, (double)(slice - num_slices)) - r_minus_N) / (1.0 - r_minus_N);
-	return (int)((double)num_splats * frac + 0.5);
+	return (int)((double)num_splats * splatSliceFraction(slice, num_slices, growth) + 0.5);
 }
 
 
@@ -9751,6 +9765,13 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 		splat_renderer->getSaturationMaskProgram().nonNull() && splat_renderer->getSaturationMaskProgram()->isBuilt() &&
 		splat_renderer->getMaskReduceProgram().nonNull() && splat_renderer->getMaskReduceProgram()->isBuilt();
 
+	// DIAGNOSTIC ONLY - the coverage-shrink diagnostic, see GaussianSplatRenderer::getCoverageShrinkStrength(). Rides on
+	// the plain gate's own mark pass (from_layer_count false there) rather than paying for one of its own, so it can only
+	// run when the gate itself is - and, since the shared mark call at markSaturatedSplatPixels() below reads from the
+	// layer counter instead whenever use_layer_cap wins that call, only when the layer cap isn't also active.
+	const bool use_coverage_shrink = use_saturation_gate && !use_layer_cap && (splat_renderer->getCoverageShrinkStrength() > 0.f) &&
+		splat_renderer->getMeanMaskReduceProgram().nonNull() && splat_renderer->getMeanMaskReduceProgram()->isBuilt();
+
 	// The caps reject fragments, not splats: the vertex test would drop a splat everywhere or nowhere, which is not what
 	// "stop compositing this pixel" means.  Off unless a cap is running, and then the two tests are mutually exclusive
 	// anyway, since the gate and the caps all own the one mask.
@@ -9782,6 +9803,13 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 			current_scene->splat_mask_reduce_framebuffer->attachTextureMipLevel(*current_scene->splat_saturation_mask_texture, GL_COLOR_ATTACHMENT0, level);
 			glClearBufferfv(GL_COLOR, /*drawBuffer=*/0, col_zero);
 		}
+		// Same reason, same way, for the coverage-shrink pyramid: see use_coverage_shrink above.
+		if(use_coverage_shrink)
+			for(int level=0; level<splat_saturation_mask_num_levels; ++level)
+			{
+				current_scene->splat_mask_reduce_framebuffer->attachTextureMipLevel(*current_scene->splat_coverage_mask_texture, GL_COLOR_ATTACHMENT0, level);
+				glClearBufferfv(GL_COLOR, /*drawBuffer=*/0, col_zero);
+			}
 		current_scene->splat_accum_framebuffer->bindForDrawing();
 	}
 
@@ -9834,8 +9862,23 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 			// Split by position in the buffer rather than by distance: the sort has already put it in depth order, so an
 			// index split is free, and it also bounds the work per slice, which a distance split would not.  Slice sizes
 			// need not be equal - see GaussianSplatRenderer::getSliceGrowth().
-			const int slice_begin = splatSliceBoundary(cloud_num_instances, slice,     num_slices, slice_growth);
-			const int slice_end   = splatSliceBoundary(cloud_num_instances, slice + 1, num_slices, slice_growth);
+			//
+			// Both boundaries are asked for by the same fraction the next slice will ask its start by, so consecutive
+			// slices tile [0, cloud_num_instances) exactly whichever of the two placements answers - a splat that fell
+			// into two slices would be blended twice.
+			const double frac_begin = splatSliceFraction(slice,     num_slices, slice_growth);
+			const double frac_end   = splatSliceFraction(slice + 1, num_slices, slice_growth);
+
+			// Frustum-aware placement, when it is on and can answer: the same fraction, but of the splats actually in
+			// view rather than of the whole draw order, so that a slice boundary lands where there is something for the
+			// saturation census to find - see GaussianSplatRenderer::getVisibleSlicingEnabled().  -1 means it cannot
+			// answer, and the plain split below stands in.
+			const int vis_begin = splat_renderer->visibleFractionToDrawIndex(ob, frac_begin, cloud_num_instances);
+			const int vis_end   = splat_renderer->visibleFractionToDrawIndex(ob, frac_end,   cloud_num_instances);
+			const bool use_visible_split = (vis_begin >= 0) && (vis_end >= 0);
+
+			const int slice_begin = use_visible_split ? vis_begin : splatSliceBoundary(cloud_num_instances, slice,     num_slices, slice_growth);
+			const int slice_end   = use_visible_split ? vis_end   : splatSliceBoundary(cloud_num_instances, slice + 1, num_slices, slice_growth);
 			if(slice_end == slice_begin)
 				continue; // Empty slice, i.e. fewer splats in this cloud than slices.
 
@@ -9847,7 +9890,7 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 				// The layer cap thresholds the layer counter at its own value; the gate and the coverage cap threshold
 				// accumulated coverage, at theirs.  Same pass, same mask, different source and threshold - and only one of
 				// the three can be running.
-				markSaturatedSplatPixels(/*from_layer_count=*/use_layer_cap, /*from_layer_count_buffer=*/use_layer_cap, /*coverage_cap_threshold=*/use_coverage_cap);
+				markSaturatedSplatPixels(/*from_layer_count=*/use_layer_cap, /*from_layer_count_buffer=*/use_layer_cap, /*coverage_cap_threshold=*/use_coverage_cap, /*build_coverage_pyramid=*/use_coverage_shrink);
 
 				// DIAGNOSTIC ONLY - see requestSplatSaturationSnapshots().  Numbered by the slice the census followed,
 				// which is the slice whose coverage it is a statement about; the slice drawn just below is the first one
@@ -9872,6 +9915,12 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 				if(mask_tex_loc >= 0)
 					bindTextureUnitToSampler(*current_scene->splat_saturation_mask_texture, /*texture_unit_index=*/SPLAT_SATURATION_MASK_TEXTURE_UNIT_INDEX,
 						/*sampler_uniform_location=*/mask_tex_loc);
+
+				// Same reasoning, for the coverage-shrink diagnostic's sampler - see GaussianSplatRenderer::getCoverageShrinkStrength().
+				const int coverage_tex_loc = splat_renderer->getCoverageMaskTexUniformLoc();
+				if(coverage_tex_loc >= 0)
+					bindTextureUnitToSampler(*current_scene->splat_coverage_mask_texture, /*texture_unit_index=*/SPLAT_COVERAGE_MASK_TEXTURE_UNIT_INDEX,
+						/*sampler_uniform_location=*/coverage_tex_loc);
 			}
 
 			ob->instance_vbo_offset_B = (uint32)(slice_begin * sizeof(uint32)); // One uint32 splat index per instance - see GaussianSplatRenderer::rebuildVAO().
@@ -10076,6 +10125,7 @@ void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffe
 	current_scene->splat_accum_framebuffer          = NULL;
 	current_scene->splat_accum_copy_framebuffer     = NULL;
 	current_scene->splat_saturation_mask_texture    = NULL;
+	current_scene->splat_coverage_mask_texture      = NULL;
 	current_scene->splat_saturation_mask_framebuffer = NULL;
 	current_scene->splat_mask_reduce_framebuffer    = NULL;
 
@@ -10142,10 +10192,23 @@ void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffe
 		splat_saturation_mask_num_levels++;
 	splat_saturation_mask_num_levels = myMin(splat_saturation_mask_num_levels, (int)current_scene->splat_saturation_mask_texture->getNumMipMapLevelsAllocated());
 
+	// The coverage-shrink diagnostic's mean pyramid - see GaussianSplatRenderer::getCoverageShrinkStrength(). Same shape
+	// as the mask above; always allocated alongside it (small, same order of cost as the mask itself) rather than only
+	// when the shrink strength is non-zero, which is what lets the mark pass always write both without checking.
+	current_scene->splat_coverage_mask_texture = new OpenGLTexture(mask_xres, mask_yres, this,
+		ArrayRef<uint8>(), // data
+		OpenGLTextureFormat::Format_Greyscale_Uint8,
+		OpenGLTexture::Filtering_Fancy,
+		OpenGLTexture::Wrapping_Clamp,
+		true, // has_mipmaps
+		/*MSAA_samples=*/1
+	);
+
 	current_scene->splat_saturation_mask_framebuffer = new FrameBuffer();
 	current_scene->splat_saturation_mask_framebuffer->attachTexture(*current_scene->splat_saturation_mask_texture, GL_COLOR_ATTACHMENT0);
+	current_scene->splat_saturation_mask_framebuffer->attachTexture(*current_scene->splat_coverage_mask_texture, GL_COLOR_ATTACHMENT1);
 
-	current_scene->splat_mask_reduce_framebuffer = new FrameBuffer(); // Re-attached to a different level for each reduction pass.
+	current_scene->splat_mask_reduce_framebuffer = new FrameBuffer(); // Re-attached to a different level for each reduction pass, of either pyramid in turn.
 
 	// The gate needs somewhere to put the mask and somewhere to read the accumulated coverage from, and nothing else -
 	// in particular no depth buffer of its own, which is what it used to need.
@@ -10208,7 +10271,7 @@ With MSAA the copy resolves the samples, so the threshold is tested against a pi
 a saturated region that is slightly wrong in both directions; the region interiors, which is where the work being
 skipped actually is, are unaffected.
 */
-void OpenGLEngine::markSaturatedSplatPixels(bool from_layer_count, bool from_layer_count_buffer, bool coverage_cap_threshold)
+void OpenGLEngine::markSaturatedSplatPixels(bool from_layer_count, bool from_layer_count_buffer, bool coverage_cap_threshold, bool build_coverage_pyramid)
 {
 	DebugGroup debug_group("markSaturatedSplatPixels()");
 	TracyGpuZone("markSaturatedSplatPixels");
@@ -10247,6 +10310,11 @@ void OpenGLEngine::markSaturatedSplatPixels(bool from_layer_count, bool from_lay
 	//----------------------- Write the mask -----------------------
 	current_scene->splat_saturation_mask_framebuffer->bindForDrawing();
 	glViewport(0, 0, (GLsizei)current_scene->splat_saturation_mask_texture->xRes(), (GLsizei)current_scene->splat_saturation_mask_texture->yRes());
+
+	// Two attachments: the mask itself, and the coverage-shrink diagnostic's pyramid base level beside it - see
+	// gaussian_splat_saturation_mask_frag_shader.glsl's second output. Written every call regardless of
+	// build_coverage_pyramid, which only decides whether it is reduced any further below - see that parameter's comment.
+	setTwoDrawBuffers(GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1);
 
 	glDisable(GL_BLEND);
 	glDisable(GL_DEPTH_TEST); // The mask framebuffer has no depth attachment, and every texel of it is rewritten regardless.
@@ -10288,6 +10356,39 @@ void OpenGLEngine::markSaturatedSplatPixels(bool from_layer_count, bool from_lay
 		bindTextureUnitToSampler(mask_tex, /*texture_unit_index=*/0, /*sampler_uniform_location=*/reduce_prog->albedo_texture_loc);
 		glTexParameteri(mask_tex.getTextureTarget(), GL_TEXTURE_BASE_LEVEL, 0);
 		glTexParameteri(mask_tex.getTextureTarget(), GL_TEXTURE_MAX_LEVEL,  splat_saturation_mask_num_levels - 1);
+	}
+
+	//----------------------- Reduce the coverage pyramid up, by mean - see GaussianSplatRenderer::getCoverageShrinkStrength() -----------------------
+	// Same loop shape as the min pyramid above, on the sibling texture, only run when something will actually read it:
+	// the base level was written unconditionally above (cheap - one more attachment on a pass already running), but
+	// reducing every level of a second pyramid every mark call would not be, so that part is conditional.
+	if(build_coverage_pyramid)
+	{
+		const Reference<OpenGLProgram>& mean_reduce_prog = splat_renderer->getMeanMaskReduceProgram();
+		OpenGLTexture& coverage_tex = *current_scene->splat_coverage_mask_texture;
+
+		mean_reduce_prog->useProgram();
+		for(int level=1; level<splat_saturation_mask_num_levels; ++level)
+		{
+			current_scene->splat_mask_reduce_framebuffer->attachTextureMipLevel(coverage_tex, GL_COLOR_ATTACHMENT0, level);
+			glViewport(0, 0, (GLsizei)myMax<size_t>(1, coverage_tex.xRes() >> level), (GLsizei)myMax<size_t>(1, coverage_tex.yRes() >> level));
+
+			bindTextureUnitToSampler(coverage_tex, /*texture_unit_index=*/0, /*sampler_uniform_location=*/mean_reduce_prog->albedo_texture_loc);
+			glTexParameteri(coverage_tex.getTextureTarget(), GL_TEXTURE_BASE_LEVEL, level - 1);
+			glTexParameteri(coverage_tex.getTextureTarget(), GL_TEXTURE_MAX_LEVEL,  level - 1);
+
+			drawElementsBaseVertex(GL_TRIANGLES, (GLsizei)unit_quad_meshdata->batches[0].num_indices, unit_quad_meshdata->getIndexType(),
+				(void*)unit_quad_meshdata->getBatch0IndicesTotalBufferOffset(), unit_quad_meshdata->vbo_handle.base_vertex);
+		}
+
+		if(splat_saturation_mask_num_levels > 1)
+		{
+			bindTextureUnitToSampler(coverage_tex, /*texture_unit_index=*/0, /*sampler_uniform_location=*/mean_reduce_prog->albedo_texture_loc);
+			glTexParameteri(coverage_tex.getTextureTarget(), GL_TEXTURE_BASE_LEVEL, 0);
+			glTexParameteri(coverage_tex.getTextureTarget(), GL_TEXTURE_MAX_LEVEL,  splat_saturation_mask_num_levels - 1);
+		}
+
+		unbindTextureFromTextureUnit(coverage_tex, /*texture_unit_index=*/0);
 	}
 
 	//----------------------- Restore the state the slice draws run in -----------------------

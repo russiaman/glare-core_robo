@@ -69,6 +69,22 @@ uniform int splat_ablation_stage;
 // blend chain all untouched - which is what makes it a way to ask whether a cost is area-proportional at all.
 uniform float splat_quad_radius_scale;
 
+// DIAGNOSTIC ONLY - makes splat_quad_radius_scale's reduction area-dependent instead of flat, see
+// GaussianSplatRenderer::getAreaScaleGamma()/getAreaScaleRefPx(). Both are inert (reduction stays flat, as before these
+// existed) while splat_quad_radius_scale is 1, since the formula below then reduces to 1 regardless of area_weight.
+uniform float splat_area_scale_gamma; // 1 (default) = weight is linear in the splat's own screen-space area.  Raising it
+                                       // concentrates the reduction on splats with more area than splat_area_scale_ref_px;
+                                       // lowering it spreads a partial reduction onto smaller splats too.
+uniform float splat_area_scale_ref_px; // Radius (px, pre-scale) at which area_weight reaches 1, i.e. the splat gets the
+                                        // full splat_quad_radius_scale reduction.  Below it, the reduction fades toward
+                                        // none as the splat's own area falls, at the rate splat_area_scale_gamma sets.
+
+// DIAGNOSTIC ONLY - the coverage-based quad shrink, see GaussianSplatRenderer::getCoverageShrinkStrength() and the
+// block below that uses these.  0 (default) is off - splat_coverage_mask_texture is then whatever the gate last built
+// it as, or uninitialised if the gate has never run, and is never sampled while this is 0.
+uniform sampler2D splat_coverage_mask_texture;
+uniform float splat_coverage_shrink_strength;
+
 out vec2 frag_screen_offset_px; // Pixel-space offset of this vertex from the splat's projected centre.
 out vec3 frag_conic; // Inverse 2D covariance (A, B, C) of [[A, B], [B, C]], for the per-pixel Gaussian evaluation.
 out vec4 frag_colour; // (r, g, b, opacity)
@@ -251,10 +267,19 @@ void main()
 	// size.  Applied here, before the conic is built from these radii below, so the Gaussian shrinks with the quad instead
 	// of being cut off by it: the picture then has smaller splats rather than hard-edged ones, and the only thing that
 	// changed is rasterised area.  Area goes as the square of this, which is what makes it a bisection of the fill.
-	float radius1 = min(sigma_cutoff * sqrt(lambda1), max_radius_px) * splat_quad_radius_scale;
-	float radius2 = min(sigma_cutoff * sqrt(lambda2), max_radius_px) * splat_quad_radius_scale;
+	float radius1_raw = min(sigma_cutoff * sqrt(lambda1), max_radius_px);
+	float radius2_raw = min(sigma_cutoff * sqrt(lambda2), max_radius_px);
 
-	vec2 screen_offset_px = position_in.x * radius1 * axis1 + position_in.y * radius2 * axis2;
+	// area_weight is how much of splat_quad_radius_scale's reduction this particular splat gets, from 0 (untouched) to 1
+	// (the full reduction) - see the uniforms' own comments above. area_ratio compares this splat's own screen-space area
+	// (radius1_raw * radius2_raw, proportional to it regardless of the ellipse's eccentricity) against the reference
+	// area splat_area_scale_ref_px^2, clamped to 1 so nothing beyond the reference gets more than the full reduction.
+	float area_ratio = clamp((radius1_raw * radius2_raw) / (splat_area_scale_ref_px * splat_area_scale_ref_px), 0.0, 1.0);
+	float area_weight = pow(area_ratio, splat_area_scale_gamma);
+	float effective_quad_scale = mix(1.0, splat_quad_radius_scale, area_weight);
+
+	float radius1 = radius1_raw * effective_quad_scale;
+	float radius2 = radius2_raw * effective_quad_scale;
 
 	vec4 clip_pos = proj_matrix * pos_vs;
 
@@ -347,6 +372,50 @@ void main()
 
 		} // end of the conservative branch
 	}
+
+	// DIAGNOSTIC ONLY - shrinks the quad continuously by how covered the composite already is under it, rather than the
+	// gate's binary keep/drop above - see GaussianSplatRenderer::getCoverageShrinkStrength(). A splat the gate would keep
+	// (nothing above returned) can still be standing somewhere partly finished, and this is what acts on that: less
+	// area for a splat contributing into an already-mostly-covered pixel, none of it lost outright the way the gate's
+	// all-texels-marked test would need. Reuses the gate's own level selection (same block size, same conservative
+	// bound on the quad's extent) but samples a *mean* pyramid built alongside the gate's min one - see
+	// gaussian_splat_saturation_mask_frag_shader.glsl - so the answer is a continuous coverage estimate rather than a
+	// pass/fail. Only meaningful, and only non-zero, while the gate itself is running: splat_saturation_mask_block is 0
+	// otherwise, which is what the second half of the condition below is testing.
+	if((splat_coverage_shrink_strength > 0.0) && (splat_saturation_mask_block > 0))
+	{
+		vec2 centre_px = ((clip_pos.xy / clip_pos.w) * 0.5 + 0.5) * viewport_dims_px;
+		float extent_px = radius1 + radius2;
+		float block = float(splat_saturation_mask_block);
+		ivec2 mask_max = textureSize(splat_coverage_mask_texture, /*mip level=*/0) - ivec2(1);
+
+		ivec2 lo = clamp(ivec2(floor((centre_px - extent_px) / block)), ivec2(0), mask_max);
+		ivec2 hi = clamp(ivec2(floor((centre_px + extent_px) / block)), ivec2(0), mask_max);
+
+		int level = 0;
+		for(int i=0; i<16; ++i)
+		{
+			if((level >= splat_saturation_mask_max_level) || all(lessThanEqual((hi >> level) - (lo >> level), ivec2(1))))
+				break;
+			level++;
+		}
+
+		ivec2 lo_l = lo >> level;
+		ivec2 hi_l = hi >> level;
+
+		// The mean of the (up to 4) coarse texels the quad spans - not conservative like the gate's minimum, on purpose:
+		// this is an estimate to weight a continuous shrink by, not a test that must never be wrong in one direction.
+		// Falls back to 0 (no shrink) for a quad too big for even the coarsest level, same as the gate's own test does.
+		float coverage_estimate = all(lessThanEqual(hi_l - lo_l, ivec2(1))) ? (0.25 * (
+			texelFetch(splat_coverage_mask_texture, ivec2(lo_l.x, lo_l.y), level).r + texelFetch(splat_coverage_mask_texture, ivec2(hi_l.x, lo_l.y), level).r +
+			texelFetch(splat_coverage_mask_texture, ivec2(lo_l.x, hi_l.y), level).r + texelFetch(splat_coverage_mask_texture, ivec2(hi_l.x, hi_l.y), level).r)) : 0.0;
+
+		float coverage_shrink = clamp(1.0 - coverage_estimate * splat_coverage_shrink_strength, 0.0, 1.0);
+		radius1 *= coverage_shrink;
+		radius2 *= coverage_shrink;
+	}
+
+	vec2 screen_offset_px = position_in.x * radius1 * axis1 + position_in.y * radius2 * axis2;
 
 	// Note that the mask test above used clip_pos as the splat's *centre*, before this offset moves it to this vertex's
 	// corner: the test is about the whole quad, and all four of its vertices have to reach the same verdict.

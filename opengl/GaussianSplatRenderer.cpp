@@ -52,6 +52,13 @@ static const float resort_threshold_dist_fraction = 0.05f;
 // caps sort memory at roughly this many times the largest cloud, rather than letting it scale with the world.
 static const int max_concurrent_sorts = 2;
 
+// How many samples of a cloud's draw order the frustum-aware slicing keeps - see
+// GaussianSplatRenderer::getVisibleSlicingEnabled().  A fixed budget rather than a fixed stride, so the per-frame cost
+// of re-testing them against the frustum does not scale with the cloud: it is the same few thousand point-in-frustum
+// tests whether the cloud holds ten thousand splats or ten million.  4096 samples place a boundary to within a
+// four-thousandth of the draw order, which is far finer than a handful of slice boundaries can use.
+static const int max_slice_samples = 4096;
+
 
 // One registered splat object, and the range of its owning cloud's arrays that it occupies.
 struct CloudMember
@@ -84,7 +91,7 @@ class SplatCloud : public RefCounted
 public:
 	SplatCloud()
 	:	cloud_id(0), gpu_capacity_splats(0), total_splats(0), structure_generation(0), sort_in_flight(false),
-		importance_layout_fingerprint(0),
+		importance_layout_fingerprint(0), slice_sample_draw_count(0),
 		have_last_sort_cam_pos(false), last_sort_cam_pos_ws(0.f), aabb_ws(js::AABBox::emptyAABBox()), added_to_engine(false),
 		topology_generation(0), traversal_in_flight(false), have_last_traversal_cam_pos(false), last_traversal_cam_pos_ws(0.f),
 		last_traversal_kicked_topology_generation(0), last_traversal_hit_budget_cap(false), last_traversal_hit_density_cap(false), last_traversal_hit_depth_cap(false),
@@ -139,6 +146,17 @@ public:
 	js::Vector<uint32, 16> importance_views_drawn;      // How many recorded views drew it at all.
 	uint64 importance_layout_fingerprint;               // What the arrays were filled against - see cloudLayoutFingerprint().  A mismatch means the indices no longer mean the same splats, so the record has to be thrown away.
 	size_t importance_num_views;                        // How many reports have been folded in.  0 = nothing accumulated yet.
+
+	// Frustum-aware draw slicing - see GaussianSplatRenderer::getVisibleSlicingEnabled().  An evenly spaced sample of
+	// this cloud's current draw order, held as world positions rather than indices so that nothing here can index out of
+	// an array that changed underneath it: the worst a stale sample can do is misplace a slice boundary, which cannot
+	// change the picture.  Refreshed by noteDrawOrderForSlicing() every time the draw order is written.
+	js::Vector<Vec3f, 16> slice_sample_positions;
+	int slice_sample_draw_count; // num_instances_to_draw the samples above were taken from, so sample j can be mapped back to a draw index.
+
+	// Cumulative count of in-frustum samples, one entry per sample, rebuilt each frame by think() while the frustum-aware
+	// slicing is on.  Empty when it is off, or when the samples cannot be used.
+	js::Vector<int, 16> slice_visible_cdf;
 };
 
 
@@ -759,7 +777,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	splat_dist_clamp_min(0.0f), splat_dist_clamp_max(1000.0f), splat_dist_clamp_invert(false), splat_alpha_cutoff(1.0f / 255.0f),
 	splat_alpha_gain(1.0f), splat_alpha_gamma(1.0f), // Identity: the cloud as captured - see getAlphaGain().
 	last_report_reached_rasteriser(0), last_report_in_frustum(0),
-	splat_num_draw_slices(1), splat_draw_slice_limit(0), splat_layer_cap(0), splat_layer_cap_opaque(true), splat_coverage_cap(0.f), splat_ablation_stage(0), splat_quad_radius_scale(1.f), cap_fill_mask_tex_uniform_loc(-2), splat_hide_test_conservative(true), splat_layer_estimate_requested(false), splat_slice_growth(1.0f), splat_saturation_gate_enabled(false), splat_saturation_threshold(1.0f - 1.0f / 255.0f),
+	splat_num_draw_slices(1), splat_draw_slice_limit(0), splat_layer_cap(0), splat_layer_cap_opaque(true), splat_coverage_cap(0.f), splat_ablation_stage(0), splat_quad_radius_scale(1.f), cap_fill_mask_tex_uniform_loc(-2), splat_area_scale_gamma(1.f), splat_area_scale_ref_px(20.f), splat_coverage_shrink_strength(0.f), coverage_mask_tex_uniform_loc(-2), splat_hide_test_conservative(true), splat_layer_estimate_requested(false), splat_slice_growth(1.0f), splat_visible_slicing(false), splat_saturation_gate_enabled(false), splat_saturation_threshold(1.0f - 1.0f / 255.0f),
 	splat_saturation_mask_downscale(4), splat_mask_tex_uniform_loc(-2),
 	splat_accum_buffer_8bit(false),
 	splat_show_overdraw_mode(0), splat_hide_overdraw_enabled(false), splat_hide_alpha_enabled(false),
@@ -813,7 +831,10 @@ void GaussianSplatRenderer::buildShadersIfNeeded()
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Vec2, "splat_alpha_gain_gamma"); // See getAlphaGain(). NOTE: user_uniform_vals is sized to match this list in allocCloud().
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,  "splat_frag_mask_block"); // DIAGNOSTIC ONLY - the per-pixel layer cap's test, see getLayerCap().  Set by the draw path, like the mask uniforms above.
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "splat_ablation_stage"); // DIAGNOSTIC ONLY - see getAblationStage().
-	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_quad_radius_scale"); // DIAGNOSTIC ONLY - see getQuadRadiusScale().  NOTE: user_uniform_vals is sized to match this list in allocCloud().
+	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_quad_radius_scale"); // DIAGNOSTIC ONLY - see getQuadRadiusScale().
+	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_area_scale_gamma"); // DIAGNOSTIC ONLY - see getAreaScaleGamma().
+	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_area_scale_ref_px"); // DIAGNOSTIC ONLY - see getAreaScaleRefPx().
+	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_coverage_shrink_strength"); // DIAGNOSTIC ONLY - see getCoverageShrinkStrength().  NOTE: user_uniform_vals is sized to match this list in allocCloud().
 
 
 	// Splats blend into an accumulation buffer of their own rather than straight onto the main colour buffer, so that
@@ -881,6 +902,18 @@ void GaussianSplatRenderer::buildShadersIfNeeded()
 		/*wait_for_build_to_complete=*/!opengl_engine->parallel_shader_compile_support
 	);
 	opengl_engine->addProgram(mask_reduce_prog);
+
+
+	// Halves the coverage pyramid by mean instead of minimum, once per level - see getCoverageShrinkStrength() and
+	// gaussian_splat_mask_reduce_mean_frag_shader.glsl. Same full-viewport quad vertex shader again.
+	mean_reduce_prog = new OpenGLProgram(
+		"gaussian splat mean mask reduce prog",
+		new OpenGLShader(shader_dir + "/gaussian_splat_resolve_vert_shader.glsl", version_directive, key_defs + preprocessor_defines, GL_VERTEX_SHADER),
+		new OpenGLShader(shader_dir + "/gaussian_splat_mask_reduce_mean_frag_shader.glsl", version_directive, key_defs + preprocessor_defines, GL_FRAGMENT_SHADER),
+		opengl_engine->getAndIncrNextProgramIndex(),
+		/*wait_for_build_to_complete=*/!opengl_engine->parallel_shader_compile_support
+	);
+	opengl_engine->addProgram(mean_reduce_prog);
 }
 
 
@@ -909,6 +942,17 @@ int GaussianSplatRenderer::getSplatMaskTexUniformLoc()
 		splat_mask_tex_uniform_loc = shader_prog->getUniformLocation("splat_saturation_mask_texture");
 	}
 	return splat_mask_tex_uniform_loc;
+}
+
+
+int GaussianSplatRenderer::getCoverageMaskTexUniformLoc()
+{
+	if(coverage_mask_tex_uniform_loc == -2)
+	{
+		assert(shader_prog.nonNull() && shader_prog->isBuilt());
+		coverage_mask_tex_uniform_loc = shader_prog->getUniformLocation("splat_coverage_mask_texture");
+	}
+	return coverage_mask_tex_uniform_loc;
 }
 
 
@@ -2340,8 +2384,40 @@ std::string GaussianSplatRenderer::getDiagnostics() const
 		s += "!! ABLATION STAGE " + toString(splat_ablation_stage) +
 			" is selected: the picture is deliberately incomplete and the frame time is that stage's, not the pass's.\n";
 	if(splat_quad_radius_scale != 1.f)
+	{
 		s += "!! QUAD RADIUS SCALE " + doubleToStringNDecimalPlaces(splat_quad_radius_scale, 2) + ": splats are drawn at " +
-			doubleToStringNDecimalPlaces(splat_quad_radius_scale * splat_quad_radius_scale * 100.0, 0) + "% of their real area.\n";
+			doubleToStringNDecimalPlaces(splat_quad_radius_scale * splat_quad_radius_scale * 100.0, 0) + "% of their real area";
+		if(splat_area_scale_gamma != 1.f || splat_area_scale_ref_px != 20.f)
+			s += " (area-weighted: gamma " + doubleToStringNDecimalPlaces(splat_area_scale_gamma, 2) + ", ref " +
+				doubleToStringNDecimalPlaces(splat_area_scale_ref_px, 0) + "px - only splats at or above the reference get the full reduction)";
+		s += ".\n";
+	}
+	if(splat_visible_slicing)
+	{
+		// What the placement actually found, not just that it is on: a cloud whose visible share is near 100% is one the
+		// setting cannot do anything for, and that is worth being able to read rather than infer from the clock.
+		size_t total_samples = 0, total_visible = 0;
+		for(size_t i=0; i<clouds.size(); ++i)
+			if(!clouds[i]->slice_visible_cdf.empty())
+			{
+				total_samples += clouds[i]->slice_visible_cdf.size();
+				total_visible += (size_t)clouds[i]->slice_visible_cdf.back();
+			}
+
+		s += "Slice placement: by visible splats";
+		if(total_samples > 0)
+			s += " (" + doubleToStringNDecimalPlaces(100.0 * (double)total_visible / (double)total_samples, 1) + "% of the sampled draw order is in frustum)";
+		else
+			s += " (no sample yet - falling back to the plain index split)";
+		s += "\n";
+	}
+	if(splat_coverage_shrink_strength > 0.f)
+	{
+		if(!splat_saturation_gate_enabled || splat_num_draw_slices <= 1)
+			s += "!! COVERAGE SHRINK " + doubleToStringNDecimalPlaces(splat_coverage_shrink_strength, 2) + " is set but idle - needs the saturation gate on with more than one draw slice.\n";
+		else
+			s += "!! COVERAGE SHRINK " + doubleToStringNDecimalPlaces(splat_coverage_shrink_strength, 2) + ": splats over already-covered pixels are drawn smaller.\n";
+	}
 
 	std::string gate_state;
 	if(!splat_saturation_gate_enabled)
@@ -2504,7 +2580,7 @@ Reference<SplatCloud> GaussianSplatRenderer::allocCloud()
 	// walks the program's uniforms and indexes this array by the same i, so a slot short is an out-of-bounds read there
 	// and an out-of-bounds write in think(). All but splat_tex_width below are set by think(), or by the draw path for the
 	// saturation mask ones.
-	mat.user_uniform_vals.resize(16);
+	mat.user_uniform_vals.resize(19);
 	mat.user_uniform_vals[2].intval = (int)splat_tex_width;
 
 	// Build a real (if minimal) texture and VAO up front: adding the object to the engine before it has those would
@@ -2743,6 +2819,44 @@ void GaussianSplatRenderer::rebuildCloudAABB(SplatCloud& cloud)
 }
 
 
+// Draw index that sample 'j' of 'num_samples' was taken from, out of a draw order of 'draw_count' instances.  Written
+// once and used from both ends - taking the samples and mapping a sample back to a draw index - so the two cannot drift
+// apart.  See GaussianSplatRenderer::getVisibleSlicingEnabled().
+static inline int sliceSampleDrawIndex(int j, int num_samples, int draw_count)
+{
+	return (int)(((int64)j * (int64)draw_count) / (int64)num_samples);
+}
+
+
+// Takes the evenly spaced sample of a cloud's draw order that frustum-aware slicing works from - see
+// getVisibleSlicingEnabled().  Called from every place that writes the instance index VBO, so the sample always
+// describes the order actually being drawn.
+//
+// The positions are copied out rather than the indices kept, so that a later renumbering of the cloud cannot turn a
+// sample into an out-of-range lookup; a sample that is merely out of date misplaces a boundary, which the slicing
+// cannot turn into a visible difference.
+//
+// Unconditional, rather than skipped while the feature is off: it is a few thousand copies against a VBO upload of the
+// whole draw order that has just happened anyway, and having the sample always present is what lets the checkbox be
+// switched on mid-session and take effect on the next frame rather than the next traversal.
+void GaussianSplatRenderer::noteDrawOrderForSlicing(SplatCloud& cloud, const uint32* draw_indices, size_t count)
+{
+	cloud.slice_visible_cdf.clear(); // Built against the previous sample, so it does not describe this one.  think() rebuilds it.
+
+	const int draw_count = (int)count;
+	const int num_samples = myMin(draw_count, max_slice_samples);
+
+	cloud.slice_sample_draw_count = draw_count;
+	cloud.slice_sample_positions.resizeNoCopy(num_samples);
+
+	for(int j=0; j<num_samples; ++j)
+	{
+		const uint32 splat_index = draw_indices[sliceSampleDrawIndex(j, num_samples, draw_count)];
+		cloud.slice_sample_positions[j] = (splat_index < cloud.positions.size()) ? cloud.positions[splat_index] : Vec3f(0.f);
+	}
+}
+
+
 // Synchronous placeholder frontier, written immediately after a structural change (append or rebuild), so the cloud
 // isn't left showing a stale or garbage selection for the one-to-a-few-frame gap before the next background traversal
 // completes.  Root-only for a member with a built tree (the cheapest non-empty frontier); every splat for a member
@@ -2765,6 +2879,7 @@ void GaussianSplatRenderer::writePlaceholderSelection(SplatCloud& cloud)
 
 	cloud.instance_index_vbo->updateData(0, selection.data(), selection.size() * sizeof(uint32));
 	cloud.ob->num_instances_to_draw = (int)selection.size();
+	noteDrawOrderForSlicing(cloud, selection.data(), selection.size());
 }
 
 
@@ -3276,6 +3391,11 @@ void GaussianSplatRenderer::drainSortResults()
 			// identity-order indices written by appendMemberToCloud().
 			const js::Vector<uint32, 16>& sorted_indices = msg->sortedIndices();
 			cloud->instance_index_vbo->updateData(0, sorted_indices.data(), sorted_indices.size() * sizeof(uint32));
+			// Sampled over exactly what this result covers.  On a cloud that grew since the sort was kicked off that is a
+			// prefix of the draw order, leaving the appended tail unsampled for the frame or two until the next sort
+			// lands - which skews where the boundaries fall slightly and can do nothing else, since slicing cannot
+			// change the picture.  See noteDrawOrderForSlicing().
+			noteDrawOrderForSlicing(*cloud, sorted_indices.data(), sorted_indices.size());
 		}
 	}
 
@@ -3395,6 +3515,7 @@ void GaussianSplatRenderer::drainTraversalResults()
 		const js::Vector<uint32, 16>& selected = msg->scratch->selected_indices;
 		cloud->instance_index_vbo->updateData(0, selected.data(), selected.size() * sizeof(uint32));
 		cloud->ob->num_instances_to_draw = (int)selected.size();
+		noteDrawOrderForSlicing(*cloud, selected.data(), selected.size());
 		cloud->last_traversal_hit_budget_cap = msg->scratch->hit_budget_cap; // Copied out here since the scratch itself goes back to the pool below and may be reused by a different cloud's traversal next.
 		cloud->last_traversal_hit_density_cap = msg->scratch->hit_density_cap;
 		cloud->last_traversal_hit_depth_cap = msg->scratch->hit_depth_cap;
@@ -3514,8 +3635,110 @@ void GaussianSplatRenderer::think()
 		// 13 (splat_frag_mask_block) belongs to the draw path - see setSplatFragMaskBlockSize().
 		mat.user_uniform_vals[14].intval = splat_ablation_stage; // DIAGNOSTIC ONLY - see getAblationStage().
 		mat.user_uniform_vals[15].floatval = splat_quad_radius_scale; // DIAGNOSTIC ONLY - see getQuadRadiusScale().
+		mat.user_uniform_vals[16].floatval = splat_area_scale_gamma; // DIAGNOSTIC ONLY - see getAreaScaleGamma().
+		mat.user_uniform_vals[17].floatval = splat_area_scale_ref_px; // DIAGNOSTIC ONLY - see getAreaScaleRefPx().
+		mat.user_uniform_vals[18].floatval = splat_coverage_shrink_strength; // DIAGNOSTIC ONLY - see getCoverageShrinkStrength().
 	}
+
+	buildVisibleSliceCDFs();
 
 	kickOffSorts();
 	kickOffTraversals();
+}
+
+
+/*
+Rebuilds each cloud's cumulative count of in-frustum samples, which is what visibleFractionToDrawIndex() inverts to place
+the draw slice boundaries - see getVisibleSlicingEnabled().
+
+Here, per frame, rather than in the background traversal, because it is the one thing about the draw order that depends
+on where the camera is *looking*: the traversal and the sort are both by distance and so survive a rotation untouched
+(see GaussianSplatLodTraversalTask's own comment on why that is deliberate), while what is in frustum changes with every
+turn of the head.  Affordable at that rate only because the sample is a fixed budget - max_slice_samples point-in-frustum
+tests per cloud, whatever the cloud's size.
+
+The test is on a splat's centre, so a splat whose centre is just off screen still rasterises and is counted as invisible
+here.  That is a statistical estimate being used to place a boundary, not a culling decision: slicing tiles the whole
+draw order whatever the boundaries are, so an error here can move where a saturation check happens and nothing else.
+*/
+void GaussianSplatRenderer::buildVisibleSliceCDFs()
+{
+	if(!splat_visible_slicing)
+	{
+		for(size_t i=0; i<clouds.size(); ++i)
+			clouds[i]->slice_visible_cdf.clear(); // So a frame with it off cannot leave a CDF behind for the draw path to pick up.
+		return;
+	}
+
+	const OpenGLScene* const scene = opengl_engine->getCurrentScene();
+	const Planef* const frustum_clip_planes = scene->frustum_clip_planes;
+	const int num_frustum_clip_planes = scene->num_frustum_clip_planes;
+
+	for(size_t i=0; i<clouds.size(); ++i)
+	{
+		SplatCloud& cloud = *clouds[i];
+		const js::Vector<Vec3f, 16>& samples = cloud.slice_sample_positions;
+
+		cloud.slice_visible_cdf.resizeNoCopy(samples.size());
+
+		int running = 0;
+		for(size_t j=0; j<samples.size(); ++j)
+		{
+			const Vec3f& p = samples[j];
+			if(pointInFrustum(frustum_clip_planes, num_frustum_clip_planes, Vec4f(p.x, p.y, p.z, 1.f)))
+				running++;
+			cloud.slice_visible_cdf[j] = running;
+		}
+	}
+}
+
+
+int GaussianSplatRenderer::visibleFractionToDrawIndex(const GLObject* ob, double fraction, int draw_count) const
+{
+	if(!splat_visible_slicing)
+		return -1;
+
+	// The ends are answered without consulting the samples at all, so that the slices still tile the whole draw order
+	// exactly: everything is drawn either way, and only the boundaries between the slices move.
+	if(fraction <= 0.0)
+		return 0;
+	if(fraction >= 1.0)
+		return draw_count;
+
+	const SplatCloud* cloud = NULL;
+	for(size_t i=0; i<clouds.size(); ++i)
+		if(clouds[i]->ob.ptr() == ob)
+		{
+			cloud = clouds[i].ptr();
+			break;
+		}
+
+	if(cloud == NULL || cloud->slice_visible_cdf.empty())
+		return -1;
+
+	// The sample describes a draw order of a different length than the one being drawn - a traversal result landed
+	// between the sample being taken and this frame.  Nothing here is wrong enough to be worth using, and the caller's
+	// fallback is the plain index split, so say so rather than guess.
+	if(cloud->slice_sample_draw_count != draw_count)
+		return -1;
+
+	const int num_samples = (int)cloud->slice_visible_cdf.size();
+	const int total_visible = cloud->slice_visible_cdf[num_samples - 1];
+	if(total_visible <= 0)
+		return -1; // Nothing of this cloud is in view, so there is no visible order to place boundaries along.
+
+	// Smallest sample at which this fraction of everything visible has been passed.  Binary search rather than a walk:
+	// the CDF is non-decreasing by construction, and this is called twice per slice per cloud per frame.
+	const int target = (int)(fraction * (double)total_visible + 0.5);
+	int lo = 0, hi = num_samples - 1;
+	while(lo < hi)
+	{
+		const int mid = lo + (hi - lo) / 2;
+		if(cloud->slice_visible_cdf[mid] >= target)
+			hi = mid;
+		else
+			lo = mid + 1;
+	}
+
+	return sliceSampleDrawIndex(lo, num_samples, draw_count);
 }

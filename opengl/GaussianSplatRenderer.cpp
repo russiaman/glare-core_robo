@@ -1855,6 +1855,97 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 			s += "    Note these are viewport-wide averages: the splats occupy part of the screen, so the dense regions the\n";
 			s += "    overdraw view shows in red are several times these numbers.\n";
 
+			//----------------------------- The biggest quads, in frustum or not -----------------------------
+			// A second pass over the same frontier, deliberately without the in-frustum test the loop above starts with.
+			//
+			// That test is right for the coverage figures - they describe what the frame is made of - but it hides the case
+			// this section exists for: the projection here is an *affine* approximation, valid near the view axis, and at a
+			// large angle off it the Jacobian's focal*v/depth^2 term diverges.  Such a splat's centre lands off screen, so the
+			// frustum test drops it, yet its quad is held only by the 2x viewport radius clamp and can reach back into the
+			// frame as a screen-filling slab.  Listing the largest quads with their off-axis angle, and saying outright which
+			// ones are sitting on the clamp, is what separates "legitimately large" from "the approximation gave up".
+			{
+				struct BigQuad
+				{
+					float radius1_px, radius2_px, quad_area_px, off_axis_deg, dist_m, feature_size_m;
+					bool at_clamp, centre_on_screen;
+				};
+
+				const size_t max_listed = 20;
+				const float max_radius_px = 2.f * (float)myMax(viewport_dims.x, viewport_dims.y); // The shader's own clamp - see gaussian_splat_vert_shader.glsl.
+				std::vector<BigQuad> biggest; // Kept sorted, largest first.  N is 20, so an insertion sort over it costs nothing against the projection work per splat.
+				size_t num_at_clamp = 0, num_offscreen_centre_reaching_frame = 0;
+
+				for(size_t i=0; i<frontier.size(); ++i)
+				{
+					const uint32 idx = frontier[i].cloud_idx;
+					const Vec3f& p = cloud.positions[idx];
+					const Vec3f& sc = cloud.scales[idx];
+					const float opacity = adjustSplatAlpha(cloud.colours[idx][3], splat_alpha_gain, splat_alpha_gamma);
+
+					const SplatFootprint fp = splatFootprint(p, sc, cloud.rotations[idx], opacity, scene->last_view_matrix,
+						focal_len_px, viewport_dims, splat_alpha_cutoff);
+					if(!fp.drawn)
+						continue;
+
+					const Vec4f pos_vs = scene->last_view_matrix * Vec4f(p.x, p.y, p.z, 1.f);
+					const float depth = -pos_vs[2];
+					const float lateral = Vec4f(pos_vs[0], pos_vs[1], 0, 0).length();
+					const float off_axis_deg = (float)(std::atan2((double)lateral, (double)myMax(depth, 1.0e-6f)) * 180.0 / Maths::pi<double>());
+
+					// Where the quad's centre lands, in pixels from the middle of the viewport.  A centre off screen whose quad
+					// still covers screen pixels is precisely the pathological case; counted separately from the clamp, since
+					// either can happen without the other.
+					const float centre_x_px = focal_len_px.x * pos_vs[0] / myMax(depth, 1.0e-6f);
+					const float centre_y_px = focal_len_px.y * pos_vs[1] / myMax(depth, 1.0e-6f);
+					const bool centre_on_screen = (std::fabs(centre_x_px) <= (float)viewport_dims.x * 0.5f) && (std::fabs(centre_y_px) <= (float)viewport_dims.y * 0.5f);
+
+					const bool at_clamp = (fp.radius1_px >= max_radius_px * 0.999f);
+					if(at_clamp)
+						num_at_clamp++;
+					if(!centre_on_screen && (fp.quad_area_px > 0.f))
+						num_offscreen_centre_reaching_frame++;
+
+					if((biggest.size() >= max_listed) && (fp.quad_area_px <= biggest.back().quad_area_px))
+						continue;
+
+					BigQuad q;
+					q.radius1_px = fp.radius1_px;
+					q.radius2_px = fp.radius2_px;
+					q.quad_area_px = fp.quad_area_px;
+					q.off_axis_deg = off_axis_deg;
+					q.dist_m = cam_pos_ws.getDist(Vec4f(p.x, p.y, p.z, 1.f));
+					q.feature_size_m = 2.f * myMax(sc.x, myMax(sc.y, sc.z));
+					q.at_clamp = at_clamp;
+					q.centre_on_screen = centre_on_screen;
+
+					size_t ins = biggest.size();
+					while((ins > 0) && (biggest[ins - 1].quad_area_px < q.quad_area_px))
+						ins--;
+					biggest.insert(biggest.begin() + ins, q);
+					if(biggest.size() > max_listed)
+						biggest.pop_back();
+				}
+
+				s += "\n  Largest quads on this frontier (frustum test deliberately not applied - see the code):\n";
+				s += "    Sitting on the " + doubleToStringNDecimalPlaces(max_radius_px, 0) + " px radius clamp: " + uInt64ToStringCommaSeparated(num_at_clamp) +
+					".  Centre off screen but still painting pixels: " + uInt64ToStringCommaSeparated(num_offscreen_centre_reaching_frame) + ".\n";
+				s += "         radius1      radius2   clipped area    off-axis    distance    own size\n";
+				for(size_t i=0; i<biggest.size(); ++i)
+				{
+					const BigQuad& q = biggest[i];
+					s += "    " + leftPad(doubleToStringNDecimalPlaces(q.radius1_px, 0), ' ', 10) + " px" +
+						leftPad(doubleToStringNDecimalPlaces(q.radius2_px, 0), ' ', 9) + " px" +
+						leftPad(uInt64ToStringCommaSeparated((uint64)q.quad_area_px), ' ', 14) + " px" +
+						leftPad(doubleToStringNDecimalPlaces(q.off_axis_deg, 1), ' ', 10) + " deg" +
+						leftPad(doubleToStringNDecimalPlaces(q.dist_m, 2), ' ', 10) + " m" +
+						leftPad(doubleToStringNDecimalPlaces(q.feature_size_m, 3), ' ', 10) + " m" +
+						(q.at_clamp ? "   AT CLAMP" : "") + (q.centre_on_screen ? "" : "   CENTRE OFF SCREEN") + "\n";
+				}
+				s += "    A row that is both AT CLAMP and CENTRE OFF SCREEN is the affine approximation having diverged: the\n";
+				s += "    quad's size is not a projection of anything, it is whatever the clamp allowed.\n";
+			}
+
 			s += "\n  Fill by splat size (blended area of one splat):\n";
 			{
 				std::vector<std::string> labels(num_area_buckets);

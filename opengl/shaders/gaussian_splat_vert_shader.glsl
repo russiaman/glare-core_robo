@@ -85,6 +85,16 @@ uniform float splat_area_scale_ref_px; // Radius (px, pre-scale) at which area_w
 uniform sampler2D splat_coverage_mask_texture;
 uniform float splat_coverage_shrink_strength;
 
+// Turns off all three of the corrections to the affine projection below - the frustum cull, the honest-size bound on the
+// radius, and the near fade - leaving the projection exactly as it was before them.  For A/B comparison; see
+// GaussianSplatRenderer::getEWAProjectionFixEnabled().
+uniform int splat_ewa_fix_enabled;
+
+// How wide, as a fraction of the ratio the test uses, the fade-out of splats the camera is getting inside of is spread -
+// see where it is used, and GaussianSplatRenderer::getNearFadeWidth().  0 makes it a hard cull at the point the splat's
+// projection stops existing; the default spreads it over the last part of the approach so nothing pops.
+uniform float splat_near_fade_width;
+
 out vec2 frag_screen_offset_px; // Pixel-space offset of this vertex from the splat's projected centre.
 out vec3 frag_conic; // Inverse 2D covariance (A, B, C) of [[A, B], [B, C]], for the per-pixel Gaussian evaluation.
 out vec4 frag_colour; // (r, g, b, opacity)
@@ -203,6 +213,73 @@ void main()
 		return;
 	}
 
+	// Fade out splats the camera is getting inside of.
+	//
+	// The near-plane test above looks at the splat's centre only.  A splat is an ellipsoid with a real extent, though, and
+	// a big flat one - a metre-wide, paper-thin splat lying along the floor, which every capture has plenty of, since a
+	// surface photographed with little parallax does not constrain its splats' size - reaches well past its own centre.
+	// Stand in the middle of a room and the floor splat under your feet has its centre a metre or two in front of you and
+	// its far edge behind you.  The part behind the camera has negative depth, the perspective divide flips it, and it
+	// lands above the horizon instead of below: that is the streak that climbs from the floor to the ceiling through the
+	// frame.  It is not an artifact of the approximation - the projection of a splat straddling the camera plane genuinely
+	// does not exist - so no bound on the radius can fix it.  Only not drawing the splat can.
+	//
+	// The condition is exactly "the camera is inside the splat's own extent": distance to its centre below its 3-sigma
+	// radius.  That is the same idea as the near_epsilon test above, with the splat's own size in place of a fixed 10 cm.
+	//
+	// Faded rather than switched, because a splat this big is often the only thing covering its patch of floor, and a
+	// hard test would pop it in and out as the camera moves.  splat_near_fade_width sets how much of the ratio the fade is
+	// spread over: 0 gives exactly the hard test, and the fade costs nothing beyond this multiply - it in fact saves
+	// rasterised area, since the sigma cutoff below derives the quad's radius from the opacity and so shrinks the quad as
+	// the splat fades.
+	if(splat_ewa_fix_enabled != 0)
+	{
+	float near_fade = clamp((1.0 - 3.0 * max(scale.x, max(scale.y, scale.z)) * length(model_matrix[0].xyz) / dist_to_cam) / max(splat_near_fade_width, 1.0e-6), 0.0, 1.0);
+	if(near_fade <= 0.0)
+	{
+		gl_Position = vec4(2.0, 2.0, 2.0, 1.0); // Push outside the clip volume.
+		frag_conic = vec3(0.0);
+		frag_screen_offset_px = vec2(0.0);
+		return;
+	}
+	frag_colour.a *= near_fade;
+	}
+
+	// Cull splats that lie entirely outside the frustum's side planes.
+	//
+	// The projection below is an *affine* approximation of the perspective divide, taken about this splat's own position,
+	// and it is only accurate near the view axis: the Jacobian's focal * v / depth^2 term grows with the off-axis angle
+	// and eventually dominates, so the 2D covariance - and with it the quad - inflates without bound.  Off screen that
+	// would not matter, except the quad is bounded only by max_radius_px below, which is twice the viewport: a splat whose
+	// centre projects well outside the frame can still reach back into it and paint a screen-covering slab of colour.
+	// Measured on an interior capture: ~20k splats per frame with their centre off screen were painting pixels this way,
+	// their quads oversized by 6-10x against the radius their own scale and distance allow.  The near-plane test above and
+	// the radius clamp cannot catch this between them, since neither knows where on screen the splat landed.
+	//
+	// Culling on the exact 3-sigma bounding sphere is what fixes it: outside the frustum the approximation is worthless,
+	// and a splat whose whole sphere is out there could not legitimately have coloured any pixel anyway.
+	//
+	// The four side planes come out of focal_len_px and viewport_dims_px, which are already here, so this needs no new
+	// uniform.  The right-hand edge of the frame is screen_x = +w with w = viewport_dims_px.x / 2, i.e.
+	// focal_x * vx / depth = w; with depth = -vz that is the plane focal_x * vx + w * vz = 0, whose normal has length
+	// sqrt(focal_x^2 + w^2), and the splat's signed distance outside it is the expression over that length.  The left
+	// plane is the same with vx negated, so taking abs(focal_x * vx) covers both at once, and likewise in y.
+	//
+	// 3 sigma rather than the opacity-aware sigma_cutoff computed below: this bound has to hold for the widest quad the
+	// splat could ever be drawn as, independently of the alpha cutoff in force.
+	float model_scale = length(model_matrix[0].xyz); // Uniform scale assumed throughout this shader - see the covariance transform below.
+	float bound_radius_vs = 3.0 * max(scale.x, max(scale.y, scale.z)) * model_scale;
+	vec2 half_viewport_px = viewport_dims_px * 0.5;
+	vec2 plane_normal_len = sqrt(focal_len_px * focal_len_px + half_viewport_px * half_viewport_px);
+	vec2 dist_outside_vs = (abs(focal_len_px * pos_vs.xy) + half_viewport_px * pos_vs.z) / plane_normal_len; // pos_vs.z is negative in front of the camera, so this is negative for a splat inside the frame.
+	if((splat_ewa_fix_enabled != 0) && (max(dist_outside_vs.x, dist_outside_vs.y) > bound_radius_vs))
+	{
+		gl_Position = vec4(2.0, 2.0, 2.0, 1.0); // Push outside the clip volume.
+		frag_conic = vec3(0.0);
+		frag_screen_offset_px = vec2(0.0);
+		return;
+	}
+
 	// Build the rotation matrix from the quaternion.  Columns are built explicitly, rather than with a 9-scalar
 	// mat3(...) literal, to avoid GLSL's column-major constructor order silently transposing this.
 	float qx = rot.x, qy = rot.y, qz = rot.z, qw = rot.w;
@@ -263,6 +340,30 @@ void main()
 	// projected size, which without a cap turns a single nearby splat into a screen-covering quad.  Twice the viewport's
 	// larger dimension is generous enough never to visibly clip a real splat while still bounding the worst case.
 	float max_radius_px = 2.0 * max(viewport_dims_px.x, viewport_dims_px.y);
+
+	// Bound the radius by what the splat's own size and distance actually allow, which the clamp above does not.
+	//
+	// The 2D covariance comes from an *affine* approximation of the perspective divide, taken about this splat's position.
+	// It is exact on the view axis and degrades away from it: the Jacobian's focal * v / depth^2 term grows with the
+	// off-axis angle, and by the edge of a wide frame it dominates, inflating the ellipse several times over.  The clamp
+	// above is twice the viewport, so it does not notice; the splat is then drawn as a slab of colour across the frame.
+	// Measured on an interior capture: splats of about 1 m at 2.5 m, some 60 degrees off axis, projecting to 4000+ px
+	// where their own size allows 1200.
+	//
+	// The honest bound needs no approximation at all.  The drawn extent is a ball of radius R = sigma_cutoff * sigma_max
+	// about the splat's centre; a ball at distance d subtends a half-angle asin(R / d), so it can never cover more than
+	// focal * tan(asin(R / d)) pixels however it is oriented.  Near the axis that equals focal * R / d, which is what the
+	// covariance gives there anyway, so this is inert on splats the approximation projects correctly - checked against a
+	// real frame, where it agreed with the computed radius to within a pixel on every well-behaved splat, and cut only
+	// the diverged ones.
+	//
+	// R >= d means the camera is inside the splat's own extent.  Its projection is then genuinely unbounded - a splat you
+	// are standing in does legitimately cover the frame - so leave those to the viewport clamp above, as before.
+	float bound_radius_ws = sigma_cutoff * max(scale.x, max(scale.y, scale.z)) * length(model_matrix[0].xyz); // Uniform model scale assumed, as in the covariance transform above.
+	float sin_half_angle = bound_radius_ws / max(dist_to_cam, 1.0e-6);
+	if((splat_ewa_fix_enabled != 0) && (sin_half_angle < 0.999))
+		max_radius_px = min(max_radius_px, max(focal_len_px.x, focal_len_px.y) * sin_half_angle / sqrt(1.0 - sin_half_angle * sin_half_angle));
+
 	// DIAGNOSTIC ONLY - splat_quad_radius_scale, see GaussianSplatRenderer::getQuadRadiusScale().  1 (default) is the real
 	// size.  Applied here, before the conic is built from these radii below, so the Gaussian shrinks with the quad instead
 	// of being cut off by it: the picture then has smaller splats rather than hard-edged ones, and the only thing that

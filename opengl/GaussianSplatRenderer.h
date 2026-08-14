@@ -431,6 +431,30 @@ public:
 	float getAreaScaleRefPx() const { return splat_area_scale_ref_px; }
 	void setAreaScaleRefPx(float v) { splat_area_scale_ref_px = v; }
 
+	// How wide the fade-out of splats the camera is getting inside of is, as a fraction of the ratio the test uses -
+	// see the block that uses splat_near_fade_width in gaussian_splat_vert_shader.glsl for the whole story.
+	//
+	// A splat is an ellipsoid, not a point, and a big flat one (a metre-wide floor splat, which every capture has, since
+	// a surface shot with little parallax does not constrain its splats' size) reaches far enough past its centre that
+	// standing in the room puts part of it behind the camera. That part has negative depth, so the perspective divide
+	// throws it above the horizon rather than below, and the splat is drawn as a streak climbing through the frame. The
+	// projection of a splat straddling the camera plane genuinely does not exist, so this is not fixable by bounding the
+	// radius: the splat has to go. The engine's own near-plane test does not catch it because it looks at the centre.
+	//
+	// 0 makes it a hard cull at the point the projection stops existing; the default spreads it over the last 30% of the
+	// approach, since these splats are often the only thing covering their patch of floor and a hard test pops them in
+	// and out as the camera moves. Fading costs nothing extra and saves area, as the quad's radius follows the opacity
+	// through the sigma cutoff.
+	// Switches all three corrections off together - the frustum cull, the honest-size bound on the radius, and the near
+	// fade - leaving the projection as it was before any of them. Here so the three can be judged against the original as
+	// one change, which is how they will be shipped: they share a cause, and turning them on one at a time only shows a
+	// picture in which the cause is partly corrected.
+	bool getEWAProjectionFixEnabled() const { return splat_ewa_fix_enabled; }
+	void setEWAProjectionFixEnabled(bool v) { splat_ewa_fix_enabled = v; }
+
+	float getNearFadeWidth() const { return splat_near_fade_width; }
+	void setNearFadeWidth(float v) { splat_near_fade_width = v; }
+
 	// DIAGNOSTIC ONLY - session046 open question (3): shrinks a splat's quad continuously by how covered the composite
 	// already is under it, instead of the saturation gate's binary keep/drop (which needs every texel the quad touches
 	// marked finished before it drops anything, and so rarely fires - see getSaturationGateEnabled()). 0 (default) is
@@ -832,6 +856,10 @@ private:
 
 	// See getCoverageShrinkStrength() above. Default 0 = off.
 	float splat_coverage_shrink_strength;
+
+	// See getEWAProjectionFixEnabled()/getNearFadeWidth() above. Defaults: on, and a fade over the last 30% of the approach.
+	bool splat_ewa_fix_enabled;
+	float splat_near_fade_width;
 	Reference<OpenGLProgram> mean_reduce_prog; // See getMeanMaskReduceProgram() above. Built alongside mask_reduce_prog.
 	int coverage_mask_tex_uniform_loc; // See getCoverageMaskTexUniformLoc() above. -2 means "not looked up yet", as with splat_mask_tex_uniform_loc.
 

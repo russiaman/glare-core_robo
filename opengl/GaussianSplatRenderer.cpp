@@ -777,7 +777,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	splat_dist_clamp_min(0.0f), splat_dist_clamp_max(1000.0f), splat_dist_clamp_invert(false), splat_alpha_cutoff(1.0f / 255.0f),
 	splat_alpha_gain(1.0f), splat_alpha_gamma(1.0f), // Identity: the cloud as captured - see getAlphaGain().
 	last_report_reached_rasteriser(0), last_report_in_frustum(0),
-	splat_num_draw_slices(1), splat_draw_slice_limit(0), splat_layer_cap(0), splat_layer_cap_opaque(true), splat_coverage_cap(0.f), splat_ablation_stage(0), splat_quad_radius_scale(1.f), cap_fill_mask_tex_uniform_loc(-2), splat_area_scale_gamma(1.f), splat_area_scale_ref_px(20.f), splat_coverage_shrink_strength(0.f), coverage_mask_tex_uniform_loc(-2), splat_hide_test_conservative(true), splat_layer_estimate_requested(false), splat_slice_growth(1.0f), splat_visible_slicing(false), splat_saturation_gate_enabled(false), splat_saturation_threshold(1.0f - 1.0f / 255.0f),
+	splat_num_draw_slices(1), splat_draw_slice_limit(0), splat_layer_cap(0), splat_layer_cap_opaque(true), splat_coverage_cap(0.f), splat_ablation_stage(0), splat_quad_radius_scale(1.f), cap_fill_mask_tex_uniform_loc(-2), splat_area_scale_gamma(1.f), splat_area_scale_ref_px(20.f), splat_coverage_shrink_strength(0.f), coverage_mask_tex_uniform_loc(-2), splat_ewa_fix_enabled(true), splat_near_fade_width(0.3f), splat_hide_test_conservative(true), splat_layer_estimate_requested(false), splat_slice_growth(1.0f), splat_visible_slicing(false), splat_saturation_gate_enabled(false), splat_saturation_threshold(1.0f - 1.0f / 255.0f),
 	splat_saturation_mask_downscale(4), splat_mask_tex_uniform_loc(-2),
 	splat_accum_buffer_8bit(false),
 	splat_show_overdraw_mode(0), splat_hide_overdraw_enabled(false), splat_hide_alpha_enabled(false),
@@ -834,7 +834,9 @@ void GaussianSplatRenderer::buildShadersIfNeeded()
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_quad_radius_scale"); // DIAGNOSTIC ONLY - see getQuadRadiusScale().
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_area_scale_gamma"); // DIAGNOSTIC ONLY - see getAreaScaleGamma().
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_area_scale_ref_px"); // DIAGNOSTIC ONLY - see getAreaScaleRefPx().
-	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_coverage_shrink_strength"); // DIAGNOSTIC ONLY - see getCoverageShrinkStrength().  NOTE: user_uniform_vals is sized to match this list in allocCloud().
+	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_coverage_shrink_strength"); // DIAGNOSTIC ONLY - see getCoverageShrinkStrength().
+	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "splat_ewa_fix_enabled"); // See getEWAProjectionFixEnabled().
+	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_near_fade_width"); // See getNearFadeWidth().  NOTE: user_uniform_vals is sized to match this list in allocCloud().
 
 
 	// Splats blend into an accumulation buffer of their own rather than straight onto the main colour buffer, so that
@@ -1210,6 +1212,7 @@ struct SplatFootprint
 	bool drawn;             // False where the vertex shader would push the quad out of the clip volume outright: behind the near plane, degenerate covariance, or opacity at or below the alpha cutoff.
 	float radius1_px;       // Screen-space semi-axes, after the same clamp the shader applies.
 	float radius2_px;
+	float max_radius_px;    // The bound those radii were clamped against, which is per-splat - see the shader's honest-size bound.  Reported so a caller can say whether a radius is a projection or just the bound.
 	float quad_area_px;     // 4*r1*r2, clipped to the viewport - fragments the rasteriser produces.
 	float ellipse_area_px;  // pi*r1*r2, clipped the same way - the part inside the alpha cutoff, i.e. fragments that survive the fragment shader's discard and reach the blender.  The gap between the two is what an octagonal or otherwise tighter quad could remove.
 
@@ -1235,11 +1238,11 @@ struct SplatFootprint
 // view_matrix is the engine's OpenGL-convention view matrix (scene->last_view_matrix); the splat's data is already baked
 // into world space, so the shader's model_matrix is the identity here and drops out.
 static SplatFootprint splatFootprint(const Vec3f& pos_ws, const Vec3f& scale, const Vec4f& rotation, float opacity,
-	const Matrix4f& view_matrix, const Vec2f& focal_len_px, const Vec2i& viewport_dims, float alpha_cutoff)
+	const Matrix4f& view_matrix, const Vec2f& focal_len_px, const Vec2i& viewport_dims, float alpha_cutoff, bool ewa_fix_enabled, float near_fade_width)
 {
 	SplatFootprint fp;
 	fp.drawn = false;
-	fp.radius1_px = fp.radius2_px = fp.quad_area_px = fp.ellipse_area_px = fp.alpha_integral_px = 0.f;
+	fp.radius1_px = fp.radius2_px = fp.max_radius_px = fp.quad_area_px = fp.ellipse_area_px = fp.alpha_integral_px = 0.f;
 
 	const Vec4f pos_vs = view_matrix * Vec4f(pos_ws.x, pos_ws.y, pos_ws.z, 1.f);
 
@@ -1247,6 +1250,27 @@ static SplatFootprint splatFootprint(const Vec3f& pos_ws, const Vec3f& scale, co
 	const float near_epsilon = 0.1f;
 	if(depth < near_epsilon)
 		return fp;
+
+	// The vertex shader's near fade and frustum cull, in that order - see gaussian_splat_vert_shader.glsl for what they
+	// are for and where the plane equations come from.  Mirrored here because this function's whole value is that it
+	// answers what the shader does.
+	const float bound_radius_vs = 3.f * myMax(scale.x, myMax(scale.y, scale.z)); // model_matrix is the identity here - see the comment above this function.
+	if(ewa_fix_enabled)
+	{
+		const float dist_to_centre = Vec4f(pos_vs[0], pos_vs[1], pos_vs[2], 0.f).length();
+		const float near_fade = myClamp((1.f - bound_radius_vs / myMax(dist_to_centre, 1.0e-6f)) / myMax(near_fade_width, 1.0e-6f), 0.f, 1.f);
+		if(near_fade <= 0.f)
+			return fp;
+		opacity *= near_fade;
+	}
+
+	{
+		const Vec2f half_viewport_px((float)viewport_dims.x * 0.5f, (float)viewport_dims.y * 0.5f);
+		const float dist_outside_x = (std::fabs(focal_len_px.x * pos_vs[0]) + half_viewport_px.x * pos_vs[2]) / std::sqrt(focal_len_px.x*focal_len_px.x + half_viewport_px.x*half_viewport_px.x);
+		const float dist_outside_y = (std::fabs(focal_len_px.y * pos_vs[1]) + half_viewport_px.y * pos_vs[2]) / std::sqrt(focal_len_px.y*focal_len_px.y + half_viewport_px.y*half_viewport_px.y);
+		if(ewa_fix_enabled && (myMax(dist_outside_x, dist_outside_y) > bound_radius_vs))
+			return fp;
+	}
 
 	const float qx = rotation[0], qy = rotation[1], qz = rotation[2], qw = rotation[3];
 	const Vec4f r_col0(1.f - 2.f*(qy*qy + qz*qz),        2.f*(qx*qy + qz*qw),        2.f*(qx*qz - qy*qw), 0.f);
@@ -1299,7 +1323,15 @@ static SplatFootprint splatFootprint(const Vec3f& pos_ws, const Vec3f& scale, co
 	if(sigma_cutoff <= 0.f)
 		return fp; // Invisible even at its centre - the shader makes a degenerate zero-area quad of it.
 
-	const float max_radius_px = 2.f * (float)myMax(viewport_dims.x, viewport_dims.y);
+	float max_radius_px = 2.f * (float)myMax(viewport_dims.x, viewport_dims.y);
+
+	// The vertex shader's honest-size bound on the radius - see gaussian_splat_vert_shader.glsl for the derivation.
+	const float bound_radius_ws = sigma_cutoff * myMax(scale.x, myMax(scale.y, scale.z));
+	const float dist_to_cam = Vec4f(pos_vs[0], pos_vs[1], pos_vs[2], 0.f).length();
+	const float sin_half_angle = bound_radius_ws / myMax(dist_to_cam, 1.0e-6f);
+	if(ewa_fix_enabled && (sin_half_angle < 0.999f))
+		max_radius_px = myMin(max_radius_px, myMax(focal_len_px.x, focal_len_px.y) * sin_half_angle / std::sqrt(1.f - sin_half_angle * sin_half_angle));
+
 	const float radius1 = myMin(sigma_cutoff * std::sqrt(lambda1), max_radius_px);
 	const float radius2 = myMin(sigma_cutoff * std::sqrt(lambda2), max_radius_px);
 
@@ -1322,6 +1354,7 @@ static SplatFootprint splatFootprint(const Vec3f& pos_ws, const Vec3f& scale, co
 	fp.drawn = true;
 	fp.radius1_px = radius1;
 	fp.radius2_px = radius2;
+	fp.max_radius_px = max_radius_px;
 	fp.centre_x_px = centre_x_px;
 	fp.centre_y_px = centre_y_px;
 	fp.axis1 = axis1;
@@ -1797,7 +1830,7 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 				}
 
 				const SplatFootprint fp = splatFootprint(p, sc, cloud.rotations[idx], opacity, scene->last_view_matrix,
-					focal_len_px, viewport_dims, splat_alpha_cutoff);
+					focal_len_px, viewport_dims, splat_alpha_cutoff, splat_ewa_fix_enabled, splat_near_fade_width);
 				if(!fp.drawn)
 				{
 					culled_by_shader++;
@@ -1867,13 +1900,16 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 			{
 				struct BigQuad
 				{
-					float radius1_px, radius2_px, quad_area_px, off_axis_deg, dist_m, feature_size_m;
+					float radius1_px, radius2_px, bound_px, quad_area_px, off_axis_deg, dist_m, feature_size_m;
 					bool at_clamp, centre_on_screen;
 				};
 
 				const size_t max_listed = 20;
-				const float max_radius_px = 2.f * (float)myMax(viewport_dims.x, viewport_dims.y); // The shader's own clamp - see gaussian_splat_vert_shader.glsl.
 				std::vector<BigQuad> biggest; // Kept sorted, largest first.  N is 20, so an insertion sort over it costs nothing against the projection work per splat.
+				// Ranked by radius1 instead of by area, because the two find different things and only one of them is what an
+				// eye picks out of the frame: a long thin streak, 900 px by 5, is among the most conspicuous quads on screen
+				// and among the smallest by area, so the list above can never show one however far it is scrolled.
+				std::vector<BigQuad> longest;
 				size_t num_at_clamp = 0, num_offscreen_centre_reaching_frame = 0;
 
 				for(size_t i=0; i<frontier.size(); ++i)
@@ -1884,7 +1920,7 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 					const float opacity = adjustSplatAlpha(cloud.colours[idx][3], splat_alpha_gain, splat_alpha_gamma);
 
 					const SplatFootprint fp = splatFootprint(p, sc, cloud.rotations[idx], opacity, scene->last_view_matrix,
-						focal_len_px, viewport_dims, splat_alpha_cutoff);
+						focal_len_px, viewport_dims, splat_alpha_cutoff, splat_ewa_fix_enabled, splat_near_fade_width);
 					if(!fp.drawn)
 						continue;
 
@@ -1900,18 +1936,21 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 					const float centre_y_px = focal_len_px.y * pos_vs[1] / myMax(depth, 1.0e-6f);
 					const bool centre_on_screen = (std::fabs(centre_x_px) <= (float)viewport_dims.x * 0.5f) && (std::fabs(centre_y_px) <= (float)viewport_dims.y * 0.5f);
 
-					const bool at_clamp = (fp.radius1_px >= max_radius_px * 0.999f);
+					const bool at_clamp = (fp.radius1_px >= fp.max_radius_px * 0.999f);
 					if(at_clamp)
 						num_at_clamp++;
 					if(!centre_on_screen && (fp.quad_area_px > 0.f))
 						num_offscreen_centre_reaching_frame++;
 
-					if((biggest.size() >= max_listed) && (fp.quad_area_px <= biggest.back().quad_area_px))
+					const bool room_by_area   = !((biggest.size() >= max_listed) && (fp.quad_area_px <= biggest.back().quad_area_px));
+					const bool room_by_length = !((longest.size() >= max_listed) && (fp.radius1_px  <= longest.back().radius1_px));
+					if(!room_by_area && !room_by_length)
 						continue;
 
 					BigQuad q;
 					q.radius1_px = fp.radius1_px;
 					q.radius2_px = fp.radius2_px;
+					q.bound_px = fp.max_radius_px;
 					q.quad_area_px = fp.quad_area_px;
 					q.off_axis_deg = off_axis_deg;
 					q.dist_m = cam_pos_ws.getDist(Vec4f(p.x, p.y, p.z, 1.f));
@@ -1919,31 +1958,54 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 					q.at_clamp = at_clamp;
 					q.centre_on_screen = centre_on_screen;
 
-					size_t ins = biggest.size();
-					while((ins > 0) && (biggest[ins - 1].quad_area_px < q.quad_area_px))
-						ins--;
-					biggest.insert(biggest.begin() + ins, q);
-					if(biggest.size() > max_listed)
-						biggest.pop_back();
+					if(room_by_area)
+					{
+						size_t ins = biggest.size();
+						while((ins > 0) && (biggest[ins - 1].quad_area_px < q.quad_area_px))
+							ins--;
+						biggest.insert(biggest.begin() + ins, q);
+						if(biggest.size() > max_listed)
+							biggest.pop_back();
+					}
+
+					if(room_by_length)
+					{
+						size_t ins = longest.size();
+						while((ins > 0) && (longest[ins - 1].radius1_px < q.radius1_px))
+							ins--;
+						longest.insert(longest.begin() + ins, q);
+						if(longest.size() > max_listed)
+							longest.pop_back();
+					}
 				}
 
-				s += "\n  Largest quads on this frontier (frustum test deliberately not applied - see the code):\n";
-				s += "    Sitting on the " + doubleToStringNDecimalPlaces(max_radius_px, 0) + " px radius clamp: " + uInt64ToStringCommaSeparated(num_at_clamp) +
+				s += "\n  Worst quads on this frontier (screen-centre test deliberately not applied - see the code):\n";
+				s += "    Sitting on the radius bound: " + uInt64ToStringCommaSeparated(num_at_clamp) +
 					".  Centre off screen but still painting pixels: " + uInt64ToStringCommaSeparated(num_offscreen_centre_reaching_frame) + ".\n";
-				s += "         radius1      radius2   clipped area    off-axis    distance    own size\n";
-				for(size_t i=0; i<biggest.size(); ++i)
+
+				const std::vector<BigQuad>* const lists[2] = { &biggest, &longest };
+				const char* const list_names[2] = { "  By area:\n", "  By length (radius1) - a long thin streak is conspicuous on screen and tiny by area:\n" };
+				for(int list_i=0; list_i<2; ++list_i)
 				{
-					const BigQuad& q = biggest[i];
-					s += "    " + leftPad(doubleToStringNDecimalPlaces(q.radius1_px, 0), ' ', 10) + " px" +
-						leftPad(doubleToStringNDecimalPlaces(q.radius2_px, 0), ' ', 9) + " px" +
-						leftPad(uInt64ToStringCommaSeparated((uint64)q.quad_area_px), ' ', 14) + " px" +
-						leftPad(doubleToStringNDecimalPlaces(q.off_axis_deg, 1), ' ', 10) + " deg" +
-						leftPad(doubleToStringNDecimalPlaces(q.dist_m, 2), ' ', 10) + " m" +
-						leftPad(doubleToStringNDecimalPlaces(q.feature_size_m, 3), ' ', 10) + " m" +
-						(q.at_clamp ? "   AT CLAMP" : "") + (q.centre_on_screen ? "" : "   CENTRE OFF SCREEN") + "\n";
+					s += std::string("\n  ") + list_names[list_i];
+					s += "         radius1      radius2        bound   clipped area    off-axis    distance    own size\n";
+					const std::vector<BigQuad>& list = *lists[list_i];
+					for(size_t i=0; i<list.size(); ++i)
+					{
+						const BigQuad& q = list[i];
+						s += "    " + leftPad(doubleToStringNDecimalPlaces(q.radius1_px, 0), ' ', 10) + " px" +
+							leftPad(doubleToStringNDecimalPlaces(q.radius2_px, 0), ' ', 9) + " px" +
+							leftPad(doubleToStringNDecimalPlaces(q.bound_px, 0), ' ', 9) + " px" +
+							leftPad(uInt64ToStringCommaSeparated((uint64)q.quad_area_px), ' ', 14) + " px" +
+							leftPad(doubleToStringNDecimalPlaces(q.off_axis_deg, 1), ' ', 10) + " deg" +
+							leftPad(doubleToStringNDecimalPlaces(q.dist_m, 2), ' ', 10) + " m" +
+							leftPad(doubleToStringNDecimalPlaces(q.feature_size_m, 3), ' ', 10) + " m" +
+							(q.at_clamp ? "   AT CLAMP" : "") + (q.centre_on_screen ? "" : "   CENTRE OFF SCREEN") + "\n";
+					}
 				}
-				s += "    A row that is both AT CLAMP and CENTRE OFF SCREEN is the affine approximation having diverged: the\n";
-				s += "    quad's size is not a projection of anything, it is whatever the clamp allowed.\n";
+				s += "    AT CLAMP means radius1 is the bound rather than a projection, i.e. the affine approximation asked for\n";
+				s += "    more than the splat's own size and distance can justify and was refused.  A row with radius1 well\n";
+				s += "    under the bound is honest geometry: that splat really is that big on screen.\n";
 			}
 
 			s += "\n  Fill by splat size (blended area of one splat):\n";
@@ -2066,7 +2128,7 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 					const Vec3f& p = cloud.positions[idx];
 					const SplatFootprint fp = splatFootprint(p, cloud.scales[idx], cloud.rotations[idx],
 						adjustSplatAlpha(cloud.colours[idx][3], splat_alpha_gain, splat_alpha_gamma), // As drawn, not as stored - see getAlphaGain().
-						scene->last_view_matrix, focal_len_px, viewport_dims, splat_alpha_cutoff);
+						scene->last_view_matrix, focal_len_px, viewport_dims, splat_alpha_cutoff, splat_ewa_fix_enabled, splat_near_fade_width);
 					if(!fp.drawn)
 						continue;
 
@@ -2671,7 +2733,7 @@ Reference<SplatCloud> GaussianSplatRenderer::allocCloud()
 	// walks the program's uniforms and indexes this array by the same i, so a slot short is an out-of-bounds read there
 	// and an out-of-bounds write in think(). All but splat_tex_width below are set by think(), or by the draw path for the
 	// saturation mask ones.
-	mat.user_uniform_vals.resize(19);
+	mat.user_uniform_vals.resize(21);
 	mat.user_uniform_vals[2].intval = (int)splat_tex_width;
 
 	// Build a real (if minimal) texture and VAO up front: adding the object to the engine before it has those would
@@ -3729,6 +3791,8 @@ void GaussianSplatRenderer::think()
 		mat.user_uniform_vals[16].floatval = splat_area_scale_gamma; // DIAGNOSTIC ONLY - see getAreaScaleGamma().
 		mat.user_uniform_vals[17].floatval = splat_area_scale_ref_px; // DIAGNOSTIC ONLY - see getAreaScaleRefPx().
 		mat.user_uniform_vals[18].floatval = splat_coverage_shrink_strength; // DIAGNOSTIC ONLY - see getCoverageShrinkStrength().
+		mat.user_uniform_vals[19].intval = splat_ewa_fix_enabled ? 1 : 0; // See getEWAProjectionFixEnabled().
+		mat.user_uniform_vals[20].floatval = splat_near_fade_width; // See getNearFadeWidth().
 	}
 
 	buildVisibleSliceCDFs();

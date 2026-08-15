@@ -85,6 +85,12 @@ uniform float splat_area_scale_ref_px; // Radius (px, pre-scale) at which area_w
 uniform sampler2D splat_coverage_mask_texture;
 uniform float splat_coverage_shrink_strength;
 
+// Which of the two shrink formulas splat_coverage_shrink_strength above feeds - see
+// GaussianSplatRenderer::getCoverageShrinkMode().  0 = scale the radii by (1 - coverage * strength), which narrows the
+// Gaussian with the quad; 1 = spend the value as a light-loss budget, which truncates the same Gaussian instead.  The
+// two read the identical coverage estimate and differ only in what they do with it, so the A/B is on the formula alone.
+uniform int splat_coverage_shrink_mode;
+
 // Turns off all three of the corrections to the affine projection below - the frustum cull, the honest-size bound on the
 // radius, and the near fade - leaving the projection exactly as it was before them.  For A/B comparison; see
 // GaussianSplatRenderer::getEWAProjectionFixEnabled().
@@ -507,13 +513,54 @@ void main()
 		// The mean of the (up to 4) coarse texels the quad spans - not conservative like the gate's minimum, on purpose:
 		// this is an estimate to weight a continuous shrink by, not a test that must never be wrong in one direction.
 		// Falls back to 0 (no shrink) for a quad too big for even the coarsest level, same as the gate's own test does.
+		//
+		// The census this reads was taken before the slice started, so every splat in a slice reads one number and it
+		// steps to a new one at the boundary.  Carrying the estimate across the slice to remove that step was built and
+		// measured, and changed the bands not at all: the band is the light mode 0 takes and the pixel had not finished
+		// with, not the step in the number.  The extrapolation is gone again rather than left as a knob that measures
+		// nothing - session050.
 		float coverage_estimate = all(lessThanEqual(hi_l - lo_l, ivec2(1))) ? (0.25 * (
 			texelFetch(splat_coverage_mask_texture, ivec2(lo_l.x, lo_l.y), level).r + texelFetch(splat_coverage_mask_texture, ivec2(hi_l.x, lo_l.y), level).r +
 			texelFetch(splat_coverage_mask_texture, ivec2(lo_l.x, hi_l.y), level).r + texelFetch(splat_coverage_mask_texture, ivec2(hi_l.x, hi_l.y), level).r)) : 0.0;
 
-		float coverage_shrink = clamp(1.0 - coverage_estimate * splat_coverage_shrink_strength, 0.0, 1.0);
-		radius1 *= coverage_shrink;
-		radius2 *= coverage_shrink;
+		if(splat_coverage_shrink_mode == 0)
+		{
+			// Scale both radii by the coverage.  The conic below is built from the radii, so the Gaussian narrows with
+			// the quad: the splat gets smaller rather than clipped, and its total contribution falls as the square of
+			// the scale even though the light still getting through the pixel only falls as (1 - coverage).  That
+			// mismatch is the mode's known cost, and mode 1 is what it is being compared against.
+			float coverage_shrink = clamp(1.0 - coverage_estimate * splat_coverage_shrink_strength, 0.0, 1.0);
+			radius1 *= coverage_shrink;
+			radius2 *= coverage_shrink;
+		}
+		else
+		{
+			// Spend the value as a budget on light lost instead.  What is thrown away by stopping the quad early is the
+			// splat's own alpha at that radius, times the (1 - coverage) of the light still reaching the eye there - so
+			// the radius at which the loss equals the budget is the radius at which alpha reaches budget/(1 - coverage).
+			// That is the same question splat_alpha_cutoff already answers, asked with a threshold raised by how covered
+			// the pixel is: same closed form, no new machinery, and no circularity, since coverage is measured, not
+			// derived from the opacity this then changes.
+			//
+			// The budget is spent *on top of* splat_alpha_cutoff rather than instead of it, so that the threshold is
+			// exactly the alpha cutoff wherever the pixel is empty, whatever this is set to.  Taking the larger of the
+			// two instead - the first form of this - meant any budget above the alpha cutoff raised the threshold
+			// everywhere, including over pixels with no coverage at all, which is what the plain alpha cutoff already
+			// does; the knob was then half itself and half that, and the extra was measured taking seven times the error
+			// out of sparse regions that the coverage-aware part alone takes.  In this form the extra light given up is
+			// budget * coverage: none on an empty pixel, the full budget only where the composite is finished.
+			//
+			// sigma_cutoff itself is scaled by the same factor as the radii, so the conic below reconstructs the
+			// identical Gaussian over a shorter quad: this truncates the faint edge rather than narrowing the splat.
+			float transmittance = max(1.0 - coverage_estimate, 1.0e-4);
+			float budget_cutoff = splat_alpha_cutoff + splat_coverage_shrink_strength * coverage_estimate / transmittance;
+			float budget_sigma = (opacity > budget_cutoff) ? min(sqrt(2.0 * log(opacity / budget_cutoff)), 3.0) : 0.0;
+
+			float cutoff_ratio = budget_sigma / max(sigma_cutoff, 1.0e-6);
+			radius1 *= cutoff_ratio;
+			radius2 *= cutoff_ratio;
+			sigma_cutoff = budget_sigma;
+		}
 	}
 
 	vec2 screen_offset_px = position_in.x * radius1 * axis1 + position_in.y * radius2 * axis2;

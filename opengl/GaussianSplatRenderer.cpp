@@ -777,7 +777,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	splat_dist_clamp_min(0.0f), splat_dist_clamp_max(1000.0f), splat_dist_clamp_invert(false), splat_alpha_cutoff(1.0f / 255.0f),
 	splat_alpha_gain(1.0f), splat_alpha_gamma(1.0f), // Identity: the cloud as captured - see getAlphaGain().
 	last_report_reached_rasteriser(0), last_report_in_frustum(0),
-	splat_num_draw_slices(1), splat_draw_slice_limit(0), splat_layer_cap(0), splat_layer_cap_opaque(true), splat_coverage_cap(0.f), splat_ablation_stage(0), splat_quad_radius_scale(1.f), cap_fill_mask_tex_uniform_loc(-2), splat_area_scale_gamma(1.f), splat_area_scale_ref_px(20.f), splat_coverage_shrink_strength(0.f), coverage_mask_tex_uniform_loc(-2), splat_ewa_fix_enabled(true), splat_near_fade_width(0.3f), splat_hide_test_conservative(true), splat_layer_estimate_requested(false), splat_slice_growth(1.0f), splat_visible_slicing(false), splat_saturation_gate_enabled(false), splat_saturation_threshold(1.0f - 1.0f / 255.0f),
+	splat_num_draw_slices(1), splat_draw_slice_limit(0), splat_layer_cap(0), splat_layer_cap_opaque(true), splat_coverage_cap(0.f), splat_ablation_stage(0), splat_quad_radius_scale(1.f), cap_fill_mask_tex_uniform_loc(-2), splat_area_scale_gamma(1.f), splat_area_scale_ref_px(20.f), splat_coverage_shrink_strength(0.f), splat_coverage_shrink_mode(0), coverage_mask_tex_uniform_loc(-2), splat_ewa_fix_enabled(true), splat_near_fade_width(0.3f), splat_hide_test_conservative(true), splat_layer_estimate_requested(false), splat_slice_growth(1.0f), splat_visible_slicing(false), splat_saturation_gate_enabled(false), splat_saturation_threshold(1.0f - 1.0f / 255.0f),
 	splat_saturation_mask_downscale(4), splat_mask_tex_uniform_loc(-2),
 	splat_accum_buffer_8bit(false),
 	splat_show_overdraw_mode(0), splat_hide_overdraw_enabled(false), splat_hide_alpha_enabled(false),
@@ -836,7 +836,8 @@ void GaussianSplatRenderer::buildShadersIfNeeded()
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_area_scale_ref_px"); // DIAGNOSTIC ONLY - see getAreaScaleRefPx().
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_coverage_shrink_strength"); // DIAGNOSTIC ONLY - see getCoverageShrinkStrength().
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "splat_ewa_fix_enabled"); // See getEWAProjectionFixEnabled().
-	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_near_fade_width"); // See getNearFadeWidth().  NOTE: user_uniform_vals is sized to match this list in allocCloud().
+	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_near_fade_width"); // See getNearFadeWidth().
+	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "splat_coverage_shrink_mode"); // DIAGNOSTIC ONLY - see getCoverageShrinkMode().  NOTE: user_uniform_vals is sized to match this list in allocCloud().
 
 
 	// Splats blend into an accumulation buffer of their own rather than straight onto the main colour buffer, so that
@@ -2566,10 +2567,15 @@ std::string GaussianSplatRenderer::getDiagnostics() const
 	}
 	if(splat_coverage_shrink_strength > 0.f)
 	{
+		// Which formula the number feeds is not something the number itself says, and the two mean different things at
+		// the same value - see getCoverageShrinkMode().
+		const std::string shrink_desc = (splat_coverage_shrink_mode == 0) ?
+			("shrink " + doubleToStringNDecimalPlaces(splat_coverage_shrink_strength, 2) + " by coverage") :
+			("loss budget " + doubleToStringNDecimalPlaces(splat_coverage_shrink_strength, 2) + " of the light still getting through");
 		if(!splat_saturation_gate_enabled || splat_num_draw_slices <= 1)
-			s += "!! COVERAGE SHRINK " + doubleToStringNDecimalPlaces(splat_coverage_shrink_strength, 2) + " is set but idle - needs the saturation gate on with more than one draw slice.\n";
+			s += "!! COVERAGE SHRINK (" + shrink_desc + ") is set but idle - needs the saturation gate on with more than one draw slice.\n";
 		else
-			s += "!! COVERAGE SHRINK " + doubleToStringNDecimalPlaces(splat_coverage_shrink_strength, 2) + ": splats over already-covered pixels are drawn smaller.\n";
+			s += "!! COVERAGE SHRINK (" + shrink_desc + "): splats over already-covered pixels are drawn smaller.\n";
 	}
 
 	std::string gate_state;
@@ -2733,7 +2739,7 @@ Reference<SplatCloud> GaussianSplatRenderer::allocCloud()
 	// walks the program's uniforms and indexes this array by the same i, so a slot short is an out-of-bounds read there
 	// and an out-of-bounds write in think(). All but splat_tex_width below are set by think(), or by the draw path for the
 	// saturation mask ones.
-	mat.user_uniform_vals.resize(21);
+	mat.user_uniform_vals.resize(22);
 	mat.user_uniform_vals[2].intval = (int)splat_tex_width;
 
 	// Build a real (if minimal) texture and VAO up front: adding the object to the engine before it has those would
@@ -3793,6 +3799,7 @@ void GaussianSplatRenderer::think()
 		mat.user_uniform_vals[18].floatval = splat_coverage_shrink_strength; // DIAGNOSTIC ONLY - see getCoverageShrinkStrength().
 		mat.user_uniform_vals[19].intval = splat_ewa_fix_enabled ? 1 : 0; // See getEWAProjectionFixEnabled().
 		mat.user_uniform_vals[20].floatval = splat_near_fade_width; // See getNearFadeWidth().
+		mat.user_uniform_vals[21].intval = splat_coverage_shrink_mode; // DIAGNOSTIC ONLY - see getCoverageShrinkMode().
 	}
 
 	buildVisibleSliceCDFs();

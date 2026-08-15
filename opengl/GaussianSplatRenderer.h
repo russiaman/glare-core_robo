@@ -473,6 +473,31 @@ public:
 	float getCoverageShrinkStrength() const { return splat_coverage_shrink_strength; }
 	void setCoverageShrinkStrength(float v) { splat_coverage_shrink_strength = v; }
 
+	// Which formula the value above feeds. Both read the same coverage estimate, so switching between them changes only
+	// what is done with it - which is what makes them comparable on one frame.
+	//
+	// 0: the original. Radii are scaled by (1 - coverage * value), and the conic is built from the scaled radii, so the
+	// Gaussian narrows along with the quad. A splat over a half-covered pixel at full strength keeps a quarter of its
+	// area but only half the light through that pixel was still available to lose, so this discards more than the
+	// coverage says it can. That overshoot is what shows as a band wherever a slice boundary crosses a surface: the band
+	// is not the step in the estimate at the boundary, which was implemented, measured and found to have no effect on it,
+	// but the light this formula takes and the pixel had not finished with.
+	//
+	// 1: the value is a budget on light lost instead. What stopping the quad early throws away is the splat's own alpha
+	// at that radius attenuated by the (1 - coverage) still reaching the eye, so the honest place to stop is where alpha
+	// falls to a threshold the coverage sets - the question splat_alpha_cutoff already answers, asked with a threshold
+	// raised by how finished the pixel is. The budget is added to splat_alpha_cutoff rather than replacing it, so an
+	// empty pixel is left at exactly the alpha cutoff however high this is set, and the extra light given up works out
+	// to budget * coverage. sigma_cutoff is scaled with the radii, so the same Gaussian is drawn over a shorter quad:
+	// the faint edge is truncated rather than the splat being made smaller.
+	//
+	// Measured against mode 0 and against raising splat_alpha_cutoff on its own, at matched cost on one frame: at the
+	// same draw time as alpha cutoff 0.04, this mode's mean error was a quarter of it, and in the sparsely covered
+	// regions - where the visible holes are - a seventh. Both take their saving from the same places on a solid wall;
+	// only this one leaves the thin regions alone, because only this one asks whether there was anything there to lose.
+	int getCoverageShrinkMode() const { return splat_coverage_shrink_mode; }
+	void setCoverageShrinkMode(int v) { splat_coverage_shrink_mode = v; }
+
 	// The program that halves the coverage pyramid by mean, once per level - see getMaskReduceProgram(), whose min
 	// pyramid this sits beside. Null until the first addObject(), like the rest.
 	const Reference<OpenGLProgram>& getMeanMaskReduceProgram() const { return mean_reduce_prog; }
@@ -856,6 +881,10 @@ private:
 
 	// See getCoverageShrinkStrength() above. Default 0 = off.
 	float splat_coverage_shrink_strength;
+
+	// See getCoverageShrinkMode() above. Defaults to the original formula, so that a session that turns the strength up
+	// sees exactly what it saw before this existed.
+	int splat_coverage_shrink_mode;
 
 	// See getEWAProjectionFixEnabled()/getNearFadeWidth() above. Defaults: on, and a fade over the last 30% of the approach.
 	bool splat_ewa_fix_enabled;

@@ -225,7 +225,8 @@ public:
 	};
 
 	js::Vector<Vec3f, 16> positions_snapshot; // A frozen copy of one cloud's world-space node positions (leaves + merged), taken on the main thread when a traversal is kicked off.
-	js::Vector<Vec3f, 16> scales_snapshot; // A frozen copy of the same cloud's world-space node scales, for feature_size = 2*max(scale) - see GaussianSplatLodTree.h's GaussianSplatLodNode::feature_size.
+	js::Vector<Vec3f, 16> scales_snapshot; // A frozen copy of the same cloud's world-space node scales - retained for callers that still read it (diagnostics, future uses); traversal itself now consults feature_size_snapshot instead.
+	js::Vector<float, 16> feature_size_snapshot; // SESSION054: precomputed 2*max(scale.xyz) per node, so the per-push makeHeapItem in the traversal loop skips the Vec3f scales[] lookup and the 3-way max entirely - the biggest per-node saving after the priority_queue removal.
 	std::vector<MemberSnapshot> members_snapshot;
 
 	js::Vector<uint32, 16> selected_indices; // Output: this frame's frontier, as cloud-array indices.  Unsorted (heap-pop order) until stage 5 wires the depth-sort up to the selection - see kickOffSorts()'s use of cloudHasLodTree().
@@ -573,12 +574,29 @@ public:
 	virtual void run(size_t /*thread_index*/) override
 	{
 		const js::Vector<Vec3f, 16>& positions = scratch->positions_snapshot; // The frozen snapshot, never the live cloud arrays.
-		const js::Vector<Vec3f, 16>& scales = scratch->scales_snapshot;
+		const js::Vector<float, 16>& feature_sizes = scratch->feature_size_snapshot; // SESSION054: replaces per-push Vec3f scales[] lookup + 3-way max in makeHeapItem.
 
 		js::Vector<uint32, 16>& output = scratch->selected_indices;
-		output.resizeNoCopy(0);
 
-		std::priority_queue<HeapItem, std::vector<HeapItem>, HeapItemLess> heap;
+		// SESSION054: replaced std::priority_queue with a plain LIFO stack (DFS). Profiling in session053/054 showed the
+		// tree is expanded to convergence, not truncated by budget, in every case observed - so the heap's best-first
+		// ordering was buying us nothing on the expand side (all nodes get visited regardless of order) while costing an
+		// O(log N) per push/pop. Peak stack size for DFS is O(depth * branching), typically ~100 entries, versus the heap
+		// which held the entire active frontier (millions of entries) - much better cache locality too. The trade: when
+		// max_splats_budget clips the traversal, which specific nodes get sacrificed is no longer "smallest pixel_scale
+		// first" but arbitrary DFS order. Acceptable per owner: budget-clip was not observed firing in the profiled scenes,
+		// and even when it does, the visual policy change is small next to the perf win.
+		std::vector<HeapItem> stack;
+		stack.reserve(4096); // Peak is O(depth * branching); 4096 covers deep trees comfortably without reallocating.
+
+		// SESSION054: build (dist_sq, idx) pairs directly during traversal, so the sort phase reuses the distance already
+		// computed for pixel_scale rather than re-scanning positions[] a second time. Squared distance is a monotone key,
+		// preserves ascending sort order, and skips 3-8M sqrt calls that the previous getDist()-per-item scan cost.
+		struct DistIdx { float dist_sq; uint32 idx; };
+		struct DistIdxLess { inline bool operator () (const DistIdx& a, const DistIdx& b) const { return a.dist_sq < b.dist_sq; } }; // Nearest first (matches GaussianSplatSortResultMsg's convention for the front-to-back "under" blend). Used only by the small-N std::sort fallback inside floatKeyAscendingSort.
+		struct DistIdxKey  { inline float operator () (const DistIdx& x) const { return x.dist_sq; } }; // Sort::floatKeyAscendingSort keys on this float; squared distance is non-negative so FloatFlip's positive-branch monotone mapping applies.
+
+		js::Vector<DistIdx, 16> decorated;
 
 		for(size_t mi=0; mi<scratch->members_snapshot.size(); ++mi)
 		{
@@ -589,32 +607,46 @@ public:
 				// always selected, exactly as it would be with no LoD at all.
 				for(size_t i=0; i<m.count; ++i)
 				{
-					output.push_back((uint32)(m.offset + i));
-					recordFrontierNode((uint32)(m.offset + i), (uint32)mi, (uint32)i, /*depth=*/0, FrontierStop_NoTree);
+					const size_t cloud_idx = m.offset + i;
+					const Vec3f& p = positions[cloud_idx];
+					DistIdx d; d.dist_sq = cam_pos_ws.getDist2(Vec4f(p.x, p.y, p.z, 1.f)); d.idx = (uint32)cloud_idx;
+					decorated.push_back(d);
+					recordFrontierNode((uint32)cloud_idx, (uint32)mi, (uint32)i, /*depth=*/0, FrontierStop_NoTree);
 				}
 			}
 			else
-				heap.push(makeHeapItem((uint32)mi, /*tree_local_idx=*/0, m.offset, /*depth=*/0, positions, scales)); // Root is always node 0 - see buildGaussianSplatLodTree().
+			{
+				stack.push_back(makeHeapItem((uint32)mi, /*tree_local_idx=*/0, m.offset, /*depth=*/0, positions, feature_sizes)); // Root is always node 0 - see buildGaussianSplatLodTree().
+			}
 		}
 
 		bool hit_budget_cap = false;
 		bool hit_density_cap = false;
 		bool hit_depth_cap = false;
-		while(!heap.empty())
+		while(!stack.empty())
 		{
-			const HeapItem top = heap.top();
-			if(top.pixel_scale <= pixel_scale_limit)
-				break; // Converged: everything still in the heap is already fine-enough detail not to need expanding further - drained as-is below.
+			const HeapItem top = stack.back();
+			stack.pop_back();
 
 			const GaussianSplatLodTraversalScratch::MemberSnapshot& m = scratch->members_snapshot[top.member_idx];
 			const GaussianSplatLodNode& node = m.splat_data->lod_tree[top.tree_local_idx];
+			const uint32 cloud_idx_u32 = (uint32)(m.offset + top.tree_local_idx);
+
+			// Converged - already fine enough, no need to expand further.
+			if(top.pixel_scale <= pixel_scale_limit)
+			{
+				DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32;
+				decorated.push_back(d);
+				recordFrontierNode(cloud_idx_u32, top.member_idx, top.tree_local_idx, top.depth, FrontierStop_Converged);
+				continue;
+			}
 
 			if(node.child_count == 0)
 			{
 				// A leaf can't be expanded regardless of pixel_scale - it's already the finest detail this tree has.
-				heap.pop();
-				output.push_back((uint32)(m.offset + top.tree_local_idx));
-				recordFrontierNode((uint32)(m.offset + top.tree_local_idx), top.member_idx, top.tree_local_idx, top.depth, FrontierStop_Leaf);
+				DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32;
+				decorated.push_back(d);
+				recordFrontierNode(cloud_idx_u32, top.member_idx, top.tree_local_idx, top.depth, FrontierStop_Leaf);
 				continue;
 			}
 
@@ -625,9 +657,9 @@ public:
 			if(max_layer_density > 0.f && node.layer_density > max_layer_density)
 			{
 				hit_density_cap = true;
-				heap.pop();
-				output.push_back((uint32)(m.offset + top.tree_local_idx));
-				recordFrontierNode((uint32)(m.offset + top.tree_local_idx), top.member_idx, top.tree_local_idx, top.depth, FrontierStop_DensityCap);
+				DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32;
+				decorated.push_back(d);
+				recordFrontierNode(cloud_idx_u32, top.member_idx, top.tree_local_idx, top.depth, FrontierStop_DensityCap);
 				continue;
 			}
 
@@ -636,61 +668,39 @@ public:
 			if(max_tree_depth > 0 && top.depth >= (uint32)max_tree_depth)
 			{
 				hit_depth_cap = true;
-				heap.pop();
-				output.push_back((uint32)(m.offset + top.tree_local_idx));
-				recordFrontierNode((uint32)(m.offset + top.tree_local_idx), top.member_idx, top.tree_local_idx, top.depth, FrontierStop_DepthCap);
+				DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32;
+				decorated.push_back(d);
+				recordFrontierNode(cloud_idx_u32, top.member_idx, top.tree_local_idx, top.depth, FrontierStop_DepthCap);
 				continue;
 			}
 
-			// Expanding replaces this one heap entry with child_count new ones, so the projected total if the loop stopped
-			// right after this expansion would be output.size() + heap.size() - 1 + child_count.
-			if(output.size() + heap.size() - 1 + node.child_count > max_splats_budget)
+			// Budget cap: expanding would push us over the ceiling. Keep this node's own merged representation instead.
+			// Current node is already popped, so the projected total after pushing children is decorated.size() + stack.size() + child_count.
+			if(decorated.size() + stack.size() + node.child_count > max_splats_budget)
 			{
 				hit_budget_cap = true;
-				break; // Leave this node, and the rest of the heap, to be drained as-is below - the budget, not convergence, is what stopped things here.
+				DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32;
+				decorated.push_back(d);
+				recordFrontierNode(cloud_idx_u32, top.member_idx, top.tree_local_idx, top.depth, FrontierStop_BudgetCap);
+				continue;
 			}
 
-			heap.pop();
 			for(uint32 c = node.child_start; c < (uint32)node.child_start + node.child_count; ++c)
-				heap.push(makeHeapItem(top.member_idx, c, m.offset, top.depth + 1, positions, scales));
+				stack.push_back(makeHeapItem(top.member_idx, c, m.offset, top.depth + 1, positions, feature_sizes));
 		}
 
-		// Whatever's left in the heap - either because pixel_scale converged, or the budget stopped further expansion - is
-		// exactly the rest of this frame's frontier.
-		while(!heap.empty())
-		{
-			const HeapItem top = heap.top();
-			heap.pop();
-			const GaussianSplatLodTraversalScratch::MemberSnapshot& m = scratch->members_snapshot[top.member_idx];
-			output.push_back((uint32)(m.offset + top.tree_local_idx));
-			// Both exits above leave the heap non-empty, so the two have to be told apart here rather than by which one
-			// broke the loop: a node small enough to have converged was going to stay in the heap either way, and counting
-			// it as budget-stopped would overstate how much the budget is actually costing.
-			recordFrontierNode((uint32)(m.offset + top.tree_local_idx), top.member_idx, top.tree_local_idx, top.depth,
-				(top.pixel_scale <= pixel_scale_limit) ? FrontierStop_Converged : FrontierStop_BudgetCap);
-		}
+		// Sort the selection front-to-back by camera distance. Each node's dist_sq was computed once in makeHeapItem (or
+		// inline in the NoTree branch) and carried through, so this pass is pure sort - no positions[] lookup or sqrt.
+		// SESSION054: uses glare-core's serial 11-bit-chunk radix sort (Sort::floatKeyAscendingSort), which was ~76% of
+		// traversal time as std::sort on 3-8M elements. floatKeyAscendingSort falls back to std::sort itself for N<320.
+		// Two-stage (coarse+precise) GaussianSplatSortTask isn't reused: that machinery exists to keep an unbounded
+		// whole-cloud sort off the main thread's critical path via a fast approximate first pass; a traversal's output is
+		// already budget-bounded, so one exact radix pass here is both simpler and fast enough - see kickOffSorts()'s
+		// cloudHasLodTree() guard, which leaves an LoD-active cloud to this sort instead of the old one.
+		js::Vector<DistIdx, 16> sort_scratch(decorated.size());
+		Sort::floatKeyAscendingSort(decorated.data(), decorated.size(), DistIdxLess(), DistIdxKey(), sort_scratch.data(), /*put_result_in_working_space=*/false);
 
-		// Sort the selection front-to-back by camera distance, here on the worker thread, with each node's distance
-		// computed exactly once (a decorate-sort) rather than recomputed per comparison - both done proactively, not as a
-		// follow-up fix: an earlier version of this renderer hit an equivalent bug twice at production scale (raw
-		// heap-pop order producing alpha-blend popping on camera movement, then a naive std::sort-with-recomputed-distance
-		// fix on the *main* thread causing a real FPS regression at 500K+ selected nodes - see Claude_LOD_plan.md's
-		// session notes). This is also why the old two-stage (coarse+precise) GaussianSplatSortTask isn't reused for the
-		// selection: that machinery exists to keep a much larger, unbounded whole-cloud sort off the main thread's
-		// critical path via a fast approximate first pass; a traversal's output is already budget-bounded, so one exact
-		// sort here is both simpler and fast enough - see kickOffSorts()'s cloudHasLodTree() guard, which leaves an
-		// LoD-active cloud to this sort instead of the old one.
-		struct DistIdx { float dist; uint32 idx; };
-		struct DistIdxLess { inline bool operator () (const DistIdx& a, const DistIdx& b) const { return a.dist < b.dist; } }; // Nearest first, matching GaussianSplatSortResultMsg's convention for the front-to-back "under" blend.
-
-		js::Vector<DistIdx, 16> decorated(output.size());
-		for(size_t i=0; i<output.size(); ++i)
-		{
-			const Vec3f& p = positions[output[i]];
-			decorated[i].dist = cam_pos_ws.getDist(Vec4f(p.x, p.y, p.z, 1.f));
-			decorated[i].idx = output[i];
-		}
-		std::sort(decorated.data(), decorated.data() + decorated.size(), DistIdxLess());
+		output.resizeNoCopy(decorated.size());
 		for(size_t i=0; i<decorated.size(); ++i)
 			output[i] = decorated[i].idx;
 
@@ -725,27 +735,29 @@ private:
 		frontier_record->push_back(rec);
 	}
 
-	// One entry under consideration in run()'s heap: either a tree root not yet examined, or a node whose parent was just
+	// One entry under consideration in run()'s stack: either a tree root not yet examined, or a node whose parent was just
 	// expanded.  member_idx/tree_local_idx together identify the node; the corresponding cloud-array index (needed to read
 	// its baked world-space position/scale, and to write it to the output) is member.offset + tree_local_idx.
+	// SESSION054: carries dist_sq so the sort phase can reuse the distance computed here rather than re-scanning positions[].
 	struct HeapItem
 	{
 		float pixel_scale;
+		float dist_sq; // Squared camera-distance already computed here; sort phase uses it directly, avoiding a second lookup of positions[].
 		uint32 member_idx;
 		uint32 tree_local_idx;
 		uint32 depth; // 0 for a tree root, parent's depth + 1 for each expansion - see max_tree_depth's use in run().
 	};
-	struct HeapItemLess { inline bool operator () (const HeapItem& a, const HeapItem& b) const { return a.pixel_scale < b.pixel_scale; } }; // std::priority_queue is a max-heap under operator<, so the largest pixel_scale (biggest on-screen feature) is always on top.
 
-	HeapItem makeHeapItem(uint32 member_idx, uint32 tree_local_idx, size_t member_offset, uint32 depth, const js::Vector<Vec3f, 16>& positions, const js::Vector<Vec3f, 16>& scales) const
+	HeapItem makeHeapItem(uint32 member_idx, uint32 tree_local_idx, size_t member_offset, uint32 depth, const js::Vector<Vec3f, 16>& positions, const js::Vector<float, 16>& feature_sizes) const
 	{
 		const size_t cloud_idx = member_offset + tree_local_idx;
 		const Vec3f& p = positions[cloud_idx];
-		const float dist = myMax(cam_pos_ws.getDist(Vec4f(p.x, p.y, p.z, 1.f)), 1.0e-6f); // Clamped away from zero so a node exactly at the camera doesn't produce an infinite pixel_scale.
-		const Vec3f& s = scales[cloud_idx];
-		const float feature_size = 2.f * myMax(s.x, myMax(s.y, s.z)); // Matches GaussianSplatLodNode::feature_size's definition, just computed from the world-baked scale rather than the object-space one, so uniform_scale_ws is already folded in.
+		const float dist_sq = cam_pos_ws.getDist2(Vec4f(p.x, p.y, p.z, 1.f));
+		const float dist = myMax(std::sqrt(dist_sq), 1.0e-6f); // Clamped away from zero so a node exactly at the camera doesn't produce an infinite pixel_scale.
+		const float feature_size = feature_sizes[cloud_idx]; // SESSION054: precomputed at kick time in fillTraversalScratch() - replaces the old Vec3f scales[] load + 3-way max on the hot per-push path.
 		HeapItem item;
 		item.pixel_scale = (feature_size / dist) * focal_px;
+		item.dist_sq = dist_sq;
 		item.member_idx = member_idx;
 		item.tree_local_idx = tree_local_idx;
 		item.depth = depth;
@@ -1515,6 +1527,17 @@ void GaussianSplatRenderer::fillTraversalScratch(const SplatCloud& cloud, Gaussi
 	std::memcpy(scratch.positions_snapshot.data(), cloud.positions.data(), cloud.total_splats * sizeof(Vec3f));
 	scratch.scales_snapshot.resizeNoCopy(cloud.total_splats);
 	std::memcpy(scratch.scales_snapshot.data(), cloud.scales.data(), cloud.total_splats * sizeof(Vec3f));
+
+	// SESSION054: precompute feature_size = 2*max(scale.xyz) once per kick, so the hot per-push makeHeapItem inside the traversal loop
+	// reads a single 4-byte float instead of a 12-byte Vec3f plus a 3-way max. On this cloud's ~750k expand iterations that's
+	// millions of fewer bytes of random-access memory traffic and no arithmetic on the critical path.
+	scratch.feature_size_snapshot.resizeNoCopy(cloud.total_splats);
+	{
+		const Vec3f* const s = scratch.scales_snapshot.data();
+		float* const fs = scratch.feature_size_snapshot.data();
+		for(size_t i=0; i<cloud.total_splats; ++i)
+			fs[i] = 2.f * myMax(s[i].x, myMax(s[i].y, s[i].z));
+	}
 
 	scratch.members_snapshot.resize(cloud.members.size());
 	for(size_t m=0; m<cloud.members.size(); ++m)

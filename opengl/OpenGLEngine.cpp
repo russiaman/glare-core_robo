@@ -70,6 +70,31 @@ Copyright Glare Technologies Limited 2023 -
 #define GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT				0x84FF
 #define GL_COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT			0x8E8F
 
+
+// File-scope draw-buffer helpers.  Upstream moved these onto FrameBuffer (see FrameBuffer::setSingleDrawBuffer etc.),
+// but our splat compositing sometimes hands a raw framebuffer name (scene_target_framebuffer_name) rather than a
+// FrameBuffer*, so a free-function form is still needed at those sites.  glDrawBuffer is not in OpenGL ES.
+inline static void setSingleDrawBuffer(GLenum buffer)
+{
+	const GLenum buffers[1] = { buffer };
+	glDrawBuffers(1, buffers);
+}
+
+
+inline static void setTwoDrawBuffers(GLenum buffer_0, GLenum buffer_1)
+{
+	const GLenum draw_buffers[] = { buffer_0, buffer_1 };
+	glDrawBuffers(/*num=*/2, draw_buffers);
+}
+
+
+[[maybe_unused]] inline static void setThreeDrawBuffers(GLenum buffer_0, GLenum buffer_1, GLenum buffer_2)
+{
+	const GLenum draw_buffers[] = { buffer_0, buffer_1, buffer_2 };
+	glDrawBuffers(/*num=*/3, draw_buffers);
+}
+
+
 // https://developer.download.nvidia.com/opengl/specs/GL_NVX_gpu_memory_info.txt
 #define GPU_MEMORY_INFO_DEDICATED_VIDMEM_NVX			0x9047
 #define GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX		0x9048
@@ -10264,7 +10289,6 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 	// Splats blend into an accumulation buffer of their own, on a framebuffer of their own, rather than straight onto
 	// the main colour buffer.  Two reasons:
 	//
-<<<<<<< HEAD
 	// - The blend has to run in the display-referred sRGB space the splats were fitted in, so that the engine's display
 	//   transform can be inverted once afterwards instead of per splat - see gaussian_splat_frag_shader.glsl.
 	// - The front-to-back "under" blend below reads the *destination's* alpha as "how much of this pixel is already
@@ -10419,18 +10443,6 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 
 		// Start the real pass from an empty buffer, exactly as if the counting pass had never run.
 		glClearBufferfv(GL_COLOR, /*drawBuffer=*/0, col_zero);
-=======
-	// Without the main render framebuffer there's no attachment to swap and no depth renderbuffer we could attach
-	// alongside our own colour buffer, so splats blend straight into the target instead.  Nothing tone maps that target,
-	// so its contents are display-referred as well, and the splats' authored colours are already the values to write.
-	const bool use_accum_buffer = allocSplatAccumBuffersIfNeeded();
-	if(use_accum_buffer)
-	{
-		assert(current_scene->main_render_framebuffer->getAttachedRenderBufferName(GL_COLOR_ATTACHMENT0) == current_scene->main_colour_renderbuffer->buffer_name);
-		current_scene->main_render_framebuffer->attachRenderBufferAndBindForDrawing(*current_scene->splat_accum_renderbuffer, GL_COLOR_ATTACHMENT0); // Replaces the colour buffer as GL_COLOR_ATTACHMENT0.  Restored in resolveSplatAccumBuffer().
-		current_scene->main_render_framebuffer->setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to the accumulation buffer (not the normal buffer).
-		current_scene->main_render_framebuffer->clearFloatColourBuffer(/*drawbuffer=*/0, Colour3f(0.f), /*alpha=*/0.f);
->>>>>>> origin/master
 	}
 
 	// Started after the counting pass above, deliberately: this timer is the number the diagnostic is read from, and it
@@ -10469,7 +10481,6 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 		// unreadable a day later, and these are exactly the knobs a session spends its time moving.
 		try
 		{
-<<<<<<< HEAD
 			FileUtils::writeEntireFileTextMode(splat_snapshot_output_dir + "/capture_info.txt",
 				"Splat saturation snapshots\n"
 				"viewport: " + toString(current_scene->viewport_w) + " x " + toString(current_scene->viewport_h) + "\n"
@@ -10485,10 +10496,6 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 		catch(glare::Exception& e)
 		{
 			conPrint("Error writing splat snapshot capture info: " + e.what());
-=======
-			this->target_frame_buffer->bindForDrawing();
-			this->target_frame_buffer->setSingleDrawBuffer(GL_COLOR_ATTACHMENT0);
->>>>>>> origin/master
 		}
 	}
 
@@ -11438,20 +11445,10 @@ void OpenGLEngine::resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name)
 		/*num_buffers_to_copy=*/1, // The splat accumulation framebuffer has just the one colour attachment.
 		/*copy_buf0_colour=*/true, /*copy_buf0_depth=*/false);
 
-<<<<<<< HEAD
 	//----------------------- Composite onto the buffer the frame is being drawn into -----------------------
 	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, scene_target_framebuffer_name);
 	if(scene_target_framebuffer_name != 0)
 		setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer (not normal buffer).  The default framebuffer has no such attachment, and the draw buffer set for it already is the right one.
-=======
-	// Restore the attachments both framebuffers had before this pass.
-	current_scene->main_render_framebuffer->attachRenderBuffer(*current_scene->main_colour_renderbuffer, GL_COLOR_ATTACHMENT0);
-	current_scene->main_render_copy_framebuffer->attachTexture(*current_scene->main_colour_copy_texture, GL_COLOR_ATTACHMENT0);
-
-	//----------------------- Composite onto the main colour buffer -----------------------
-	current_scene->main_render_framebuffer->bindForDrawing();
-	current_scene->main_render_framebuffer->setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer (not normal buffer)
->>>>>>> origin/master
 
 	glDepthMask(GL_FALSE); // Don't write to z-buffer: the splats were depth tested as they were drawn, this is just a composite.
 	glDisable(GL_DEPTH_TEST); // Don't depth test

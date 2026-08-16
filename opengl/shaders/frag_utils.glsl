@@ -374,6 +374,34 @@ float getShadowMappingSunVisFactor(in vec3 final_shadow_tex_coords[NUM_DEPTH_TEX
 }
 
 
+// Sun visibility during a probe capture.
+//
+// getShadowMappingSunVisFactor() picks its cascade from -pos_cs.z, which during a capture is distance from the
+// probe, not from the camera.  So a fragment a few metres from a probe selects dynamic cascade 0 however far the
+// probe is from the camera, and the dynamic cascades are fitted to the main camera's view frustum - the fragment
+// is nowhere near the volume those depth maps cover, and the lookup returns nonsense.  The shadow texture
+// coordinates themselves are fine: the vertex shader builds them from pos_ws, so they do not depend on the
+// capture's view matrix.
+//
+// The static cascades, unlike the dynamic ones, are axis-aligned boxes centred on the camera rather than fitted
+// to its frustum - cascade 0 spans +/-64 m horizontally and +/-256 m vertically.  That contains the whole probe
+// grid whichever direction a probe lies in, so selecting it unconditionally sidesteps the problem rather than
+// papering over it.
+//
+// Static only, so dynamic objects cast no shadows into the grid.  Acceptable here: the bounce is dominated by
+// static geometry, and the result is convolved down to an 8x8 irradiance tile regardless.
+float getProbeCaptureSunVisFactor(in vec3 final_shadow_tex_coords[NUM_DEPTH_TEXTURES], in sampler2DShadow static_depth_tex,
+	float pixel_hash, float shadow_map_samples_xy_scale_, float to_light_dot_n)
+{
+	float pattern_theta = pixel_hash * 6.283185307179586f;
+	mat2 R = mat2(cos(pattern_theta), sin(pattern_theta), -sin(pattern_theta), cos(pattern_theta)) * shadow_map_samples_xy_scale_;
+
+	float bias = 5.0e-4f / max(to_light_dot_n, 0.3); // Same as static_depth_map_0_bias in getShadowMappingSunVisFactor().
+
+	return sampleStaticDepthMap(R, final_shadow_tex_coords[NUM_DYNAMIC_DEPTH_TEXTURES], bias, static_depth_tex);
+}
+
+
 float getShadowMappingSunVisFactorFast(in vec3 final_shadow_tex_coords[NUM_DEPTH_TEXTURES], in sampler2DShadow dynamic_depth_tex, in sampler2DShadow static_depth_tex,
 	vec3 pos_cs, float shadow_map_samples_xy_scale_)
 {
@@ -490,7 +518,7 @@ vec2 float32x3_to_oct(in vec3 v) {
 	return (v.z <= 0.0) ? ((1.0 - abs(p.yx)) * signNotZero(p)) : p;
 }
 
-// Optimized snorm12×2 packing into unorm8×3
+// Optimized snorm12x2 packing into unorm8x3
 // From 'A Survey of Efficient Representations for Independent Unit Vectors', listing 5.
 #if NORMAL_TEXTURE_IS_UINT
 uvec4 snorm12x2_to_unorm8x3(vec2 f) {
@@ -653,3 +681,263 @@ float getCumulusTransparencyFactor(vec3 pos_ws, vec3 sundir_ws, float time, in s
 	float cumulus_trans = max(0.f, 1.f - cumulus_val * 1.4);
 	return cumulus_trans;
 }
+
+
+//========================= Irradiance probe atlas =========================
+// Probes are stored as octahedral maps packed into a 2D atlas.  Each tile is PROBE_TILE_INTERIOR_RES^2
+// interior texels surrounded by a PROBE_TILE_BORDER-texel ring holding wrapped-around copies of interior
+// texels, so that a bilinear tap near a tile edge stays within the same probe.
+// PROBE_* values are #defined by OpenGLEngine from IrradianceProbes::getShaderPreprocessorDefines().
+//
+// The whole section is compiled out unless OpenGLEngineSettings::irradiance_probes_support is set, since the
+// PROBE_* defines are only emitted in that case.
+#if IRRADIANCE_PROBES_SUPPORT
+
+// The octahedral mapping itself is float32x3_to_oct() / oct_to_float32x3() above, which the normal encoding
+// already uses.  Both are from Cigolle et al., "A Survey of Efficient Representations for Independent Unit
+// Vectors", and are exact inverses of each other.
+
+// Fold an octahedral coordinate that has strayed outside [-1, 1]^2 back onto the octahedron.  Used to give
+// the border ring of a tile the directions its wrapped-around interior neighbours have.
+vec2 wrapOctCoord(vec2 p)
+{
+	if(p.x >  1.0) { p.x =  2.0 - p.x; p.y = -p.y; }
+	else if(p.x < -1.0) { p.x = -2.0 - p.x; p.y = -p.y; }
+
+	if(p.y >  1.0) { p.y =  2.0 - p.y; p.x = -p.x; }
+	else if(p.y < -1.0) { p.y = -2.0 - p.y; p.x = -p.x; }
+
+	return p;
+}
+
+// Atlas texture coordinates at which to sample probe 'probe_index' for direction 'dir'.
+// The irradiance tiles form a band across the top of the atlas; the depth tiles a band below it.  Columns are
+// pitched at PROBE_ATLAS_COLUMN_PITCH in both.
+vec2 probeAtlasTexCoords(int probe_index, vec3 dir)
+{
+	vec2 oct_uv = float32x3_to_oct(dir) * 0.5 + vec2(0.5); // To [0, 1] x [0, 1]
+
+	// Texel position within the tile.  oct_uv = 0 lands on the boundary between the border texel and the
+	// first interior texel, which is where the border ring is needed.
+	vec2 tile_texel = vec2(float(PROBE_TILE_BORDER)) + oct_uv * float(PROBE_TILE_INTERIOR_RES);
+
+	vec2 tile_origin = vec2(
+		float(probe_index % PROBE_ATLAS_PROBES_PER_ROW) * float(PROBE_ATLAS_COLUMN_PITCH),
+		float(probe_index / PROBE_ATLAS_PROBES_PER_ROW) * float(PROBE_TILE_RES));
+
+	return (tile_origin + tile_texel) / vec2(float(PROBE_ATLAS_W), float(PROBE_ATLAS_H));
+}
+
+
+vec2 probeDepthAtlasTexCoords(int probe_index, vec3 dir)
+{
+	vec2 oct_uv = float32x3_to_oct(dir) * 0.5 + vec2(0.5);
+
+	vec2 tile_texel = vec2(float(PROBE_DEPTH_TILE_BORDER)) + oct_uv * float(PROBE_DEPTH_TILE_INTERIOR_RES);
+
+	vec2 tile_origin = vec2(
+		float(probe_index % PROBE_ATLAS_PROBES_PER_ROW) * float(PROBE_ATLAS_COLUMN_PITCH),
+		float(PROBE_DEPTH_REGION_Y) + float(probe_index / PROBE_ATLAS_PROBES_PER_ROW) * float(PROBE_DEPTH_TILE_RES));
+
+	return (tile_origin + tile_texel) / vec2(float(PROBE_ATLAS_W), float(PROBE_ATLAS_H));
+}
+
+
+// Mean distance and mean squared distance stored for probe 'probe_index' in direction 'dir'.
+vec2 sampleProbeDepth(int probe_index, vec3 dir, in sampler2D probe_irradiance_tex)
+{
+	return texture(probe_irradiance_tex, probeDepthAtlasTexCoords(probe_index, dir)).xy;
+}
+
+// Set to 0 to go back to plain bilinear, for comparison.
+#define PROBE_IRRADIANCE_BICUBIC 1
+
+
+#if PROBE_IRRADIANCE_BICUBIC
+
+// Cubic B-spline reconstruction of a 2D texture, using 4 bilinear fetches rather than 16 point fetches: each
+// pair of adjacent taps is folded into one fetch placed between them, weighted so the hardware's own linear
+// blend produces the pair's contribution (Sigg & Hadwiger).
+// See also ("Using a a single linearly interpolated sample to evaluate a weighted sum of two texels") https://forwardscattering.org/post/76
+//
+// tex_coord is in texel space, where texel k's centre is at k + 0.5.
+vec3 sampleTextureBSplineBicubic(in sampler2D tex, vec2 tex_coord, vec2 tex_size)
+{
+	vec2 c = tex_coord - 0.5; // Sample-index space, where texel k sits at integer k.
+	vec2 i = floor(c);
+	vec2 f = c - i;
+	vec2 f2 = f * f;
+	vec2 f3 = f2 * f;
+
+	// Uniform cubic B-spline basis over the 4 taps i-1, i, i+1, i+2.  These sum to 1.
+	vec2 w0 = -(1.0 / 6.0) * f3 +       0.5 * f2 - 0.5 * f + (1.0 / 6.0);
+	vec2 w1 =         0.5  * f3 -             f2           + (2.0 / 3.0);
+	vec2 w2 =        -0.5  * f3 +       0.5 * f2 + 0.5 * f + (1.0 / 6.0);
+	vec2 w3 =  (1.0 / 6.0) * f3;
+
+	// Pair weights, and the position between each pair at which a bilinear fetch reproduces it.  Neither sum can
+	// reach zero over f in [0, 1] - s0 runs 5/6 down to 1/6 and s1 the other way - so the divides are safe.
+	vec2 s0 = w0 + w1;
+	vec2 s1 = w2 + w3;
+	vec2 t0 = (i - 1.0 + w1 / s0 + 0.5) / tex_size;
+	vec2 t1 = (i + 1.0 + w3 / s1 + 0.5) / tex_size;
+
+	return
+		(texture(tex, vec2(t0.x, t0.y)).xyz * s0.x + texture(tex, vec2(t1.x, t0.y)).xyz * s1.x) * s0.y +
+		(texture(tex, vec2(t0.x, t1.y)).xyz * s0.x + texture(tex, vec2(t1.x, t1.y)).xyz * s1.x) * s1.y;
+}
+
+#endif // PROBE_IRRADIANCE_BICUBIC
+
+
+// Cosine-weighted irradiance arriving at a surface with normal 'dir', from probe 'probe_index'.
+// Units match the old cosine_env_tex: integral over hemisphere of cosine * incoming radiance * 1.0e-9.
+vec3 sampleProbeIrradiance(int probe_index, vec3 dir, in sampler2D probe_irradiance_tex)
+{
+	// Use bicubic sampling, since linear sampling has some nasty visible artifacts around x=0 and y=0 on the sphere of normals, due to the 45 degree slope of the texels in the 
+	// octahedral encoding and the way bilinear sampling works.
+#if PROBE_IRRADIANCE_BICUBIC
+	// The B-spline reaches taps i-1 .. i+2.  With a 2-texel border the tile texel coordinate runs over
+	// [2, 2 + PROBE_TILE_INTERIOR_RES], so the taps span exactly the tile's own texels and never stray into a
+	// neighbouring probe - see IRRADIANCE_TILE_BORDER in IrradianceProbes.h.
+	return sampleTextureBSplineBicubic(probe_irradiance_tex,
+		probeAtlasTexCoords(probe_index, dir) * vec2(float(PROBE_ATLAS_W), float(PROBE_ATLAS_H)),
+		vec2(float(PROBE_ATLAS_W), float(PROBE_ATLAS_H)));
+#else
+	return texture(probe_irradiance_tex, probeAtlasTexCoords(probe_index, dir)).xyz;
+#endif
+}
+
+
+// Atlas index of the grid probe at window coordinates 'c'.
+// grid_dims: xyz = probe counts along each axis, w = atlas index of the first grid probe.
+// base_cell: world cell coordinates of window cell (0, 0, 0).
+//
+// Slots are assigned toroidally, by world cell modulo the grid dimensions, so that scrolling the window by one
+// cell only invalidates the newly exposed slab instead of shifting every probe to a different slot.  Must agree
+// with IrradianceProbes::gridProbeIndex().
+int probeIndexForGridCoords(ivec3 c, ivec3 base_cell, ivec4 grid_dims)
+{
+	ivec3 slot = (c + base_cell) % grid_dims.xyz;
+	slot += ivec3(lessThan(slot, ivec3(0))) * grid_dims.xyz; // % can be negative in GLSL, as in C.
+
+	return grid_dims.w + (slot.z * grid_dims.y + slot.y) * grid_dims.x + slot.x;
+}
+
+// Distance outside the probe volume, in probe spacings, over which the result fades to the global sky probe.
+// One spacing is enough to hide the transition without the band reaching so far in that it dilutes the
+// outermost probes.
+const float PROBE_VOLUME_FADE_BAND = 1.0;
+
+// Irradiance at pos_ws for a surface with normal 'dir', trilinearly interpolated from the 8 grid probes
+// surrounding pos_ws.
+//
+// Outside the volume the 8-tap lookup has nothing to interpolate - the grid coordinates clamp, so it just
+// smears the boundary probes outwards, which is only defensible right at the boundary.  So the result fades to
+// the global sky probe over PROBE_VOLUME_FADE_BAND, and beyond that the grid is not sampled at all.  Shading
+// inside the volume is untouched, since the fade factor is zero there.
+//
+// dir is in world space.  So is the global sky probe tile - probe_bake_from_cubemap_frag_shader.glsl rotates out
+// of cosine_env_tex's sun-aligned frame at bake time - so every tile here is indexed the same way.
+// grid_origin: xyz = world space position of grid probe (0, 0, 0), w = probe spacing.
+// Weights are accumulated and normalised rather than assumed to sum to 1, because individual probes get
+// dropped by the backface and visibility tests.
+// sky_fallback: blend to the global sky probe outside the volume.  False during a probe capture, where that sky
+// is unoccluded and would be fed back into the grid on every iteration, putting a floor under how dark an
+// enclosed space can get.  Fading to zero instead converges from below, which is the safer error.
+vec3 sampleProbeGridIrradiance(vec3 pos_ws, vec3 dir, vec4 grid_origin, ivec4 grid_dims, bool use_visibility, bool sky_fallback, in sampler2D probe_irradiance_tex)
+{
+	float grid_spacing = grid_origin.w;
+
+	vec3 grid_coords = (pos_ws - grid_origin.xyz) * (1.0 / grid_spacing);
+
+	ivec3 max_coords = grid_dims.xyz - ivec3(1);
+
+	// Per-axis overshoot past the outermost probe planes, negative when inside.  Taking the length of the
+	// positive part gives the Euclidean distance to the volume, so the fade behaves the same across faces,
+	// edges and corners.
+	vec3 overshoot = max(-grid_coords, grid_coords - vec3(max_coords));
+	float dist_outside = length(max(overshoot, vec3(0.0)));
+
+	float sky_blend = clamp(dist_outside * (1.0 / PROBE_VOLUME_FADE_BAND), 0.0, 1.0);
+
+	vec3 sky_probe_irradiance = (sky_blend > 0.0 && sky_fallback) ? sampleProbeIrradiance(GLOBAL_SKY_PROBE_INDEX, dir, probe_irradiance_tex) : vec3(0.0);
+
+	if(sky_blend >= 1.0)
+		return sky_probe_irradiance; // Fully outside the band: skip the 8 grid taps and their depth taps.
+
+	vec3 base_coords = floor(grid_coords);
+	vec3 frac_coords = grid_coords - base_coords;
+	ivec3 base = ivec3(base_coords);
+
+	// World cell of window cell (0,0,0), needed for the toroidal slot mapping.  Derived rather than passed in,
+	// since grid_origin is snapped to whole probe spacings.
+	ivec3 base_cell = ivec3(floor(grid_origin.xyz / grid_spacing + vec3(0.5)));
+
+	vec3 irradiance_sum = vec3(0.0);
+	float weight_sum = 0.0;
+
+	// Accumulated without the visibility term, as a fallback for when every probe gets rejected.
+	vec3 unweighted_sum = vec3(0.0);
+	float unweighted_weight_sum = 0.0;
+
+	for(int i=0; i<8; ++i)
+	{
+		ivec3 offset = ivec3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+
+		vec3 axis_weights = mix(vec3(1.0) - frac_coords, frac_coords, vec3(offset));
+		float weight = axis_weights.x * axis_weights.y * axis_weights.z;
+		if(weight <= 0.0)
+			continue;
+
+		ivec3 c = clamp(base + offset, ivec3(0), max_coords);
+		int probe_index = probeIndexForGridCoords(c, base_cell, grid_dims);
+
+		vec3 probe_irradiance = sampleProbeIrradiance(probe_index, dir, probe_irradiance_tex);
+
+		unweighted_sum += probe_irradiance * weight;
+		unweighted_weight_sum += weight;
+
+		if(use_visibility)
+		{
+			vec3 probe_pos = grid_origin.xyz + vec3(c) * grid_spacing;
+			vec3 to_probe = probe_pos - pos_ws;
+			float dist_to_probe = length(to_probe);
+			vec3 unit_to_probe = (dist_to_probe > 0.0) ? (to_probe / dist_to_probe) : dir;
+
+			// Probes behind the surface see a different side of it, so fade them out.  Smooth rather than a hard
+			// cutoff, otherwise the transition shows up as a seam.
+			weight *= square(max(0.0, dot(dir, unit_to_probe)) * 0.5 + 0.5);
+
+			// Chebyshev's inequality bounds the probability that the shading point is further from the probe than
+			// whatever the probe can see in this direction - i.e. the probability it is not occluded from it.
+			// The depth tile is indexed by direction away from the probe, hence -unit_to_probe.
+			vec2 depth_stats = sampleProbeDepth(probe_index, -unit_to_probe, probe_irradiance_tex);
+			float mean_dist = depth_stats.x;
+
+			if(dist_to_probe > mean_dist)
+			{
+				float variance = max(0.0, depth_stats.y - mean_dist * mean_dist);
+				float excess = dist_to_probe - mean_dist;
+				float chebyshev = variance / (variance + excess * excess);
+
+				weight *= chebyshev * chebyshev * chebyshev; // Cubed to bias hard towards rejecting occluded probes.
+			}
+		}
+
+		irradiance_sum += probe_irradiance * weight;
+		weight_sum += weight;
+	}
+
+	// Where every probe was rejected there is nothing sensible to interpolate, so fall back to plain trilinear
+	// rather than going black.
+	vec3 grid_irradiance;
+	if(weight_sum <= 1.0e-6)
+		grid_irradiance = (unweighted_weight_sum > 0.0) ? (unweighted_sum * (1.0 / unweighted_weight_sum)) : vec3(0.0);
+	else
+		grid_irradiance = irradiance_sum * (1.0 / weight_sum);
+
+	return mix(grid_irradiance, sky_probe_irradiance, sky_blend);
+}
+
+#endif // IRRADIANCE_PROBES_SUPPORT

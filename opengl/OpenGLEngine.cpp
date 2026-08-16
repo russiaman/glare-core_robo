@@ -11,6 +11,7 @@ Copyright Glare Technologies Limited 2023 -
 #include "OpenGLShader.h"
 #include "RenderBuffer.h"
 #include "ShadowMapping.h"
+#include "IrradianceProbes.h"
 #include "OpenGLExtensions.h"
 #include "GLMeshBuilding.h"
 #include "MeshPrimitiveBuilding.h"
@@ -104,6 +105,10 @@ Copyright Glare Technologies Limited 2023 -
 #define CLOUD_SHADOWS_FLAG					1
 #define DO_SSAO_FLAG						2
 #define DOING_SSAO_PREPASS_FLAG				4
+#define USE_PROBE_IRRADIANCE_FLAG			8
+#define USE_PROBE_GRID_FLAG					16
+#define USE_PROBE_VISIBILITY_FLAG			32
+#define DOING_PROBE_CAPTURE_FLAG			64
 
 
 #define OVERLAY_HAVE_TEXTURE_FLAG			1
@@ -137,6 +142,7 @@ enum TextureUnitIndices
 	STATIC_DEPTH_TEX_TEXTURE_UNIT_INDEX,
 
 	COSINE_ENV_TEXTURE_UNIT_INDEX,
+	PROBE_IRRADIANCE_TEXTURE_UNIT_INDEX,
 	SPECULAR_ENV_TEXTURE_UNIT_INDEX,
 	BLUE_NOISE_TEXTURE_UNIT_INDEX,
 	FBM_TEXTURE_UNIT_INDEX,
@@ -517,12 +523,29 @@ OpenGLEngine::OpenGLEngine(const OpenGLEngineSettings& settings_)
 	use_ob_and_mat_data_gpu_resident(false),
 	use_reverse_z(true),
 	use_scatter_shader(false),
+	use_probe_irradiance(true),
+	use_probe_grid(true),
+	use_probe_visibility(true),
+	probe_updates_enabled(true),
+	max_probe_captures_per_frame(2),
+	draw_probe_debug_spheres(false),
+	probe_debug_sphere_pos_radius_location(-1),
+	probe_debug_probe_index_location(-1),
+	probe_bake_source_cube_tex_location(-1),
+	probe_bake_tile_origin_location(-1),
+	probe_bake_env_phi_location(-1),
+	probe_convolve_capture_tex_location(-1),
+	probe_convolve_capture_depth_tex_location(-1),
+	probe_convolve_tile_origin_location(-1),
+	probe_convolve_depth_mode_location(-1),
+	probe_convolve_near_clip_location(-1),
+	probe_convolve_max_dist_location(-1),
+	global_sky_probe_needs_bake(false),
 	//object_pool_allocator(sizeof(GLObject), /*alignment=*/16, /*block capacity=*/1024),
 	running_in_renderdoc(false),
 	add_debug_obs(false),
 	async_texture_loader(NULL),
 	current_bound_phong_uniform_buf_ob_index(0),
-	show_ssao(true),
 	num_draw_commands(0),
 	reload_shaders_callback(nullptr)
 {
@@ -1430,6 +1453,8 @@ void OpenGLEngine::loadMapsForSunDir()
 
 	current_scene->loaded_maps_for_sun_dir = true;
 
+	global_sky_probe_needs_bake = true; // cosine_env_tex has changed, so the global sky probe is stale.
+
 	conPrint("OpenGLEngine::loadMapsForSunDir took " + timer.elapsedStringNSigFigs(5));
 }
 
@@ -1529,6 +1554,12 @@ void OpenGLEngine::getUniformLocations(Reference<OpenGLProgram>& prog)
 	prog->uniform_locations.normal_map_location				= prog->getUniformLocation("normal_map");
 	prog->uniform_locations.combined_array_tex_location		= prog->getUniformLocation("combined_array_tex");
 	prog->uniform_locations.cosine_env_tex_location			= prog->getUniformLocation("cosine_env_tex");
+	prog->uniform_locations.probe_irradiance_tex_location	= prog->getUniformLocation("probe_irradiance_tex");
+
+	prog->uniform_locations.env_diffuse_colour_location		= prog->getUniformLocation("diffuse_colour");
+	prog->uniform_locations.env_have_texture_location		= prog->getUniformLocation("have_texture");
+	prog->uniform_locations.env_texture_matrix_location		= prog->getUniformLocation("texture_matrix");
+	prog->uniform_locations.env_campos_ws_location			= prog->getUniformLocation("env_campos_ws");
 	prog->uniform_locations.specular_env_tex_location		= prog->getUniformLocation("specular_env_tex");
 	prog->uniform_locations.lightmap_tex_location			= prog->getUniformLocation("lightmap_tex");
 	prog->uniform_locations.fbm_tex_location				= prog->getUniformLocation("fbm_tex");
@@ -1776,6 +1807,11 @@ void OpenGLEngine::initialise(const std::string& data_dir_, Reference<TextureSer
 		// See "Porting Source to Linux: Valve's Lessons Learned": https://developer.nvidia.com/sites/default/files/akamai/gamedev/docs/Porting%20Source%20to%20Linux.pdf
 		glDebugMessageCallback(myMessageCallback, this); 
 		glEnable(GL_DEBUG_OUTPUT);
+
+		// Disable glPushDebugGroup/glPopDebugGroup notifications.
+		glDebugMessageControl(GL_DONT_CARE, GL_DEBUG_TYPE_PUSH_GROUP, GL_DONT_CARE, 0, NULL, GL_FALSE);
+		glDebugMessageControl(GL_DONT_CARE, GL_DEBUG_TYPE_POP_GROUP,  GL_DONT_CARE, 0, NULL, GL_FALSE);
+
 		// glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS); // When this is enabled the offending gl call will be on the call stack when the message callback is called.
 #endif
 	}
@@ -2146,6 +2182,16 @@ void OpenGLEngine::initialise(const std::string& data_dir_, Reference<TextureSer
 
 		preprocessor_defines += "#define SSAO_SUPPORT " + (settings.ssao_support ? std::string("1") : std::string("0")) + "\n";
 
+		preprocessor_defines += "#define IRRADIANCE_PROBES_SUPPORT " + (settings.irradiance_probes_support ? std::string("1") : std::string("0")) + "\n";
+
+		if(settings.irradiance_probes_support)
+		{
+			// Create the probe atlas before the defines are finalised: frag_utils.glsl does tile addressing with
+			// PROBE_* defines, so the atlas layout has to be known at shader build time.
+			this->irradiance_probes = new IrradianceProbes(/*grid dims=*/16, 16, 8, /*grid spacing (m)=*/1.f);
+			this->irradiance_probes->allocateGLResources(this);
+			preprocessor_defines += irradiance_probes->getShaderPreprocessorDefines();
+		}
 
 		if(use_bindless_textures)
 			preprocessor_defines += "#extension GL_ARB_bindless_texture : require\n";
@@ -2745,7 +2791,18 @@ void OpenGLEngine::buildPrograms()
 		compute_ssao_prog = buildComputeSSAOProg();
 		blur_ssao_prog = buildBlurSSAOProg();
 	}
-	
+
+	//------------------------------------------- Build irradiance probe progs -------------------------------------------
+	if(irradianceProbesEnabled())
+	{
+		probe_bake_from_cubemap_prog = buildProbeBakeFromCubeMapProg();
+		probe_capture_env_prog = buildProbeCaptureEnvProgram();
+		probe_convolve_prog = buildProbeConvolveProg();
+		probe_debug_prog = buildProbeDebugProg();
+
+		clearProbeIrradianceAtlas(); // Also sets global_sky_probe_needs_bake.
+	}
+
 
 	if(settings.render_to_offscreen_renderbuffers)
 	{
@@ -2969,11 +3026,6 @@ OpenGLProgramRef OpenGLEngine::buildEnvProgram()
 	getUniformLocations(new_env_prog);
 	setStandardTextureUnitUniformsForProgram(*new_env_prog);
 
-	env_diffuse_colour_location		= new_env_prog->getUniformLocation("diffuse_colour");
-	env_have_texture_location		= new_env_prog->getUniformLocation("have_texture");
-	env_texture_matrix_location		= new_env_prog->getUniformLocation("texture_matrix");
-	env_campos_ws_location			= new_env_prog->getUniformLocation("env_campos_ws");
-
 	bindUniformBlockToProgram(new_env_prog, "MaterialCommonUniforms",		MATERIAL_COMMON_UBO_BINDING_POINT_INDEX);
 
 	return new_env_prog;
@@ -3078,6 +3130,28 @@ OpenGLProgramRef OpenGLEngine::buildAuroraProgram()
 
 	bindUniformBlockToProgram(prog, "MaterialCommonUniforms",		MATERIAL_COMMON_UBO_BINDING_POINT_INDEX);
 	bindUniformBlockToProgram(prog, "SharedVertUniforms",			SHARED_VERT_UBO_BINDING_POINT_INDEX);
+
+	return prog;
+}
+
+
+OpenGLProgramRef OpenGLEngine::buildProbeBakeFromCubeMapProg()
+{
+	const std::string key_defs = preprocessorDefsForKey(ProgramKey(ProgramKey::ProgramName_blur_ssao, ProgramKeyArgs())); // Needed to define MATERIALISE_EFFECT to 0 etc. for frag_utils_glsl.
+
+	OpenGLProgramRef prog = new OpenGLProgram(
+		"probe_bake_from_cubemap",
+		new OpenGLShader(shaders_dir + "/blur_ssao_vert_shader.glsl", version_directive, key_defs + preprocessor_defines, GL_VERTEX_SHADER), // Plain unit-quad-to-clip-space vertex shader.
+		new OpenGLShader(shaders_dir + "/probe_bake_from_cubemap_frag_shader.glsl", version_directive, key_defs + preprocessor_defines + frag_utils_glsl, GL_FRAGMENT_SHADER),
+		getAndIncrNextProgramIndex(),
+		/*wait for build to complete=*/true
+	);
+	getUniformLocations(prog); // Make sure any unused uniforms have their locations set to -1.
+	addProgram(prog);
+
+	probe_bake_source_cube_tex_location = prog->getUniformLocation("source_cube_tex");
+	probe_bake_tile_origin_location     = prog->getUniformLocation("probe_tile_origin");
+	probe_bake_env_phi_location         = prog->getUniformLocation("env_phi");
 
 	return prog;
 }
@@ -3677,9 +3751,9 @@ void OpenGLScene::createSSAOTextures(OpenGLEngine* engine, bool normal_texture_i
 	prepass_normal_renderbuffer = new RenderBuffer(prepass_xres, prepass_yres, prepass_msaa_samples, normal_buffer_format);
 	prepass_depth_renderbuffer  = new RenderBuffer(prepass_xres, prepass_yres, prepass_msaa_samples, depth_format);
 	prepass_framebuffer = new FrameBuffer();
-	prepass_framebuffer->attachRenderBuffer(*prepass_colour_renderbuffer, GL_COLOR_ATTACHMENT0);
-	prepass_framebuffer->attachRenderBuffer(*prepass_normal_renderbuffer, GL_COLOR_ATTACHMENT1);
-	prepass_framebuffer->attachRenderBuffer(*prepass_depth_renderbuffer, GL_DEPTH_ATTACHMENT);
+	prepass_framebuffer->attachRenderBuffers(*prepass_colour_renderbuffer, GL_COLOR_ATTACHMENT0,
+	                                         *prepass_normal_renderbuffer, GL_COLOR_ATTACHMENT1,
+	                                         *prepass_depth_renderbuffer, GL_DEPTH_ATTACHMENT);
 
 	prepass_colour_copy_texture = new OpenGLTexture(prepass_xres, prepass_yres, engine, /*data=*/ArrayRef<uint8>(), prepass_col_buffer_format, OpenGLTexture::Filtering_Nearest, OpenGLTexture::Wrapping_Clamp, /*has_mipmaps=*/false, /*MSAA_samples=*/1);
 	prepass_colour_copy_texture->setDebugName("prepass_colour_copy_texture");
@@ -3688,9 +3762,9 @@ void OpenGLScene::createSSAOTextures(OpenGLEngine* engine, bool normal_texture_i
 	prepass_depth_copy_texture = new OpenGLTexture(prepass_xres, prepass_yres, engine, /*data=*/ArrayRef<uint8>(), depth_format, OpenGLTexture::Filtering_Nearest, OpenGLTexture::Wrapping_Clamp, /*has_mipmaps=*/false, /*MSAA_samples=*/1);
 	prepass_depth_copy_texture->setDebugName("prepass_depth_copy_texture");
 	prepass_copy_framebuffer = new FrameBuffer();
-	prepass_copy_framebuffer->attachTexture(*prepass_colour_copy_texture, GL_COLOR_ATTACHMENT0);
-	prepass_copy_framebuffer->attachTexture(*prepass_normal_copy_texture, GL_COLOR_ATTACHMENT1);
-	prepass_copy_framebuffer->attachTexture(*prepass_depth_copy_texture, GL_DEPTH_ATTACHMENT);
+	prepass_copy_framebuffer->attachTextures(*prepass_colour_copy_texture, GL_COLOR_ATTACHMENT0,
+	                                         *prepass_normal_copy_texture, GL_COLOR_ATTACHMENT1,
+	                                         *prepass_depth_copy_texture, GL_DEPTH_ATTACHMENT);
 
 	ssao_texture = new OpenGLTexture(prepass_xres, prepass_yres, engine, /*data=*/ArrayRef<uint8>(), 
 		OpenGLTextureFormat::Format_RGBA_Linear_Half/*col_buffer_format*/, OpenGLTexture::Filtering_Nearest, OpenGLTexture::Wrapping_Clamp, /*has_mipmaps=*/false, /*MSAA_samples=*/1);
@@ -3714,8 +3788,8 @@ void OpenGLScene::createSSAOTextures(OpenGLEngine* engine, bool normal_texture_i
 	blurred_ssao_specular_texture->setDebugName("blurred_ssao_specular_texture");
 
 	compute_ssao_framebuffer = new FrameBuffer();
-	compute_ssao_framebuffer->attachTexture(*ssao_texture, GL_COLOR_ATTACHMENT0);
-	compute_ssao_framebuffer->attachTexture(*ssao_specular_texture, GL_COLOR_ATTACHMENT1);
+	compute_ssao_framebuffer->attachTextures(*ssao_texture, GL_COLOR_ATTACHMENT0,
+	                                         *ssao_specular_texture, GL_COLOR_ATTACHMENT1);
 
 	blurred_ssao_framebuffer = new FrameBuffer();
 	blurred_ssao_framebuffer->attachTexture(*blurred_ssao_texture, GL_COLOR_ATTACHMENT0);
@@ -4538,6 +4612,79 @@ static inline OpenGLProgram* getBuiltDepthDrawProgForMat(OpenGLMaterial& mat)
 }
 
 
+// If the material is drawn during a probe capture, and its shader program has finished building, return the
+// program, otherwise NULL.  The set of materials matches the flag test drawNonTransparentMaterialBatches() does.
+static inline OpenGLProgram* getBuiltProbeCaptureProgForMat(const OpenGLMaterial& mat)
+{
+	if(mat.shader_prog.nonNull() && mat.shader_prog->isBuilt() &&
+		!mat.transparent && !mat.water && !mat.decal && !mat.alpha_blend && !mat.participating_media)
+		return mat.shader_prog.ptr();
+	else
+		return NULL;
+}
+
+
+// Build the batch list used when rendering probe capture cube faces.
+//
+// It exists to get face culling switched off.  A probe sitting inside solid geometry has that geometry's front
+// faces pointing away from it, so with culling on the geometry is not drawn at all and the probe sees straight
+// through the wall.  That is bad twice over: the irradiance tile collects sky, and the depth tile records the
+// distance to whatever lies beyond the wall rather than to the wall, which disarms the Chebyshev test in
+// sampleProbeGridIrradiance() that exists to stop such a probe leaking into everything around it.
+//
+// Zeroing the culling bits in the key is enough - setFaceCulling() already reads zero as 'disabled', so the
+// existing per-batch state machine does the rest and the draw loops need no special case.
+//
+// Note that batches are not merged the way rebuildObjectDepthDrawBatches() merges them.  There, two contiguous
+// batches sharing a program can be collapsed because the depth-draw shaders that allow it read no material
+// textures.  These are the full material shaders, so two batches with the same program still sample different
+// textures, and merging them would draw one material's geometry with another's textures.  Merging becomes
+// worthwhile once there is a stripped capture-specific permutation to build this list against.
+void OpenGLEngine::rebuildObjectProbeCaptureBatches(GLObject& object)
+{
+	const ArrayRef<OpenGLBatch> use_src_batches = object.getUsedBatches();
+
+	// Count first: materials that a capture does not draw get no batch at all, so this is not just the source
+	// batch count.
+	size_t num_batches_required = 0;
+	for(size_t i=0; i<use_src_batches.size(); ++i)
+		if(getBuiltProbeCaptureProgForMat(object.materials[use_src_batches[i].material_index]))
+			num_batches_required++;
+
+	object.probe_capture_batches.resize(num_batches_required);
+
+	size_t dest_batch_i = 0;
+	for(size_t i=0; i<use_src_batches.size(); ++i)
+	{
+		const uint32 mat_index = use_src_batches[i].material_index;
+		const OpenGLMaterial& mat = object.materials[mat_index];
+
+		const OpenGLProgram* prog = getBuiltProbeCaptureProgForMat(mat);
+		if(prog == NULL)
+			continue;
+
+		GLObjectBatchDrawInfo& info = object.probe_capture_batches[dest_batch_i++];
+
+		// Face culling bits deliberately left zero.  The material category bits (transparent, water, decal,
+		// alpha blend) are left out as well: everything that reaches this list is drawn, so there is nothing
+		// left for the draw loop to test them for.
+		info.program_index_and_flags = prog->program_index |
+			(prog->supports_gpu_resident ? PROG_SUPPORTS_GPU_RESIDENT_BITFLAG : 0) |
+			PROGRAM_FINISHED_BUILDING_BITFLAG;
+
+		assert((mat.material_data_index != -1) || !use_ob_and_mat_data_gpu_resident);
+		if(use_ob_and_mat_data_gpu_resident && prog->supports_gpu_resident)
+			info.material_data_or_mat_index = mat.material_data_index;
+		else
+			info.material_data_or_mat_index = mat_index;
+
+		info.prim_start_offset_B = use_src_batches[i].prim_start_offset_B;
+		info.num_indices         = use_src_batches[i].num_indices;
+	}
+	assert(dest_batch_i == num_batches_required);
+}
+
+
 void OpenGLEngine::rebuildObjectDepthDrawBatches(GLObject& object)
 {
 	// Compute shadow mapping depth-draw batches.  We can merge multiple index batches into one if they are contiguous, if they share the same depth-draw shader, and the depth-draw shader does not do alpha testing.
@@ -4657,6 +4804,12 @@ void OpenGLEngine::rebuildObjectDepthDrawBatches(GLObject& object)
 
 		// conPrint("Collapsed " + toString(object.getUsedBatches().size()) + " batches to " + toString(object.depth_draw_batches.size()) + " depth-draw batches");
 	}
+
+	// Built here rather than from the five places that call this, so that a new call site cannot forget it and
+	// leave captures drawing with stale programs.  Outside the shadow_mapping test above: probe captures do not
+	// depend on that setting.
+	if(irradianceProbesEnabled())
+		rebuildObjectProbeCaptureBatches(object);
 }
 
 
@@ -6756,25 +6909,580 @@ void OpenGLEngine::addDebugVisForShadowFrustum(const Vec4f frustum_verts_ws[8], 
 }
 
 
-// glDrawBuffer does not seem to be in OpenGL ES, so use glDrawBuffers.
-inline static void setSingleDrawBuffer(GLenum buffer)
+// The env program used when capturing probes.  RENDER_SUN_AND_SKY is forced off, which strips the sun disc,
+// clouds and aurora from env_frag_shader.glsl, leaving just the sky map lookup.
+// The sun disc drawn for the background is deliberately not radiometric - see the sunscale fudge in
+// env_frag_shader.glsl - and in any case the sun subtends far less than one capture texel, so it has to be
+// excluded here and applied analytically per-fragment instead.
+OpenGLProgramRef OpenGLEngine::buildProbeCaptureEnvProgram()
 {
-	const GLenum buffers[1] = { buffer };
-	glDrawBuffers(1, buffers);
+	const std::string key_defs = preprocessorDefsForKey(ProgramKey(ProgramKey::ProgramName_env, ProgramKeyArgs()));
+
+	// RENDER_SUN_AND_SKY is already in preprocessor_defines, so undefine it before redefining.
+	const std::string no_sun_defs = "\n#undef RENDER_SUN_AND_SKY\n#define RENDER_SUN_AND_SKY 0\n";
+
+	OpenGLProgramRef prog = new OpenGLProgram(
+		"probe_capture_env",
+		new OpenGLShader(shaders_dir + "/env_vert_shader.glsl", version_directive, key_defs + preprocessor_defines + no_sun_defs, GL_VERTEX_SHADER),
+		new OpenGLShader(shaders_dir + "/env_frag_shader.glsl", version_directive, key_defs + preprocessor_defines_with_common_frag_structs + no_sun_defs, GL_FRAGMENT_SHADER),
+		getAndIncrNextProgramIndex(),
+		/*wait for build to complete=*/true
+	);
+	addProgram(prog);
+
+	getUniformLocations(prog);
+	setStandardTextureUnitUniformsForProgram(*prog);
+
+	bindUniformBlockToProgram(prog, "MaterialCommonUniforms", MATERIAL_COMMON_UBO_BINDING_POINT_INDEX);
+
+	return prog;
 }
 
 
-inline static void setTwoDrawBuffers(GLenum buffer_0, GLenum buffer_1)
+OpenGLProgramRef OpenGLEngine::buildProbeDebugProg()
 {
-	const GLenum draw_buffers[] = { buffer_0, buffer_1 };
-	glDrawBuffers(/*num=*/2, draw_buffers);
+	const std::string key_defs = preprocessorDefsForKey(ProgramKey(ProgramKey::ProgramName_blur_ssao, ProgramKeyArgs())); // Needed to define MATERIALISE_EFFECT to 0 etc. for frag_utils_glsl.
+
+	OpenGLProgramRef prog = new OpenGLProgram(
+		"probe_debug",
+		new OpenGLShader(shaders_dir + "/probe_debug_vert_shader.glsl", version_directive, key_defs + preprocessor_defines, GL_VERTEX_SHADER),
+		new OpenGLShader(shaders_dir + "/probe_debug_frag_shader.glsl", version_directive, key_defs + preprocessor_defines + frag_utils_glsl, GL_FRAGMENT_SHADER),
+		getAndIncrNextProgramIndex(),
+		/*wait for build to complete=*/true
+	);
+	getUniformLocations(prog);
+	addProgram(prog);
+
+	probe_debug_sphere_pos_radius_location = prog->getUniformLocation("probe_sphere_pos_radius");
+	probe_debug_probe_index_location       = prog->getUniformLocation("probe_index");
+
+	return prog;
 }
 
 
-[[maybe_unused]] inline static void setThreeDrawBuffers(GLenum buffer_0, GLenum buffer_1, GLenum buffer_2)
+// Draw a small sphere at each grid probe, shaded by looking that probe up in the direction of the sphere normal.
+// Called from draw() with the main render framebuffer bound, so the spheres get the scene's exposure.
+void OpenGLEngine::drawProbeDebugSpheres(const Matrix4f& view_matrix, const Matrix4f& proj_matrix)
 {
-	const GLenum draw_buffers[] = { buffer_0, buffer_1, buffer_2 };
-	glDrawBuffers(/*num=*/3, draw_buffers);
+	DebugGroup debug_group("drawProbeDebugSpheres");
+
+	probe_debug_prog->useProgram();
+	setSharedUniformsForProg(*probe_debug_prog, view_matrix, proj_matrix);
+
+	bindTextureUnitToSampler(*irradiance_probes->irradiance_tex, PROBE_IRRADIANCE_TEXTURE_UNIT_INDEX,
+		probe_debug_prog->uniform_locations.probe_irradiance_tex_location);
+
+	// No face culling: makeSphereMesh() winds its triangles so that the outward-facing surface is the back face
+	// under the default GL_CCW front convention, and for a closed convex sphere with depth testing the near
+	// surface wins anyway, so there is nothing to gain from getting the cull direction right.
+	glDisable(GL_CULL_FACE);
+
+	bindMeshData(*sphere_meshdata);
+
+	const float radius = irradiance_probes->grid_spacing * 0.15f;
+
+	for(int z=0; z<irradiance_probes->grid_dims[2]; ++z)
+	for(int y=0; y<irradiance_probes->grid_dims[1]; ++y)
+	for(int x=0; x<irradiance_probes->grid_dims[0]; ++x)
+	{
+		const Vec4f pos = irradiance_probes->gridProbePos(x, y, z);
+
+		glUniform4f(probe_debug_sphere_pos_radius_location, pos[0], pos[1], pos[2], radius);
+		glUniform1i(probe_debug_probe_index_location, irradiance_probes->gridProbeIndex(x, y, z)); // Toroidal, so not a plain linear index.
+
+		drawElementsBaseVertex(GL_TRIANGLES, (GLsizei)sphere_meshdata->batches[0].num_indices, sphere_meshdata->getIndexType(),
+			(void*)sphere_meshdata->getBatch0IndicesTotalBufferOffset(), sphere_meshdata->vbo_handle.base_vertex);
+	}
+
+	flushDrawCommandsAndUnbindPrograms();
+}
+
+
+// The probe members of MaterialCommonUniforms are present whether or not probes are enabled, so that the block
+// layout does not depend on the setting.  They are just left zeroed when there are no probes.
+void OpenGLEngine::setProbeGridUniforms(MaterialCommonUniforms& common_uniforms)
+{
+	if(irradianceProbesEnabled())
+	{
+		common_uniforms.probe_grid_origin = Vec4f(irradiance_probes->grid_origin[0], irradiance_probes->grid_origin[1], irradiance_probes->grid_origin[2],
+			irradiance_probes->grid_spacing);
+		common_uniforms.probe_grid_dims[0] = irradiance_probes->grid_dims[0];
+		common_uniforms.probe_grid_dims[1] = irradiance_probes->grid_dims[1];
+		common_uniforms.probe_grid_dims[2] = irradiance_probes->grid_dims[2];
+		common_uniforms.probe_grid_dims[3] = IrradianceProbes::FIRST_GRID_PROBE_INDEX;
+	}
+	else
+	{
+		common_uniforms.probe_grid_origin = Vec4f(0.f);
+		common_uniforms.probe_grid_dims[0] = common_uniforms.probe_grid_dims[1] = common_uniforms.probe_grid_dims[2] = common_uniforms.probe_grid_dims[3] = 0;
+	}
+}
+
+
+// Capture and convolve every grid probe in one go.  Blocking, so only for debugging - normal operation goes
+// through updateProbes().
+//
+// Now that captures shade from the grid, one call is one bounce iteration, not a finished result: from a cleared
+// atlas it gives directly visible sky plus directly sunlit surfaces, and each further call adds a bounce.
+// Enclosed spaces need several - the fraction of converged indirect after n calls is roughly 1 - albedo^n, so a
+// room at albedo 0.7 is still only two thirds of the way there after 3.  Call clearProbeIrradianceAtlas() first
+// to restart the sequence rather than continuing it.
+void OpenGLEngine::captureProbeGrid(const Vec4f& grid_centre)
+{
+	runtimeCheck(irradianceProbesEnabled());
+
+	DebugGroup debug_group("captureProbeGrid");
+
+	Timer timer;
+
+	irradiance_probes->setGridCentre(grid_centre);
+	irradiance_probes->markAllProbesForCapture();
+
+	for(int z=0; z<irradiance_probes->grid_dims[2]; ++z)
+	for(int y=0; y<irradiance_probes->grid_dims[1]; ++y)
+	for(int x=0; x<irradiance_probes->grid_dims[0]; ++x)
+	{
+		captureProbe(irradiance_probes->gridProbePos(x, y, z));
+		convolveProbeCaptureToTile(irradiance_probes->gridProbeIndex(x, y, z));
+		irradiance_probes->markProbeCaptured(x, y, z);
+	}
+
+	conPrint("captureProbeGrid: captured " + toString(irradiance_probes->numGridProbes()) + " probes in " + timer.elapsedStringNSigFigs(4));
+}
+
+
+// Recentre the probe window on the camera and recapture a few of the stale probes.  Called once per frame.
+//
+// Scrolling the window only invalidates the newly exposed slab, because atlas slots are assigned toroidally, so
+// steady movement costs a slab per cell crossed rather than the whole volume.
+void OpenGLEngine::updateProbes()
+{
+	if(!probe_updates_enabled || (max_probe_captures_per_frame <= 0))
+		return;
+
+	const Vec4f campos_ws = current_scene->cam_to_world.getColumn(3);
+
+	irradiance_probes->setGridCentre(campos_ws);
+
+	if(!irradiance_probes->anyProbesNeedCapture())
+		return;
+
+	DebugGroup debug_group("updateProbes");
+
+	for(int i=0; i<max_probe_captures_per_frame; ++i)
+	{
+		int x, y, z;
+		if(irradiance_probes->nextProbeToCapture(campos_ws, x, y, z) < 0)
+			break;
+
+		captureProbe(irradiance_probes->gridProbePos(x, y, z));
+		convolveProbeCaptureToTile(irradiance_probes->gridProbeIndex(x, y, z));
+		irradiance_probes->markProbeCaptured(x, y, z);
+	}
+}
+
+
+OpenGLProgramRef OpenGLEngine::buildProbeConvolveProg()
+{
+	const std::string key_defs = preprocessorDefsForKey(ProgramKey(ProgramKey::ProgramName_blur_ssao, ProgramKeyArgs())); // Needed to define MATERIALISE_EFFECT to 0 etc. for frag_utils_glsl.
+
+	OpenGLProgramRef prog = new OpenGLProgram(
+		"probe_convolve",
+		new OpenGLShader(shaders_dir + "/blur_ssao_vert_shader.glsl", version_directive, key_defs + preprocessor_defines, GL_VERTEX_SHADER),
+		new OpenGLShader(shaders_dir + "/probe_convolve_frag_shader.glsl", version_directive, key_defs + preprocessor_defines + frag_utils_glsl, GL_FRAGMENT_SHADER),
+		getAndIncrNextProgramIndex(),
+		/*wait for build to complete=*/true
+	);
+	getUniformLocations(prog);
+	addProgram(prog);
+
+	probe_convolve_capture_tex_location       = prog->getUniformLocation("capture_tex");
+	probe_convolve_capture_depth_tex_location = prog->getUniformLocation("capture_depth_tex");
+	probe_convolve_tile_origin_location       = prog->getUniformLocation("probe_tile_origin");
+	probe_convolve_depth_mode_location        = prog->getUniformLocation("convolve_depth");
+	probe_convolve_near_clip_location         = prog->getUniformLocation("capture_near_clip_dist");
+	probe_convolve_max_dist_location          = prog->getUniformLocation("max_probe_distance");
+
+	// The face basis is fixed, so upload it once here.  IrradianceProbes is the single source of truth for it:
+	// the capture view matrices are built from the same function.
+	float basis[18 * 3];
+	for(int face=0; face<6; ++face)
+	{
+		Vec4f face_forward, face_right, face_up;
+		IrradianceProbes::getCaptureFaceBasis(face, face_forward, face_right, face_up);
+
+		const Vec4f axes[3] = { face_forward, face_right, face_up };
+		for(int a=0; a<3; ++a)
+			for(int c=0; c<3; ++c)
+				basis[(face*3 + a)*3 + c] = axes[a][c];
+	}
+
+	prog->useProgram();
+	glUniform3fv(prog->getUniformLocation("capture_face_basis"), /*count=*/18, basis);
+	OpenGLProgram::useNoPrograms();
+
+	return prog;
+}
+
+
+// Convolve the current probe capture into probe 'probe_index's irradiance and depth tiles.
+void OpenGLEngine::convolveProbeCaptureToTile(int probe_index)
+{
+	runtimeCheck(irradianceProbesEnabled());
+
+	DebugGroup debug_group("convolveProbeCaptureToTile");
+
+	irradiance_probes->irradiance_framebuffer->bindForDrawing();
+
+	glDisable(GL_BLEND);
+	glDisable(GL_DEPTH_TEST);
+	glDepthMask(GL_FALSE);
+
+	probe_convolve_prog->useProgram();
+
+	bindTextureUnitToSampler(*irradiance_probes->capture_tex,       /*texture_unit_index=*/0, /*sampler_uniform_location=*/probe_convolve_capture_tex_location);
+	bindTextureUnitToSampler(*irradiance_probes->capture_depth_tex, /*texture_unit_index=*/1, /*sampler_uniform_location=*/probe_convolve_capture_depth_tex_location);
+
+	glUniform1f(probe_convolve_near_clip_location, current_scene->near_draw_dist);
+
+	// Beyond this a surface is far enough away that it should not influence the visibility test.  1.5 probe
+	// spacings is enough to cover a neighbouring probe with margin.
+	glUniform1f(probe_convolve_max_dist_location, irradiance_probes->grid_spacing * 1.5f);
+
+	bindMeshData(*unit_quad_meshdata);
+
+	for(int depth_mode=0; depth_mode<2; ++depth_mode)
+	{
+		int tile_x, tile_y, tile_w, tile_h;
+		if(depth_mode != 0)
+			irradiance_probes->getDepthTileRect(probe_index, tile_x, tile_y, tile_w, tile_h);
+		else
+			irradiance_probes->getIrradianceTileRect(probe_index, tile_x, tile_y, tile_w, tile_h);
+
+		glViewport(tile_x, tile_y, tile_w, tile_h);
+
+		glUniform2f(probe_convolve_tile_origin_location, (float)tile_x, (float)tile_y);
+		glUniform1i(probe_convolve_depth_mode_location, depth_mode);
+
+		drawElementsBaseVertex(GL_TRIANGLES, (GLsizei)unit_quad_meshdata->batches[0].num_indices, unit_quad_meshdata->getIndexType(),
+			(void*)unit_quad_meshdata->getBatch0IndicesTotalBufferOffset(), unit_quad_meshdata->vbo_handle.base_vertex);
+	}
+
+	flushDrawCommandsAndUnbindPrograms();
+
+	glDepthMask(GL_TRUE);
+	glEnable(GL_DEPTH_TEST);
+
+	FrameBuffer::unbind();
+}
+
+
+// Render the 6 cube faces around probe_pos into the capture texture.
+// capture_radius bounds how far out geometry is gathered, so the cost scales with local scene complexity rather
+// than with the size of the world.
+void OpenGLEngine::captureProbe(const Vec4f& probe_pos, float capture_radius)
+{
+	runtimeCheck(irradianceProbesEnabled());
+
+	DebugGroup debug_group("captureProbe");
+	TracyGpuZone("captureProbe");
+
+	// setSharedUniformsForProg() asserts that the standard textures are bound to their standard texture units.
+	// That only holds during the object draw passes - by the time a frame has finished, post processing has bound
+	// its own textures over those units - so re-establish it here rather than requiring callers to run at a
+	// particular point in the frame.
+	bindStandardTexturesToTextureUnits();
+
+	// drawBackgroundEnvMap() and the object draw passes choose their framebuffer from these, so point them at
+	// the capture target for the duration.  Same approach as drawToBufferAndReturnImageMap().
+	const bool old_render_to_main_framebuffer = current_scene->render_to_main_render_framebuffer;
+	const Reference<FrameBuffer> old_target_frame_buffer = this->target_frame_buffer;
+	current_scene->render_to_main_render_framebuffer = false;
+	this->target_frame_buffer = irradiance_probes->capture_framebuffer;
+
+	// Swap in the sun-less env program.
+	const Reference<OpenGLProgram> old_env_shader_prog = current_scene->env_ob->materials[0].shader_prog;
+	current_scene->env_ob->materials[0].shader_prog = probe_capture_env_prog;
+
+	// Gather geometry within capture_radius of the probe.  Culling is by the frustum AABB only, with no clip
+	// planes, so the same draw list serves all 6 faces and each face's own clipping is left to the rasteriser.
+	const int old_num_frustum_clip_planes = current_scene->num_frustum_clip_planes;
+	const js::AABBox old_frustum_aabb = current_scene->frustum_aabb;
+	current_scene->num_frustum_clip_planes = 0;
+	current_scene->frustum_aabb = js::AABBox(probe_pos - Vec4f(capture_radius, capture_radius, capture_radius, 0),
+		                                     probe_pos + Vec4f(capture_radius, capture_radius, capture_radius, 0));
+
+	// 90 degree field of view, with the same depth convention as the main render so that geometry drawn here
+	// later depth-tests correctly.
+	const double z_near = current_scene->near_draw_dist;
+	const double z_far  = current_scene->max_draw_dist;
+	const Matrix4f proj_matrix = getReverseZMatrixOrIdentity() * frustumMatrix(-z_near, z_near, -z_near, z_near, z_near, z_far);
+
+	// This runs outside the normal frame flow, so establish the state it depends on rather than inheriting
+	// whatever the last pass left behind.  Matches what the main object passes assume.
+	glEnable(GL_SCISSOR_TEST); // Confine the per-face clear to that face's rect.
+	glDisable(GL_BLEND);
+	glDisable(GL_CULL_FACE); // Off for the whole capture - see rebuildObjectProbeCaptureBatches().  drawProbeCaptureBatches() re-establishes this after drawBackgroundEnvMap().
+	glEnable(GL_DEPTH_TEST);
+	glDepthMask(GL_TRUE);
+	glDepthFunc(use_reverse_z ? GL_GREATER : GL_LESS);
+
+	// Reuse the main render's shadow texture matrices.  They map world space to shadow texture space, so they do
+	// not depend on the capture's view matrix and carry over unchanged.
+	//
+	// What does not carry over is the cascade selection: getShadowMappingSunVisFactor() picks a cascade from
+	// -pos_cs.z, which here is distance from the probe rather than from the camera, so it would choose a cascade
+	// whose depth map covers somewhere else entirely.  The dynamic cascades make that fatal, being fitted to the
+	// main camera's view frustum.  So during a capture the shaders take getProbeCaptureSunVisFactor() instead,
+	// which always reads static cascade 0 - an axis-aligned box centred on the camera, large enough to contain
+	// the whole probe grid in any direction.  This matters more than it looks: with captures now shading from the
+	// grid, a sunlit patch of floor is the dominant indirect source for an enclosed space, so getting its
+	// shadowing wrong throws off the whole room.
+	//
+	// The cost is that only static geometry casts shadows into the grid.  A probe volume placed far from the
+	// camera would still need its own shadow render.
+	Matrix4f shadow_tex_matrices[ShadowMapping::NUM_DYNAMIC_DEPTH_TEXTURES + ShadowMapping::NUM_STATIC_DEPTH_TEXTURES];
+	if(current_scene->shadow_mapping)
+	{
+		for(int i = 0; i < ShadowMapping::NUM_DYNAMIC_DEPTH_TEXTURES; ++i)
+			shadow_tex_matrices[i] = current_scene->shadow_mapping->dynamic_tex_matrix[i];
+		for(int i = 0; i < ShadowMapping::NUM_STATIC_DEPTH_TEXTURES; ++i)
+			shadow_tex_matrices[ShadowMapping::NUM_DYNAMIC_DEPTH_TEXTURES + i] =
+				current_scene->shadow_mapping->static_tex_matrix[current_scene->shadow_mapping->cur_static_depth_tex * ShadowMapping::NUM_STATIC_DEPTH_TEXTURES + i];
+	}
+	else
+		for(int i = 0; i < ShadowMapping::NUM_DYNAMIC_DEPTH_TEXTURES + ShadowMapping::NUM_STATIC_DEPTH_TEXTURES; ++i)
+			shadow_tex_matrices[i] = Matrix4f::identity();
+
+	for(int face=0; face<6; ++face)
+	{
+		int face_x, face_y, face_w, face_h;
+		IrradianceProbes::getCaptureFaceRect(face, face_x, face_y, face_w, face_h);
+
+		glViewport(face_x, face_y, face_w, face_h);
+		glScissor(face_x, face_y, face_w, face_h);
+
+		irradiance_probes->capture_framebuffer->bindForDrawing();
+
+		glClearColor(0.f, 0.f, 0.f, 0.f);
+		glClearDepthf(use_reverse_z ? 0.f : 1.f);
+		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+		const Matrix4f face_view_matrix = IrradianceProbes::getCaptureFaceViewMatrix(face, probe_pos);
+
+		// The object vertex shaders take view_matrix and proj_matrix from SharedVertUniforms, not from per-program
+		// uniforms - see phong_vert_shader.glsl:220 - so this block has to be rewritten per face too.  (The env
+		// sphere is the exception: env_vert_shader.glsl declares them as plain uniforms, which is why the sky was
+		// correct per face while geometry was not.)
+		{
+			SharedVertUniforms vert_uniforms;
+			vert_uniforms.proj_matrix = proj_matrix;
+			vert_uniforms.view_matrix = face_view_matrix;
+			for(int i = 0; i < ShadowMapping::NUM_DYNAMIC_DEPTH_TEXTURES + ShadowMapping::NUM_STATIC_DEPTH_TEXTURES; ++i)
+				vert_uniforms.shadow_texture_matrix[i] = shadow_tex_matrices[i];
+			vert_uniforms.campos_ws = probe_pos;
+			vert_uniforms.vert_sundir_ws = current_scene->sun_dir;
+			vert_uniforms.grass_pusher_sphere_pos = current_scene->grass_pusher_sphere_pos;
+			vert_uniforms.vert_uniforms_time = current_time;
+			vert_uniforms.wind_strength = current_scene->wind_strength;
+			vert_uniforms.padding_0 = vert_uniforms.padding_1 = 0;
+
+			this->shared_vert_uniform_buf_ob->updateData(/*dest offset=*/0, &vert_uniforms, sizeof(SharedVertUniforms));
+		}
+
+		// The material shaders read the view matrix, camera position and flags from MaterialCommonUniforms, so
+		// rewrite it for this face.  Duplicated from draw() rather than shared, so no restore is needed: draw()
+		// rewrites both blocks unconditionally at the start of every frame.
+		{
+			MaterialCommonUniforms common_uniforms;
+			common_uniforms.frag_view_matrix = face_view_matrix;
+			common_uniforms.sundir_cs = face_view_matrix * current_scene->sun_dir;
+			common_uniforms.sundir_ws = current_scene->sun_dir;
+			common_uniforms.sun_spec_rad_times_solid_angle = current_scene->sun_spec_rad_times_solid_angle * 1.0e-9f;
+			common_uniforms.sky_av_spec_rad         = current_scene->sky_av_spec_rad         * 1.0e-9f;
+			common_uniforms.sun_and_sky_av_spec_rad = current_scene->sun_and_sky_av_spec_rad * 1.0e-9f;
+			common_uniforms.air_scattering_coeffs = current_scene->air_scattering_coeffs;
+			common_uniforms.mat_common_campos_ws = probe_pos;
+			common_uniforms.near_clip_dist = current_scene->near_draw_dist;
+			common_uniforms.far_clip_dist = current_scene->max_draw_dist;
+			common_uniforms.time = current_time;
+			common_uniforms.l_over_w = 0.5f; // 90 degree field of view: half-width 1 at distance 1.
+			common_uniforms.l_over_h = 0.5f;
+			common_uniforms.env_phi = current_scene->sun_phi;
+			common_uniforms.water_level_z = current_scene->water_level_z;
+			common_uniforms.camera_type = (int)OpenGLScene::CameraType_Perspective;
+
+			// DO_SSAO_FLAG is deliberately not set: the SSAO textures are sized for the main viewport and hold the
+			// main camera's view, so they are meaningless here.
+			//
+			// USE_PROBE_GRID_FLAG is set, so fragments shade with the grid as it currently stands.  That makes each
+			// capture one iteration of a bounce: with the atlas zeroed, the first capture of a probe sees only
+			// directly visible sky plus directly sunlit surfaces, the next adds a bounce off what those lit, and so
+			// on.  Sampling the global sky probe instead - which is what this did before - shades every interior
+			// surface with full unoccluded sky irradiance, which is why a room with a small opening captured to
+			// uniformly light grey walls.
+			//
+			// The grid is both read and written here, one probe at a time, so this is Gauss-Seidel rather than
+			// Jacobi: a probe's result depends on which of its neighbours were recaptured before it.  That is
+			// deliberate - it converges faster than double buffering the atlas, and the fixed point is the same.
+			// The transient asymmetry is what the convolve blend is for.
+			common_uniforms.mat_common_flags = (current_scene->cloud_shadows ? CLOUD_SHADOWS_FLAG : 0) | (use_probe_irradiance ? USE_PROBE_IRRADIANCE_FLAG : 0) |
+				(use_probe_grid ? USE_PROBE_GRID_FLAG : 0) | (use_probe_visibility ? USE_PROBE_VISIBILITY_FLAG : 0) | DOING_PROBE_CAPTURE_FLAG;
+
+			common_uniforms.shadow_map_samples_xy_scale = current_scene->shadow_mapping ? (2048.f / current_scene->shadow_mapping->dynamic_w) : 1.f;
+			common_uniforms.padding_a1 = common_uniforms.padding_a2 = 0;
+
+			for(int i = 0; i < ShadowMapping::NUM_DYNAMIC_DEPTH_TEXTURES + ShadowMapping::NUM_STATIC_DEPTH_TEXTURES; ++i)
+				common_uniforms.frag_shadow_texture_matrix[i] = shadow_tex_matrices[i];
+
+			setProbeGridUniforms(common_uniforms);
+
+			this->material_common_uniform_buf_ob->updateData(/*dest offset=*/0, &common_uniforms, sizeof(MaterialCommonUniforms));
+		}
+
+		drawBackgroundEnvMap(face_view_matrix, proj_matrix);
+
+		drawProbeCaptureBatches(face_view_matrix, proj_matrix);
+	}
+
+	glDisable(GL_SCISSOR_TEST);
+	glDepthMask(GL_TRUE); // Leave the state the main passes expect to find.
+
+	current_scene->num_frustum_clip_planes = old_num_frustum_clip_planes;
+	current_scene->frustum_aabb = old_frustum_aabb;
+	current_scene->env_ob->materials[0].shader_prog = old_env_shader_prog;
+	this->target_frame_buffer = old_target_frame_buffer;
+	current_scene->render_to_main_render_framebuffer = old_render_to_main_framebuffer;
+
+	FrameBuffer::unbind();
+}
+
+
+#if !defined(EMSCRIPTEN)
+// Debug: read back a float framebuffer and write it as both an EXR and a normalised PNG.
+// glReadPixels with GL_FLOAT does the half-float conversion for us.
+void OpenGLEngine::debugDumpFloatFrameBuffer(FrameBuffer& framebuffer, int w, int h, const std::string& path)
+{
+	js::Vector<float, 16> read_pixels(w * h * 4, 0.f);
+
+	framebuffer.bindForReading();
+	glReadBuffer(GL_COLOR_ATTACHMENT0);
+	glReadPixels(0, 0, w, h, GL_RGBA, GL_FLOAT, read_pixels.data());
+	setReadFrameBufferToDefault();
+
+	// glReadPixels returns rows bottom-up; both image writers want top-down.  Flip once here so the EXR and the
+	// PNG agree with each other.
+	js::Vector<float, 16> pixels(w * h * 4, 0.f);
+	for(int y=0; y<h; ++y)
+		std::memcpy(&pixels[y * w * 4], &read_pixels[(h - 1 - y) * w * 4], w * 4 * sizeof(float));
+
+	EXRDecoder::saveImageToEXR(pixels.data(), w, h, /*num_channels_in_buffer=*/4, /*save_alpha_channel=*/true, path, /*layer_name=*/"", EXRDecoder::SaveOptions());
+
+	// Also write a normalised 8-bit PNG, since the EXR needs a viewer that handles float.  Auto-exposed to the
+	// brightest texel so it is legible whatever the absolute radiance scale is - this is for judging structure
+	// and orientation, not for reading values off.
+	//float max_component = 0.f;
+	//for(int i=0; i<w*h; ++i)
+	//	for(int c=0; c<3; ++c)
+	//		max_component = myMax(max_component, pixels[i*4 + c]);
+	//
+	//const float scale = (max_component > 0.f) ? (1.f / max_component) : 1.f;
+	const float scale = 2.f;
+
+	js::Vector<uint8, 16> png_pixels(w * h * 3, 0);
+	for(int i=0; i<w*h; ++i)
+		for(int c=0; c<3; ++c)
+			png_pixels[i*3 + c] = (uint8)(std::pow(myClamp(pixels[i*4 + c] * scale, 0.f, 1.f), 1.f / 2.2f) * 255.f + 0.5f);
+
+	const std::string png_path = ::eatExtension(path) + "png";
+	PNGDecoder::write(png_pixels.data(), (unsigned int)w, (unsigned int)h, /*N=*/3, /*bits_per_channel=*/8, png_path);
+
+	conPrint("Wrote " + path + " and " + png_path + ", scale: " + toString(scale));
+}
+
+
+void OpenGLEngine::debugDumpProbeCapture(const std::string& path)
+{
+	runtimeCheck(irradianceProbesEnabled());
+
+	debugDumpFloatFrameBuffer(*irradiance_probes->capture_framebuffer, IrradianceProbes::CAPTURE_FACE_RES * 6, IrradianceProbes::CAPTURE_FACE_RES, path);
+}
+
+
+void OpenGLEngine::debugDumpProbeAtlas(const std::string& path)
+{
+	runtimeCheck(irradianceProbesEnabled());
+
+	debugDumpFloatFrameBuffer(*irradiance_probes->irradiance_framebuffer, irradiance_probes->atlas_w, irradiance_probes->atlas_h, path);
+}
+#endif
+
+
+// Zero every tile in the irradiance atlas.
+// Since captures now shade from the grid, an uncaptured tile is not just missing data, it is an input to the
+// next capture that reads it: the texture is allocated with no data, so without this the first captures of a
+// scene would bounce undefined values around the grid.  Zero is the right starting point - the grid then
+// converges upwards, one bounce per round of captures, rather than starting too bright and having to decay.
+// Wipes the global sky probe tile as well, hence the re-bake request; it is regenerated in draw().
+void OpenGLEngine::clearProbeIrradianceAtlas()
+{
+	runtimeCheck(irradianceProbesEnabled());
+
+	DebugGroup debug_group("clearProbeIrradianceAtlas");
+
+	irradiance_probes->irradiance_framebuffer->bindForDrawing();
+
+	// glClear is bounded by the scissor rect, not the viewport, so the scissor is the only state that matters
+	// here - a rect left set by another pass would spare part of the atlas.
+	glDisable(GL_SCISSOR_TEST);
+
+	glClearColor(0.f, 0.f, 0.f, 0.f);
+	glClear(GL_COLOR_BUFFER_BIT);
+
+	FrameBuffer::unbind();
+
+	global_sky_probe_needs_bake = true;
+}
+
+
+// Rewrite the global sky probe tile from cosine_env_tex.  Cheap: a single quad the size of one tile.
+void OpenGLEngine::bakeGlobalSkyProbe()
+{
+	DebugGroup debug_group("bakeGlobalSkyProbe");
+
+	int tile_x, tile_y, tile_w, tile_h;
+	irradiance_probes->getIrradianceTileRect(IrradianceProbes::GLOBAL_SKY_PROBE_INDEX, tile_x, tile_y, tile_w, tile_h);
+
+	irradiance_probes->irradiance_framebuffer->bindForDrawing();
+
+	glViewport(tile_x, tile_y, tile_w, tile_h);
+
+	glDepthMask(GL_FALSE);
+	glDisable(GL_DEPTH_TEST);
+
+	probe_bake_from_cubemap_prog->useProgram();
+
+	// The bake is self-contained, so use texture unit 0 (the scratch unit) rather than reserving a unit for a
+	// texture that is only read here.
+	bindTextureUnitToSampler(*this->cosine_env_tex, /*texture_unit_index=*/0, /*sampler_uniform_location=*/probe_bake_source_cube_tex_location);
+
+	glUniform2f(probe_bake_tile_origin_location, (float)tile_x, (float)tile_y);
+
+	// Baked into the tile so the lookups take a world space direction.  Any change to sun_phi goes through
+	// setSunDir(), which clears loaded_maps_for_sun_dir and so routes through loadMapsForSunDir(), which sets
+	// global_sky_probe_needs_bake - so the tile cannot be left holding a stale rotation.
+	glUniform1f(probe_bake_env_phi_location, current_scene->sun_phi);
+
+	bindMeshData(*unit_quad_meshdata);
+	drawElementsBaseVertex(GL_TRIANGLES, (GLsizei)unit_quad_meshdata->batches[0].num_indices, unit_quad_meshdata->getIndexType(),
+		(void*)unit_quad_meshdata->getBatch0IndicesTotalBufferOffset(), unit_quad_meshdata->vbo_handle.base_vertex);
+
+	flushDrawCommandsAndUnbindPrograms();
+
+	glEnable(GL_DEPTH_TEST);
+	glDepthMask(GL_TRUE);
+
+	FrameBuffer::unbind();
 }
 
 
@@ -6804,6 +7512,7 @@ void OpenGLEngine::draw()
 	glActiveTexture(GL_TEXTURE0);
 	glUseProgram(0);
 	VAO::unbind();
+	current_bound_VAO = NULL;
 	assertCurrentProgramIsZero();
 
 	cur_scene->frame_num++;
@@ -6971,6 +7680,15 @@ void OpenGLEngine::draw()
 		catch(glare::Exception& e)
 		{
 			conPrint("Error while reloading fog prog: " + e.what());
+		}
+
+		try
+		{
+			probe_debug_prog = buildProbeDebugProg();
+		}
+		catch(glare::Exception& e)
+		{
+			conPrint("Error while reloading downsize and blur progs: " + e.what());
 		}
 
 		// Try and reload draw-aurora shader
@@ -7228,6 +7946,19 @@ void OpenGLEngine::draw()
 	this->last_num_animated_obs_processed = num_animated_obs_processed;
 	anim_update_duration = anim_profile_timer.elapsed();
 
+
+	if(global_sky_probe_needs_bake && probe_bake_from_cubemap_prog.nonNull() && cosine_env_tex.nonNull())
+	{
+		bakeGlobalSkyProbe();
+		global_sky_probe_needs_bake = false;
+	}
+
+	// Before the main render: probe capture rebinds framebuffers and rewrites the shared uniform blocks, and the
+	// blocks are written again below for this frame's camera.
+	if(irradianceProbesEnabled())
+		updateProbes();
+
+
 	//================= Compute view (world space to camera space) matrix =================
 	// Indigo/Substrata camera convention is z=up, y=forwards, x=right.
 	// OpenGL is y=up, x=right, -z=forwards.
@@ -7257,9 +7988,12 @@ void OpenGLEngine::draw()
 	common_uniforms.env_phi = cur_scene->sun_phi;
 	common_uniforms.water_level_z = cur_scene->water_level_z;
 	common_uniforms.camera_type = (int)cur_scene->camera_type;
-	common_uniforms.mat_common_flags = (cur_scene->cloud_shadows ? CLOUD_SHADOWS_FLAG : 0) | (settings.ssao ? DO_SSAO_FLAG : 0);
+	common_uniforms.mat_common_flags = (cur_scene->cloud_shadows ? CLOUD_SHADOWS_FLAG : 0) | (settings.ssao ? DO_SSAO_FLAG : 0) | (use_probe_irradiance ? USE_PROBE_IRRADIANCE_FLAG : 0) | (use_probe_grid ? USE_PROBE_GRID_FLAG : 0) | (use_probe_visibility ? USE_PROBE_VISIBILITY_FLAG : 0);
 	common_uniforms.shadow_map_samples_xy_scale = cur_scene->shadow_mapping ? (2048.f / cur_scene->shadow_mapping->dynamic_w) : 1.f; // Shadow map sample pattern is scaled for 2048^2 textures.
 	common_uniforms.padding_a1 = common_uniforms.padding_a2 = 0;
+
+	setProbeGridUniforms(common_uniforms);
+
 	this->material_common_uniform_buf_ob->updateData(/*dest offset=*/0, &common_uniforms, sizeof(MaterialCommonUniforms));
 
 
@@ -7413,16 +8147,16 @@ void OpenGLEngine::draw()
 			}
 
 			cur_scene->main_render_framebuffer = new FrameBuffer();
-			cur_scene->main_render_framebuffer->attachRenderBuffer(*cur_scene->main_colour_renderbuffer, GL_COLOR_ATTACHMENT0);
-			cur_scene->main_render_framebuffer->attachRenderBuffer(*cur_scene->main_normal_renderbuffer, GL_COLOR_ATTACHMENT1);
-			cur_scene->main_render_framebuffer->attachRenderBuffer(*cur_scene->main_depth_renderbuffer, GL_DEPTH_ATTACHMENT);
+			cur_scene->main_render_framebuffer->attachRenderBuffers(*cur_scene->main_colour_renderbuffer, GL_COLOR_ATTACHMENT0,
+			                                                        *cur_scene->main_normal_renderbuffer, GL_COLOR_ATTACHMENT1,
+			                                                        *cur_scene->main_depth_renderbuffer, GL_DEPTH_ATTACHMENT);
 			assert(cur_scene->main_render_framebuffer->isComplete());
 
 
 			cur_scene->main_render_copy_framebuffer = new FrameBuffer();
-			cur_scene->main_render_copy_framebuffer->attachTexture(*cur_scene->main_colour_copy_texture, GL_COLOR_ATTACHMENT0);
-			cur_scene->main_render_copy_framebuffer->attachTexture(*cur_scene->main_normal_copy_texture, GL_COLOR_ATTACHMENT1);
-			cur_scene->main_render_copy_framebuffer->attachTexture(*cur_scene->main_depth_copy_texture, GL_DEPTH_ATTACHMENT);
+			cur_scene->main_render_copy_framebuffer->attachTextures(*cur_scene->main_colour_copy_texture, GL_COLOR_ATTACHMENT0,
+			                                                        *cur_scene->main_normal_copy_texture, GL_COLOR_ATTACHMENT1,
+			                                                        *cur_scene->main_depth_copy_texture, GL_DEPTH_ATTACHMENT);
 			assert(cur_scene->main_render_copy_framebuffer->isComplete());
 
 
@@ -7492,44 +8226,31 @@ void OpenGLEngine::draw()
 	if(cur_scene->render_to_main_render_framebuffer)
 	{
 		// Bind normal texture as the second colour target.  Need to do this here as transparent object render pass changes this binding.
-		cur_scene->main_render_framebuffer->attachRenderBuffer(*cur_scene->main_colour_renderbuffer, GL_COLOR_ATTACHMENT0);
-		cur_scene->main_render_framebuffer->attachRenderBuffer(*cur_scene->main_normal_renderbuffer, GL_COLOR_ATTACHMENT1);
+		cur_scene->main_render_framebuffer->attachRenderBuffersAndBindForDrawing(
+			*cur_scene->main_colour_renderbuffer, GL_COLOR_ATTACHMENT0, 
+			*cur_scene->main_normal_renderbuffer, GL_COLOR_ATTACHMENT1
+		);
 
 		// Draw to all colour buffers: colour and normal buffer.
-		setTwoDrawBuffers(GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1);
+		cur_scene->main_render_framebuffer->setTwoDrawBuffers(GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1);
 
 		// Clear colour render buffer
-		{
-			const float clear_val[4] = { cur_scene->background_colour.r, cur_scene->background_colour.g, cur_scene->background_colour.b, 1.f};
-			glClearBufferfv(GL_COLOR, /*drawbuffer=*/0, clear_val);
-		}
+		cur_scene->main_render_framebuffer->clearFloatColourBuffer(/*drawbuffer=*/0, cur_scene->background_colour, /*alpha=*/1.f);
 
 		// Clear normal render buffer.  Note that we have to use the uint version for clearing the normal buffer if it's a uint format.
 		if(normal_texture_is_uint)
-		{
-			const GLuint clear_val[] = { 0, 0, 0, 0 };
-			glClearBufferuiv(GL_COLOR, /*drawbuffer=*/1, clear_val);
-		}
+			cur_scene->main_render_framebuffer->clearUIntColourBuffer(/*drawbuffer=*/1, /*r=*/0, 0, 0, 0);
 		else
-		{
-			const float clear_val[4] = { 0, 0, 0, 0 };
-			glClearBufferfv(GL_COLOR, /*drawbuffer=*/1, clear_val);
-		}
+			cur_scene->main_render_framebuffer->clearFloatColourBuffer(/*drawbuffer=*/1, Colour3f(0.f), /*alpha=*/0.f);
 	}
 	else
 	{
 		// Clear colour render buffer
-		{
-			const float clear_val[4] = { cur_scene->background_colour.r, cur_scene->background_colour.g, cur_scene->background_colour.b, 1.f};
-			glClearBufferfv(GL_COLOR, /*drawbuffer=*/0, clear_val);
-		}
+		FrameBuffer::clearCurrentlyBoundFloatColourBuffer(/*drawbuffer=*/0, cur_scene->background_colour, /*alpha=*/1.f);
 	}
 
 	// Clear depth buffer
-	{
-		const float val = use_reverse_z ? 0.0f : 1.f; // For reversed-z, the 'far' z value is 0, instead of 1.
-		glClearBufferfv(GL_DEPTH, /*drawbuffer=*/0, &val);
-	}
+	FrameBuffer::clearCurrentlyBoundDepthBuffer(/*depth=*/use_reverse_z ? 0.0f : 1.f); // For reversed-z, the 'far' z value is 0, instead of 1.
 	
 	glLineWidth(1);
 
@@ -7690,7 +8411,10 @@ void OpenGLEngine::draw()
 
 	if(settings.ssao)
 	{
-		common_uniforms.mat_common_flags = (cur_scene->cloud_shadows ? CLOUD_SHADOWS_FLAG : 0) | DOING_SSAO_PREPASS_FLAG; // Disable reading from SSAO output texture (DO_SSAO_FLAG) for the prepass, set DOING_SSAO_PREPASS_FLAG.
+		// Disable reading from SSAO output texture (DO_SSAO_FLAG) for the prepass, set DOING_SSAO_PREPASS_FLAG.
+		const int old_flags = common_uniforms.mat_common_flags;
+		common_uniforms.mat_common_flags = common_uniforms.mat_common_flags;
+		common_uniforms.mat_common_flags = BitUtils::getWithBitZeroed(common_uniforms.mat_common_flags, DO_SSAO_FLAG) | DOING_SSAO_PREPASS_FLAG;
 		this->material_common_uniform_buf_ob->updateData(/*dest offset=*/0, &common_uniforms, sizeof(MaterialCommonUniforms));
 
 		// drawDepthPrePass(view_matrix, proj_matrix);
@@ -7699,12 +8423,15 @@ void OpenGLEngine::draw()
 		computeSSAO(proj_matrix);
 
 		// Restore flags
-		common_uniforms.mat_common_flags = (cur_scene->cloud_shadows ? CLOUD_SHADOWS_FLAG : 0) | ((this->settings.ssao && show_ssao) ? DO_SSAO_FLAG : 0);
+		common_uniforms.mat_common_flags = old_flags;
 		this->material_common_uniform_buf_ob->updateData(/*dest offset=*/0, &common_uniforms, sizeof(MaterialCommonUniforms));
 	}
 
 	//================= Draw non-transparent (opaque) batches from objects =================
 	drawNonTransparentMaterialBatches(view_matrix, proj_matrix);
+
+	if(draw_probe_debug_spheres && irradianceProbesEnabled())
+		drawProbeDebugSpheres(view_matrix, proj_matrix);
 
 	//================= Draw water objects =================
 	drawWaterObjects(view_matrix, proj_matrix);
@@ -7946,6 +8673,7 @@ void OpenGLEngine::draw()
 
 
 	VAO::unbind(); // Unbind any bound VAO, so that its vertex and index buffers don't get accidentally overridden.
+	current_bound_VAO = NULL;
 	glActiveTexture(GL_TEXTURE0); // Make sure we don't overwrite a texture binding to a non-zero texture unit (tex unit zero is the scratch texture unit), while loading data into textures or creating new textures, outside of this draw() call.
 
 	if(query_profiling_enabled && cur_scene->collect_stats)
@@ -8156,7 +8884,7 @@ void OpenGLEngine::doDOFBlur(OpenGLTexture* colour_tex_input)
 
 // Input: colour_tex_input
 // Output: fog_colour_texture
-void OpenGLEngine::doFogPostProcess(OpenGLTexture* colour_tex_input, const Matrix4f& view_matrix, const Matrix4f& proj_matrix)
+void OpenGLEngine::doFogPostProcess(OpenGLTexture* colour_tex_input, const Matrix4f& /*view_matrix*/, const Matrix4f& /*proj_matrix*/)
 {
 	DebugGroup debug_group("doFogPostProcess()");
 	TracyGpuZone("doFogPostProcess");
@@ -8978,14 +9706,14 @@ void OpenGLEngine::drawBackgroundEnvMap(const Matrix4f& view_matrix, const Matri
 			{
 				current_scene->main_render_framebuffer->bindForDrawing();
 				assert(current_scene->main_render_framebuffer->getAttachedRenderBufferName(GL_COLOR_ATTACHMENT0) == current_scene->main_colour_renderbuffer->buffer_name); // Check main colour renderbuffer is attached at GL_COLOR_ATTACHMENT0.
-				setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer, not normal buffer
+				current_scene->main_render_framebuffer->setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer, not normal buffer
 			}
 			else
 			{
 				if(this->target_frame_buffer)
 				{
 					this->target_frame_buffer->bindForDrawing();
-					setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer, not normal buffer.
+					this->target_frame_buffer->setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer, not normal buffer.
 				}
 				else
 					glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0); // Bind to default frame buffer and use the draw buffer already set already for it.
@@ -9042,14 +9770,14 @@ void OpenGLEngine::drawAlphaBlendedObjects(const Matrix4f& view_matrix, const Ma
 		{
 			current_scene->main_render_framebuffer->bindForDrawing();
 			assert(current_scene->main_render_framebuffer->getAttachedRenderBufferName(GL_COLOR_ATTACHMENT0) == current_scene->main_colour_renderbuffer->buffer_name); // Check main colour renderbuffer is attached at GL_COLOR_ATTACHMENT0.
-			setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer (not normal buffer)
+			current_scene->main_render_framebuffer->setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer (not normal buffer)
 		}
 		else
 		{
 			if(this->target_frame_buffer)
 			{
 				this->target_frame_buffer->bindForDrawing();
-				setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer, not normal buffer.
+				this->target_frame_buffer->setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer, not normal buffer.
 			}
 			else
 				glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0); // Bind to default frame buffer and use the draw buffer already set already for it.
@@ -9536,6 +10264,7 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 	// Splats blend into an accumulation buffer of their own, on a framebuffer of their own, rather than straight onto
 	// the main colour buffer.  Two reasons:
 	//
+<<<<<<< HEAD
 	// - The blend has to run in the display-referred sRGB space the splats were fitted in, so that the engine's display
 	//   transform can be inverted once afterwards instead of per splat - see gaussian_splat_frag_shader.glsl.
 	// - The front-to-back "under" blend below reads the *destination's* alpha as "how much of this pixel is already
@@ -9690,6 +10419,18 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 
 		// Start the real pass from an empty buffer, exactly as if the counting pass had never run.
 		glClearBufferfv(GL_COLOR, /*drawBuffer=*/0, col_zero);
+=======
+	// Without the main render framebuffer there's no attachment to swap and no depth renderbuffer we could attach
+	// alongside our own colour buffer, so splats blend straight into the target instead.  Nothing tone maps that target,
+	// so its contents are display-referred as well, and the splats' authored colours are already the values to write.
+	const bool use_accum_buffer = allocSplatAccumBuffersIfNeeded();
+	if(use_accum_buffer)
+	{
+		assert(current_scene->main_render_framebuffer->getAttachedRenderBufferName(GL_COLOR_ATTACHMENT0) == current_scene->main_colour_renderbuffer->buffer_name);
+		current_scene->main_render_framebuffer->attachRenderBufferAndBindForDrawing(*current_scene->splat_accum_renderbuffer, GL_COLOR_ATTACHMENT0); // Replaces the colour buffer as GL_COLOR_ATTACHMENT0.  Restored in resolveSplatAccumBuffer().
+		current_scene->main_render_framebuffer->setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to the accumulation buffer (not the normal buffer).
+		current_scene->main_render_framebuffer->clearFloatColourBuffer(/*drawbuffer=*/0, Colour3f(0.f), /*alpha=*/0.f);
+>>>>>>> origin/master
 	}
 
 	// Started after the counting pass above, deliberately: this timer is the number the diagnostic is read from, and it
@@ -9728,6 +10469,7 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 		// unreadable a day later, and these are exactly the knobs a session spends its time moving.
 		try
 		{
+<<<<<<< HEAD
 			FileUtils::writeEntireFileTextMode(splat_snapshot_output_dir + "/capture_info.txt",
 				"Splat saturation snapshots\n"
 				"viewport: " + toString(current_scene->viewport_w) + " x " + toString(current_scene->viewport_h) + "\n"
@@ -9743,6 +10485,10 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 		catch(glare::Exception& e)
 		{
 			conPrint("Error writing splat snapshot capture info: " + e.what());
+=======
+			this->target_frame_buffer->bindForDrawing();
+			this->target_frame_buffer->setSingleDrawBuffer(GL_COLOR_ATTACHMENT0);
+>>>>>>> origin/master
 		}
 	}
 
@@ -10692,10 +11438,20 @@ void OpenGLEngine::resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name)
 		/*num_buffers_to_copy=*/1, // The splat accumulation framebuffer has just the one colour attachment.
 		/*copy_buf0_colour=*/true, /*copy_buf0_depth=*/false);
 
+<<<<<<< HEAD
 	//----------------------- Composite onto the buffer the frame is being drawn into -----------------------
 	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, scene_target_framebuffer_name);
 	if(scene_target_framebuffer_name != 0)
 		setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer (not normal buffer).  The default framebuffer has no such attachment, and the draw buffer set for it already is the right one.
+=======
+	// Restore the attachments both framebuffers had before this pass.
+	current_scene->main_render_framebuffer->attachRenderBuffer(*current_scene->main_colour_renderbuffer, GL_COLOR_ATTACHMENT0);
+	current_scene->main_render_copy_framebuffer->attachTexture(*current_scene->main_colour_copy_texture, GL_COLOR_ATTACHMENT0);
+
+	//----------------------- Composite onto the main colour buffer -----------------------
+	current_scene->main_render_framebuffer->bindForDrawing();
+	current_scene->main_render_framebuffer->setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer (not normal buffer)
+>>>>>>> origin/master
 
 	glDepthMask(GL_FALSE); // Don't write to z-buffer: the splats were depth tested as they were drawn, this is just a composite.
 	glDisable(GL_DEPTH_TEST); // Don't depth test
@@ -10826,7 +11582,7 @@ void OpenGLEngine::drawDecals(const Matrix4f& view_matrix, const Matrix4f& proj_
 			// Restore main render buffer binding
 			current_scene->main_render_framebuffer->bindForDrawing();
 			assert(current_scene->main_render_framebuffer->getAttachedRenderBufferName(GL_COLOR_ATTACHMENT0) == current_scene->main_colour_renderbuffer->buffer_name);
-			setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Only write to colour buffer for decal shader (don't write to normal buffer).
+			current_scene->main_render_framebuffer->setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Only write to colour buffer for decal shader (don't write to normal buffer).
 
 
 
@@ -10942,14 +11698,14 @@ void OpenGLEngine::drawWaterObjects(const Matrix4f& view_matrix, const Matrix4f&
 			assert(current_scene->main_render_framebuffer->getAttachedRenderBufferName(GL_COLOR_ATTACHMENT1) == current_scene->main_normal_renderbuffer->buffer_name);
 		
 			// Draw to all colour buffers: colour and normal buffer.
-			setTwoDrawBuffers(GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1);
+			current_scene->main_render_framebuffer->setTwoDrawBuffers(GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1);
 		}
 		else
 		{
 			if(this->target_frame_buffer)
 			{
 				this->target_frame_buffer->bindForDrawing();
-				setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer, not normal buffer.
+				this->target_frame_buffer->setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer, not normal buffer.
 			}
 			else
 				glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0); // Bind to default frame buffer and use the draw buffer already set already for it.
@@ -11077,6 +11833,103 @@ void OpenGLEngine::drawWaterObjects(const Matrix4f& view_matrix, const Matrix4f&
 
 
 // Draw non-transparent (opaque) batches from objects
+// Draw the scene into a probe capture cube face, from each object's probe_capture_batches.
+//
+// Separate from drawNonTransparentMaterialBatches() rather than sharing it, following how the shadow passes
+// iterate depth_draw_batches in their own loop.  The material category filtering that function does was already
+// applied when this list was built, so all that is left here is frustum culling, sorting and submission.
+//
+// Face culling stays off throughout: every key in this list has zero culling bits, so setFaceCulling() is never
+// asked to enable it.  See rebuildObjectProbeCaptureBatches() for why that matters.
+void OpenGLEngine::drawProbeCaptureBatches(const Matrix4f& view_matrix, const Matrix4f& proj_matrix)
+{
+	DebugGroup debug_group("drawProbeCaptureBatches");
+
+	temp_batch_draw_info.reserve(current_scene->objects.size());
+	temp_batch_draw_info.resize(0);
+
+	{
+		const Planef* const frustum_clip_planes = current_scene->frustum_clip_planes;
+		const int num_frustum_clip_planes       = current_scene->num_frustum_clip_planes;
+		const js::AABBox frustum_aabb           = current_scene->frustum_aabb;
+
+		const GLObjectRef* const current_scene_obs = current_scene->objects.vector.data();
+		const size_t current_scene_obs_size        = current_scene->objects.vector.size();
+		for(size_t i=0; i<current_scene_obs_size; ++i)
+		{
+			if(i + 16 < current_scene_obs_size)
+			{
+				_mm_prefetch((const char*)(&current_scene_obs[i + 16]->aabb_ws), _MM_HINT_T0);
+				_mm_prefetch((const char*)(&current_scene_obs[i + 16]->aabb_ws) + 64, _MM_HINT_T0);
+			}
+
+			const GLObject* const ob = current_scene_obs[i].ptr();
+			if(AABBIntersectsFrustum(frustum_clip_planes, num_frustum_clip_planes, frustum_aabb, ob->aabb_ws))
+			{
+				const size_t ob_batches_size                  = ob->probe_capture_batches.size();
+				const GLObjectBatchDrawInfo* const ob_batches = ob->probe_capture_batches.data();
+				for(uint32 z = 0; z < ob_batches_size; ++z)
+				{
+					const uint32 prog_index_and_face_culling = ob_batches[z].getProgramIndexAndFaceCulling();
+					assert((prog_index_and_face_culling & ISOLATE_FACE_CULLING_MASK) == 0); // Culling must be off for captures.
+
+					BatchDrawInfo info(
+						prog_index_and_face_culling,
+						ob->vao_and_vbo_key,
+						ob, // object ptr
+						z // batch_i
+					);
+					temp_batch_draw_info.push_back(info);
+				}
+			}
+		}
+	}
+
+	sortBatchDrawInfos();
+
+	// A program index no real program will have, so the first batch always takes the branch and binds.  The other
+	// draw loops or this with SHIFTED_CULL_BACKFACE_BITS to match the culling state they establish; not needed
+	// here, since nothing below reads the culling bits.
+	uint32 current_prog_index_and_face_culling = 1000000;
+
+	glDisable(GL_CULL_FACE); // Stays off for the whole pass - drawBackgroundEnvMap() may have enabled it.
+
+	const BatchDrawInfo* const batch_draw_info_data = temp_batch_draw_info.data();
+	const size_t batch_draw_info_size               = temp_batch_draw_info.size();
+	for(size_t z=0; z<batch_draw_info_size; ++z)
+	{
+		const BatchDrawInfo& info = batch_draw_info_data[z];
+		const GLObjectBatchDrawInfo& batch = info.ob->probe_capture_batches[info.batch_i];
+		const uint32 prog_index_and_face_culling = batch.getProgramIndexAndFaceCulling();
+		if(prog_index_and_face_culling != current_prog_index_and_face_culling)
+		{
+			if(use_multi_draw_indirect)
+				submitBufferedDrawCommands(); // Flush existing draw commands
+
+			// No face culling handling: every key here has zero culling bits, asserted above.
+			const uint32 prog_index = prog_index_and_face_culling & ISOLATE_PROG_INDEX_MASK;
+			if(prog_index != (current_prog_index_and_face_culling & ISOLATE_PROG_INDEX_MASK))
+			{
+				const OpenGLProgram* prog = this->prog_vector[prog_index].ptr();
+				prog->useProgram();
+				current_bound_prog = prog;
+				current_bound_prog_index = prog_index;
+				current_uniforms_ob = NULL; // Program has changed, so we need to set object uniforms for the current program.
+				setSharedUniformsForProg(*prog, view_matrix, proj_matrix);
+			}
+
+			current_prog_index_and_face_culling = prog_index_and_face_culling;
+		}
+
+		bindMeshData(*info.ob);
+
+		drawBatchWithDenormalisedData(*info.ob, batch, info.batch_i);
+	}
+
+	flushDrawCommandsAndUnbindPrograms();
+}
+
+
 void OpenGLEngine::drawNonTransparentMaterialBatches(const Matrix4f& view_matrix, const Matrix4f& proj_matrix)
 {
 	ZoneScopedN("Draw opaque obs"); // Tracy profiler
@@ -11099,14 +11952,14 @@ void OpenGLEngine::drawNonTransparentMaterialBatches(const Matrix4f& view_matrix
 		current_scene->main_render_framebuffer->bindForDrawing();
 		assert(current_scene->main_render_framebuffer->getAttachedRenderBufferName(GL_COLOR_ATTACHMENT0) == current_scene->main_colour_renderbuffer->buffer_name); // Check main colour renderbuffer is attached at GL_COLOR_ATTACHMENT0.
 		assert(current_scene->main_render_framebuffer->getAttachedRenderBufferName(GL_COLOR_ATTACHMENT1) == current_scene->main_normal_renderbuffer->buffer_name); // Check main normal renderbuffer is attached at GL_COLOR_ATTACHMENT1.
-		setTwoDrawBuffers(GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1); // Draw to colour and normal buffers.
+		current_scene->main_render_framebuffer->setTwoDrawBuffers(GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1); // Draw to colour and normal buffers.
 	}
 	else
 	{
 		if(this->target_frame_buffer)
 		{
 			this->target_frame_buffer->bindForDrawing();
-			setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer, not normal buffer.
+			this->target_frame_buffer->setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer, not normal buffer.
 		}
 		else
 			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0); // Bind to default frame buffer and use the draw buffer already set already for it.
@@ -11299,13 +12152,21 @@ void OpenGLEngine::drawTransparentMaterialBatches(const Matrix4f& view_matrix, c
 		assert(current_scene->main_render_framebuffer->getAttachedRenderBufferName(GL_COLOR_ATTACHMENT0) == current_scene->main_colour_renderbuffer->buffer_name); // Check main colour renderbuffer is attached at GL_COLOR_ATTACHMENT0.
 		if(use_order_indep_transparency)
 		{
-			current_scene->main_render_framebuffer->attachRenderBuffer(*current_scene->total_transmittance_renderbuffer, GL_COLOR_ATTACHMENT0); // Replaces color buffer as GL_COLOR_ATTACHMENT0
-			current_scene->main_render_framebuffer->attachRenderBuffer(*current_scene->transparent_accum_renderbuffer, GL_COLOR_ATTACHMENT1); // Replaces normal buffer as GL_COLOR_ATTACHMENT1
-			setTwoDrawBuffers(GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1); // Draw to two colour buffers:  total_transmittance, transparent_accum.
+			current_scene->main_render_framebuffer->attachRenderBuffersAndBindForDrawing(
+				*current_scene->total_transmittance_renderbuffer, GL_COLOR_ATTACHMENT0, // Replaces color buffer as GL_COLOR_ATTACHMENT0
+				*current_scene->transparent_accum_renderbuffer,   GL_COLOR_ATTACHMENT1  // Replaces normal buffer as GL_COLOR_ATTACHMENT1
+			);
+			current_scene->main_render_framebuffer->setTwoDrawBuffers(GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1); // Draw to two colour buffers:  total_transmittance, transparent_accum.
+
+			// Clear total_transmittance_texture (GL_COLOR_ATTACHMENT0).
+			current_scene->main_render_framebuffer->clearFloatColourBuffer(/*drawbuffer=*/0, Colour3f(1.f), /*alpha=*/1.f);
+
+			// Clear transparent_accum_texture buffer (GL_COLOR_ATTACHMENT1)
+			current_scene->main_render_framebuffer->clearFloatColourBuffer(/*drawbuffer=*/1, Colour3f(0.f), /*alpha=*/0.f);
 		}
 		else
 		{
-			setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer
+			current_scene->main_render_framebuffer->setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer
 		}
 	}
 	else
@@ -11313,22 +12174,10 @@ void OpenGLEngine::drawTransparentMaterialBatches(const Matrix4f& view_matrix, c
 		if(this->target_frame_buffer)
 		{
 			this->target_frame_buffer->bindForDrawing();
-			setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer, not normal buffer.
+			this->target_frame_buffer->setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer, not normal buffer.
 		}
 		else
 			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0); // Bind to default frame buffer and use the draw buffer already set already for it.
-	}
-
-	if(use_order_indep_transparency && current_scene->render_to_main_render_framebuffer)
-	{
-		// Clear total_transmittance_texture (GL_COLOR_ATTACHMENT0).
-		// NOTE that glClearBufferfv uses draw buffer indices, so glDrawBuffers() needs to be called first.
-		const float col_one[4] = { 1, 1, 1, 1 };
-		glClearBufferfv(GL_COLOR, /*drawBuffer=*/0, col_one);
-
-		// Clear transparent_accum_texture buffer (GL_COLOR_ATTACHMENT1)
-		const float col_zero[4] = { 0, 0, 0, 0 };
-		glClearBufferfv(GL_COLOR, /*drawBuffer=*/1, col_zero);
 	}
 
 
@@ -11442,8 +12291,8 @@ void OpenGLEngine::drawTransparentMaterialBatches(const Matrix4f& view_matrix, c
 	if(use_order_indep_transparency && current_scene->render_to_main_render_framebuffer)
 	{
 		//----------------------- Copy total_transmittance render buffer to total_transmittance_copy_texture -----------------------
-		current_scene->main_render_copy_framebuffer->attachTexture(*current_scene->total_transmittance_copy_texture, GL_COLOR_ATTACHMENT0);
-		current_scene->main_render_copy_framebuffer->attachTexture(*current_scene->transparent_accum_copy_texture,   GL_COLOR_ATTACHMENT1);
+		current_scene->main_render_copy_framebuffer->attachTextures(*current_scene->total_transmittance_copy_texture, GL_COLOR_ATTACHMENT0,
+		                                                            *current_scene->transparent_accum_copy_texture,   GL_COLOR_ATTACHMENT1);
 
 		blitFrameBuffer(/*src_framebuffer=*/*current_scene->main_render_framebuffer, /*dest_framebuffer=*/*current_scene->main_render_copy_framebuffer, 
 				/*num_buffers_to_copy=*/2, // Copy total_transmittance and transparent_accum buffer
@@ -11452,10 +12301,10 @@ void OpenGLEngine::drawTransparentMaterialBatches(const Matrix4f& view_matrix, c
 		// main_render_framebuffer->discardContents(GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1); // Discard total_transmittance and transparent_accum now it has been copied out of
 
 		// Restore render buffer bindings for main_render_framebuffer and main_render_copy_framebuffer
-		current_scene->main_render_framebuffer->attachRenderBuffer(*current_scene->main_colour_renderbuffer, GL_COLOR_ATTACHMENT0);
-		current_scene->main_render_framebuffer->attachRenderBuffer(*current_scene->main_normal_renderbuffer, GL_COLOR_ATTACHMENT1);
-		current_scene->main_render_copy_framebuffer->attachTexture(*current_scene->main_colour_copy_texture, GL_COLOR_ATTACHMENT0);
-		current_scene->main_render_copy_framebuffer->attachTexture(*current_scene->main_normal_copy_texture, GL_COLOR_ATTACHMENT1);
+		current_scene->main_render_framebuffer->attachRenderBuffers(*current_scene->main_colour_renderbuffer, GL_COLOR_ATTACHMENT0,
+		                                                            *current_scene->main_normal_renderbuffer, GL_COLOR_ATTACHMENT1);
+		current_scene->main_render_copy_framebuffer->attachTextures(*current_scene->main_colour_copy_texture, GL_COLOR_ATTACHMENT0,
+		                                                            *current_scene->main_normal_copy_texture, GL_COLOR_ATTACHMENT1);
 	}
 }
 
@@ -11478,7 +12327,7 @@ void OpenGLEngine::drawColourAndDepthPrePass(const Matrix4f& view_matrix, const 
 		assert(current_scene->prepass_framebuffer->getAttachedRenderBufferName(GL_COLOR_ATTACHMENT0) == current_scene->prepass_colour_renderbuffer->buffer_name);
 		assert(current_scene->prepass_framebuffer->getAttachedRenderBufferName(GL_COLOR_ATTACHMENT1) == current_scene->prepass_normal_renderbuffer->buffer_name);
 		assert(current_scene->prepass_framebuffer->getAttachedRenderBufferName(GL_DEPTH_ATTACHMENT)  == current_scene->prepass_depth_renderbuffer->buffer_name);
-		setTwoDrawBuffers(GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1); // Draw to colour and normal buffer
+		current_scene->prepass_framebuffer->setTwoDrawBuffers(GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1); // Draw to colour and normal buffer
 
 
 		glViewport(0, 0, (GLsizei)current_scene->prepass_framebuffer->xRes(), (GLsizei)current_scene->prepass_framebuffer->yRes());
@@ -11899,7 +12748,7 @@ void OpenGLEngine::computeSSAO(const Matrix4f& /*proj_matrix*/)
 			glViewport(0, 0, (GLsizei)current_scene->prepass_framebuffer->xRes(), (GLsizei)current_scene->prepass_framebuffer->yRes());
 
 			current_scene->compute_ssao_framebuffer->bindForDrawing();
-			setTwoDrawBuffers(GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1);
+			current_scene->compute_ssao_framebuffer->setTwoDrawBuffers(GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1);
 
 
 			glDepthMask(GL_FALSE); // Don't write to z-buffer
@@ -12070,14 +12919,14 @@ void OpenGLEngine::drawAlwaysVisibleObjects(const Matrix4f& view_matrix, const M
 		{
 			current_scene->main_render_framebuffer->bindForDrawing();
 			assert(current_scene->main_render_framebuffer->getAttachedRenderBufferName(GL_COLOR_ATTACHMENT0) == current_scene->main_colour_renderbuffer->buffer_name); // Check main colour renderbuffer is attached at GL_COLOR_ATTACHMENT0.			
-			setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just write to colour buffer
+			current_scene->main_render_framebuffer->setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just write to colour buffer
 		}
 		else
 		{
 			if(this->target_frame_buffer)
 			{
 				this->target_frame_buffer->bindForDrawing();
-				setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer, not normal buffer.
+				this->target_frame_buffer->setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer, not normal buffer.
 			}
 			else
 				glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0); // Bind to default frame buffer and use the draw buffer already set already for it.
@@ -12165,10 +13014,9 @@ void OpenGLEngine::generateOutlineTexture(const Matrix4f& view_matrix, const Mat
 		}
 		outline_edge_mat.albedo_texture = current_scene->outline_edge_tex;
 
-		setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer (not normal buffer)
-
 		// -------------------------- Stage 1: draw flat selected objects. --------------------
 		current_scene->outline_solid_framebuffer->bindForDrawing();
+		current_scene->outline_solid_framebuffer->setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer (not normal buffer)
 		glViewport(0, 0, (GLsizei)current_scene->outline_solid_tex->xRes(), (GLsizei)current_scene->outline_solid_tex->yRes()); // Make viewport same size as texture.
 		glClearColor(0.f, 0.f, 0.f, 1.f);
 		glClearDepthf(use_reverse_z ? 0.0f : 1.f); // For reversed-z, the 'far' z value is 0, instead of 1.
@@ -12237,7 +13085,7 @@ void OpenGLEngine::drawOutlinesAroundSelectedObjects()
 
 		current_scene->main_render_framebuffer->bindForDrawing();
 		assert(current_scene->main_render_framebuffer->getAttachedRenderBufferName(GL_COLOR_ATTACHMENT0) == current_scene->main_colour_renderbuffer->buffer_name);
-		setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer (not normal buffer)
+		current_scene->main_render_framebuffer->setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer (not normal buffer)
 
 		glEnable(GL_BLEND);
 		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -12299,7 +13147,7 @@ void OpenGLEngine::drawUIOverlayObjects(const Matrix4f& reverse_z_matrix)
 	if(this->target_frame_buffer)
 	{
 		this->target_frame_buffer->bindForDrawing();
-		setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer, not normal buffer.
+		this->target_frame_buffer->setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer, not normal buffer.
 	}
 	else
 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0); // Bind to default frame buffer and use the draw buffer already set already for it.
@@ -12420,8 +13268,7 @@ void OpenGLEngine::drawAuroraTex()
 		aurora_tex_frame_buffer = new FrameBuffer();
 		aurora_tex_frame_buffer->attachTexture(*aurora_tex, GL_COLOR_ATTACHMENT0);
 
-		GLenum is_complete = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-		if(is_complete != GL_FRAMEBUFFER_COMPLETE)
+		if(!aurora_tex_frame_buffer->isComplete())
 		{
 			conPrint("Error: drawAuroraTex(): framebuffer is not complete.");
 			assert(0);
@@ -12790,6 +13637,7 @@ void OpenGLEngine::doSetStandardTextureUnitUniformsForBoundProgram(const OpenGLP
 	glUniform1i(program.uniform_locations.static_depth_tex_location, STATIC_DEPTH_TEX_TEXTURE_UNIT_INDEX);
 
 	glUniform1i(program.uniform_locations.cosine_env_tex_location, COSINE_ENV_TEXTURE_UNIT_INDEX);
+	glUniform1i(program.uniform_locations.probe_irradiance_tex_location, PROBE_IRRADIANCE_TEXTURE_UNIT_INDEX);
 	glUniform1i(program.uniform_locations.specular_env_tex_location, SPECULAR_ENV_TEXTURE_UNIT_INDEX);
 	glUniform1i(program.uniform_locations.blue_noise_tex_location, BLUE_NOISE_TEXTURE_UNIT_INDEX);
 	glUniform1i(program.uniform_locations.fbm_tex_location, FBM_TEXTURE_UNIT_INDEX);
@@ -12850,6 +13698,8 @@ void OpenGLEngine::bindStandardTexturesToTextureUnits()
 		bindTextureToTextureUnit(*this->cosine_env_tex,    /*texture_unit_index=*/COSINE_ENV_TEXTURE_UNIT_INDEX);
 		bindTextureToTextureUnit(*this->specular_env_tex,  /*texture_unit_index=*/SPECULAR_ENV_TEXTURE_UNIT_INDEX);
 	}
+	if(irradianceProbesEnabled() && irradiance_probes->irradiance_tex.nonNull())
+		bindTextureToTextureUnit(*irradiance_probes->irradiance_tex, /*texture_unit_index=*/PROBE_IRRADIANCE_TEXTURE_UNIT_INDEX);
 	bindTextureToTextureUnit(*this->blue_noise_tex,    /*texture_unit_index=*/BLUE_NOISE_TEXTURE_UNIT_INDEX);
 	bindTextureToTextureUnit(*this->fbm_tex,           /*texture_unit_index=*/FBM_TEXTURE_UNIT_INDEX);
 
@@ -12912,7 +13762,7 @@ void OpenGLEngine::bindStandardTexturesToTextureUnits()
 
 
 
-void OpenGLEngine::setUniformsForPhongProg(const OpenGLMaterial& opengl_mat, const OpenGLMeshRenderData& mesh_data, PhongUniforms& uniforms) const
+void OpenGLEngine::setUniformsForPhongProg(const OpenGLMaterial& opengl_mat, [[maybe_unused]] const OpenGLMeshRenderData& mesh_data, PhongUniforms& uniforms) const
 {
 	ZoneScoped; // Tracy profiler
 
@@ -13148,12 +13998,14 @@ void OpenGLEngine::drawBatch(const GLObject& ob, const OpenGLMaterial& opengl_ma
 		if(!use_bindless_textures)
 			bindTexturesForPhongProg(opengl_mat);
 	}
-	else if(shader_prog == this->env_prog.getPointer())
+	// Either the normal env program, or the sun-less variant used when capturing probes.  The uniform locations
+	// are read from shader_prog rather than from members on the engine, since they differ between the two.
+	else if((shader_prog == this->env_prog.getPointer()) || (shader_prog == this->probe_capture_env_prog.getPointer()))
 	{
-		glUniform4f(this->env_diffuse_colour_location, opengl_mat.albedo_linear_rgb.r, opengl_mat.albedo_linear_rgb.g, opengl_mat.albedo_linear_rgb.b, 1.f);
-		glUniform1i(this->env_have_texture_location, opengl_mat.albedo_texture.nonNull() ? 1 : 0);
+		glUniform4f(shader_prog->uniform_locations.env_diffuse_colour_location, opengl_mat.albedo_linear_rgb.r, opengl_mat.albedo_linear_rgb.g, opengl_mat.albedo_linear_rgb.b, 1.f);
+		glUniform1i(shader_prog->uniform_locations.env_have_texture_location, opengl_mat.albedo_texture.nonNull() ? 1 : 0);
 		const Vec4f campos_ws = current_scene->cam_to_world.getColumn(3);
-		glUniform3fv(this->env_campos_ws_location, 1, campos_ws.x);
+		glUniform3fv(shader_prog->uniform_locations.env_campos_ws_location, 1, campos_ws.x);
 		if(shader_prog->time_loc >= 0)
 			glUniform1f(shader_prog->time_loc, this->current_time);
 
@@ -13164,23 +14016,27 @@ void OpenGLEngine::drawBatch(const GLObject& ob, const OpenGLMaterial& opengl_ma
 				opengl_mat.tex_matrix.e[1], opengl_mat.tex_matrix.e[3], 0,
 				opengl_mat.tex_translation.x, opengl_mat.tex_translation.y, 1
 			};
-			glUniformMatrix3fv(this->env_texture_matrix_location, /*count=*/1, /*transpose=*/false, tex_elems);
+			glUniformMatrix3fv(shader_prog->uniform_locations.env_texture_matrix_location, /*count=*/1, /*transpose=*/false, tex_elems);
 
 			bindTextureToTextureUnit(*opengl_mat.albedo_texture, DIFFUSE_TEXTURE_UNIT_INDEX);
 		}
 
 		// There seems to be an Emscripten bug where sometimes the uniform values gets changed.  Just set it every frame as a workaround.
 #if EMSCRIPTEN
-		doSetStandardTextureUnitUniformsForBoundProgram(*this->env_prog);
+		doSetStandardTextureUnitUniformsForBoundProgram(*shader_prog);
 #endif
 
-		//assert(getIntUniformVal(*env_prog, this->env_prog->uniform_locations.blue_noise_tex_location) == BLUE_NOISE_TEXTURE_UNIT_INDEX);
-		assert(getIntUniformVal(*env_prog, this->env_prog->uniform_locations.diffuse_tex_location) == DIFFUSE_TEXTURE_UNIT_INDEX);
-		if(settings.render_sun_and_clouds)
+		// The probe capture variant has the sun and cloud code compiled out, so it has no fbm or cirrus samplers.
+		if(shader_prog == this->env_prog.getPointer())
 		{
-			assert(getIntUniformVal(*env_prog, this->env_prog->uniform_locations.fbm_tex_location) == FBM_TEXTURE_UNIT_INDEX);
-			if(this->cirrus_tex.nonNull())
-				assert(getIntUniformVal(*env_prog, this->env_prog->uniform_locations.cirrus_tex_location) == CIRRUS_TEX_TEXTURE_UNIT_INDEX);
+			//assert(getIntUniformVal(*env_prog, this->env_prog->uniform_locations.blue_noise_tex_location) == BLUE_NOISE_TEXTURE_UNIT_INDEX);
+			assert(getIntUniformVal(*env_prog, this->env_prog->uniform_locations.diffuse_tex_location) == DIFFUSE_TEXTURE_UNIT_INDEX);
+			if(settings.render_sun_and_clouds)
+			{
+				assert(getIntUniformVal(*env_prog, this->env_prog->uniform_locations.fbm_tex_location) == FBM_TEXTURE_UNIT_INDEX);
+				if(this->cirrus_tex.nonNull())
+					assert(getIntUniformVal(*env_prog, this->env_prog->uniform_locations.cirrus_tex_location) == CIRRUS_TEX_TEXTURE_UNIT_INDEX);
+			}
 		}
 
 		assert(getBoundTexture2D(BLUE_NOISE_TEXTURE_UNIT_INDEX) == blue_noise_tex->texture_handle);
@@ -13412,7 +14268,7 @@ void OpenGLEngine::drawBatchWithDenormalisedData(const GLObject& ob, const GLObj
 			const OpenGLProgram* const prog = this->prog_vector[batch.getProgramIndex()].ptr();
 			if(prog->uses_phong_uniforms)
 			{
-				assert(batch.material_data_or_mat_index == ob.getUsedBatches()[batch_index].material_index);
+				//assert(batch.material_data_or_mat_index == ob.getUsedBatches()[batch_index].material_index);
 				const OpenGLMaterial& opengl_mat = ob.materials[batch.material_data_or_mat_index]; // This is the non-MDI case, so material_data_or_mat_index is the index into ob.materials
 
 #if UNIFORM_BUF_PER_MAT_SUPPORT
@@ -13968,8 +14824,8 @@ Reference<ImageMap<uint8, UInt8ComponentValueTraits>> OpenGLEngine::drawToBuffer
 	RenderBufferRef depth_renderbuffer  = new RenderBuffer(xres, yres, msaa_samples, depth_format);
 
 	FrameBufferRef render_framebuffer = new FrameBuffer();
-	render_framebuffer->attachRenderBuffer(*colour_renderbuffer, GL_COLOR_ATTACHMENT0);
-	render_framebuffer->attachRenderBuffer(*depth_renderbuffer, GL_DEPTH_ATTACHMENT);
+	render_framebuffer->attachRenderBuffers(*colour_renderbuffer, GL_COLOR_ATTACHMENT0,
+	                                        *depth_renderbuffer,  GL_DEPTH_ATTACHMENT);
 	assert(render_framebuffer->isComplete());
 
 	// Create render_copy_framebuffer.  This is similar to render_framebuffer except it doesn't use MSAA (is not clear to me how glReadPixels works with MSAA)
@@ -13993,8 +14849,8 @@ Reference<ImageMap<uint8, UInt8ComponentValueTraits>> OpenGLEngine::drawToBuffer
 	);
 
 	FrameBufferRef render_copy_framebuffer = new FrameBuffer();
-	render_copy_framebuffer->attachTexture(*colour_copy_texture, GL_COLOR_ATTACHMENT0);
-	render_copy_framebuffer->attachTexture(*depth_copy_texture, GL_DEPTH_ATTACHMENT);
+	render_copy_framebuffer->attachTextures(*colour_copy_texture, GL_COLOR_ATTACHMENT0,
+	                                        *depth_copy_texture,  GL_DEPTH_ATTACHMENT);
 	assert(render_copy_framebuffer->isComplete());
 
 
@@ -14010,6 +14866,8 @@ Reference<ImageMap<uint8, UInt8ComponentValueTraits>> OpenGLEngine::drawToBuffer
 	render_copy_framebuffer->bindForReading();
 	glReadBuffer(GL_COLOR_ATTACHMENT0);
 	ImageMapUInt8Ref image = getRenderedColourBuffer(xres, yres, /*buffer has alpha=*/numChannels(col_buffer_format) == 4); // Capture the framebuffer
+
+	FrameBuffer::unbind(); // Unbind render_copy_framebuffer for drawing, unbind render_copy_framebuffer for reading.
 
 	// Free the framebuffers we just made
 	render_framebuffer = nullptr;
@@ -14230,6 +15088,12 @@ void OpenGLEngine::setSSAOEnabled(bool ssao_enabled)
 }
 
 
+bool OpenGLEngine::isSSAOEnabled() const
+{
+	return settings.ssao;
+}
+
+
 bool OpenGLEngine::openglDriverVendorIsIntel() const
 {
 	return StringUtils::containsString(::toLowerCase(opengl_vendor), "intel");
@@ -14242,54 +15106,84 @@ bool OpenGLEngine::openglDriverVendorIsATI() const
 }
 
 
-void OpenGLEngine::toggleShowTexDebug(int index)
+// Matches index handling in setCurDebugTexIndex() below.
+static const char* debug_pass_view_names[] = { 
+	"none",
+	"AO (sky irradiance fraction)", 
+	"blurred AO", 
+	"prepass colour", 
+	"indirect illum",
+	"blurred indirect illum", 
+	"specular", 
+	"specular refl roughness * trace dist"
+};
+
+const char** OpenGLEngine::getDebugPassViewNames() const
 {
-	if(large_debug_overlay_ob)
+	return debug_pass_view_names;
+}
+
+
+size_t OpenGLEngine::getDebugPassViewNamesSize() const
+{
+	return staticArrayNumElems(debug_pass_view_names);
+}
+
+
+void OpenGLEngine::setCurDebugTexIndex(int index)
+{
+	large_debug_overlay_ob->material.overlay_show_just_tex_rgb = false;
+	large_debug_overlay_ob->material.overlay_show_just_tex_w   = false;
+
+	if(index == 0)
 	{
-		large_debug_overlay_ob->draw = !large_debug_overlay_ob->draw;
+		// none - disable pass overlay drawing.
+		large_debug_overlay_ob->draw = false;
+	}
+	else
+	{
+		large_debug_overlay_ob->draw = true;
 
-		large_debug_overlay_ob->material.overlay_show_just_tex_rgb = false;
-		large_debug_overlay_ob->material.overlay_show_just_tex_w = false;
-
-		if(index == 0)
+		if(index == 1)
 		{
-			// AO
-			conPrint("Showing AO");
+			// AO ((sky irradiance fraction))
 			large_debug_overlay_ob->material.albedo_texture = current_scene->ssao_texture;
-			large_debug_overlay_ob->material.overlay_show_just_tex_w = true;
-		}
-		else if(index == 1)
-		{
-			// blurred AO
-			conPrint("Showing blurred AO");
-			large_debug_overlay_ob->material.albedo_texture = current_scene->blurred_ssao_texture;
 			large_debug_overlay_ob->material.overlay_show_just_tex_w = true;
 		}
 		else if(index == 2)
 		{
-			// indirect illum
-			conPrint("Showing indirect illum");
-			large_debug_overlay_ob->material.albedo_texture = current_scene->ssao_texture;
-			large_debug_overlay_ob->material.overlay_show_just_tex_rgb = true;
+			// blurred AO
+			large_debug_overlay_ob->material.albedo_texture = current_scene->blurred_ssao_texture;
+			large_debug_overlay_ob->material.overlay_show_just_tex_w = true;
 		}
 		else if(index == 3)
 		{
-			// blurred indirect illum
-			conPrint("Showing blurred indirect illum");
-			large_debug_overlay_ob->material.albedo_texture = current_scene->blurred_ssao_texture;
+			// prepass colour
+			large_debug_overlay_ob->material.albedo_texture = current_scene->prepass_colour_copy_texture;
 			large_debug_overlay_ob->material.overlay_show_just_tex_rgb = true;
+			large_debug_overlay_ob->material.overlay_show_just_tex_w = false;
 		}
 		else if(index == 4)
 		{
-			// specular refl
-			conPrint("Showing specular");
-			large_debug_overlay_ob->material.albedo_texture = current_scene->ssao_specular_texture;
+			// indirect illum
+			large_debug_overlay_ob->material.albedo_texture = current_scene->ssao_texture;
 			large_debug_overlay_ob->material.overlay_show_just_tex_rgb = true;
 		}
 		else if(index == 5)
 		{
+			// blurred indirect illum
+			large_debug_overlay_ob->material.albedo_texture = current_scene->blurred_ssao_texture;
+			large_debug_overlay_ob->material.overlay_show_just_tex_rgb = true;
+		}
+		else if(index == 6)
+		{
+			// specular refl
+			large_debug_overlay_ob->material.albedo_texture = current_scene->ssao_specular_texture;
+			large_debug_overlay_ob->material.overlay_show_just_tex_rgb = true;
+		}
+		else if(index == 7)
+		{
 			// specular refl roughness * trace dist
-			conPrint("showing refl roughness * trace dist");
 			large_debug_overlay_ob->material.albedo_texture = current_scene->ssao_specular_texture;
 			large_debug_overlay_ob->material.overlay_show_just_tex_w = true;
 
@@ -14303,7 +15197,7 @@ void OpenGLEngine::toggleShowTexDebug(int index)
 bool OpenGLEngine::shouldUseSharedTextures() const
 {
 	// Shared textures seem to crash using Intel drivers.
-	return GL_EXT_memory_object_win32_support && GL_EXT_memory_object_win32_support && !openglDriverVendorIsIntel();
+	return GL_EXT_memory_object_support && GL_EXT_memory_object_win32_support && !openglDriverVendorIsIntel();
 }
 
 
@@ -14336,8 +15230,7 @@ void OpenGLEngine::renderMaskMap(OpenGLTexture& mask_map_texture, const Vec2f& b
 		mask_map_frame_buffer = new FrameBuffer();
 		mask_map_frame_buffer->attachTexture(mask_map_texture, GL_COLOR_ATTACHMENT0);
 
-		GLenum is_complete = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-		if(is_complete != GL_FRAMEBUFFER_COMPLETE)
+		if(!mask_map_frame_buffer->isComplete())
 		{
 			conPrint("Error: renderMaskMap(): framebuffer is not complete.");
 			assert(0);
@@ -14356,7 +15249,8 @@ void OpenGLEngine::renderMaskMap(OpenGLTexture& mask_map_texture, const Vec2f& b
 
 	mask_map_frame_buffer->attachTexture(mask_map_texture, GL_COLOR_ATTACHMENT0);
 
-	setSingleDrawBuffer(GL_COLOR_ATTACHMENT0);
+	mask_map_frame_buffer->bindForDrawing();
+	mask_map_frame_buffer->setSingleDrawBuffer(GL_COLOR_ATTACHMENT0);
 
 	glClearColor(0, 0, 0, 1);
 	glClear(GL_COLOR_BUFFER_BIT);
@@ -14438,6 +15332,7 @@ void OpenGLEngine::renderMaskMap(OpenGLTexture& mask_map_texture, const Vec2f& b
 
 
 	VAO::unbind(); // Unbind any bound VAO, so that it's vertex and index buffers don't get accidentally overridden.
+	current_bound_VAO = NULL;
 	OpenGLProgram::useNoPrograms();
 
 	glDepthMask(GL_TRUE); // Restore writing to z-buffer.

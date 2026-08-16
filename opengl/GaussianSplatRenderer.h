@@ -491,12 +491,52 @@ public:
 	// to budget * coverage. sigma_cutoff is scaled with the radii, so the same Gaussian is drawn over a shorter quad:
 	// the faint edge is truncated rather than the splat being made smaller.
 	//
+	// 2: mode 1 without the 1/(1 - coverage) amplification, so the threshold is splat_alpha_cutoff + budget * coverage
+	// and cannot exceed splat_alpha_cutoff + budget however finished the pixel is. Mode 1's derivation is sound for a
+	// splat considered alone and wrong for a stack: the budget it licenses is spent again, in full, by every splat over
+	// the same pixel, and the amplification makes that ruinous - at coverage 0.99 the factor is 99, so a 0.02 budget
+	// asks for a threshold of 2.0 and removes every remaining splat outright instead of trimming its edge. The pixel
+	// freezes at whatever coverage it had reached (0.92 on the measured cushion, against 0.999 without the shrink) and
+	// the missing light shows as a hole onto what is behind - one that moves with the camera, since where a pixel
+	// freezes depends on where the slice boundaries fell. This mode gives up mode 1's closed form to bound that.
+	//
 	// Measured against mode 0 and against raising splat_alpha_cutoff on its own, at matched cost on one frame: at the
 	// same draw time as alpha cutoff 0.04, this mode's mean error was a quarter of it, and in the sparsely covered
 	// regions - where the visible holes are - a seventh. Both take their saving from the same places on a solid wall;
 	// only this one leaves the thin regions alone, because only this one asks whether there was anything there to lose.
 	int getCoverageShrinkMode() const { return splat_coverage_shrink_mode; }
 	void setCoverageShrinkMode(int v) { splat_coverage_shrink_mode = v; }
+
+	// How the coverage pyramid the shrink above reads is reduced from one level to the next.
+	//
+	// 0 (mean, the original): a coarse texel is the average coverage under it. Cheap to reason about in the middle of a
+	// solid surface, and wrong at its edge: a splat straddling a boundary between finished and unfinished screen gets an
+	// answer describing neither half, and over the unfinished half that answer is too high. It then truncates itself as
+	// if the pixels under it were done. On a low-opacity splat the truncation radius reaches zero at a modest threshold,
+	// so the splat is not trimmed but removed outright - which is what an unfinished region surrounded by finished ones
+	// (a cushion seen against a wall, say) shows as holes full of flickering splat-sized rectangles.
+	//
+	// 1 (min): a coarse texel is the *least* covered pixel under it, so the estimate becomes a lower bound - "under you
+	// at least this much is covered" - and the straddling splat above is answered by its unfinished half and draws in
+	// full. The error changes direction: the shrink can then only fail to save work, never remove light that was needed.
+	// This is the same rule the binary gate's own pyramid has always used, and for the same reason.
+	//
+	// Kept as a switch rather than a replacement so the two can be A/B'd on one frame: the difference is entirely in
+	// what the estimate says, and both formulas above read it identically.
+	int getCoverageReduceMode() const { return splat_coverage_reduce_mode; }
+	void setCoverageReduceMode(int v) { splat_coverage_reduce_mode = v; }
+
+	// DIAGNOSTIC ONLY - draws the coverage pyramid itself over the frame, as grey levels, instead of the resolved splats:
+	// this is what the shrink reads, at the level asked for, in the screen position it stands for. -1 (default) = off.
+	//
+	// The level is the point of it. Level 0 is one texel per getSaturationMaskDownscale() pixels and looks much like the
+	// alpha snapshots; the coarse levels are what a big quad actually samples, and are where a mean pyramid smears a
+	// small unfinished region away entirely. Comparing a level between the two reduce modes above is the whole use.
+	//
+	// Requires the saturation gate to be running, since the pyramid is built by its mark pass. Costs nothing while off:
+	// the pyramid is not reduced and the resolve shader's branch is one integer compare on a pass that already runs.
+	int getShowCoverageMapLevel() const { return splat_show_coverage_map_level; }
+	void setShowCoverageMapLevel(int v) { splat_show_coverage_map_level = v; }
 
 	// The program that halves the coverage pyramid by mean, once per level - see getMaskReduceProgram(), whose min
 	// pyramid this sits beside. Null until the first addObject(), like the rest.
@@ -758,7 +798,21 @@ public:
 	// getOverdrawRangeMax() values. Called by OpenGLEngine::resolveSplatAccumBuffer() right after the resolve program
 	// is bound: that draw is one manual full-viewport quad with no material, so it bypasses the generic per-object
 	// user-uniform path the main splat program's addObject()/think() machinery uses for its own uniforms.
-	void setResolveOverdrawUniforms() const;
+	//
+	// coverage_map_block is how many screen pixels across one level-0 texel of the coverage pyramid covers, needed by
+	// getShowCoverageMapLevel()'s view to map a fragment back to the texel standing for it. The caller's, since it
+	// depends on the size the mask was actually allocated at - the same reason setSaturationMaskUniforms() takes it.
+	void setResolveOverdrawUniforms(int coverage_map_block) const;
+
+	// Which texture unit the resolve pass reads the coverage pyramid on, for getShowCoverageMapLevel()'s view. Unit 0 is
+	// the accumulation buffer that pass already reads; this is a pass of its own, so the numbering is local to it and has
+	// nothing to do with the splat program's units. Named here because the bind (OpenGLEngine) and the sampler uniform
+	// (setResolveOverdrawUniforms() above) have to agree, and they live in different files.
+	static const int RESOLVE_COVERAGE_MAP_TEXTURE_UNIT_INDEX = 1;
+
+	// Location of that sampler, or -1 while the program is still building. Kept here rather than indexed into the
+	// user-uniform list at the call site, so that the list's layout stays this class's business.
+	int getResolveCoverageMapTexUniformLoc() const;
 
 private:
 	GLARE_DISABLE_COPY(GaussianSplatRenderer);
@@ -885,6 +939,13 @@ private:
 	// See getCoverageShrinkMode() above. Defaults to the original formula, so that a session that turns the strength up
 	// sees exactly what it saw before this existed.
 	int splat_coverage_shrink_mode;
+
+	// See getCoverageReduceMode() above. Defaults to the mean pyramid, i.e. to what the shrink read before the switch
+	// existed, so that turning the strength up reproduces the earlier sessions' numbers unchanged.
+	int splat_coverage_reduce_mode;
+
+	// See getShowCoverageMapLevel() above. -1 = off.
+	int splat_show_coverage_map_level;
 
 	// See getEWAProjectionFixEnabled()/getNearFadeWidth() above. Defaults: on, and a fade over the last 30% of the approach.
 	bool splat_ewa_fix_enabled;

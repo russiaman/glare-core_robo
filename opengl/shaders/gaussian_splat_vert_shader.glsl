@@ -552,8 +552,24 @@ void main()
 			//
 			// sigma_cutoff itself is scaled by the same factor as the radii, so the conic below reconstructs the
 			// identical Gaussian over a shorter quad: this truncates the faint edge rather than narrowing the splat.
+			// Mode 2 drops the 1/transmittance amplification the line below carries, and is what the two are being
+			// compared on. That factor is honest for one splat in isolation - the light it still had to lose through the
+			// pixel is (1 - coverage), so spending a fixed budget of light needs a threshold that large - but the budget
+			// is then spent again, in full, by every one of the dozens of splats standing over the same pixel. What the
+			// pixel actually gives up is that budget times the number of splats, not the budget. The amplification is
+			// what makes the total ruinous: at coverage 0.9 the factor is 9 and at 0.99 it is 99, so a 0.02 budget asks
+			// for a threshold of 0.2 and then 2.0, and every splat whose own opacity is under that vanishes outright
+			// rather than being trimmed. The pixel then freezes wherever it had got to - 0.92 on the measured cushion
+			// against the 0.999 it reaches without the shrink - and the missing light is a hole showing what is behind.
+			//
+			// Without the factor the threshold cannot exceed alpha_cutoff + budget however finished the pixel is, so a
+			// splat with any real opacity keeps a real radius and the wipe cannot happen. It gives up the closed-form
+			// claim about light lost per splat, which was the mode's original argument for itself; that claim was about
+			// a splat on its own and the picture is made of stacks.
 			float transmittance = max(1.0 - coverage_estimate, 1.0e-4);
-			float budget_cutoff = splat_alpha_cutoff + splat_coverage_shrink_strength * coverage_estimate / transmittance;
+			float budget_cutoff = (splat_coverage_shrink_mode == 2) ?
+				(splat_alpha_cutoff + splat_coverage_shrink_strength * coverage_estimate) :
+				(splat_alpha_cutoff + splat_coverage_shrink_strength * coverage_estimate / transmittance);
 			float budget_sigma = (opacity > budget_cutoff) ? min(sqrt(2.0 * log(opacity / budget_cutoff)), 3.0) : 0.0;
 
 			float cutoff_ratio = budget_sigma / max(sigma_cutoff, 1.0e-6);

@@ -18,6 +18,13 @@ uniform int splat_show_overdraw; // Overdraw debug view (GaussianSplatSettingsWi
 uniform float splat_overdraw_range_min; // Accumulated value (layers, or summed alpha in mode 2) that maps to solid blue.
 uniform float splat_overdraw_range_max; // Likewise for solid red. Between the two, the ramp runs blue -> green -> red.
 
+// DIAGNOSTIC ONLY - the coverage map view (GaussianSplatSettingsWidget, Qt only), see
+// GaussianSplatRenderer::getShowCoverageMapLevel(). Shows the pyramid the coverage shrink reads, at the level asked for,
+// instead of the resolved splats. -1 = off, and then nothing below is sampled.
+uniform int splat_show_coverage_map_level;
+uniform int splat_coverage_map_block;   // Screen pixels across one level-0 texel of it.
+uniform sampler2D splat_coverage_map_texture;
+
 out vec4 colour_out;
 
 
@@ -48,6 +55,25 @@ void main()
 	// the blit, which averages the premultiplied colour and the coverage together - the right order, since dividing
 	// per-sample and then averaging would weight sparsely covered samples equally with fully covered ones.
 	vec4 accum = texelFetch(albedo_texture, ivec2(gl_FragCoord.xy), /*mip level=*/0);
+
+	// DIAGNOSTIC ONLY - see splat_show_coverage_map_level above.  Written before the overdraw view and the resolve
+	// proper, since it replaces both: this is a view of what the shrink reads, not of what the splats produced.
+	if(splat_show_coverage_map_level >= 0)
+	{
+		// One texel of the level covers block << level screen pixels, because the pyramid halves each step and its base
+		// texel already stands for block of them.  Clamped for the same reason the vertex shader clamps: the viewport is
+		// not necessarily a whole number of texels across, and the last row and column are partly outside.
+		int level = splat_show_coverage_map_level;
+		int texels_per_px = splat_coverage_map_block << level;
+		ivec2 level_max = max(textureSize(splat_coverage_map_texture, level) - ivec2(1), ivec2(0));
+		ivec2 texel = min(ivec2(gl_FragCoord.xy) / ivec2(texels_per_px), level_max);
+
+		// Grey, straight through: 0 = nothing covered, 1 = finished.  No ramp, because the question this view answers is
+		// "how far off 1 is this number", and a colour ramp makes near-equal values look further apart than they are.
+		float coverage = texelFetch(splat_coverage_map_texture, texel, level).r;
+		colour_out = vec4(vec3(coverage), 1.0); // Opaque, so it replaces the background rather than blending over it - as the overdraw view below does.
+		return;
+	}
 
 	if(splat_show_overdraw != 0)
 	{

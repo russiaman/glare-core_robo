@@ -9769,8 +9769,22 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 	// the plain gate's own mark pass (from_layer_count false there) rather than paying for one of its own, so it can only
 	// run when the gate itself is - and, since the shared mark call at markSaturatedSplatPixels() below reads from the
 	// layer counter instead whenever use_layer_cap wins that call, only when the layer cap isn't also active.
-	const bool use_coverage_shrink = use_saturation_gate && !use_layer_cap && (splat_renderer->getCoverageShrinkStrength() > 0.f) &&
-		splat_renderer->getMeanMaskReduceProgram().nonNull() && splat_renderer->getMeanMaskReduceProgram()->isBuilt();
+	// Which program reduces that pyramid, mean or min - see GaussianSplatRenderer::getCoverageReduceMode().  The min one
+	// is the gate's own, which use_saturation_gate above has already established is built, so only the mean one needs
+	// checking here.
+	const bool coverage_reduce_by_min = splat_renderer->getCoverageReduceMode() != 0;
+	const bool coverage_reduce_prog_ready = coverage_reduce_by_min ||
+		(splat_renderer->getMeanMaskReduceProgram().nonNull() && splat_renderer->getMeanMaskReduceProgram()->isBuilt());
+
+	const bool use_coverage_shrink = use_saturation_gate && !use_layer_cap && (splat_renderer->getCoverageShrinkStrength() > 0.f) && coverage_reduce_prog_ready;
+
+	// DIAGNOSTIC ONLY - the coverage map view reads the very same pyramid, so it has to be built for it even when the
+	// shrink itself is off, which is the case the view is most wanted in - see
+	// GaussianSplatRenderer::getShowCoverageMapLevel().
+	const bool show_coverage_map = (splat_renderer->getShowCoverageMapLevel() >= 0) && use_saturation_gate && !use_layer_cap && coverage_reduce_prog_ready;
+
+	// Everything below asks this rather than either of the two above: whether the pyramid is wanted at all, by anyone.
+	const bool build_coverage_pyramid = use_coverage_shrink || show_coverage_map;
 
 	// The caps reject fragments, not splats: the vertex test would drop a splat everywhere or nowhere, which is not what
 	// "stop compositing this pixel" means.  Off unless a cap is running, and then the two tests are mutually exclusive
@@ -9803,8 +9817,8 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 			current_scene->splat_mask_reduce_framebuffer->attachTextureMipLevel(*current_scene->splat_saturation_mask_texture, GL_COLOR_ATTACHMENT0, level);
 			glClearBufferfv(GL_COLOR, /*drawBuffer=*/0, col_zero);
 		}
-		// Same reason, same way, for the coverage-shrink pyramid: see use_coverage_shrink above.
-		if(use_coverage_shrink)
+		// Same reason, same way, for the coverage-shrink pyramid: see build_coverage_pyramid above.
+		if(build_coverage_pyramid)
 			for(int level=0; level<splat_saturation_mask_num_levels; ++level)
 			{
 				current_scene->splat_mask_reduce_framebuffer->attachTextureMipLevel(*current_scene->splat_coverage_mask_texture, GL_COLOR_ATTACHMENT0, level);
@@ -9890,7 +9904,7 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 				// The layer cap thresholds the layer counter at its own value; the gate and the coverage cap threshold
 				// accumulated coverage, at theirs.  Same pass, same mask, different source and threshold - and only one of
 				// the three can be running.
-				markSaturatedSplatPixels(/*from_layer_count=*/use_layer_cap, /*from_layer_count_buffer=*/use_layer_cap, /*coverage_cap_threshold=*/use_coverage_cap, /*build_coverage_pyramid=*/use_coverage_shrink);
+				markSaturatedSplatPixels(/*from_layer_count=*/use_layer_cap, /*from_layer_count_buffer=*/use_layer_cap, /*coverage_cap_threshold=*/use_coverage_cap, /*build_coverage_pyramid=*/build_coverage_pyramid);
 
 				// DIAGNOSTIC ONLY - see requestSplatSaturationSnapshots().  Numbered by the slice the census followed,
 				// which is the slice whose coverage it is a statement about; the slice drawn just below is the first one
@@ -10358,22 +10372,27 @@ void OpenGLEngine::markSaturatedSplatPixels(bool from_layer_count, bool from_lay
 		glTexParameteri(mask_tex.getTextureTarget(), GL_TEXTURE_MAX_LEVEL,  splat_saturation_mask_num_levels - 1);
 	}
 
-	//----------------------- Reduce the coverage pyramid up, by mean - see GaussianSplatRenderer::getCoverageShrinkStrength() -----------------------
+	//----------------------- Reduce the coverage pyramid up - see GaussianSplatRenderer::getCoverageShrinkStrength() -----------------------
 	// Same loop shape as the min pyramid above, on the sibling texture, only run when something will actually read it:
 	// the base level was written unconditionally above (cheap - one more attachment on a pass already running), but
 	// reducing every level of a second pyramid every mark call would not be, so that part is conditional.
+	//
+	// By mean or by minimum, as getCoverageReduceMode() says - the two differ in nothing but which program runs here,
+	// which is what lets them be compared on one frame. The min case reuses the gate's own reduce program: the pyramids
+	// hold different numbers but are reduced by the identical rule, so there is no second shader to keep in step.
 	if(build_coverage_pyramid)
 	{
-		const Reference<OpenGLProgram>& mean_reduce_prog = splat_renderer->getMeanMaskReduceProgram();
+		const Reference<OpenGLProgram>& coverage_reduce_prog = (splat_renderer->getCoverageReduceMode() != 0) ?
+			splat_renderer->getMaskReduceProgram() : splat_renderer->getMeanMaskReduceProgram();
 		OpenGLTexture& coverage_tex = *current_scene->splat_coverage_mask_texture;
 
-		mean_reduce_prog->useProgram();
+		coverage_reduce_prog->useProgram();
 		for(int level=1; level<splat_saturation_mask_num_levels; ++level)
 		{
 			current_scene->splat_mask_reduce_framebuffer->attachTextureMipLevel(coverage_tex, GL_COLOR_ATTACHMENT0, level);
 			glViewport(0, 0, (GLsizei)myMax<size_t>(1, coverage_tex.xRes() >> level), (GLsizei)myMax<size_t>(1, coverage_tex.yRes() >> level));
 
-			bindTextureUnitToSampler(coverage_tex, /*texture_unit_index=*/0, /*sampler_uniform_location=*/mean_reduce_prog->albedo_texture_loc);
+			bindTextureUnitToSampler(coverage_tex, /*texture_unit_index=*/0, /*sampler_uniform_location=*/coverage_reduce_prog->albedo_texture_loc);
 			glTexParameteri(coverage_tex.getTextureTarget(), GL_TEXTURE_BASE_LEVEL, level - 1);
 			glTexParameteri(coverage_tex.getTextureTarget(), GL_TEXTURE_MAX_LEVEL,  level - 1);
 
@@ -10383,7 +10402,7 @@ void OpenGLEngine::markSaturatedSplatPixels(bool from_layer_count, bool from_lay
 
 		if(splat_saturation_mask_num_levels > 1)
 		{
-			bindTextureUnitToSampler(coverage_tex, /*texture_unit_index=*/0, /*sampler_uniform_location=*/mean_reduce_prog->albedo_texture_loc);
+			bindTextureUnitToSampler(coverage_tex, /*texture_unit_index=*/0, /*sampler_uniform_location=*/coverage_reduce_prog->albedo_texture_loc);
 			glTexParameteri(coverage_tex.getTextureTarget(), GL_TEXTURE_BASE_LEVEL, 0);
 			glTexParameteri(coverage_tex.getTextureTarget(), GL_TEXTURE_MAX_LEVEL,  splat_saturation_mask_num_levels - 1);
 		}
@@ -10686,10 +10705,19 @@ void OpenGLEngine::resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name)
 	const Reference<OpenGLProgram>& resolve_prog = splat_renderer->getResolveProgram();
 	assert(resolve_prog.nonNull()); // Non-null since a cloud was drawn, which means GaussianSplatRenderer built its shaders.
 	resolve_prog->useProgram();
-	splat_renderer->setResolveOverdrawUniforms(); // Overdraw debug view uniforms - see the method's own comment for why this can't go through the generic per-object uniform path.
+	splat_renderer->setResolveOverdrawUniforms(splat_saturation_mask_block); // Overdraw debug view uniforms - see the method's own comment for why this can't go through the generic per-object uniform path.
 	bindMeshData(*unit_quad_meshdata);
 
 	bindTextureUnitToSampler(*current_scene->splat_accum_copy_texture, /*texture_unit_index=*/0, /*sampler_uniform_location=*/resolve_prog->albedo_texture_loc);
+
+	// DIAGNOSTIC ONLY - the coverage map view's source, see GaussianSplatRenderer::getShowCoverageMapLevel().  Bound
+	// whether or not the view is on, for the same reason the splat program's masks are: a declared sampler with no
+	// texture bound is invalid in WebGL even where the shader's branch never samples it.  The texture is allocated
+	// alongside the mask, so it exists whenever the accumulation buffer does.
+	if(current_scene->splat_coverage_mask_texture.nonNull())
+		bindTextureUnitToSampler(*current_scene->splat_coverage_mask_texture,
+			/*texture_unit_index=*/GaussianSplatRenderer::RESOLVE_COVERAGE_MAP_TEXTURE_UNIT_INDEX,
+			/*sampler_uniform_location=*/splat_renderer->getResolveCoverageMapTexUniformLoc());
 
 	//----------------------- Draw the quad -----------------------
 	drawElementsBaseVertex(GL_TRIANGLES, (GLsizei)unit_quad_meshdata->batches[0].num_indices, unit_quad_meshdata->getIndexType(), (void*)unit_quad_meshdata->getBatch0IndicesTotalBufferOffset(), unit_quad_meshdata->vbo_handle.base_vertex);

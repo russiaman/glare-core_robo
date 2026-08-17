@@ -1122,7 +1122,7 @@ static inline bool pointInFrustum(const Planef* frustum_clip_planes, int num_fru
 }
 
 
-size_t GaussianSplatRenderer::countSplatsInFrustum() const
+GaussianSplatRenderer::FrustumCounts GaussianSplatRenderer::countSplatsInFrustum() const
 {
 	const OpenGLScene* scene = opengl_engine->getCurrentScene();
 	const Planef* frustum_clip_planes = scene->frustum_clip_planes;
@@ -1130,10 +1130,13 @@ size_t GaussianSplatRenderer::countSplatsInFrustum() const
 
 	const bool clamp_active = (splat_size_clamp_min > 0.f) || (splat_size_clamp_max > 0.f);
 
-	size_t count = 0;
+	FrustumCounts result;
+	result.in_frustum = 0;
+	result.total = 0;
 	for(size_t c=0; c<clouds.size(); ++c)
 	{
 		const SplatCloud& cloud = *clouds[c];
+		result.total += cloud.total_splats; // Leaves + merged internal nodes - matches what the traversal iterates over.
 		for(size_t i=0; i<cloud.total_splats; ++i)
 		{
 			const Vec3f& pos = cloud.positions[i];
@@ -1152,10 +1155,10 @@ size_t GaussianSplatRenderer::countSplatsInFrustum() const
 					continue;
 			}
 
-			count++;
+			result.in_frustum++;
 		}
 	}
-	return count;
+	return result;
 }
 
 

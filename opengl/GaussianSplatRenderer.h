@@ -149,9 +149,11 @@ public:
 	// One-off diagnostic (GaussianSplatSettingsWidget's "Count in frustum" button, Qt only): counts splats, across every
 	// cloud, that are both in the camera's current frustum and pass the size clamp above (same test as the shader's,
 	// including the invert flag - if the clamp is disabled, every in-frustum splat counts). O(total splats in the
-	// world); meant to be triggered once by a button click, not called per-frame. Answers "how many of what the size
-	// filter is currently isolating are actually in view right now" without needing a GPU capture.
-	size_t countSplatsInFrustum() const;
+	// world); meant to be triggered once by a button click, not called per-frame. Returns in_frustum and total (leaves +
+	// merged internal nodes summed across all clouds) so callers can report both the absolute number and the fraction -
+	// used to size the ceiling for traversal frustum-cull work (session054 §2A).
+	struct FrustumCounts { size_t in_frustum; size_t total; };
+	FrustumCounts countSplatsInFrustum() const;
 
 	// One-off diagnostic (GaussianSplatSettingsWidget's "Frustum report" button, Qt only): a multi-line breakdown of what
 	// the LoD hierarchy offers at the current camera position and what the traversal actually took from it, for every

@@ -14,6 +14,7 @@ Copyright Glare Technologies Limited 2026 -
 #include "../physics/jscol_aabbox.h"
 #include "../utils/Platform.h"
 #include "../utils/Reference.h"
+#include "../utils/Timer.h" // For the camera-motion EMA prev-think time reference used by kickOffTraversals() dilation.
 #include "../utils/ThreadMessage.h"
 #include "../utils/ThreadSafeQueue.h"
 #include "../utils/Vector.h"
@@ -250,6 +251,17 @@ public:
 	// world", independent of pixel_scale_limit/max_layer_density/max_splats_budget. 0 (default) disables the check.
 	int getMaxTreeDepth() const { return lod_max_tree_depth; }
 	void setMaxTreeDepth(int v) { lod_max_tree_depth = v; }
+
+	// SESSION055: turns on frustum-culling inside the traversal's expand loop - each popped node is tested against the
+	// scene's frustum planes (dilated by 1.5 * feature_size to keep large-radius nodes whose centre is just outside),
+	// and out-of-frustum nodes are neither recorded nor expanded, pruning entire subtrees behind the camera. Paired with
+	// an angular re-kick threshold in kickOffTraversals(), so that turning on the spot re-runs the traversal.
+	//
+	// Trades the property that the old comment on GaussianSplatLodTraversalTask leans on ("rotation stays free") for a
+	// large drop in nodes visited on interior scenes - see session054 §2A. Kept as a live switch to allow A/B comparison
+	// and to fall back if a rotation-heavy workflow shows the extra re-kicks costing more than the cull saves.
+	bool getFrustumCullEnabled() const { return lod_frustum_cull_enabled; }
+	void setFrustumCullEnabled(bool v) { lod_frustum_cull_enabled = v; }
 
 	// Diagnostic tool, not a LoD parameter: culls any splat whose feature_size (2 * max scale axis, matching
 	// GaussianSplatLodNode::feature_size) falls outside [min, max], directly in the vertex shader, regardless of
@@ -892,6 +904,23 @@ private:
 
 	// See getMaxTreeDepth() above. 0 disables the check.
 	int lod_max_tree_depth;
+
+	// See getFrustumCullEnabled() above. On by default from session055.
+	bool lod_frustum_cull_enabled;
+
+	// SESSION055: camera-motion tracker for anisotropic frustum-cull dilation. think() diffs the current cam pose against
+	// the previous one to compute an instantaneous velocity and angular speed, feeds them through an EMA with a
+	// max(instant, ema) override (rise-fast, fall-slow, so movement start doesn't lag). kickOffTraversals() turns them
+	// into per-plane translation dilation and a per-node-distance rotation dilation rate, so the traversal keeps enough
+	// margin for nodes that will enter the frustum before the async result lands - see the cull block in
+	// GaussianSplatLodTraversalTask::run(). Zero-init: first think() only records the pose, no dilation yet.
+	bool have_prev_think_cam_state;
+	Vec4f prev_think_cam_pos_ws;
+	Vec4f prev_think_cam_forward_ws;
+	Timer prev_think_timer;                  // Reset each think(); elapsed() between resets is dt for the velocity diff.
+	Vec4f cam_velocity_ema_ws;               // World-space linear velocity (m/s), EMA-smoothed.
+	float cam_angular_speed_ema;             // Scalar angular speed (rad/s), max(inst, blended).
+	float cam_angular_speed_peak;            // SESSION055: slow-decay peak of angular speed, so a mouse flick keeps rotation dilation elevated for the next ~1s of kicks - covers subsequent bursts that neither EMA nor empirical predict in time.
 
 	// See getSizeClampMin()/getSizeClampMax() above. Defaults (0, 0) disable both bounds, so never exclude a real splat.
 	float splat_size_clamp_min;

@@ -93,7 +93,7 @@ public:
 	:	cloud_id(0), gpu_capacity_splats(0), total_splats(0), structure_generation(0), sort_in_flight(false),
 		importance_layout_fingerprint(0), slice_sample_draw_count(0),
 		have_last_sort_cam_pos(false), last_sort_cam_pos_ws(0.f), aabb_ws(js::AABBox::emptyAABBox()), added_to_engine(false),
-		topology_generation(0), traversal_in_flight(false), have_last_traversal_cam_pos(false), last_traversal_cam_pos_ws(0.f),
+		topology_generation(0), traversal_in_flight(false), have_last_traversal_cam_pos(false), last_traversal_cam_pos_ws(0.f), last_traversal_cam_forward_ws(0.f), last_traversal_kick_time_s(0.0),
 		last_traversal_kicked_topology_generation(0), last_traversal_hit_budget_cap(false), last_traversal_hit_density_cap(false), last_traversal_hit_depth_cap(false),
 		importance_num_views(0)
 	{}
@@ -111,6 +111,7 @@ public:
 	js::Vector<Vec3f, 16> scales;
 	js::Vector<Vec4f, 16> rotations; // (x, y, z, w)
 	js::Vector<Vec4f, 16> colours;
+	js::Vector<float, 16> feature_size; // SESSION055: 2*max(scale.xyz), maintained in step with scales at bake time so kickOffTraversals()'s fillTraversalScratch() doesn't rebuild it from scales on every kick - a session055 hot path once the frustum-cull re-kick started firing on rotation.
 
 	std::vector<CloudMember> members;
 	js::AABBox aabb_ws; // The union of the members' padded bounds.  Doubles as the merge test and, via ob, the cull and draw-order box.
@@ -129,6 +130,8 @@ public:
 	bool traversal_in_flight; // True from when a traversal is kicked off until its result is applied (or dropped as stale).
 	bool have_last_traversal_cam_pos;
 	Vec4f last_traversal_cam_pos_ws; // Camera position as of the last traversal kicked off (not necessarily completed).
+	Vec4f last_traversal_cam_forward_ws; // SESSION055: camera forward at that kick, so kickOffTraversals() can re-trigger on rotation now that the traversal is view-dependent - see lod_frustum_cull_enabled.
+	double last_traversal_kick_time_s; // SESSION055: timestamp of that kick (kick_debug_timer.elapsed()) so the next kick can compute the *empirical* rotation/translation rate since - see the dilation block in kickOffTraversals().
 	uint64 last_traversal_kicked_topology_generation; // topology_generation as of the last traversal kicked off - a mismatch against the live value means the cloud's structure has changed since, so it's unconditionally overdue for a fresh one (see kickOffTraversals()), the same idea as !have_last_sort_cam_pos for the sort.
 	bool last_traversal_hit_budget_cap; // Copied from the most recently applied traversal result's GaussianSplatLodTraversalScratch::hit_budget_cap (which itself doesn't persist - the scratch goes back to the pool) - surfaced in getDiagnostics() as a "detail is being truncated by the budget" warning.
 	bool last_traversal_hit_density_cap; // As above, for GaussianSplatLodTraversalScratch::hit_density_cap.
@@ -225,7 +228,7 @@ public:
 	};
 
 	js::Vector<Vec3f, 16> positions_snapshot; // A frozen copy of one cloud's world-space node positions (leaves + merged), taken on the main thread when a traversal is kicked off.
-	js::Vector<Vec3f, 16> scales_snapshot; // A frozen copy of the same cloud's world-space node scales - retained for callers that still read it (diagnostics, future uses); traversal itself now consults feature_size_snapshot instead.
+	js::Vector<Vec3f, 16> scales_snapshot; // SESSION055: left empty by fillTraversalScratch() - feature_size_snapshot is fed from the cloud's own maintained feature_size array (see SplatCloud::feature_size), which is what the traversal actually reads. Vector kept in the struct so the memory accounting in getDiagnostics() and any future diagnostic that wants scales can be re-enabled without a struct change.
 	js::Vector<float, 16> feature_size_snapshot; // SESSION054: precomputed 2*max(scale.xyz) per node, so the per-push makeHeapItem in the traversal loop skips the Vec3f scales[] lookup and the 3-way max entirely - the biggest per-node saving after the priority_queue removal.
 	std::vector<MemberSnapshot> members_snapshot;
 
@@ -494,6 +497,7 @@ enum FrontierStopReason
 	FrontierStop_DepthCap,   // max_tree_depth stopped expansion here.
 	FrontierStop_BudgetCap,  // max_splats_budget stopped expansion, and this node was drained from the heap as-is.
 	FrontierStop_NoTree,     // The member has no LoD tree at all, so every one of its splats is always selected.
+	FrontierStop_OutOfFrustum, // SESSION055: the node's centre is outside the frustum (dilated by 1.5*feature_size to keep large nodes whose centre is just past a plane), so it and its subtree were skipped. Only produced when frustum-cull is on (see GaussianSplatRenderer::setFrustumCullEnabled). getFrustumStructureReport() disables cull, so this bucket stays 0 there - it exists so the runtime path can bucket cheaply and so the count matches what the fast path actually did.
 	FrontierStop_NumReasons
 };
 
@@ -564,12 +568,27 @@ public:
 	// see GaussianSplatRenderer::getFrustumStructureReport().  Both are null/absent for the normal per-frame traversal,
 	// where the enqueued result is the whole point and nothing wants the per-node breakdown.
 	GaussianSplatLodTraversalTask(uint64 cloud_id_, uint64 topology_generation_, const Reference<GaussianSplatLodTraversalScratch>& scratch_,
-		const Vec4f& cam_pos_ws_, float pixel_scale_limit_, size_t max_splats_budget_, float max_layer_density_, int max_tree_depth_, float focal_px_, ThreadSafeQueue<Reference<ThreadMessage> >* result_queue_,
+		const Vec4f& cam_pos_ws_, float pixel_scale_limit_, size_t max_splats_budget_, float max_layer_density_, int max_tree_depth_, float focal_px_,
+		const Planef* frustum_clip_planes_, int num_frustum_clip_planes_, bool frustum_cull_enabled_, // SESSION055: planes are copied into num_frustum_clip_planes below rather than pointed at, because OpenGLScene's own array is mutated by the draw path each frame and a worker running across a frame boundary would otherwise read torn values.
+		const float* translation_dilation_, float rotation_dilation_rate_, // SESSION055: per-plane translation dilation (metres) + rotation dilation rate (rad, multiplied by dist-to-node inside cull) - see kickOffTraversals()'s anisotropic dilation block.
+		ThreadSafeQueue<Reference<ThreadMessage> >* result_queue_,
 		js::Vector<FrontierNodeRecord, 16>* frontier_record_ = NULL)
 	:	cloud_id(cloud_id_), topology_generation(topology_generation_), scratch(scratch_), cam_pos_ws(cam_pos_ws_),
-		pixel_scale_limit(pixel_scale_limit_), max_splats_budget(max_splats_budget_), max_layer_density(max_layer_density_), max_tree_depth(max_tree_depth_), focal_px(focal_px_), result_queue(result_queue_),
+		pixel_scale_limit(pixel_scale_limit_), max_splats_budget(max_splats_budget_), max_layer_density(max_layer_density_), max_tree_depth(max_tree_depth_), focal_px(focal_px_),
+		num_frustum_clip_planes(num_frustum_clip_planes_), frustum_cull_enabled(frustum_cull_enabled_),
+		rotation_dilation_rate(rotation_dilation_rate_),
+		result_queue(result_queue_),
 		frontier_record(frontier_record_)
-	{}
+	{
+		if(num_frustum_clip_planes < 0)
+			num_frustum_clip_planes = 0;
+		if(num_frustum_clip_planes > (int)staticArrayNumElems(frustum_clip_planes))
+			num_frustum_clip_planes = (int)staticArrayNumElems(frustum_clip_planes); // Bounds guard against a scene ever growing past 6 planes; the cull just misses planes past the 6th, cannot false-cull.
+		for(int i=0; i<num_frustum_clip_planes; ++i)
+			frustum_clip_planes[i] = frustum_clip_planes_[i];
+		for(int i=0; i<(int)staticArrayNumElems(translation_dilation); ++i)
+			translation_dilation[i] = translation_dilation_ ? translation_dilation_[i] : 0.f;
+	}
 
 	virtual void run(size_t /*thread_index*/) override
 	{
@@ -631,6 +650,38 @@ public:
 			const GaussianSplatLodTraversalScratch::MemberSnapshot& m = scratch->members_snapshot[top.member_idx];
 			const GaussianSplatLodNode& node = m.splat_data->lod_tree[top.tree_local_idx];
 			const uint32 cloud_idx_u32 = (uint32)(m.offset + top.tree_local_idx);
+
+			// SESSION055: frustum-cull check. Each plane's margin has three parts:
+			//   base_margin = 1.5 * feature_size  - keeps a node whose centre is just past the plane but whose 3-sigma
+			//                                       footprint still crosses it (max radius = 3*max_scale = 1.5*feature_size,
+			//                                       see the shader's quad sizing in gaussian_splat_vert_shader.glsl).
+			//   translation_dilation[i]           - anisotropic pad for camera movement toward this plane over the async
+			//                                       traversal latency window; ~zero for planes the camera moves away from.
+			//   rotation_dilation_rate * dist     - rotational pad: r*theta tangential shift at distance r from camera.
+			// The whole point of the cull is to skip the subtree entirely when the parent is outside, so on cull we neither
+			// push children nor add the node to decorated. Overrides the "no frustum test here" property called out at the
+			// top of the class; the paired re-kick-on-rotation trigger in kickOffTraversals() puts back the property that
+			// turning on the spot updates the selection.
+			if(frustum_cull_enabled)
+			{
+				const Vec3f& p = positions[cloud_idx_u32];
+				const float base_margin = 1.5f * feature_sizes[cloud_idx_u32];
+				const float dist_to_node = std::sqrt(top.dist_sq); // dist_sq is already computed in makeHeapItem (session054); one sqrt per pop.
+				const float rot_pad = rotation_dilation_rate * dist_to_node;
+				const Vec4f pos4(p.x, p.y, p.z, 1.f);
+				bool outside = false;
+				for(int i=0; i<num_frustum_clip_planes; ++i)
+				{
+					const float margin_i = base_margin + translation_dilation[i] + rot_pad;
+					if(dot(frustum_clip_planes[i].getNormal(), pos4) >= frustum_clip_planes[i].getD() + margin_i)
+					{ outside = true; break; }
+				}
+				if(outside)
+				{
+					recordFrontierNode(cloud_idx_u32, top.member_idx, top.tree_local_idx, top.depth, FrontierStop_OutOfFrustum);
+					continue;
+				}
+			}
 
 			// Converged - already fine enough, no need to expand further.
 			if(top.pixel_scale <= pixel_scale_limit)
@@ -773,6 +824,11 @@ private:
 	float max_layer_density;
 	int max_tree_depth;
 	float focal_px;
+	Planef frustum_clip_planes[6]; // SESSION055: local copy; matches OpenGLEngine.h's cap. Empty when frustum_cull_enabled=false (getFrustumStructureReport() takes that path).
+	int num_frustum_clip_planes;
+	bool frustum_cull_enabled;
+	float translation_dilation[6]; // SESSION055: per-plane world-space margin (metres) - see kickOffTraversals()'s anisotropic dilation block.
+	float rotation_dilation_rate;  // SESSION055: rad; multiplied by dist-to-node inside cull so a rotation of theta at range r dilates the plane by r*theta.
 	ThreadSafeQueue<Reference<ThreadMessage> >* result_queue;
 	js::Vector<FrontierNodeRecord, 16>* frontier_record; // Null (the normal case) means don't record anything - see recordFrontierNode().
 };
@@ -784,7 +840,8 @@ private:
 GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 :	opengl_engine(&opengl_engine_), next_handle(1), next_cloud_id(1), num_sorts_in_flight(0),
 	num_traversals_in_flight(0), lod_pixel_scale_limit(1.0f), lod_max_splats_budget(10000000), lod_resort_move_threshold_ws(0.1f),
-	lod_max_layer_density(0.0f), lod_max_tree_depth(0),
+	lod_max_layer_density(0.0f), lod_max_tree_depth(0), lod_frustum_cull_enabled(true),
+	have_prev_think_cam_state(false), prev_think_cam_pos_ws(0.f), prev_think_cam_forward_ws(0.f), cam_velocity_ema_ws(0.f), cam_angular_speed_ema(0.f), cam_angular_speed_peak(0.f),
 	splat_size_clamp_min(0.0f), splat_size_clamp_max(0.0f), splat_size_clamp_invert(false),
 	splat_dist_clamp_min(0.0f), splat_dist_clamp_max(1000.0f), splat_dist_clamp_invert(false), splat_alpha_cutoff(1.0f / 255.0f),
 	splat_alpha_gain(1.0f), splat_alpha_gamma(1.0f), // Identity: the cloud as captured - see getAlphaGain().
@@ -1518,7 +1575,8 @@ static const char* const stop_reason_labels[FrontierStop_NumReasons] =
 	"density cap",
 	"depth cap",
 	"budget cap",
-	"member has no LoD tree"
+	"member has no LoD tree",
+	"out of frustum" // SESSION055 - only produced by the fast path with cull enabled; getFrustumStructureReport() disables cull so this stays 0 there.
 };
 
 
@@ -1528,19 +1586,13 @@ void GaussianSplatRenderer::fillTraversalScratch(const SplatCloud& cloud, Gaussi
 	// growable/mutable state - same rule the sort task follows, for the same reason.
 	scratch.positions_snapshot.resizeNoCopy(cloud.total_splats);
 	std::memcpy(scratch.positions_snapshot.data(), cloud.positions.data(), cloud.total_splats * sizeof(Vec3f));
-	scratch.scales_snapshot.resizeNoCopy(cloud.total_splats);
-	std::memcpy(scratch.scales_snapshot.data(), cloud.scales.data(), cloud.total_splats * sizeof(Vec3f));
 
-	// SESSION054: precompute feature_size = 2*max(scale.xyz) once per kick, so the hot per-push makeHeapItem inside the traversal loop
-	// reads a single 4-byte float instead of a 12-byte Vec3f plus a 3-way max. On this cloud's ~750k expand iterations that's
-	// millions of fewer bytes of random-access memory traffic and no arithmetic on the critical path.
+	// SESSION055: feature_size is now maintained on the cloud itself (see SplatCloud::feature_size), so all we do here is a
+	// single 4-byte-per-node memcpy - no scales copy, no per-node arithmetic loop. This shaves ~180MB of memory traffic per
+	// kick on a 7.5M-splat cloud, which was the bottleneck the session055 rotation re-kick surfaced. scales_snapshot is
+	// left empty by design; no downstream caller reads it, and keeping the vector around costs nothing while unused.
 	scratch.feature_size_snapshot.resizeNoCopy(cloud.total_splats);
-	{
-		const Vec3f* const s = scratch.scales_snapshot.data();
-		float* const fs = scratch.feature_size_snapshot.data();
-		for(size_t i=0; i<cloud.total_splats; ++i)
-			fs[i] = 2.f * myMax(s[i].x, myMax(s[i].y, s[i].z));
-	}
+	std::memcpy(scratch.feature_size_snapshot.data(), cloud.feature_size.data(), cloud.total_splats * sizeof(float));
 
 	scratch.members_snapshot.resize(cloud.members.size());
 	for(size_t m=0; m<cloud.members.size(); ++m)
@@ -1687,8 +1739,14 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 		frontier.reserve(cloud.total_splats);
 
 		// Null result queue: this frontier is for reading, not for drawing - see the task's own comment there.
+		// SESSION055: report deliberately runs with frustum-cull off. It has to see the whole tree to answer "what would the
+		// LoD hierarchy offer at this camera" - a frustum-culled traversal would misreport pruning ceilings and reason
+		// classifications for anything behind the camera.
 		GaussianSplatLodTraversalTask task(cloud.cloud_id, cloud.topology_generation, scratch, cam_pos_ws,
-			lod_pixel_scale_limit, lod_max_splats_budget, lod_max_layer_density, lod_max_tree_depth, focal_px, /*result_queue=*/NULL, &frontier);
+			lod_pixel_scale_limit, lod_max_splats_budget, lod_max_layer_density, lod_max_tree_depth, focal_px,
+			/*frustum_clip_planes=*/NULL, /*num_frustum_clip_planes=*/0, /*frustum_cull_enabled=*/false,
+			/*translation_dilation=*/NULL, /*rotation_dilation_rate=*/0.f,
+			/*result_queue=*/NULL, &frontier);
 		task.run(0);
 
 		// Not returned to the pool yet: the pruning ceiling below walks scratch->selected_indices, which is the frontier in
@@ -2967,7 +3025,9 @@ static void bakeMember(SplatCloud& cloud, CloudMember& member)
 			cloud.rotations[dest] = world_quat.v; // Quat::v is already (x, y, z, w), matching our storage convention.
 			cloud.colours  [dest] = splat_data.colours[i]; // Colour and opacity aren't affected by the cloud's pose, but re-deriving them keeps this the single place a member's data is written.
 
-			const float radius = splat_cutoff_sigmas * myMax(world_scale.x, myMax(world_scale.y, world_scale.z));
+			const float max_scale = myMax(world_scale.x, myMax(world_scale.y, world_scale.z));
+			cloud.feature_size[dest] = 2.f * max_scale; // SESSION055 - see SplatCloud::feature_size.
+			const float radius = splat_cutoff_sigmas * max_scale;
 			aabb_ws.enlargeToHoldPoint(world_pos - Vec4f(radius, radius, radius, 0.f));
 			aabb_ws.enlargeToHoldPoint(world_pos + Vec4f(radius, radius, radius, 0.f));
 		}
@@ -2997,7 +3057,9 @@ static void bakeMember(SplatCloud& cloud, CloudMember& member)
 			cloud.rotations[dest] = world_quat.v;
 			cloud.colours  [dest] = tree[i].colour;
 
-			const float radius = splat_cutoff_sigmas * myMax(world_scale.x, myMax(world_scale.y, world_scale.z));
+			const float max_scale = myMax(world_scale.x, myMax(world_scale.y, world_scale.z));
+			cloud.feature_size[dest] = 2.f * max_scale; // SESSION055 - see SplatCloud::feature_size.
+			const float radius = splat_cutoff_sigmas * max_scale;
 			aabb_ws.enlargeToHoldPoint(world_pos - Vec4f(radius, radius, radius, 0.f));
 			aabb_ws.enlargeToHoldPoint(world_pos + Vec4f(radius, radius, radius, 0.f));
 		}
@@ -3096,6 +3158,7 @@ void GaussianSplatRenderer::appendMemberToCloud(SplatCloud& cloud, const CloudMe
 	cloud.scales   .resize(new_total);
 	cloud.rotations.resize(new_total);
 	cloud.colours  .resize(new_total);
+	cloud.feature_size.resize(new_total); // SESSION055 - see SplatCloud::feature_size.
 
 	cloud.members.push_back(member_in);
 	CloudMember& member = cloud.members.back();
@@ -3141,6 +3204,7 @@ void GaussianSplatRenderer::rebuildCloud(SplatCloud& cloud)
 	cloud.scales   .resize(total);
 	cloud.rotations.resize(total);
 	cloud.colours  .resize(total);
+	cloud.feature_size.resize(total); // SESSION055 - see SplatCloud::feature_size.
 
 	for(size_t m=0; m<cloud.members.size(); ++m)
 		bakeMember(cloud, cloud.members[m]);
@@ -3729,6 +3793,19 @@ void GaussianSplatRenderer::drainTraversalResults()
 }
 
 
+// SESSION055 diag: one shared Timer for kickOffTraversals logging; timestamps are ms-since-first-log so
+// pauses and streaks in the traversal pipeline read easily against each other. Toggle kick_debug_log below.
+// Only two events actually print, both signal-only:
+//   [gsr-kick]        each successful traversal kick, with reason (rot / trans / topo / first).
+//   [gsr-rot-blocked] when the camera is rotating fast enough to trigger the 5deg re-kick BUT no kick went out
+//                     (either the target cloud's slot is in flight, or all concurrent slots are full).
+// Both are throttled per-event-type - see rot_blocked_min_gap_ms below - so a held-down rotation logs a heartbeat,
+// not a flood.
+static const bool kick_debug_log = false; // Flip to true to re-enable [gsr-kick] / [gsr-rot-blocked] stdout traces from session055 tuning.
+static Timer kick_debug_timer;
+static double last_rot_blocked_log_ms = -1e9;
+static const double rot_blocked_min_gap_ms = 250.0;
+
 void GaussianSplatRenderer::kickOffTraversals()
 {
 	glare::TaskManager* const task_manager = opengl_engine->getMainTaskManager();
@@ -3737,11 +3814,37 @@ void GaussianSplatRenderer::kickOffTraversals()
 
 	const OpenGLScene* const scene = opengl_engine->getCurrentScene();
 	const Vec4f cam_pos_ws = scene->cam_to_world.getColumn(3);
+	// SESSION055: Substrata camera basis convention is right=col0, forward=col1, up=col2 (see OpenGLEngine.cpp uses of
+	// cam_to_world.getColumn). Column 2 (up) is INSENSITIVE to pure-yaw rotation at zero pitch, which is exactly the case
+	// (keyboard turn) where re-kicks were silently not firing during session055 diagnosis. Read col 1 (forward), and
+	// normalise: a small non-unit drift in the matrix makes dot > 1 at small angles, myClamp truncates to 1, acos returns
+	// 0, and small rotations vanish from the trigger and from cam_angular_speed_ema in think().
+	const Vec4f cam_forward_ws = normalise(scene->cam_to_world.getColumn(1));
 
 	const Vec2i viewport_dims = opengl_engine->getViewportDims();
 	const float focal_x = (float)viewport_dims.x * scene->lens_sensor_dist / scene->use_sensor_width;
 	const float focal_y = (float)viewport_dims.y * scene->lens_sensor_dist / scene->use_sensor_height;
 	const float focal_px = (focal_x + focal_y) * 0.5f; // Average of the two axes - a splat's on-screen size only differs meaningfully per axis with a non-square viewport/sensor, close enough for the traversal's coarse pixel_scale budget.
+
+	// SESSION055: with frustum-cull on the traversal is view-dependent, so a rotation in place has to trigger a re-kick even
+	// though the camera position hasn't changed. 5deg is the coarse threshold - a full 360deg pan then costs 72 traversals,
+	// which is far under the concurrency cap and negligible per traversal after the session054 speed-up. Kept an internal
+	// constant rather than a live knob: the trade is not scene-dependent, it's about how large a stale frustum edge is
+	// tolerable, and 5deg was chosen to be well under what a first-person turn perceives as a hitch. cos(5deg) ~= 0.99619.
+	const float rotation_cos_threshold = 0.99619f;
+	const bool cull_active = lod_frustum_cull_enabled;
+
+	// SESSION055: anisotropic frustum-cull dilation. Async traversal takes ~150-500ms per session054; during that window
+	// the camera keeps moving/rotating, so nodes that were outside at kick time can be inside by the time the result
+	// applies - visible as holes along the screen edge on turns and back-motion.
+	// Rate model: max(EMA, empirical). EMA is the smoothed motion tracker (rise-fast, fall-slow); empirical is the
+	// actual (translation, rotation) that has happened between the previous kick for THIS cloud and now. Empirical
+	// catches burst motion (mouse flicks) that EMA underestimates once the flick ends and the value decays before the
+	// next kick; EMA catches motion that just started (empirical from last kick is stale then). The max covers both.
+	// traversal_latency_estimate is a conservative constant matching session054's measured 165ms interior / 450ms
+	// bridge - one number for both because the dilation is a safety margin, not a precise correction.
+	const float traversal_latency_estimate = 0.3f; // seconds. Conservative; raising it costs a little cull, lowering it risks holes.
+	const double now_s = kick_debug_timer.elapsed();
 
 	while(num_traversals_in_flight < max_concurrent_traversals)
 	{
@@ -3752,6 +3855,7 @@ void GaussianSplatRenderer::kickOffTraversals()
 		// SplatCloud::topology_generation's comment.
 		SplatCloud* best_cloud = NULL;
 		float best_ratio = 1.f;
+		const char* best_reason = "none"; // SESSION055 diag - see kick_debug_log.
 		for(size_t i=0; i<clouds.size(); ++i)
 		{
 			SplatCloud* const cloud = clouds[i].ptr();
@@ -3759,20 +3863,40 @@ void GaussianSplatRenderer::kickOffTraversals()
 				continue;
 
 			float ratio;
+			const char* reason;
 			if(cloud->last_traversal_kicked_topology_generation != cloud->topology_generation)
+			{
 				ratio = std::numeric_limits<float>::max();
+				reason = "topo";
+			}
 			else if(!cloud->have_last_traversal_cam_pos)
+			{
 				ratio = std::numeric_limits<float>::max();
+				reason = "first";
+			}
 			else
 			{
 				const float threshold = myMax(lod_resort_move_threshold_ws, cloud->aabb_ws.distanceToPoint(cam_pos_ws) * resort_threshold_dist_fraction);
 				ratio = cam_pos_ws.getDist(cloud->last_traversal_cam_pos_ws) / threshold;
+				reason = "trans";
+
+				// SESSION055: only meaningful while cull is on; without it the traversal is rotation-invariant as before.
+				if(cull_active)
+				{
+					const float rot_dot = dot(cam_forward_ws, cloud->last_traversal_cam_forward_ws);
+					if(rot_dot < rotation_cos_threshold)
+					{
+						ratio = std::numeric_limits<float>::max();
+						reason = "rot";
+					}
+				}
 			}
 
 			if(ratio > best_ratio)
 			{
 				best_ratio = ratio;
 				best_cloud = cloud;
+				best_reason = reason;
 			}
 		}
 
@@ -3790,14 +3914,117 @@ void GaussianSplatRenderer::kickOffTraversals()
 
 		fillTraversalScratch(*best_cloud, *scratch);
 
+		// SESSION055: per-cloud dilation. Empirical rates use the delta since THIS cloud's previous kick (each cloud may
+		// have been kicked at a different moment). First-kick fallback: no empirical, EMA only.
+		float translation_dilation[6] = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
+		float rotation_dilation_rate = 0.f;
+		float empirical_ang_rate_dbg = 0.f;
+		if(cull_active)
+		{
+			// SESSION055: per-plane max of EMA-vs-empirical directional shift. Doing max on the *shift* rather than on
+			// the velocity vector lets each plane pick the estimate that actually threatens it: a stale-east EMA gives
+			// dot(west_plane_n, ema*L)<0 (rejected by max with 0), while empirical west gives dot(west_plane_n, emp*L)>0
+			// (kept). Handles direction reversals without needing to reason about "which velocity direction is real".
+			const Vec4f ema_expected = cam_velocity_ema_ws * traversal_latency_estimate;
+			Vec4f emp_expected(0.f);
+			float w_effective = myMax(cam_angular_speed_ema, cam_angular_speed_peak); // SESSION055: peak covers mouse-flick-in-past for the next ~1s of kicks - see the peak update in think().
+			if(best_cloud->have_last_traversal_cam_pos)
+			{
+				const double dt = myMax(1.0e-3, now_s - best_cloud->last_traversal_kick_time_s); // Floor guards a degenerate 0 dt (would explode empirical rate); 1ms is well below any realistic kick cadence.
+				const Vec4f empirical_v = (cam_pos_ws - best_cloud->last_traversal_cam_pos_ws) * (float)(1.0 / dt);
+				emp_expected = empirical_v * traversal_latency_estimate;
+				const float rot_dot = myClamp(dot(cam_forward_ws, best_cloud->last_traversal_cam_forward_ws), -1.f, 1.f);
+				const float empirical_w = std::acos(rot_dot) / (float)dt;
+				empirical_ang_rate_dbg = empirical_w;
+				w_effective = myMax(w_effective, empirical_w);
+			}
+			for(int i=0; i<scene->num_frustum_clip_planes && i<6; ++i)
+			{
+				const Vec4f n = scene->frustum_clip_planes[i].getNormal();
+				const float shift_ema = dot(n, ema_expected);
+				const float shift_emp = dot(n, emp_expected);
+				translation_dilation[i] = myMax(0.f, myMax(shift_ema, shift_emp));
+			}
+			rotation_dilation_rate = w_effective * traversal_latency_estimate;
+
+			// SESSION055: baseline minimum dilation covers the "static->moving" transition. Both EMA and empirical
+			// read zero at that transition (nothing has moved yet since last kick), so the traversal that lands next
+			// has no rotation margin at all - and by the time the next kick captures the new motion, another 120ms
+			// of holes have shown. Baseline says "even if pose looked frozen at kick time, allow for X m/s and Y
+			// deg/s of motion possibly starting during this traversal". Tunable; roll back this block if the picture
+			// doesn't improve, since it costs a modest amount of over-inclusion in genuinely static scenes.
+			const float min_trans_rate_m_per_s = 2.0f;   // ~walking pace
+			const float min_rot_rate_deg_per_s = 45.f;   // half of typical keyboard turn rate
+			const float min_trans_dilation_m  = min_trans_rate_m_per_s * traversal_latency_estimate;
+			const float min_rot_dilation_rad  = min_rot_rate_deg_per_s * (3.14159265f / 180.f) * traversal_latency_estimate;
+			for(int i=0; i<scene->num_frustum_clip_planes && i<6; ++i)
+				translation_dilation[i] = myMax(translation_dilation[i], min_trans_dilation_m);
+			rotation_dilation_rate = myMax(rotation_dilation_rate, min_rot_dilation_rad);
+		}
+
 		best_cloud->traversal_in_flight = true;
 		best_cloud->have_last_traversal_cam_pos = true;
 		best_cloud->last_traversal_cam_pos_ws = cam_pos_ws;
+		best_cloud->last_traversal_cam_forward_ws = cam_forward_ws; // SESSION055 - see rotation_cos_threshold above.
+		best_cloud->last_traversal_kick_time_s = now_s;
 		best_cloud->last_traversal_kicked_topology_generation = best_cloud->topology_generation;
 		num_traversals_in_flight++;
 
+		if(kick_debug_log)
+			conPrint("[gsr-kick] t" + doubleToStringNDecimalPlaces(now_s * 1000.0, 0) + "ms cloud=" +
+				toString(best_cloud->cloud_id) + " reason=" + std::string(best_reason) +
+				" ratio=" + (best_ratio == std::numeric_limits<float>::max() ? std::string("inf") : doubleToStringNDecimalPlaces(best_ratio, 2)) +
+				" in_flight=" + toString(num_traversals_in_flight) + "/" + toString(max_concurrent_traversals) +
+				" splats=" + toString(best_cloud->total_splats) +
+				" w_ema=" + doubleToStringNDecimalPlaces(cam_angular_speed_ema * (180.0 / 3.14159265), 1) +
+				" w_emp=" + doubleToStringNDecimalPlaces(empirical_ang_rate_dbg * (180.0 / 3.14159265), 1) +
+				" rot_dil=" + doubleToStringNDecimalPlaces(rotation_dilation_rate * (180.0 / 3.14159265), 1) + "deg");
+
+		// SESSION055: pass frustum planes (copied into task, see its ctor) and the anisotropic dilation numbers computed
+		// once above per kickOffTraversals() call.
 		task_manager->addTask(new GaussianSplatLodTraversalTask(best_cloud->cloud_id, best_cloud->topology_generation, scratch, cam_pos_ws,
-			lod_pixel_scale_limit, lod_max_splats_budget, lod_max_layer_density, lod_max_tree_depth, focal_px, &traversal_result_queue));
+			lod_pixel_scale_limit, lod_max_splats_budget, lod_max_layer_density, lod_max_tree_depth, focal_px,
+			scene->frustum_clip_planes, scene->num_frustum_clip_planes, cull_active,
+			translation_dilation, rotation_dilation_rate,
+			&traversal_result_queue));
+	}
+
+	// SESSION055 diag: after the while-loop, detect *unmet* rotation demand - a cloud whose forward has shifted past the
+	// re-kick threshold since its last kick, but that couldn't be kicked this pass because its slot is in flight or all
+	// concurrent slots are full. Throttled: at most one line every rot_blocked_min_gap_ms, so a held-down rotation logs a
+	// heartbeat rather than a per-frame stream.
+	if(kick_debug_log && cull_active)
+	{
+		int blocked_inflight = 0, blocked_no_slot = 0;
+		float worst_deg_over_threshold = 0.f;
+		for(size_t i=0; i<clouds.size(); ++i)
+		{
+			const SplatCloud* const cloud = clouds[i].ptr();
+			if(cloud->total_splats == 0 || !cloudHasLodTree(*cloud) || !cloud->have_last_traversal_cam_pos)
+				continue;
+			const float rot_dot = myClamp(dot(cam_forward_ws, cloud->last_traversal_cam_forward_ws), -1.f, 1.f);
+			if(rot_dot >= rotation_cos_threshold)
+				continue; // Within tolerance, no demand.
+			const float deg = std::acos(rot_dot) * (180.f / 3.14159265f);
+			if(deg > worst_deg_over_threshold)
+				worst_deg_over_threshold = deg;
+			if(cloud->traversal_in_flight)
+				blocked_inflight++;
+			else if(num_traversals_in_flight >= max_concurrent_traversals) // Slot exhaustion by *other* clouds' work.
+				blocked_no_slot++;
+		}
+		if(blocked_inflight > 0 || blocked_no_slot > 0)
+		{
+			const double now_ms = kick_debug_timer.elapsed() * 1000.0;
+			if(now_ms - last_rot_blocked_log_ms >= rot_blocked_min_gap_ms)
+			{
+				last_rot_blocked_log_ms = now_ms;
+				conPrint("[gsr-rot-blocked] t" + doubleToStringNDecimalPlaces(now_ms, 0) + "ms worst=" +
+					doubleToStringNDecimalPlaces(worst_deg_over_threshold, 1) + "deg (thr 5deg) inflight_blocked=" +
+					toString(blocked_inflight) + " no_slot_blocked=" + toString(blocked_no_slot) +
+					" w=" + doubleToStringNDecimalPlaces(cam_angular_speed_ema * (180.0 / 3.14159265), 1) + "deg/s");
+			}
+		}
 	}
 }
 
@@ -3848,6 +4075,44 @@ void GaussianSplatRenderer::think()
 	}
 
 	buildVisibleSliceCDFs();
+
+	// SESSION055: camera-motion tracker for anisotropic frustum-cull dilation - see the cull block in
+	// GaussianSplatLodTraversalTask::run() and the members' comments in GaussianSplatRenderer.h. Filter rule is
+	// max(instant, ema): rises the moment motion starts (so kickOffTraversals() picks up on the first-motion frame,
+	// not three frames in) and decays exponentially on stop. alpha 0.15 = ~7-frame time constant at 60 Hz.
+	{
+		const Vec4f cur_cam_pos = scene->cam_to_world.getColumn(3);
+		const Vec4f cur_cam_forward = normalise(scene->cam_to_world.getColumn(1)); // SESSION055: col 1 is forward in Substrata, col 2 is up - see the parallel note in kickOffTraversals(). Normalise so tiny non-unit drift can't clamp acos() to zero at small angles.
+		const double dt_raw = prev_think_timer.elapsed();
+		prev_think_timer.reset();
+		if(have_prev_think_cam_state && dt_raw > 1.0e-4 && dt_raw < 0.5) // Guard against zero/huge dt (first frame post-load, breakpoint, tab-out).
+		{
+			const float dt = (float)dt_raw;
+			const Vec4f inst_vel = (cur_cam_pos - prev_think_cam_pos_ws) * (1.f / dt); // Vec4f arithmetic gives .w = 0 (positions differ, w cancels), correct for a velocity vector.
+			const float dot_fw = myClamp(dot(cur_cam_forward, prev_think_cam_forward_ws), -1.f, 1.f);
+			const float inst_ang = std::acos(dot_fw) / dt;
+			const float alpha = 0.15f;
+			// SESSION055: plain EMA for velocity vector - the per-axis abs-max used earlier kept the STALE direction on
+			// reversal (e.g. long east motion followed by short west step held ema pointing east, so kickOff dilated
+			// the east plane instead of west and left holes on the west edge). max(EMA, empirical) is applied per
+			// plane at kick time instead, where it can compare directional shifts against a specific plane normal.
+			// For angular speed the value is a scalar magnitude (non-negative), so a simple max(inst, blended) is
+			// safe and useful - it holds bursts through the EMA decay tail.
+			const Vec4f blended_vel = cam_velocity_ema_ws * (1.f - alpha) + inst_vel * alpha;
+			const float blended_ang = cam_angular_speed_ema * (1.f - alpha) + inst_ang * alpha;
+			cam_velocity_ema_ws = blended_vel;
+			cam_velocity_ema_ws.x[3] = 0.f;
+			cam_angular_speed_ema = myMax(inst_ang, blended_ang);
+			// SESSION055: slow-decay peak (attack instant, half-life ~35 frames @ 60Hz ~ 580ms). After a mouse flick,
+			// dilation stays elevated for ~1s of subsequent kicks - covers the case where the FLICK happens between
+			// two kicks and the currently-in-flight traversal (kicked before the flick with low w) can't help, but
+			// the NEXT kick, informed by peak, is over-dilated so a follow-up flick is already covered.
+			cam_angular_speed_peak = myMax(inst_ang, cam_angular_speed_peak * 0.98f);
+		}
+		prev_think_cam_pos_ws = cur_cam_pos;
+		prev_think_cam_forward_ws = cur_cam_forward;
+		have_prev_think_cam_state = true;
+	}
 
 	kickOffSorts();
 	kickOffTraversals();

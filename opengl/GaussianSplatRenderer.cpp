@@ -129,7 +129,7 @@ public:
 		importance_layout_fingerprint(0), slice_sample_draw_count(0),
 		have_last_sort_cam_pos(false), last_sort_cam_pos_ws(0.f), aabb_ws(js::AABBox::emptyAABBox()), added_to_engine(false),
 		topology_generation(0), traversal_in_flight(false), have_last_traversal_cam_pos(false), last_traversal_cam_pos_ws(0.f), last_traversal_cam_forward_ws(0.f), last_traversal_kick_time_s(0.0),
-		last_traversal_kicked_topology_generation(0), last_traversal_hit_budget_cap(false), last_traversal_hit_density_cap(false), last_traversal_hit_depth_cap(false),
+		last_traversal_kicked_topology_generation(0), last_traversal_hit_budget_cap(false), last_traversal_hit_density_cap(false), last_traversal_hit_depth_cap(false), last_traversal_dilation_elevated(false),
 		cached_traversal_geom_generation(0), importance_num_views(0)
 	{}
 
@@ -179,6 +179,17 @@ public:
 	bool last_traversal_hit_budget_cap; // Copied from the most recently applied traversal result's GaussianSplatLodTraversalScratch::hit_budget_cap (which itself doesn't persist - the scratch goes back to the pool) - surfaced in getDiagnostics() as a "detail is being truncated by the budget" warning.
 	bool last_traversal_hit_density_cap; // As above, for GaussianSplatLodTraversalScratch::hit_density_cap.
 	bool last_traversal_hit_depth_cap; // As above, for GaussianSplatLodTraversalScratch::hit_depth_cap.
+
+	// SESSION059: true if the traversal just kicked for this cloud used a rotation_dilation_rate above the baseline
+	// floor (i.e. cam_angular_speed_ema/peak was elevated at kick time) - see kickOffTraversals()'s "settle" re-kick.
+	// A rotation past the 5deg re-kick threshold naturally corrects an over-wide selection on the next real kick, but a
+	// single violent mouse flick can leave cam_angular_speed_peak elevated for ~1-3s (its decay is slow by design - see
+	// think()) with NO further rotation happening at all: nothing re-triggers, so the over-dilated selection from the
+	// flick's own kick stays applied indefinitely - session059 found this stuck at ~2x the GPU cost of a settled scene,
+	// on a real-world (km-scale) capture where rotation_dilation_rate's distance-proportional term amplifies the effect.
+	// This flag lets kickOffTraversals() notice, once w_effective has decayed back to baseline, that this cloud is
+	// still carrying a stale wide margin and deserves one more kick to tighten it back up.
+	bool last_traversal_dilation_elevated;
 
 	// Per-splat importance, accumulated across getFrustumStructureReport() runs so that "does this splat matter from
 	// anywhere?" can be asked of several viewpoints instead of one.  The pruning ceiling in that report is a single-camera
@@ -4036,7 +4047,7 @@ void GaussianSplatRenderer::drainTraversalResults()
 // SESSION055 diag: one shared Timer for kickOffTraversals logging; timestamps are ms-since-first-log so
 // pauses and streaks in the traversal pipeline read easily against each other. Toggle kick_debug_log below.
 // Only two events actually print, both signal-only:
-//   [gsr-kick]        each successful traversal kick, with reason (rot / trans / topo / first).
+//   [gsr-kick]        each successful traversal kick, with reason (rot / trans / topo / first / settle - SESSION059).
 //   [gsr-rot-blocked] when the camera is rotating fast enough to trigger the 5deg re-kick BUT no kick went out
 //                     (either the target cloud's slot is in flight, or all concurrent slots are full).
 // Both are throttled per-event-type - see rot_blocked_min_gap_ms below - so a held-down rotation logs a heartbeat,
@@ -4085,6 +4096,32 @@ void GaussianSplatRenderer::kickOffTraversals()
 	const float traversal_latency_estimate = 0.3f; // seconds. Conservative; raising it costs a little cull, lowering it risks holes.
 	const double now_s = diag_timer.elapsed();
 
+	// SESSION055 baseline (see its own comment further down, where it's applied) - hoisted here too so the SESSION059
+	// "settle" check just below can compare the *current* w_effective against the same floor every kick already
+	// guarantees, without duplicating the derivation. min_rot_dilation_rad is the amount of dilation baseline alone
+	// contributes; min_rot_rate_rad_s is the underlying rate, which is what "has w_effective calmed back down" needs.
+	//
+	// SESSION059 tried giving the settle-triggered kick extra margin here, to cover a mouse flick starting during the
+	// settle kick's own in-flight window (the "first flick after calm" hole session055 already documented as generally
+	// unavoidable - previously seen once at app startup, now recurring on every pause because the "stuck wide" bug this
+	// session fixed used to accidentally leave a wide margin in place forever instead of correctly tightening it).
+	// Two attempts, both reverted:
+	//   - Raising this constant itself fixed the hole but made EVERY kick pay for mouse-flick-sized margin permanently
+	//     (measured: pinned CPU at ~19ms with no drop, regardless of motion).
+	//   - Scoping the extra margin to just the settle kick avoided that, but on this session's km-scale test scene,
+	//     rotation_dilation_rate's distance-proportional term means even a scoped ~60deg margin balloons the settle
+	//     kick's own selection back up near the stuck-bug's size (~7.8M vs ~2.4M splats) - so "settle" stopped visibly
+	//     dropping GPU at all, defeating its purpose.
+	// Root cause turned out to be latency, not margin: the first kick after resuming motion already computes a large,
+	// correct dilation (session059 measured 80.9deg from a fresh flick) but still takes the full ~500ms
+	// traversal_latency_estimate to land, and the tight, undialted settle selection is what's on screen for that whole
+	// window regardless of how generous the *next* kick's margin will be once it arrives. No margin tuning here can
+	// shorten that window - the real fix (parallel expand, session054 §2A.4 - splitting the DFS expand across worker
+	// threads to cut traversal latency directly, ~3x expected) is next session's work, see the session059 snapshot.
+	const float min_rot_rate_deg_per_s = 45.f;   // half of typical keyboard turn rate
+	const float min_rot_rate_rad_s = min_rot_rate_deg_per_s * (3.14159265f / 180.f);
+	const float min_rot_dilation_rad = min_rot_rate_rad_s * traversal_latency_estimate;
+
 	while(num_traversals_in_flight < max_concurrent_traversals)
 	{
 		// Pick the cloud most overdue for a traversal, same "how far the camera has moved relative to this cloud's own
@@ -4127,6 +4164,16 @@ void GaussianSplatRenderer::kickOffTraversals()
 					{
 						ratio = std::numeric_limits<float>::max();
 						reason = "rot";
+					}
+					// SESSION059: "settle" re-kick - see SplatCloud::last_traversal_dilation_elevated's comment. Only
+					// reached when rotation itself didn't already trigger above: this cloud's applied selection was
+					// picked with an elevated margin, but nothing has rotated since, so nothing else would ever notice
+					// that margin is now stale. Once w_effective has decayed back to (or below) the baseline every kick
+					// already floors to, one more kick captures a tight selection at the current, calmed-down pose.
+					else if(cloud->last_traversal_dilation_elevated && (myMax(cam_angular_speed_ema, cam_angular_speed_peak) <= min_rot_rate_rad_s))
+					{
+						ratio = std::numeric_limits<float>::max();
+						reason = "settle";
 					}
 				}
 			}
@@ -4192,14 +4239,20 @@ void GaussianSplatRenderer::kickOffTraversals()
 			// of holes have shown. Baseline says "even if pose looked frozen at kick time, allow for X m/s and Y
 			// deg/s of motion possibly starting during this traversal". Tunable; roll back this block if the picture
 			// doesn't improve, since it costs a modest amount of over-inclusion in genuinely static scenes.
+			// min_rot_rate_deg_per_s/min_rot_dilation_rad are hoisted above the while-loop now - see SESSION059's comment
+			// there - so the "settle" check can share the exact same floor this block applies.
 			const float min_trans_rate_m_per_s = 2.0f;   // ~walking pace
-			const float min_rot_rate_deg_per_s = 45.f;   // half of typical keyboard turn rate
 			const float min_trans_dilation_m  = min_trans_rate_m_per_s * traversal_latency_estimate;
-			const float min_rot_dilation_rad  = min_rot_rate_deg_per_s * (3.14159265f / 180.f) * traversal_latency_estimate;
 			for(int i=0; i<scene->num_frustum_clip_planes && i<6; ++i)
 				translation_dilation[i] = myMax(translation_dilation[i], min_trans_dilation_m);
 			rotation_dilation_rate = myMax(rotation_dilation_rate, min_rot_dilation_rad);
 		}
+
+		// SESSION059: remember whether this kick used more than baseline dilation, so the "settle" check above can catch
+		// this cloud once w_effective decays back down with no further rotation to naturally trigger a fresh kick - see
+		// SplatCloud::last_traversal_dilation_elevated's comment. A tiny epsilon avoids flagging float noise right at
+		// the floor as "elevated".
+		best_cloud->last_traversal_dilation_elevated = cull_active && (rotation_dilation_rate > min_rot_dilation_rad + 1.0e-6f);
 
 		best_cloud->traversal_in_flight = true;
 		best_cloud->have_last_traversal_cam_pos = true;

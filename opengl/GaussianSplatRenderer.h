@@ -919,7 +919,7 @@ private:
 
 	void noteDrawOrderForSlicing(SplatCloud& cloud, const uint32* draw_indices, size_t count); // Refreshes the sample of a cloud's draw order the frustum-aware slicing works from - see getVisibleSlicingEnabled().  Called from every place that writes the instance index VBO.
 	void buildVisibleSliceCDFs(); // Per-frame, from think(): re-tests each cloud's sample against the current frustum.  The one part of the draw order that depends on where the camera is looking rather than where it is.
-	void fillTraversalScratch(const SplatCloud& cloud, GaussianSplatLodTraversalScratch& scratch) const; // Freezes a cloud's world-space node data and member layout into a scratch, ready for a traversal to read without touching the live arrays.
+	void fillTraversalScratch(SplatCloud& cloud, GaussianSplatLodTraversalScratch& scratch) const; // Freezes a cloud's world-space node data and member layout into a scratch, ready for a traversal to read without touching the live arrays. SESSION058: non-const - may cache the snapshot on the cloud (see SplatCloud::cached_traversal_geom) so repeated kicks against an unchanged cloud reuse it instead of re-copying.
 
 	Reference<OpenGLProgram> shader_prog; // Shared by every cloud.  Null until the first addObject().
 	Reference<OpenGLProgram> resolve_prog; // Resolves the splat accumulation buffer onto the main colour buffer.  Built alongside shader_prog.

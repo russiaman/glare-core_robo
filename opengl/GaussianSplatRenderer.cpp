@@ -59,6 +59,34 @@ static const int max_concurrent_sorts = 2;
 // four-thousandth of the draw order, which is far finer than a handful of slice boundaries can use.
 static const int max_slice_samples = 4096;
 
+// SESSION055/058: one shared Timer for ALL traversal-pipeline diagnostic prints in this file (kick log, rot-blocked
+// log, session058 CPU-cost profiling) - see [[feedback_shared_diag_timer]]. Declared at file scope, above every diag
+// print site (some of which - e.g. fillTraversalScratch() - are defined earlier in the file than kickOffTraversals()),
+// so every timestamp shares the same zero point and lines from different sites stay chronologically comparable.
+static Timer diag_timer;
+
+// SESSION058: toggle for [gsr-prof] stdout traces around fillTraversalScratch() and the traversal-result VBO upload -
+// see session058 snapshot §3. Measures whether the memcpy-per-kick over the whole cloud (not just the visible subset)
+// is really the 23ms session057 §3 flagged, before committing to the CoW refactor (session058 snapshot §2 plan A).
+static const bool cpu_prof_log = false; // Flip to true to re-enable [gsr-prof] stdout traces from session058 tuning.
+
+
+// SESSION058: immutable, cacheable copy of one cloud's world-space node positions + feature_size, shared (via Reference<>)
+// between every traversal kicked off since the cloud's last structural change, instead of each kick paying its own
+// memcpy. Safe to share across the worker and later kicks because nothing ever mutates an instance of this class after
+// it's built: bakeMember() (the only writer of the LIVE cloud.positions/feature_size arrays) always runs on a code path
+// that bumps SplatCloud::topology_generation in the same call (appendMemberToCloud(), rebuildCloud(), and - since
+// session057 - updateObjectTransform()'s re-bake), and fillTraversalScratch() only reuses a cached instance when its
+// cloud's topology_generation still matches the one it was built against. A generation mismatch means a *new* instance
+// is built and cached; the old one lives on, unmodified, for as long as some in-flight traversal (or a diagnostics
+// dump) still holds a reference to it - see SplatCloud::cached_traversal_geom.
+class GaussianSplatCachedGeom : public ThreadSafeRefCounted
+{
+public:
+	js::Vector<Vec3f, 16> positions;
+	js::Vector<float, 16> feature_size;
+};
+
 
 // One registered splat object, and the range of its owning cloud's arrays that it occupies.
 struct CloudMember
@@ -95,7 +123,7 @@ public:
 		have_last_sort_cam_pos(false), last_sort_cam_pos_ws(0.f), aabb_ws(js::AABBox::emptyAABBox()), added_to_engine(false),
 		topology_generation(0), traversal_in_flight(false), have_last_traversal_cam_pos(false), last_traversal_cam_pos_ws(0.f), last_traversal_cam_forward_ws(0.f), last_traversal_kick_time_s(0.0),
 		last_traversal_kicked_topology_generation(0), last_traversal_hit_budget_cap(false), last_traversal_hit_density_cap(false), last_traversal_hit_depth_cap(false),
-		importance_num_views(0)
+		cached_traversal_geom_generation(0), importance_num_views(0)
 	{}
 
 	uint64 cloud_id; // Stable, never reused.  Sort results carry it, so a result for a cloud that has since been merged away can be dropped.
@@ -112,6 +140,13 @@ public:
 	js::Vector<Vec4f, 16> rotations; // (x, y, z, w)
 	js::Vector<Vec4f, 16> colours;
 	js::Vector<float, 16> feature_size; // SESSION055: 2*max(scale.xyz), maintained in step with scales at bake time so kickOffTraversals()'s fillTraversalScratch() doesn't rebuild it from scales on every kick - a session055 hot path once the frustum-cull re-kick started firing on rotation.
+
+	// SESSION058: cached copy of positions+feature_size for the traversal path, valid as long as
+	// cached_traversal_geom_generation == topology_generation - see GaussianSplatCachedGeom's comment for why that's a
+	// safe invalidation signal. Null cached_traversal_geom means "never built yet"; fillTraversalScratch() handles both
+	// that and a generation mismatch the same way (build and cache a fresh one).
+	Reference<GaussianSplatCachedGeom> cached_traversal_geom;
+	uint64 cached_traversal_geom_generation;
 
 	std::vector<CloudMember> members;
 	js::AABBox aabb_ws; // The union of the members' padded bounds.  Doubles as the merge test and, via ob, the cull and draw-order box.
@@ -131,7 +166,7 @@ public:
 	bool have_last_traversal_cam_pos;
 	Vec4f last_traversal_cam_pos_ws; // Camera position as of the last traversal kicked off (not necessarily completed).
 	Vec4f last_traversal_cam_forward_ws; // SESSION055: camera forward at that kick, so kickOffTraversals() can re-trigger on rotation now that the traversal is view-dependent - see lod_frustum_cull_enabled.
-	double last_traversal_kick_time_s; // SESSION055: timestamp of that kick (kick_debug_timer.elapsed()) so the next kick can compute the *empirical* rotation/translation rate since - see the dilation block in kickOffTraversals().
+	double last_traversal_kick_time_s; // SESSION055: timestamp of that kick (diag_timer.elapsed()) so the next kick can compute the *empirical* rotation/translation rate since - see the dilation block in kickOffTraversals().
 	uint64 last_traversal_kicked_topology_generation; // topology_generation as of the last traversal kicked off - a mismatch against the live value means the cloud's structure has changed since, so it's unconditionally overdue for a fresh one (see kickOffTraversals()), the same idea as !have_last_sort_cam_pos for the sort.
 	bool last_traversal_hit_budget_cap; // Copied from the most recently applied traversal result's GaussianSplatLodTraversalScratch::hit_budget_cap (which itself doesn't persist - the scratch goes back to the pool) - surfaced in getDiagnostics() as a "detail is being truncated by the budget" warning.
 	bool last_traversal_hit_density_cap; // As above, for GaussianSplatLodTraversalScratch::hit_density_cap.
@@ -214,8 +249,9 @@ public:
 
 
 // Reusable working buffers for the background LoD traversals - pooled the same way GaussianSplatSortScratch is, and for
-// the same reason (a large tree can make positions_snapshot/scales_snapshot run to a non-trivial size, so N clouds
-// shouldn't mean N sets of these).
+// the same reason (selected_indices can run to a non-trivial size for a large tree, so N clouds shouldn't mean N sets of
+// these). SESSION058: geom below is no longer one of these per-scratch allocations - it's a Reference<> into a shared,
+// per-cloud cache (see GaussianSplatCachedGeom), so it costs nothing extra to pool.
 class GaussianSplatLodTraversalScratch : public ThreadSafeRefCounted
 {
 public:
@@ -227,9 +263,7 @@ public:
 		size_t count;
 	};
 
-	js::Vector<Vec3f, 16> positions_snapshot; // A frozen copy of one cloud's world-space node positions (leaves + merged), taken on the main thread when a traversal is kicked off.
-	js::Vector<Vec3f, 16> scales_snapshot; // SESSION055: left empty by fillTraversalScratch() - feature_size_snapshot is fed from the cloud's own maintained feature_size array (see SplatCloud::feature_size), which is what the traversal actually reads. Vector kept in the struct so the memory accounting in getDiagnostics() and any future diagnostic that wants scales can be re-enabled without a struct change.
-	js::Vector<float, 16> feature_size_snapshot; // SESSION054: precomputed 2*max(scale.xyz) per node, so the per-push makeHeapItem in the traversal loop skips the Vec3f scales[] lookup and the 3-way max entirely - the biggest per-node saving after the priority_queue removal.
+	Reference<GaussianSplatCachedGeom> geom; // SESSION058: shared, cloud-topology-generation-scoped snapshot of positions/feature_size - see GaussianSplatCachedGeom. Replaces the old per-kick positions_snapshot/feature_size_snapshot copies.
 	std::vector<MemberSnapshot> members_snapshot;
 
 	js::Vector<uint32, 16> selected_indices; // Output: this frame's frontier, as cloud-array indices.  Unsorted (heap-pop order) until stage 5 wires the depth-sort up to the selection - see kickOffSorts()'s use of cloudHasLodTree().
@@ -592,8 +626,8 @@ public:
 
 	virtual void run(size_t /*thread_index*/) override
 	{
-		const js::Vector<Vec3f, 16>& positions = scratch->positions_snapshot; // The frozen snapshot, never the live cloud arrays.
-		const js::Vector<float, 16>& feature_sizes = scratch->feature_size_snapshot; // SESSION054: replaces per-push Vec3f scales[] lookup + 3-way max in makeHeapItem.
+		const js::Vector<Vec3f, 16>& positions = scratch->geom->positions; // SESSION058: shared cached snapshot, never the live cloud arrays - see GaussianSplatCachedGeom.
+		const js::Vector<float, 16>& feature_sizes = scratch->geom->feature_size; // SESSION054: replaces per-push Vec3f scales[] lookup + 3-way max in makeHeapItem.
 
 		js::Vector<uint32, 16>& output = scratch->selected_indices;
 
@@ -1601,19 +1635,45 @@ static const char* const stop_reason_labels[FrontierStop_NumReasons] =
 };
 
 
-void GaussianSplatRenderer::fillTraversalScratch(const SplatCloud& cloud, GaussianSplatLodTraversalScratch& scratch) const
+void GaussianSplatRenderer::fillTraversalScratch(SplatCloud& cloud, GaussianSplatLodTraversalScratch& scratch) const
 {
-	// Freeze a snapshot of the cloud's current world-space node data and member layout, so a worker never touches the live,
-	// growable/mutable state - same rule the sort task follows, for the same reason.
-	scratch.positions_snapshot.resizeNoCopy(cloud.total_splats);
-	std::memcpy(scratch.positions_snapshot.data(), cloud.positions.data(), cloud.total_splats * sizeof(Vec3f));
+	// SESSION058 diag: measures the cost below - see cpu_prof_log's declaration and the session058 snapshot. Before this
+	// function's rewrite, this cost was a fixed ~23ms full-cloud memcpy on EVERY kick (session057 §3's mystery CPU load
+	// when 0 splats were visible: an empty traversal returns near-instantly, so kicks - each paying this cost - queued
+	// back to back with no gap). Now it's ~0 on a cache hit (the common case: camera moved/rotated, cloud unchanged) and
+	// the same ~23ms memcpy only on a cache miss (the cloud's topology_generation changed since the cache was built).
+	Timer prof_timer;
+	bool cache_hit;
 
-	// SESSION055: feature_size is now maintained on the cloud itself (see SplatCloud::feature_size), so all we do here is a
-	// single 4-byte-per-node memcpy - no scales copy, no per-node arithmetic loop. This shaves ~180MB of memory traffic per
-	// kick on a 7.5M-splat cloud, which was the bottleneck the session055 rotation re-kick surfaced. scales_snapshot is
-	// left empty by design; no downstream caller reads it, and keeping the vector around costs nothing while unused.
-	scratch.feature_size_snapshot.resizeNoCopy(cloud.total_splats);
-	std::memcpy(scratch.feature_size_snapshot.data(), cloud.feature_size.data(), cloud.total_splats * sizeof(float));
+	// SESSION058: reuse the cached snapshot if the cloud hasn't structurally changed since it was built - see
+	// GaussianSplatCachedGeom's comment for why topology_generation is a safe invalidation signal (every writer of
+	// cloud.positions/cloud.feature_size bumps it in the same call). A hit is just a Reference<> copy: no allocation,
+	// no memcpy, regardless of cloud size.
+	if(!cloud.cached_traversal_geom.isNull() && cloud.cached_traversal_geom_generation == cloud.topology_generation)
+	{
+		cache_hit = true;
+	}
+	else
+	{
+		cache_hit = false;
+
+		// Freeze a fresh snapshot of the cloud's current world-space node data, so a worker never touches the live,
+		// growable/mutable state - same rule the sort task follows, for the same reason. The old cached_traversal_geom
+		// (if any) is left alone, not overwritten in place: an in-flight traversal or a diagnostics dump may still hold
+		// a reference to it, and this rewrite's whole point is that nothing is ever mutated once shared.
+		Reference<GaussianSplatCachedGeom> geom = new GaussianSplatCachedGeom();
+		geom->positions.resizeNoCopy(cloud.total_splats);
+		std::memcpy(geom->positions.data(), cloud.positions.data(), cloud.total_splats * sizeof(Vec3f));
+
+		// SESSION055: feature_size is maintained on the cloud itself (see SplatCloud::feature_size), so all we do here is
+		// a single 4-byte-per-node memcpy - no scales copy, no per-node arithmetic loop.
+		geom->feature_size.resizeNoCopy(cloud.total_splats);
+		std::memcpy(geom->feature_size.data(), cloud.feature_size.data(), cloud.total_splats * sizeof(float));
+
+		cloud.cached_traversal_geom = geom;
+		cloud.cached_traversal_geom_generation = cloud.topology_generation;
+	}
+	scratch.geom = cloud.cached_traversal_geom;
 
 	scratch.members_snapshot.resize(cloud.members.size());
 	for(size_t m=0; m<cloud.members.size(); ++m)
@@ -1621,6 +1681,16 @@ void GaussianSplatRenderer::fillTraversalScratch(const SplatCloud& cloud, Gaussi
 		scratch.members_snapshot[m].splat_data = cloud.members[m].splat_data;
 		scratch.members_snapshot[m].offset = cloud.members[m].offset;
 		scratch.members_snapshot[m].count = cloud.members[m].count;
+	}
+
+	if(cpu_prof_log)
+	{
+		const size_t bytes_copied = cache_hit ? 0 : cloud.total_splats * (sizeof(Vec3f) + sizeof(float));
+		conPrint("[gsr-prof] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms fillTraversalScratch cloud=" +
+			toString(cloud.cloud_id) + " splats=" + toString(cloud.total_splats) +
+			" " + (cache_hit ? std::string("HIT") : std::string("MISS")) +
+			" bytes=" + toString(bytes_copied) +
+			" took=" + doubleToStringNDecimalPlaces(prof_timer.elapsed() * 1000.0, 2) + "ms");
 	}
 }
 
@@ -2574,8 +2644,11 @@ std::string GaussianSplatRenderer::getDiagnostics() const
 	for(size_t i=0; i<free_traversal_scratch.size(); ++i)
 	{
 		const GaussianSplatLodTraversalScratch& s = *free_traversal_scratch[i];
-		traversal_scratch_bytes += (uint64)(s.positions_snapshot.size() * sizeof(Vec3f) + s.scales_snapshot.size() * sizeof(Vec3f) +
-			s.selected_indices.size() * sizeof(uint32));
+		// SESSION058: s.geom is now a Reference<> into a per-cloud cache (see GaussianSplatCachedGeom) that may be shared
+		// by more than one pooled scratch here, so this can overcount the geom bytes when that sharing happens - a
+		// diagnostic-only imprecision, not a correctness issue (nothing here frees or double-counts an owned allocation).
+		const uint64 geom_bytes = s.geom.isNull() ? 0 : (uint64)(s.geom->positions.size() * sizeof(Vec3f) + s.geom->feature_size.size() * sizeof(float));
+		traversal_scratch_bytes += geom_bytes + (uint64)(s.selected_indices.size() * sizeof(uint32));
 	}
 
 	// Total leaf count (pre-merge) vs total node count (leaves + merged, what's actually GPU-resident) across every
@@ -3822,7 +3895,17 @@ void GaussianSplatRenderer::drainTraversalResults()
 		// but write it.  kickOffSorts() never touches an LoD-active cloud (see its cloudHasLodTree() guard), so there's no
 		// separate sort state on the cloud to invalidate here the way a structural change invalidates the old sort's.
 		const js::Vector<uint32, 16>& selected = msg->scratch->selected_indices;
+
+		// SESSION058 diag: measures the synchronous GL upload cost on drain, the second suspected contributor to the
+		// session057 §3 CPU cost alongside fillTraversalScratch() (see that function's [gsr-prof] instrumentation).
+		Timer prof_timer;
 		cloud->instance_index_vbo->updateData(0, selected.data(), selected.size() * sizeof(uint32));
+		if(cpu_prof_log)
+			conPrint("[gsr-prof] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms drainVBOUpload cloud=" +
+				toString(cloud->cloud_id) + " indices=" + toString(selected.size()) +
+				" bytes=" + toString(selected.size() * sizeof(uint32)) +
+				" took=" + doubleToStringNDecimalPlaces(prof_timer.elapsed() * 1000.0, 2) + "ms");
+
 		cloud->ob->num_instances_to_draw = (int)selected.size();
 		noteDrawOrderForSlicing(*cloud, selected.data(), selected.size());
 		cloud->last_traversal_hit_budget_cap = msg->scratch->hit_budget_cap; // Copied out here since the scratch itself goes back to the pool below and may be reused by a different cloud's traversal next.
@@ -3843,7 +3926,6 @@ void GaussianSplatRenderer::drainTraversalResults()
 // Both are throttled per-event-type - see rot_blocked_min_gap_ms below - so a held-down rotation logs a heartbeat,
 // not a flood.
 static const bool kick_debug_log = false; // Flip to true to re-enable [gsr-kick] / [gsr-rot-blocked] stdout traces from session055 tuning.
-static Timer kick_debug_timer;
 static double last_rot_blocked_log_ms = -1e9;
 static const double rot_blocked_min_gap_ms = 250.0;
 
@@ -3885,7 +3967,7 @@ void GaussianSplatRenderer::kickOffTraversals()
 	// traversal_latency_estimate is a conservative constant matching session054's measured 165ms interior / 450ms
 	// bridge - one number for both because the dilation is a safety margin, not a precise correction.
 	const float traversal_latency_estimate = 0.3f; // seconds. Conservative; raising it costs a little cull, lowering it risks holes.
-	const double now_s = kick_debug_timer.elapsed();
+	const double now_s = diag_timer.elapsed();
 
 	while(num_traversals_in_flight < max_concurrent_traversals)
 	{
@@ -4056,7 +4138,7 @@ void GaussianSplatRenderer::kickOffTraversals()
 		}
 		if(blocked_inflight > 0 || blocked_no_slot > 0)
 		{
-			const double now_ms = kick_debug_timer.elapsed() * 1000.0;
+			const double now_ms = diag_timer.elapsed() * 1000.0;
 			if(now_ms - last_rot_blocked_log_ms >= rot_blocked_min_gap_ms)
 			{
 				last_rot_blocked_log_ms = now_ms;

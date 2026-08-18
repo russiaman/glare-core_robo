@@ -101,6 +101,12 @@ uniform int splat_ewa_fix_enabled;
 // projection stops existing; the default spreads it over the last part of the approach so nothing pops.
 uniform float splat_near_fade_width;
 
+// Depth below which a splat centre is culled unconditionally (independent of the EWA-fix radius clamp),
+// because the Jacobian's 1/d and 1/d^2 terms produce numerically extreme covariances there.  Default 0.1 m
+// (the historical hardcode); can be lowered by the Photo Mode "Near clip" override for very close-up shots,
+// at the cost of the artefacts near_epsilon exists to hide.  See GaussianSplatRenderer::getNearEpsilon().
+uniform float splat_near_epsilon;
+
 out vec2 frag_screen_offset_px; // Pixel-space offset of this vertex from the splat's projected centre.
 out vec3 frag_conic; // Inverse 2D covariance (A, B, C) of [[A, B], [B, C]], for the per-pixel Gaussian evaluation.
 out vec4 frag_colour; // (r, g, b, opacity)
@@ -210,8 +216,9 @@ void main()
 	}
 
 	float depth = -pos_vs.z;
-	const float near_epsilon = 0.1; // Splats closer than this blow the 1/d and 1/d^2 terms in the Jacobian up to numerically extreme values, so cull them rather than relying on the radius clamp alone.
-	if(depth < near_epsilon)
+	// Depth below which the splat's own centre is culled, to keep the Jacobian's 1/d / 1/d^2 terms bounded.
+	// Was a hardcoded 0.1; now a uniform so the Photo Mode "Near clip" override can drop it for close-ups.
+	if(depth < splat_near_epsilon)
 	{
 		gl_Position = vec4(2.0, 2.0, 2.0, 1.0); // Push outside the clip volume.
 		frag_conic = vec3(0.0);

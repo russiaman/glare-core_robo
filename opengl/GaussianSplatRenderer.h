@@ -469,6 +469,14 @@ public:
 	float getNearFadeWidth() const { return splat_near_fade_width; }
 	void setNearFadeWidth(float v) { splat_near_fade_width = v; }
 
+	// Depth (metres) below which the splat vertex shader culls a splat by its centre - an unconditional
+	// guard against the Jacobian's 1/d / 1/d^2 terms exploding at very small d.  Default 0.1 (the historical
+	// hardcode); can be lowered when the app wants to accept the projection artefacts in exchange for a
+	// closer near clip (e.g. Photo Mode's "Near clip" override).  See splat_near_epsilon in
+	// gaussian_splat_vert_shader.glsl.
+	float getNearEpsilon() const { return splat_near_epsilon; }
+	void setNearEpsilon(float v) { splat_near_epsilon = v; }
+
 	// DIAGNOSTIC ONLY - session046 open question (3): shrinks a splat's quad continuously by how covered the composite
 	// already is under it, instead of the saturation gate's binary keep/drop (which needs every texel the quad touches
 	// marked finished before it drops anything, and so rarely fires - see getSaturationGateEnabled()). 0 (default) is
@@ -981,6 +989,7 @@ private:
 	// See getEWAProjectionFixEnabled()/getNearFadeWidth() above. Defaults: on, and a fade over the last 30% of the approach.
 	bool splat_ewa_fix_enabled;
 	float splat_near_fade_width;
+	float splat_near_epsilon; // See getNearEpsilon(). Default 0.1 (historical hardcode).
 	Reference<OpenGLProgram> mean_reduce_prog; // See getMeanMaskReduceProgram() above. Built alongside mask_reduce_prog.
 	int coverage_mask_tex_uniform_loc; // See getCoverageMaskTexUniformLoc() above. -2 means "not looked up yet", as with splat_mask_tex_uniform_loc.
 

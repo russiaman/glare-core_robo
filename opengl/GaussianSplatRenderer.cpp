@@ -3570,7 +3570,27 @@ bool GaussianSplatRenderer::updateObjectTransform(Handle handle, const Vec4f& tr
 
 			// This member's splats may now be in the wrong depth order relative to the rest of the cloud.  This doesn't
 			// bump structure_generation: offsets and counts are unchanged, so an in-flight sort's indices stay meaningful.
+			// Still needed for a cloud with no LoD tree at all - see kickOffSorts().
 			cloud.have_last_sort_cam_pos = false;
+
+			// SESSION057: for an LoD-active cloud, kickOffSorts() above does nothing - it unconditionally skips any cloud
+			// with an LoD tree, because sorting is folded into the traversal's selection instead (see kickOffSorts()'s
+			// cloudHasLodTree check and comment). So moving/rotating/rescaling a member here previously left the cloud's
+			// draw order and LoD frontier stale until the *camera* moved far enough to naturally re-kick a traversal -
+			// visibly, moving one splat object inside another (e.g. an avatar posed inside a building capture) did not
+			// re-sort. Bumping topology_generation makes kickOffTraversals() treat the cloud as unconditionally overdue,
+			// the same mechanism appendMemberToCloud()/rebuildCloud() already use for their own structural changes - a
+			// bake here is exactly that "any add or rebuild" this counter is defined to catch. It also makes
+			// drainTraversalResults() drop any in-flight traversal computed against this member's old world-space pose.
+			//
+			// Deliberately NOT calling writePlaceholderSelection() here, unlike those two: this is a live per-drag-frame
+			// path (a gizmo drag or a UI transform spinbox calls updateObjectTransform() every frame while editing), and
+			// the placeholder collapses the *whole cloud* to one root node per member - visibly flashing the entire
+			// merged cloud down to a handful of splats every frame during a drag, not just the member being moved. That
+			// collapse is unnecessary here anyway: offsets/counts are unchanged, so the previous selection's indices
+			// still point at valid data - bakeMember() already overwrote it in place with the new pose - just possibly
+			// not the ideal LoD choice for the new pose until the forced-overdue traversal above lands.
+			cloud.topology_generation++;
 
 			// The cloud's bounds have moved, so it may now touch clouds it didn't before.  Note that the reverse is not
 			// checked: a cloud is never split back apart once merged.  An over-merged cloud draws correctly, just with

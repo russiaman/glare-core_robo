@@ -110,6 +110,12 @@ struct CloudMember
 	Vec4f translation_ws;
 	Quat<float> rotation_ws;
 	float uniform_scale_ws;
+
+	// SESSION059: debug-only "leave this object out of the draw entirely" toggle - see GaussianSplatRenderer::setObjectHidden().
+	// Deliberately in-memory only, never touches QSettings: every session must start with every object visible. Survives a
+	// merge for free (mergeIntersectingClouds() copies the whole CloudMember by value), which is exactly the behaviour
+	// wanted - hiding an object shouldn't depend on which cloud it currently happens to be merged into.
+	bool hidden;
 };
 
 
@@ -263,6 +269,7 @@ public:
 		GaussianSplatDataRef splat_data; // Kept alive so the worker can read lod_tree from it directly - never mutated after decode, so safe to read cross-thread without copying its contents.
 		size_t offset;
 		size_t count;
+		bool hidden; // SESSION059: mirrors CloudMember::hidden as of when this snapshot was taken - see GaussianSplatRenderer::setObjectHidden().
 	};
 
 	Reference<GaussianSplatCachedGeom> geom; // SESSION058: shared, cloud-topology-generation-scoped snapshot of positions/feature_size - see GaussianSplatCachedGeom. Replaces the old per-kick positions_snapshot/feature_size_snapshot copies.
@@ -657,6 +664,8 @@ public:
 		for(size_t mi=0; mi<scratch->members_snapshot.size(); ++mi)
 		{
 			const GaussianSplatLodTraversalScratch::MemberSnapshot& m = scratch->members_snapshot[mi];
+			if(m.hidden) // SESSION059: debug "hide this object" toggle - see GaussianSplatRenderer::setObjectHidden(). Contributes nothing to the frontier at all, root or leaves.
+				continue;
 			if(m.splat_data->lod_tree.empty())
 			{
 				// No tree built for this member (yet, or ever) - nothing to choose between, so every one of its splats is
@@ -1692,6 +1701,7 @@ void GaussianSplatRenderer::fillTraversalScratch(SplatCloud& cloud, GaussianSpla
 		scratch.members_snapshot[m].splat_data = cloud.members[m].splat_data;
 		scratch.members_snapshot[m].offset = cloud.members[m].offset;
 		scratch.members_snapshot[m].count = cloud.members[m].count;
+		scratch.members_snapshot[m].hidden = cloud.members[m].hidden; // SESSION059
 	}
 
 	if(cpu_prof_log)
@@ -3243,6 +3253,8 @@ void GaussianSplatRenderer::writePlaceholderSelection(SplatCloud& cloud)
 	for(size_t m=0; m<cloud.members.size(); ++m)
 	{
 		const CloudMember& member = cloud.members[m];
+		if(member.hidden) // SESSION059 - see GaussianSplatRenderer::setObjectHidden().
+			continue;
 		if(member.splat_data->lod_tree.empty())
 			for(size_t i=0; i<member.count; ++i)
 				selection.push_back((uint32)(member.offset + i));
@@ -3621,6 +3633,7 @@ GaussianSplatRenderer::Handle GaussianSplatRenderer::addObject(const GaussianSpl
 	member.translation_ws = translation_ws;
 	member.rotation_ws = rotation_ws;
 	member.uniform_scale_ws = uniform_scale_ws;
+	member.hidden = false; // SESSION059 - every object starts visible; see CloudMember::hidden.
 
 	// Start the member in a cloud of its own and then let the partitioning merge it, rather than deciding up front
 	// which cloud it belongs in.  Baking is what produces the member's bounds, and the bounds are what the merge test
@@ -3690,6 +3703,59 @@ bool GaussianSplatRenderer::updateObjectTransform(Handle handle, const Vec4f& tr
 	}
 
 	assert(0); // handle_to_cloud pointed at a cloud that doesn't hold this member.
+	return false;
+}
+
+
+bool GaussianSplatRenderer::setObjectHidden(Handle handle, bool hidden)
+{
+	const std::map<Handle, SplatCloud*>::iterator res = handle_to_cloud.find(handle);
+	if(res == handle_to_cloud.end())
+		return false;
+
+	SplatCloud& cloud = *res->second;
+	for(size_t m=0; m<cloud.members.size(); ++m)
+		if(cloud.members[m].handle == handle)
+		{
+			if(cloud.members[m].hidden == hidden)
+				return true; // No-op - avoid the synchronous placeholder flash below for a toggle that didn't change anything.
+
+			cloud.members[m].hidden = hidden;
+
+			// Immediate synchronous feedback (same tool writeIdentityIndices()... no, writePlaceholderSelection() uses
+			// for a structural change): the toggle is a debug action a person is watching happen, not a per-frame drag,
+			// so - unlike updateObjectTransform()'s live-drag path just above, which deliberately skips this exact call
+			// to avoid a flash - collapsing to root-only immediately here is the right trade: instant confirmation the
+			// checkbox did something, at the cost of one frame at coarse LoD until the traversal below lands with full
+			// detail (minus the now-hidden member).
+			writePlaceholderSelection(cloud);
+
+			// Force a fresh traversal/sort so the change also takes effect for whichever path is live for this cloud
+			// (cloudHasLodTree() decides which - see kickOffTraversals()/kickOffSorts()), the same "unconditionally
+			// overdue" mechanism forceTraversalRefresh() uses, just scoped to this one cloud rather than the whole world.
+			cloud.have_last_traversal_cam_pos = false;
+			cloud.have_last_sort_cam_pos = false;
+
+			return true;
+		}
+
+	assert(0); // handle_to_cloud pointed at a cloud that doesn't hold this member.
+	return false;
+}
+
+
+bool GaussianSplatRenderer::getObjectHidden(Handle handle) const
+{
+	const std::map<Handle, SplatCloud*>::const_iterator res = handle_to_cloud.find(handle);
+	if(res == handle_to_cloud.end())
+		return false;
+
+	const SplatCloud& cloud = *res->second;
+	for(size_t m=0; m<cloud.members.size(); ++m)
+		if(cloud.members[m].handle == handle)
+			return cloud.members[m].hidden;
+
+	assert(0);
 	return false;
 }
 
@@ -3786,13 +3852,48 @@ void GaussianSplatRenderer::drainSortResults()
 			// The snapshot this was computed from may be a strict prefix of the current, possibly since-grown cloud.
 			// Only write as many bytes as the result actually covers: any appended tail beyond it already holds valid
 			// identity-order indices written by appendMemberToCloud().
+			// Sampled over exactly what this result covers (see noteDrawOrderForSlicing() below).  On a cloud that grew
+			// since the sort was kicked off that is a prefix of the draw order, leaving the appended tail unsampled for
+			// the frame or two until the next sort lands - which skews where the boundaries fall slightly and can do
+			// nothing else, since slicing cannot change the picture.
 			const js::Vector<uint32, 16>& sorted_indices = msg->sortedIndices();
-			cloud->instance_index_vbo->updateData(0, sorted_indices.data(), sorted_indices.size() * sizeof(uint32));
-			// Sampled over exactly what this result covers.  On a cloud that grew since the sort was kicked off that is a
-			// prefix of the draw order, leaving the appended tail unsampled for the frame or two until the next sort
-			// lands - which skews where the boundaries fall slightly and can do nothing else, since slicing cannot
-			// change the picture.  See noteDrawOrderForSlicing().
-			noteDrawOrderForSlicing(*cloud, sorted_indices.data(), sorted_indices.size());
+
+			// SESSION059: this path (a cloud with no LoD-active member - see kickOffSorts()'s cloudHasLodTree() guard)
+			// has no per-member awareness inside GaussianSplatSortTask itself, unlike the traversal path, which skips a
+			// hidden member's nodes during expand (see GaussianSplatLodTraversalTask::run()). Filtering here instead, on
+			// every landed sort, is what keeps a hidden member hidden across re-sorts - the one-off filter
+			// writePlaceholderSelection() applies at toggle time (see setObjectHidden()) would otherwise be undone by
+			// the very next sort completing with the full, unfiltered order. Common case (nothing hidden) skips the scan
+			// entirely - this is a debug tool, not a path worth a permanent per-cloud "any hidden" cache.
+			bool any_hidden = false;
+			for(size_t m=0; m<cloud->members.size(); ++m)
+				if(cloud->members[m].hidden) { any_hidden = true; break; }
+
+			if(!any_hidden)
+			{
+				cloud->instance_index_vbo->updateData(0, sorted_indices.data(), sorted_indices.size() * sizeof(uint32));
+				noteDrawOrderForSlicing(*cloud, sorted_indices.data(), sorted_indices.size());
+			}
+			else
+			{
+				js::Vector<uint32, 16> filtered;
+				filtered.reserve(sorted_indices.size());
+				for(size_t k=0; k<sorted_indices.size(); ++k)
+				{
+					const uint32 idx = sorted_indices[k];
+					bool hidden = false;
+					for(size_t m=0; m<cloud->members.size(); ++m)
+					{
+						const CloudMember& member = cloud->members[m];
+						if(idx >= member.offset && idx < member.offset + member.count) { hidden = member.hidden; break; }
+					}
+					if(!hidden)
+						filtered.push_back(idx);
+				}
+				cloud->instance_index_vbo->updateData(0, filtered.data(), filtered.size() * sizeof(uint32));
+				cloud->ob->num_instances_to_draw = (int)filtered.size();
+				noteDrawOrderForSlicing(*cloud, filtered.data(), filtered.size());
+			}
 		}
 	}
 

@@ -130,6 +130,12 @@ public:
 
 	bool isValidHandle(Handle handle) const;
 
+	// SESSION059: debug tool - leave one splat object out of the draw entirely (frustum-cull path, sort path and the
+	// synchronous placeholder frontier all respect it), without touching its baked data. Deliberately in-memory only,
+	// never persisted - every session starts with every object visible. Returns false if the handle isn't valid.
+	bool setObjectHidden(Handle handle, bool hidden);
+	bool getObjectHidden(Handle handle) const; // Returns false (not hidden) if the handle isn't valid.
+
 	// The most splats one drawable cloud can hold, given the real GL_MAX_TEXTURE_SIZE.  Note that this is a per-cloud
 	// limit, not a world-wide one: several clouds of this size can coexist, so long as they don't have to be merged.
 	size_t maxSplatsPerCloud() const;

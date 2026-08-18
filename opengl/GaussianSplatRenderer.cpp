@@ -85,6 +85,7 @@ class GaussianSplatCachedGeom : public ThreadSafeRefCounted
 public:
 	js::Vector<Vec3f, 16> positions;
 	js::Vector<float, 16> feature_size;
+	js::Vector<float, 16> cull_radius; // SESSION059: world-space enclosing-sphere radius per node - see SplatCloud::cull_radius and GaussianSplatLodNode::bounding_radius_os.
 };
 
 
@@ -140,6 +141,7 @@ public:
 	js::Vector<Vec4f, 16> rotations; // (x, y, z, w)
 	js::Vector<Vec4f, 16> colours;
 	js::Vector<float, 16> feature_size; // SESSION055: 2*max(scale.xyz), maintained in step with scales at bake time so kickOffTraversals()'s fillTraversalScratch() doesn't rebuild it from scales on every kick - a session055 hot path once the frustum-cull re-kick started firing on rotation.
+	js::Vector<float, 16> cull_radius; // SESSION059: world-space enclosing-sphere radius (uniform_scale_ws * the tree node's bounding_radius_os, or the same 3-sigma cutoff feature_size already gives for a no-tree member's own splats), maintained in step with feature_size at bake time. Used for the traversal's frustum-cull margin instead of feature_size - see GaussianSplatLodNode::bounding_radius_os's comment for why feature_size alone isn't a safe bound.
 
 	// SESSION058: cached copy of positions+feature_size for the traversal path, valid as long as
 	// cached_traversal_geom_generation == topology_generation - see GaussianSplatCachedGeom's comment for why that's a
@@ -628,6 +630,7 @@ public:
 	{
 		const js::Vector<Vec3f, 16>& positions = scratch->geom->positions; // SESSION058: shared cached snapshot, never the live cloud arrays - see GaussianSplatCachedGeom.
 		const js::Vector<float, 16>& feature_sizes = scratch->geom->feature_size; // SESSION054: replaces per-push Vec3f scales[] lookup + 3-way max in makeHeapItem.
+		const js::Vector<float, 16>& cull_radii = scratch->geom->cull_radius; // SESSION059: enclosing-sphere bound for the frustum-cull margin below - NOT the same quantity as feature_size, see GaussianSplatLodNode::bounding_radius_os's comment.
 
 		js::Vector<uint32, 16>& output = scratch->selected_indices;
 
@@ -685,10 +688,14 @@ public:
 			const GaussianSplatLodNode& node = m.splat_data->lod_tree[top.tree_local_idx];
 			const uint32 cloud_idx_u32 = (uint32)(m.offset + top.tree_local_idx);
 
-			// SESSION055: frustum-cull check. Each plane's margin has three parts:
-			//   base_margin = 1.5 * feature_size  - keeps a node whose centre is just past the plane but whose 3-sigma
-			//                                       footprint still crosses it (max radius = 3*max_scale = 1.5*feature_size,
-			//                                       see the shader's quad sizing in gaussian_splat_vert_shader.glsl).
+			// SESSION055/059: frustum-cull check. Each plane's margin has three parts:
+			//   base_margin = cull_radius          - SESSION059: enclosing-sphere radius of this node's whole subtree
+			//                                       (see GaussianSplatLodNode::bounding_radius_os), NOT feature_size.
+			//                                       feature_size is a statistical fit of this node's own merged
+			//                                       appearance and can be smaller than the true spread of its
+			//                                       descendants - using it here was session055's original choice and
+			//                                       worked at the small scenes tested then, but under-culls (drops
+			//                                       visible subtrees) at real-world/km scale - see session059 snapshot.
 			//   translation_dilation[i]           - anisotropic pad for camera movement toward this plane over the async
 			//                                       traversal latency window; ~zero for planes the camera moves away from.
 			//   rotation_dilation_rate * dist     - rotational pad: r*theta tangential shift at distance r from camera.
@@ -699,7 +706,7 @@ public:
 			if(frustum_cull_enabled)
 			{
 				const Vec3f& p = positions[cloud_idx_u32];
-				const float base_margin = 1.5f * feature_sizes[cloud_idx_u32];
+				const float base_margin = cull_radii[cloud_idx_u32];
 				const float dist_to_node = std::sqrt(top.dist_sq); // dist_sq is already computed in makeHeapItem (session054); one sqrt per pop.
 				const float rot_pad = rotation_dilation_rate * dist_to_node;
 				const Vec4f pos4(p.x, p.y, p.z, 1.f);
@@ -1670,6 +1677,10 @@ void GaussianSplatRenderer::fillTraversalScratch(SplatCloud& cloud, GaussianSpla
 		geom->feature_size.resizeNoCopy(cloud.total_splats);
 		std::memcpy(geom->feature_size.data(), cloud.feature_size.data(), cloud.total_splats * sizeof(float));
 
+		// SESSION059: cull_radius is maintained on the cloud the same way feature_size is - see SplatCloud::cull_radius.
+		geom->cull_radius.resizeNoCopy(cloud.total_splats);
+		std::memcpy(geom->cull_radius.data(), cloud.cull_radius.data(), cloud.total_splats * sizeof(float));
+
 		cloud.cached_traversal_geom = geom;
 		cloud.cached_traversal_geom_generation = cloud.topology_generation;
 	}
@@ -1685,7 +1696,7 @@ void GaussianSplatRenderer::fillTraversalScratch(SplatCloud& cloud, GaussianSpla
 
 	if(cpu_prof_log)
 	{
-		const size_t bytes_copied = cache_hit ? 0 : cloud.total_splats * (sizeof(Vec3f) + sizeof(float));
+		const size_t bytes_copied = cache_hit ? 0 : cloud.total_splats * (sizeof(Vec3f) + sizeof(float) + sizeof(float)); // positions + feature_size + cull_radius (SESSION059).
 		conPrint("[gsr-prof] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms fillTraversalScratch cloud=" +
 			toString(cloud.cloud_id) + " splats=" + toString(cloud.total_splats) +
 			" " + (cache_hit ? std::string("HIT") : std::string("MISS")) +
@@ -2647,7 +2658,7 @@ std::string GaussianSplatRenderer::getDiagnostics() const
 		// SESSION058: s.geom is now a Reference<> into a per-cloud cache (see GaussianSplatCachedGeom) that may be shared
 		// by more than one pooled scratch here, so this can overcount the geom bytes when that sharing happens - a
 		// diagnostic-only imprecision, not a correctness issue (nothing here frees or double-counts an owned allocation).
-		const uint64 geom_bytes = s.geom.isNull() ? 0 : (uint64)(s.geom->positions.size() * sizeof(Vec3f) + s.geom->feature_size.size() * sizeof(float));
+		const uint64 geom_bytes = s.geom.isNull() ? 0 : (uint64)(s.geom->positions.size() * sizeof(Vec3f) + s.geom->feature_size.size() * sizeof(float) + s.geom->cull_radius.size() * sizeof(float)); // SESSION059: + cull_radius.
 		traversal_scratch_bytes += geom_bytes + (uint64)(s.selected_indices.size() * sizeof(uint32));
 	}
 
@@ -3122,6 +3133,7 @@ static void bakeMember(SplatCloud& cloud, CloudMember& member)
 			const float max_scale = myMax(world_scale.x, myMax(world_scale.y, world_scale.z));
 			cloud.feature_size[dest] = 2.f * max_scale; // SESSION055 - see SplatCloud::feature_size.
 			const float radius = splat_cutoff_sigmas * max_scale;
+			cloud.cull_radius[dest] = radius; // SESSION059: a no-tree member's splats are never culled individually (see the traversal's NoTree branch), but keep this array correctly populated everywhere regardless - this is exactly the same 3-sigma cutoff radius as the tree-leaf case below.
 			aabb_ws.enlargeToHoldPoint(world_pos - Vec4f(radius, radius, radius, 0.f));
 			aabb_ws.enlargeToHoldPoint(world_pos + Vec4f(radius, radius, radius, 0.f));
 		}
@@ -3153,6 +3165,7 @@ static void bakeMember(SplatCloud& cloud, CloudMember& member)
 
 			const float max_scale = myMax(world_scale.x, myMax(world_scale.y, world_scale.z));
 			cloud.feature_size[dest] = 2.f * max_scale; // SESSION055 - see SplatCloud::feature_size.
+			cloud.cull_radius[dest] = uniform_scale_ws * tree[i].bounding_radius_os; // SESSION059: rigid + uniform-scale bake preserves lengths up to uniform_scale_ws, same reasoning as feature_size above - see GaussianSplatLodNode::bounding_radius_os's comment for why this (not feature_size) is what the traversal's frustum-cull margin needs.
 			const float radius = splat_cutoff_sigmas * max_scale;
 			aabb_ws.enlargeToHoldPoint(world_pos - Vec4f(radius, radius, radius, 0.f));
 			aabb_ws.enlargeToHoldPoint(world_pos + Vec4f(radius, radius, radius, 0.f));
@@ -3253,6 +3266,7 @@ void GaussianSplatRenderer::appendMemberToCloud(SplatCloud& cloud, const CloudMe
 	cloud.rotations.resize(new_total);
 	cloud.colours  .resize(new_total);
 	cloud.feature_size.resize(new_total); // SESSION055 - see SplatCloud::feature_size.
+	cloud.cull_radius.resize(new_total); // SESSION059 - see SplatCloud::cull_radius.
 
 	cloud.members.push_back(member_in);
 	CloudMember& member = cloud.members.back();
@@ -3299,6 +3313,7 @@ void GaussianSplatRenderer::rebuildCloud(SplatCloud& cloud)
 	cloud.rotations.resize(total);
 	cloud.colours  .resize(total);
 	cloud.feature_size.resize(total); // SESSION055 - see SplatCloud::feature_size.
+	cloud.cull_radius.resize(total); // SESSION059 - see SplatCloud::cull_radius.
 
 	for(size_t m=0; m<cloud.members.size(); ++m)
 		bakeMember(cloud, cloud.members[m]);

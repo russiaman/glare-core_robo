@@ -46,6 +46,21 @@ struct GaussianSplatLodNode
 	Vec4f rotation; // Unit quaternion (x, y, z, w) - matches GaussianSplatData::rotations' convention.
 	Vec4f colour; // (r, g, b, opacity), all in [0, 1] - matches GaussianSplatData::colours' convention. See the file header comment re: the deferred D-parameter opacity model.
 	float feature_size; // 2 * max(scale.x, scale.y, scale.z) - the "how big does this node look" metric traversal prioritises nodes by.
+
+	// SESSION059: object-space radius of a sphere centred at centre_os that is GUARANTEED to enclose every original leaf
+	// splat beneath this node (its full 3-sigma cutoff footprint, matching what the renderer actually draws) - used for
+	// frustum-cull margin instead of feature_size. feature_size is a statistical fit (moment-matched covariance of the
+	// merge) and is correct for "how big does the merged stand-in look on screen", but is NOT a bound on the true spread
+	// of a node's descendants - see the mismatch this exact quantity is already known to have for layer_density, in the
+	// comment on that field below ("re-fit covariance can end up more compact along its single largest axis than the
+	// union of its children"). At small scenes that mismatch stayed under the traversal's frustum-cull margin and never
+	// showed; at real-world (km-scale) scenes it doesn't, and a wrongly-culled high-level node drops its entire subtree,
+	// visible as a whole rectangular chunk of the scene vanishing during straight-line camera translation (see session059
+	// snapshot). Leaves: 1.5 * feature_size (the same 3-sigma cutoff radius the shader already draws to). Merged nodes:
+	// max over children of (dist(child.centre_os, this.centre_os) + child.bounding_radius_os) - a proper bottom-up
+	// enclosing-sphere bound, exact regardless of how the children are distributed.
+	float bounding_radius_os;
+
 	float layer_density; // Estimated overdraw (splat layers a ray would see if this node were expanded all the way down to full leaf resolution): (sum over direct children of that child's own cumulative leaf cross-section area) / (sum over direct children of that child's own cross-section area, pi * (1.5 * feature_size)^2 - the same 3-sigma cutoff radius the renderer actually draws out to) - see buildGaussianSplatLodTree()'s bookkeeping for where it's computed, and layerDensityFromSums()'s comment for why the denominator deliberately sums the *children's own* footprints rather than using this node's own (re-fit) feature_size: a widely-spread merge's covariance can end up more compact along its single largest axis than the true union of its children, which without this would let a parent come out denser than every one of its own children - this formulation is a weighted average of the children's own density values, so it's mathematically bounded between their min and max instead. 0 for leaves (nothing beneath them). Scale-invariant (areas scale as length^2 under a uniform scale, same on both sides of the ratio), so valid to read directly off the object-space tree without re-baking to world space - see GaussianSplatLodTraversalTask::run()'s use of it as a live-tunable traversal cutoff, independent of feature_size/pixel_scale_limit's screen-space one.
 
 	uint32 child_start; // Index of the first child in the tree's linearised array. Always 0 on a node fresh out of mergeGaussianSplatLodNodes()/makeGaussianSplatLodLeafNode() - the tree builder is what actually places nodes into the array and fills this in.

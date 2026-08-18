@@ -145,6 +145,7 @@ GaussianSplatLodNode makeGaussianSplatLodLeafNode(const Vec3f& centre_os, const 
 	node.rotation = rotation;
 	node.colour = colour;
 	node.feature_size = 2.f * myMax(scale.x, myMax(scale.y, scale.z));
+	node.bounding_radius_os = 1.5f * node.feature_size; // SESSION059: a leaf's own 3-sigma cutoff radius - see the field's comment.
 	node.layer_density = 0.f; // Nothing to recurse into - see the field's own comment.
 	node.child_start = 0;
 	node.child_count = 0;
@@ -218,6 +219,20 @@ GaussianSplatLodNode mergeGaussianSplatLodNodes(const GaussianSplatLodNode* chil
 	parent.colour = Vec4f(colour_rgb.x[0], colour_rgb.x[1], colour_rgb.x[2], myClamp(A, 0.f, 1.f));
 
 	parent.feature_size = 2.f * myMax(parent.scale.x, myMax(parent.scale.y, parent.scale.z));
+
+	// SESSION059: bottom-up enclosing-sphere bound - see the field's comment. Exact (not a statistical fit): every
+	// child's own bound, offset by how far that child's centre sits from the parent's, is guaranteed to still contain
+	// that child's whole subtree, so the max over children bounds all of them regardless of how they're distributed
+	// spatially (unlike parent.feature_size/scale above, which can end up smaller than the true spread - see the field's
+	// comment for why that specifically bites at real-world scale).
+	float bounding_radius_os = 0.f;
+	for(size_t i = 0; i < num_children; ++i)
+	{
+		const float d = (children[i].centre_os - centre).length();
+		bounding_radius_os = myMax(bounding_radius_os, d + children[i].bounding_radius_os);
+	}
+	parent.bounding_radius_os = bounding_radius_os;
+
 	parent.layer_density = 0.f; // Caller fills this in where it knows the merge voxel's step (buildGaussianSplatLodTree()) - this function has no notion of a voxel grid, so 0 (meaning "unknown/not applicable") is the only defensible default here (e.g. the tests in this file merge arbitrary node pairs with no voxel step at all).
 	parent.child_start = 0;
 	parent.child_count = 0;

@@ -25,6 +25,15 @@ uniform int splat_show_coverage_map_level;
 uniform int splat_coverage_map_block;   // Screen pixels across one level-0 texel of it.
 uniform sampler2D splat_coverage_map_texture;
 
+// GaussianSplatRenderer::SplatDoFDepthMode_Weighted - see GaussianSplatRenderer::setResolveDoFDepthUniforms().
+// splat_dof_depth_texture holds (sum of view_depth_i * alpha_i * T_i, coverage) accumulated the same way as the
+// main albedo_texture above; dividing its .r by the coverage this pass already recovers from albedo_texture.a
+// gives the splat stack's mean view-space depth at this pixel (see main() below for why the two accumulations'
+// alpha channels are guaranteed identical, rather than needing dof_depth_texture's own .a).
+uniform int splat_write_weighted_depth;
+uniform float splat_dof_near_clip_dist;
+uniform sampler2D splat_dof_depth_texture;
+
 out vec4 colour_out;
 
 
@@ -118,4 +127,20 @@ void main()
 	// Premultiplied again for the composite: drawSplatClouds() blends this with (GL_ONE, GL_ONE_MINUS_SRC_ALPHA), so
 	// the splat stack goes over the background with its accumulated coverage.
 	colour_out = vec4(col * coverage, coverage);
+
+	// SplatDoFDepthMode_Weighted: write this pixel's splat-stack mean depth into the real depth buffer, for Depth
+	// of Field (and fog) to read afterwards. Safe without a depth test: any splat that contributed to `coverage`
+	// here was already depth-tested against opaque geometry while it was drawn (see drawSplatClouds()), so the
+	// mean depth recovered below can only be at or nearer than whatever was already there - never further.
+	//
+	// The two accumulation buffers' alpha channels are bit-identical: both blend with the exact same front-to-back
+	// "under" operator (GL_ONE_MINUS_DST_ALPHA, GL_ONE), which applies the same blend factors to every channel
+	// including alpha, over the exact same sequence of draw calls - so dof_depth_texture's own alpha recurrence is
+	// identical to albedo_texture's, and `coverage` (already known > 0, from the discard above) serves both.
+	if(splat_write_weighted_depth != 0)
+	{
+		float depth_accum = texelFetch(splat_dof_depth_texture, ivec2(gl_FragCoord.xy), 0).r;
+		float mean_view_depth = depth_accum / coverage;
+		gl_FragDepth = getDeviceDepthFromLinearDepth(splat_dof_near_clip_dist, mean_view_depth);
+	}
 }

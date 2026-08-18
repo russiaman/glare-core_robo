@@ -10351,19 +10351,45 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 
 	current_scene->splat_accum_framebuffer->bindForDrawing();
 
+	// GaussianSplatRenderer::SplatDoFDepthMode - see the enum's own comment.  Computed once here, used for the draw
+	// buffer selection immediately below, the Prepass pass at the end of this function, and passed on to
+	// resolveSplatAccumBuffer().  Live-gated on dof_blur_strength (Weighted's only current consumer) rather than
+	// on the mode setting alone, so dragging that slider through zero doesn't pay for either mode's extra work -
+	// unlike the buffer allocation itself (see GaussianSplatRenderer::wantsDoFDepthBuffer()), which stays put
+	// across that to avoid reallocating on every slider tick.
+	const int dof_depth_mode = splat_renderer->getDoFDepthMode();
+	const bool dof_active_this_frame = (current_scene->dof_blur_strength > 0) && current_scene->render_to_main_render_framebuffer && current_scene->main_depth_renderbuffer.nonNull();
+	const bool use_weighted_depth = dof_active_this_frame && (dof_depth_mode == GaussianSplatRenderer::SplatDoFDepthMode_Weighted) && current_scene->splat_dof_depth_renderbuffer.nonNull();
+	const bool use_depth_prepass = dof_active_this_frame && (dof_depth_mode == GaussianSplatRenderer::SplatDoFDepthMode_Prepass);
+
 	// DIAGNOSTIC ONLY - the per-pixel layer cap and its estimate both need the layer counter written alongside the
 	// colour, so those frames draw into two attachments instead of one - see GaussianSplatRenderer::getLayerCap().
+	// Weighted DoF depth is a second, independent extra attachment (GL_COLOR_ATTACHMENT2 - see
+	// OpenGLScene::splat_dof_depth_renderbuffer), since the layer cap diagnostic and DoF can in principle both be
+	// in use at once.
 	const bool have_layer_count = current_scene->splat_layer_count_renderbuffer.nonNull();
-	if(have_layer_count)
+	if(have_layer_count && use_weighted_depth)
+		setThreeDrawBuffers(GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2);
+	else if(use_weighted_depth)
+		// dof_depth_out in gaussian_splat_frag_shader.glsl is fixed at layout(location = 2), so GL_COLOR_ATTACHMENT2
+		// has to sit at draw-buffer index 2 here too, not index 1 - a plain setTwoDrawBuffers(ATTACHMENT0, ATTACHMENT2)
+		// would put it at index 1, leaving location 2 unbound and the depth accumulation silently dropped (this was
+		// the actual reason SplatDoFDepthMode_Weighted did nothing whenever the layer-cap diagnostic was off).
+		setThreeDrawBuffers(GL_COLOR_ATTACHMENT0, GL_NONE, GL_COLOR_ATTACHMENT2);
+	else if(have_layer_count)
 		setTwoDrawBuffers(GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1);
 	else
 		setSingleDrawBuffer(GL_COLOR_ATTACHMENT0);
 
-	// NOTE that glClearBufferfv uses draw buffer indices, so glDrawBuffers() needs to be called first.
+	// NOTE that glClearBufferfv uses draw buffer indices (position in the glDrawBuffers() array just set above),
+	// not attachment numbers - so these three clears are correct regardless of which attachments the array above
+	// actually listed at each position.
 	const float col_zero[4] = { 0, 0, 0, 0 };
 	glClearBufferfv(GL_COLOR, /*drawBuffer=*/0, col_zero);
-	if(have_layer_count)
+	if(have_layer_count) // Index 1 is GL_COLOR_ATTACHMENT1 only in this case - see the draw-buffer selection above; when use_weighted_depth alone set index 1 to GL_NONE, so there is nothing there to clear.
 		glClearBufferfv(GL_COLOR, /*drawBuffer=*/1, col_zero);
+	if(use_weighted_depth) // Index 2 is GL_COLOR_ATTACHMENT2 whenever use_weighted_depth is set, whether or not have_layer_count also is.
+		glClearBufferfv(GL_COLOR, /*drawBuffer=*/2, col_zero);
 
 	// The hide-overdraw diagnostic - see GaussianSplatRenderer::getHideOverdrawEnabled().  Owns the same mask texture the
 	// saturation gate does, so the two cannot run together; this one wins while it is on, since it is only ever switched
@@ -10731,14 +10757,74 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 	glDisable(GL_BLEND);
 
 	// Back to one attachment before the resolve, which draws to the scene's framebuffer and has nothing to say about the
-	// layer counter.
-	if(have_layer_count)
+	// layer counter or the DoF depth accumulator.
+	if(have_layer_count || use_weighted_depth)
 		setSingleDrawBuffer(GL_COLOR_ATTACHMENT0);
 
-	resolveSplatAccumBuffer(scene_target_framebuffer_name);
+	resolveSplatAccumBuffer(scene_target_framebuffer_name, use_weighted_depth);
 
 	if(query_profiling_enabled && draw_splats_gpu_timer->isRunning())
 		draw_splats_gpu_timer->endTimerQuery();
+
+	// Splats never write depth by themselves (see the glDepthMask(GL_FALSE) note above, and
+	// resolveSplatAccumBuffer()'s own), so at every pixel a splat covers, the depth buffer still holds whatever
+	// was behind it - background geometry, or nothing at all.  Depth of field (and fog) read that buffer
+	// afterwards - via main_depth_copy_texture, blitted from this framebuffer once draw() gets to its
+	// post-process block - to work out each pixel's blur/fog amount, so splats blurred/fogged wrong regardless
+	// of focus_distance and only looked right when focus_distance happened to match whatever was behind them.
+	//
+	// SplatDoFDepthMode_Weighted was handled above (it configures the splat draw itself to accumulate weighted
+	// depth into a second colour attachment, and resolveSplatAccumBuffer() just now wrote gl_FragDepth from it).
+	// Only Prepass needs a pass of its own here.
+	if(use_depth_prepass)
+	{
+		DebugGroup depth_prepass_debug_group("splat depth prepass (for DoF)");
+		TracyGpuZone("splat depth prepass");
+
+		// Depth test, depth write and blending are already in the states we want here: resolveSplatAccumBuffer()
+		// left GL_DEPTH_TEST enabled, depth mask GL_TRUE, and blending disabled.  Only the colour mask needs
+		// changing, to leave the resolved colour buffer this pass draws over untouched.
+		//
+		// No alpha_cutoff override here: this uses whatever alpha_cutoff the main draw above already used to size
+		// quads, exactly like a first attempt at this pass did.  A stricter, separate threshold was tried (see
+		// GaussianSplatRenderer::getDoFDepthPrepassAlphaMin()) to stop near-transparent foreground wisps from
+		// winning depth at pixels they barely touch, on the theory that a smaller quad would settle depth on the
+		// meaningfully opaque splats instead - but tested worse, not better: shrinking the quad just means more
+		// pixels get no near-splat depth at all, and the mix of the two effects reads as rougher transitions than
+		// the plain alpha_cutoff version. Kept as a documented dead end rather than silently dropped; the setter is
+		// still there in case a future attempt wants a different starting point.
+		glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+
+		for(size_t i=num_visible; i-- > 0; )
+		{
+			// ob->num_instances_to_draw and ob->instance_vbo_offset_B were restored to the whole cloud at the end of
+			// the slice loop above (see the "Put back what the LoD traversal left" comment) - this pass draws each
+			// cloud in one call, unsliced: it has nothing to composite between slices, only depth to test and write.
+			GLObject* const ob = const_cast<GLObject*>(visible_splat_clouds[i]);
+			const uint32 batch_i = 0;
+			if(checkUseProgram(ob->batch_draw_info[batch_i].getProgramIndex()))
+			{
+				setSharedUniformsForProg(*prog_vector[ob->batch_draw_info[batch_i].getProgramIndex()].ptr(), view_matrix, proj_matrix);
+				const int mask_tex_loc = splat_renderer->getSplatMaskTexUniformLoc();
+				if(mask_tex_loc >= 0)
+					bindTextureUnitToSampler(*current_scene->splat_saturation_mask_texture, /*texture_unit_index=*/SPLAT_SATURATION_MASK_TEXTURE_UNIT_INDEX,
+						/*sampler_uniform_location=*/mask_tex_loc);
+				const int coverage_tex_loc = splat_renderer->getCoverageMaskTexUniformLoc();
+				if(coverage_tex_loc >= 0)
+					bindTextureUnitToSampler(*current_scene->splat_coverage_mask_texture, /*texture_unit_index=*/SPLAT_COVERAGE_MASK_TEXTURE_UNIT_INDEX,
+						/*sampler_uniform_location=*/coverage_tex_loc);
+			}
+			bindMeshData(*ob);
+#if DO_INDIVIDUAL_VAO_ALLOC
+			setInstanceAttribPointerOffset(*ob);
+#endif
+			drawBatchWithDenormalisedData(*ob, ob->batch_draw_info[batch_i], batch_i);
+		}
+
+		flushDrawCommandsAndUnbindPrograms();
+
+		glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+	}
 }
 
 
@@ -10826,6 +10912,7 @@ void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffe
 	// second colour attachment; nothing else does, so it is allocated only while one of them is asking - see
 	// GaussianSplatRenderer::getLayerCap().
 	const bool want_layer_count = splat_renderer->wantsLayerCountBuffer();
+	const bool want_dof_depth = splat_renderer->wantsDoFDepthBuffer();
 
 	const bool share_scene_depth = current_scene->render_to_main_render_framebuffer && current_scene->main_depth_renderbuffer.nonNull();
 
@@ -10877,7 +10964,8 @@ void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffe
 		current_scene->splat_saturation_mask_texture->xRes() == mask_xres && // Changing the mask downscale rebuilds too.
 		current_scene->splat_saturation_mask_texture->yRes() == mask_yres &&
 		current_scene->splat_accum_depth_renderbuffer.isNull() == share_scene_depth && // Also reallocate if the scene gained or lost a depth buffer we can share.
-		current_scene->splat_layer_count_renderbuffer.nonNull() == want_layer_count) // Switching the layer cap or its estimate on adds a second colour attachment, so it rebuilds.
+		current_scene->splat_layer_count_renderbuffer.nonNull() == want_layer_count && // Switching the layer cap or its estimate on adds a second colour attachment, so it rebuilds.
+		current_scene->splat_dof_depth_renderbuffer.nonNull() == want_dof_depth) // Likewise for switching DoF depth mode to/from Weighted.
 		return; // Already allocated, in the right size and configuration.
 
 	splat_accum_buffer_format = splat_accum_format;
@@ -10887,6 +10975,9 @@ void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffe
 	current_scene->splat_layer_count_renderbuffer   = NULL;
 	current_scene->splat_layer_count_copy_texture   = NULL;
 	current_scene->splat_layer_count_copy_framebuffer = NULL;
+	current_scene->splat_dof_depth_renderbuffer     = NULL;
+	current_scene->splat_dof_depth_copy_texture     = NULL;
+	current_scene->splat_dof_depth_copy_framebuffer = NULL;
 	current_scene->splat_accum_renderbuffer         = NULL;
 	current_scene->splat_accum_depth_renderbuffer   = NULL;
 	current_scene->splat_accum_framebuffer          = NULL;
@@ -11016,6 +11107,31 @@ void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffe
 
 		if(!current_scene->splat_accum_framebuffer->isComplete())
 			conPrint("Error: splat accumulation framebuffer is not complete with the layer count attachment.");
+	}
+
+	// GaussianSplatRenderer::SplatDoFDepthMode_Weighted's accumulator - see the member comment in OpenGLEngine.h.
+	// Half float, same reasoning as the layer counter above: depth accumulates over hundreds of blended layers and
+	// wants more range/precision than an 8-bit buffer normalised to [0, 1] can hold. GL_COLOR_ATTACHMENT2 rather
+	// than reusing attachment 1, so this and the layer counter can coexist without one displacing the other.
+	if(want_dof_depth)
+	{
+		current_scene->splat_dof_depth_renderbuffer = new RenderBuffer(xres, yres, msaa_samples, OpenGLTextureFormat::Format_RGBA_Linear_Half);
+		current_scene->splat_accum_framebuffer->attachRenderBuffer(*current_scene->splat_dof_depth_renderbuffer, GL_COLOR_ATTACHMENT2);
+
+		current_scene->splat_dof_depth_copy_texture = new OpenGLTexture(xres, yres, this,
+			ArrayRef<uint8>(), // data
+			OpenGLTextureFormat::Format_RGBA_Linear_Half,
+			OpenGLTexture::Filtering_Nearest,
+			OpenGLTexture::Wrapping_Clamp,
+			false, // has_mipmaps
+			/*MSAA_samples=*/1
+		);
+
+		current_scene->splat_dof_depth_copy_framebuffer = new FrameBuffer();
+		current_scene->splat_dof_depth_copy_framebuffer->attachTexture(*current_scene->splat_dof_depth_copy_texture, GL_COLOR_ATTACHMENT0);
+
+		if(!current_scene->splat_accum_framebuffer->isComplete())
+			conPrint("Error: splat accumulation framebuffer is not complete with the DoF depth attachment.");
 	}
 }
 
@@ -11433,25 +11549,59 @@ order: the samples hold premultiplied colour and coverage, so averaging them and
 how much of it the splats actually covered, whereas dividing per-sample first would weight a barely covered sample the
 same as a fully covered one.
 */
-void OpenGLEngine::resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name)
+void OpenGLEngine::resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name, bool write_weighted_depth)
 {
 	DebugGroup debug_group("resolveSplatAccumBuffer()");
 	TracyGpuZone("resolveSplatAccumBuffer");
 
 	assert(current_scene->splat_accum_framebuffer.nonNull() && current_scene->splat_accum_copy_framebuffer.nonNull() && current_scene->splat_accum_copy_texture.nonNull());
+	assert(!write_weighted_depth || current_scene->splat_dof_depth_copy_framebuffer.nonNull()); // Caller only passes true when the buffer exists - see drawSplatClouds()'s use_weighted_depth.
 
 	//----------------------- Copy the accumulation renderbuffer to splat_accum_copy_texture, so it can be read -----------------------
 	blitFrameBuffer(/*src_framebuffer=*/*current_scene->splat_accum_framebuffer, /*dest_framebuffer=*/*current_scene->splat_accum_copy_framebuffer,
-		/*num_buffers_to_copy=*/1, // The splat accumulation framebuffer has just the one colour attachment.
+		/*num_buffers_to_copy=*/1, // The splat accumulation framebuffer has just the one colour attachment paired at the same index as the copy's.
 		/*copy_buf0_colour=*/true, /*copy_buf0_depth=*/false);
+
+	// GaussianSplatRenderer::SplatDoFDepthMode_Weighted's accumulator lives at GL_COLOR_ATTACHMENT2 of
+	// splat_accum_framebuffer, but its copy is attachment 0 of a framebuffer of its own - the same
+	// attachment-i-pairs-with-attachment-i limitation blitFrameBuffer() has that the layer counter's copy
+	// (estimateSplatLayerCapSaving(), markSaturatedSplatPixels()) already works around the same way.
+	if(write_weighted_depth)
+	{
+		current_scene->splat_accum_framebuffer->bindForReading();
+		current_scene->splat_dof_depth_copy_framebuffer->bindForDrawing();
+		glReadBuffer(GL_COLOR_ATTACHMENT2);
+		setSingleDrawBuffer(GL_COLOR_ATTACHMENT0);
+		glBlitFramebuffer(0, 0, (int)current_scene->splat_dof_depth_renderbuffer->xRes(), (int)current_scene->splat_dof_depth_renderbuffer->yRes(),
+			0, 0, (int)current_scene->splat_dof_depth_renderbuffer->xRes(), (int)current_scene->splat_dof_depth_renderbuffer->yRes(),
+			GL_COLOR_BUFFER_BIT, GL_NEAREST);
+		glReadBuffer(GL_COLOR_ATTACHMENT0);
+	}
 
 	//----------------------- Composite onto the buffer the frame is being drawn into -----------------------
 	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, scene_target_framebuffer_name);
 	if(scene_target_framebuffer_name != 0)
 		setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer (not normal buffer).  The default framebuffer has no such attachment, and the draw buffer set for it already is the right one.
 
-	glDepthMask(GL_FALSE); // Don't write to z-buffer: the splats were depth tested as they were drawn, this is just a composite.
-	glDisable(GL_DEPTH_TEST); // Don't depth test
+	// write_weighted_depth's gl_FragDepth write only actually happens (in the shader) at pixels with non-zero
+	// coverage, which are guaranteed at or in front of whatever opaque depth was already there - see the shader's
+	// own comment. Depth *write* is enabled only for that mode; every other mode (and every pixel a splat didn't
+	// reach, which discards before it would write anything) leaves the depth buffer exactly as drawSplatClouds()
+	// found it, same as before this mode existed.
+	//
+	// GL_DEPTH_TEST has to stay *enabled* for that write to happen at all - a depth write is part of the depth
+	// test in the spec, and glDepthMask(GL_TRUE) alone does nothing while the test is disabled (this is what made
+	// SplatDoFDepthMode_Weighted a no-op: the old code disabled the test unconditionally here). GL_ALWAYS keeps
+	// every fragment passing, so the resolve quad still draws in full; it only stops being a no-op when
+	// write_weighted_depth is true and glDepthMask(GL_TRUE) is what actually lets the write reach the buffer.
+	glDepthMask(write_weighted_depth ? GL_TRUE : GL_FALSE);
+	if(write_weighted_depth)
+	{
+		glEnable(GL_DEPTH_TEST);
+		glDepthFunc(GL_ALWAYS);
+	}
+	else
+		glDisable(GL_DEPTH_TEST); // Don't depth test
 	glEnable(GL_BLEND);
 	glBlendFunc(/*source factor=*/GL_ONE, /*destination factor=*/GL_ONE_MINUS_SRC_ALPHA); // The resolve shader outputs colour premultiplied by the accumulated coverage.
 
@@ -11459,6 +11609,7 @@ void OpenGLEngine::resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name)
 	assert(resolve_prog.nonNull()); // Non-null since a cloud was drawn, which means GaussianSplatRenderer built its shaders.
 	resolve_prog->useProgram();
 	splat_renderer->setResolveOverdrawUniforms(splat_saturation_mask_block); // Overdraw debug view uniforms - see the method's own comment for why this can't go through the generic per-object uniform path.
+	splat_renderer->setResolveDoFDepthUniforms(write_weighted_depth, (float)current_scene->near_draw_dist);
 	bindMeshData(*unit_quad_meshdata);
 
 	bindTextureUnitToSampler(*current_scene->splat_accum_copy_texture, /*texture_unit_index=*/0, /*sampler_uniform_location=*/resolve_prog->albedo_texture_loc);
@@ -11472,6 +11623,15 @@ void OpenGLEngine::resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name)
 			/*texture_unit_index=*/GaussianSplatRenderer::RESOLVE_COVERAGE_MAP_TEXTURE_UNIT_INDEX,
 			/*sampler_uniform_location=*/splat_renderer->getResolveCoverageMapTexUniformLoc());
 
+	// The DoF depth sampler needs a valid texture bound whenever the program runs, for the same WebGL reason as the
+	// coverage map above - the shader's own branch on splat_write_weighted_depth doesn't exempt the static sampler
+	// binding. splat_dof_depth_copy_texture is only allocated while the mode is selected (see
+	// GaussianSplatRenderer::wantsDoFDepthBuffer()); splat_accum_copy_texture is always present as a harmless
+	// stand-in otherwise; the shader never actually reads it in that case, since write_weighted_depth is false.
+	OpenGLTexture& dof_depth_tex = current_scene->splat_dof_depth_copy_texture.nonNull() ? *current_scene->splat_dof_depth_copy_texture : *current_scene->splat_accum_copy_texture;
+	bindTextureUnitToSampler(dof_depth_tex, /*texture_unit_index=*/GaussianSplatRenderer::RESOLVE_DOF_DEPTH_TEXTURE_UNIT_INDEX,
+		/*sampler_uniform_location=*/splat_renderer->getResolveDoFDepthTexUniformLoc());
+
 	//----------------------- Draw the quad -----------------------
 	drawElementsBaseVertex(GL_TRIANGLES, (GLsizei)unit_quad_meshdata->batches[0].num_indices, unit_quad_meshdata->getIndexType(), (void*)unit_quad_meshdata->getBatch0IndicesTotalBufferOffset(), unit_quad_meshdata->vbo_handle.base_vertex);
 
@@ -11484,6 +11644,8 @@ void OpenGLEngine::resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name)
 	glDisable(GL_BLEND);
 	glEnable(GL_DEPTH_TEST);
 	glDepthMask(GL_TRUE); // Restore writing to z-buffer.
+	if(write_weighted_depth)
+		glDepthFunc(use_reverse_z ? GL_GREATER : GL_LESS); // Restore the normal depth func - see the GL_ALWAYS switch above.
 }
 
 

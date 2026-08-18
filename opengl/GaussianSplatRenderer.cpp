@@ -846,7 +846,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	splat_dist_clamp_min(0.0f), splat_dist_clamp_max(1000.0f), splat_dist_clamp_invert(false), splat_alpha_cutoff(1.0f / 255.0f),
 	splat_alpha_gain(1.0f), splat_alpha_gamma(1.0f), // Identity: the cloud as captured - see getAlphaGain().
 	last_report_reached_rasteriser(0), last_report_in_frustum(0),
-	splat_num_draw_slices(1), splat_draw_slice_limit(0), splat_layer_cap(0), splat_layer_cap_opaque(true), splat_coverage_cap(0.f), splat_ablation_stage(0), splat_quad_radius_scale(1.f), cap_fill_mask_tex_uniform_loc(-2), splat_area_scale_gamma(1.f), splat_area_scale_ref_px(20.f), splat_coverage_shrink_strength(0.f), splat_coverage_shrink_mode(0), splat_coverage_reduce_mode(0), splat_show_coverage_map_level(-1), coverage_mask_tex_uniform_loc(-2), splat_ewa_fix_enabled(true), splat_near_fade_width(0.3f), splat_near_epsilon(0.1f), splat_hide_test_conservative(true), splat_layer_estimate_requested(false), splat_slice_growth(1.0f), splat_visible_slicing(false), splat_saturation_gate_enabled(false), splat_saturation_threshold(1.0f - 1.0f / 255.0f),
+	splat_num_draw_slices(1), splat_draw_slice_limit(0), splat_layer_cap(0), splat_layer_cap_opaque(true), splat_coverage_cap(0.f), splat_ablation_stage(0), splat_quad_radius_scale(1.f), cap_fill_mask_tex_uniform_loc(-2), splat_area_scale_gamma(1.f), splat_area_scale_ref_px(20.f), splat_coverage_shrink_strength(0.f), splat_coverage_shrink_mode(0), splat_coverage_reduce_mode(0), splat_show_coverage_map_level(-1), coverage_mask_tex_uniform_loc(-2), splat_ewa_fix_enabled(true), splat_near_fade_width(0.3f), splat_near_epsilon(0.1f), splat_dof_depth_mode(0), splat_dof_depth_prepass_alpha_min(0.3f), splat_hide_test_conservative(true), splat_layer_estimate_requested(false), splat_slice_growth(1.0f), splat_visible_slicing(false), splat_saturation_gate_enabled(false), splat_saturation_threshold(1.0f - 1.0f / 255.0f),
 	splat_saturation_mask_downscale(4), splat_mask_tex_uniform_loc(-2),
 	splat_accum_buffer_8bit(false),
 	splat_show_overdraw_mode(0), splat_hide_overdraw_enabled(false), splat_hide_alpha_enabled(false),
@@ -936,6 +936,12 @@ void GaussianSplatRenderer::buildShadersIfNeeded()
 	resolve_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "splat_show_coverage_map_level");
 	resolve_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "splat_coverage_map_block");
 	resolve_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "splat_coverage_map_texture");
+
+	// SplatDoFDepthMode_Weighted - see setResolveDoFDepthUniforms(). Indices 6-8, read back there and by
+	// getResolveDoFDepthTexUniformLoc() in this same order.
+	resolve_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "splat_write_weighted_depth");
+	resolve_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_dof_near_clip_dist");
+	resolve_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "splat_dof_depth_texture");
 
 
 	// Marks the pixels the composite has already finished with, between draw slices - see
@@ -1121,6 +1127,20 @@ int GaussianSplatRenderer::getResolveCoverageMapTexUniformLoc() const
 {
 	// The six entries are appended together in buildShadersIfNeeded(); a shorter list means the program was never built.
 	return (resolve_prog.nonNull() && (resolve_prog->user_uniform_info.size() >= 6)) ? resolve_prog->user_uniform_info[5].loc : -1;
+}
+
+
+void GaussianSplatRenderer::setResolveDoFDepthUniforms(bool write_weighted_depth, float near_clip_dist) const
+{
+	glUniform1i(resolve_prog->user_uniform_info[6].loc, write_weighted_depth ? 1 : 0);
+	glUniform1f(resolve_prog->user_uniform_info[7].loc, near_clip_dist);
+	glUniform1i(resolve_prog->user_uniform_info[8].loc, RESOLVE_DOF_DEPTH_TEXTURE_UNIT_INDEX);
+}
+
+
+int GaussianSplatRenderer::getResolveDoFDepthTexUniformLoc() const
+{
+	return (resolve_prog.nonNull() && (resolve_prog->user_uniform_info.size() >= 9)) ? resolve_prog->user_uniform_info[8].loc : -1;
 }
 
 

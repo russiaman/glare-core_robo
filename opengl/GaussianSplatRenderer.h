@@ -477,6 +477,49 @@ public:
 	float getNearEpsilon() const { return splat_near_epsilon; }
 	void setNearEpsilon(float v) { splat_near_epsilon = v; }
 
+	// How Gaussian splats contribute depth for post-process effects (Depth of Field, fog) that read the depth
+	// buffer.  Splats normally never write depth (see drawSplatClouds()), so a splat pixel's depth is whatever
+	// was behind it - which is why DoF blurs splats regardless of focus distance in the upstream code path.
+	//
+	// This whole feature only engages when a post-process consumer is asking for it (currently: dof_blur_strength
+	// > 0).  Zero cost otherwise, regardless of the setting.
+	enum SplatDoFDepthMode
+	{
+		// Upstream behaviour: splats do not write depth at all.  DoF/fog use the depth of whatever was behind the
+		// splats, so splats blur wrong.  Kept as an option for A/B against the two modes below.
+		SplatDoFDepthMode_Off = 0,
+
+		// A: a second, colour-masked depth-only pass over every visible splat after the composite, using a
+		// strict alpha threshold (see getDoFDepthPrepassAlphaMin()) so only meaningfully opaque fragments write
+		// depth.  Cheap - one extra geometry pass per DoF frame - but the answer is "the frontmost surviving
+		// fragment" per pixel, which is a discrete choice.  Neighbouring pixels can pick different splats, so
+		// silhouettes step visibly where the frontmost splat changes.
+		SplatDoFDepthMode_Prepass = 1,
+
+		// B: accumulate depth * alpha * transmittance into a second colour attachment during the splat pass,
+		// resolve pass divides through by coverage and writes gl_FragDepth.  Gives the expected depth of the
+		// splat stack per pixel - smooth by construction, no silhouette steps - at the cost of a second
+		// attachment (RGBA16F) blended alongside the accumulation buffer.  Not physically depth of a surface:
+		// where a lacy foreground shows a distant background through it, the mean depth lands between them,
+		// where nothing actually is.
+		SplatDoFDepthMode_Weighted = 2,
+	};
+	int getDoFDepthMode() const { return splat_dof_depth_mode; }
+	void setDoFDepthMode(int mode) { splat_dof_depth_mode = mode; }
+	// Whether SplatDoFDepthMode_Weighted's second accumulation attachment should be allocated - decided by the
+	// mode alone, not by whether DoF is live this frame, so dragging the DoF blur strength slider through zero
+	// doesn't repeatedly allocate/free it.  See OpenGLScene::splat_dof_depth_renderbuffer.
+	bool wantsDoFDepthBuffer() const { return splat_dof_depth_mode == SplatDoFDepthMode_Weighted; }
+
+	// Alpha threshold that gates depth writes in SplatDoFDepthMode_Prepass.  Fragments below it are discarded
+	// before writing depth, and vertex-side quads shrink to the same threshold (see splat_alpha_cutoff in
+	// gaussian_splat_vert_shader.glsl).  Default 0.3: 1/255 (matching the main draw's own discard) lets the
+	// almost-transparent wing of a foreground splat win depth for pixels the wing barely touches, which shows
+	// as ghost silhouettes in the resulting DoF.  0.3 is the empirical setting that pushes those out without
+	// obviously starving depth over regions where the frontmost splat is legitimately semi-transparent.
+	float getDoFDepthPrepassAlphaMin() const { return splat_dof_depth_prepass_alpha_min; }
+	void setDoFDepthPrepassAlphaMin(float v) { splat_dof_depth_prepass_alpha_min = v; }
+
 	// DIAGNOSTIC ONLY - session046 open question (3): shrinks a splat's quad continuously by how covered the composite
 	// already is under it, instead of the saturation gate's binary keep/drop (which needs every texel the quad touches
 	// marked finished before it drops anything, and so rarely fires - see getSaturationGateEnabled()). 0 (default) is
@@ -836,6 +879,18 @@ public:
 	// user-uniform list at the call site, so that the list's layout stays this class's business.
 	int getResolveCoverageMapTexUniformLoc() const;
 
+	// SplatDoFDepthMode_Weighted: tells the resolve pass whether to divide the weighted-depth accumulation
+	// (OpenGLScene::splat_dof_depth_renderbuffer) through by coverage and write gl_FragDepth from it this frame,
+	// and gives it the near-clip distance the view-depth -> device-depth conversion needs (this program has no
+	// use for the MaterialCommonUniforms block the rest of the engine's shaders get near_clip_dist from - see
+	// setResolveOverdrawUniforms()'s own comment on why this pass's uniforms are all set manually). Called by
+	// OpenGLEngine::resolveSplatAccumBuffer() alongside setResolveOverdrawUniforms().
+	void setResolveDoFDepthUniforms(bool write_weighted_depth, float near_clip_dist) const;
+
+	// See RESOLVE_COVERAGE_MAP_TEXTURE_UNIT_INDEX's comment - same reasoning, a different unit.
+	static const int RESOLVE_DOF_DEPTH_TEXTURE_UNIT_INDEX = 2;
+	int getResolveDoFDepthTexUniformLoc() const;
+
 private:
 	GLARE_DISABLE_COPY(GaussianSplatRenderer);
 
@@ -990,6 +1045,8 @@ private:
 	bool splat_ewa_fix_enabled;
 	float splat_near_fade_width;
 	float splat_near_epsilon; // See getNearEpsilon(). Default 0.1 (historical hardcode).
+	int splat_dof_depth_mode; // See getDoFDepthMode(). Default SplatDoFDepthMode_Off.
+	float splat_dof_depth_prepass_alpha_min; // See getDoFDepthPrepassAlphaMin(). Default 0.3.
 	Reference<OpenGLProgram> mean_reduce_prog; // See getMeanMaskReduceProgram() above. Built alongside mask_reduce_prog.
 	int coverage_mask_tex_uniform_loc; // See getCoverageMaskTexUniformLoc() above. -2 means "not looked up yet", as with splat_mask_tex_uniform_loc.
 

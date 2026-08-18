@@ -601,6 +601,20 @@ float getDepthFromDepthTextureValue(float near_clip_dist_, float val)
 }
 
 
+// Inverse of getDepthFromDepthTextureValue() above: given a linear view-space depth, recovers the device depth
+// (the [0, 1] value the depth buffer itself stores) that would have produced it. Used by
+// gaussian_splat_resolve_frag_shader.glsl to write gl_FragDepth from a splat stack's weighted mean depth - see
+// GaussianSplatRenderer::SplatDoFDepthMode_Weighted.
+float getDeviceDepthFromLinearDepth(float near_clip_dist_, float linear_depth)
+{
+#if USE_REVERSE_Z
+	return near_clip_dist_ / linear_depth;
+#else
+	return 1.0 - near_clip_dist_ / linear_depth;
+#endif
+}
+
+
 // See https://forwardscattering.org/post/66
 float fastApproxACos(float x)
 {

@@ -110,6 +110,7 @@ uniform float splat_near_epsilon;
 out vec2 frag_screen_offset_px; // Pixel-space offset of this vertex from the splat's projected centre.
 out vec3 frag_conic; // Inverse 2D covariance (A, B, C) of [[A, B], [B, C]], for the per-pixel Gaussian evaluation.
 out vec4 frag_colour; // (r, g, b, opacity)
+out float frag_view_depth; // -pos_vs.z at the splat's centre - see GaussianSplatRenderer::SplatDoFDepthMode_Weighted. Flat across the quad, like frag_conic: an approximation from the centre, not a true per-fragment depth.
 
 
 ivec2 splatTexelCoord(int texel_index)
@@ -216,6 +217,7 @@ void main()
 	}
 
 	float depth = -pos_vs.z;
+	frag_view_depth = depth;
 	// Depth below which the splat's own centre is culled, to keep the Jacobian's 1/d / 1/d^2 terms bounded.
 	// Was a hardcoded 0.1; now a uniform so the Photo Mode "Near clip" override can drop it for close-ups.
 	if(depth < splat_near_epsilon)

@@ -707,6 +707,17 @@ public:
 	OpenGLTextureRef splat_layer_count_copy_texture;
 	Reference<FrameBuffer> splat_layer_count_copy_framebuffer;
 
+	// GaussianSplatRenderer::SplatDoFDepthMode_Weighted's accumulator: (depth * alpha, coverage), blended with the
+	// same front-to-back "under" op as the colour attachment, at GL_COLOR_ATTACHMENT2 of splat_accum_framebuffer -
+	// attachment 1 is the layer counter above, which this has to coexist with independently, since the layer cap
+	// diagnostic and DoF can in principle both be in use at once. Resolve divides accum.r by the colour
+	// attachment's own alpha (the same coverage, written twice) to get the mean depth, and writes gl_FragDepth
+	// from it - see gaussian_splat_resolve_frag_shader.glsl. Only allocated while DoF depth mode is set to
+	// Weighted - see GaussianSplatRenderer::wantsDoFDepthBuffer().
+	Reference<RenderBuffer> splat_dof_depth_renderbuffer;
+	OpenGLTextureRef splat_dof_depth_copy_texture;
+	Reference<FrameBuffer> splat_dof_depth_copy_framebuffer;
+
 	// The saturation gate's mask of finished pixels, usually a fraction of the viewport's resolution - see
 	// OpenGLEngine::markSaturatedSplatPixels(), which writes it, and gaussian_splat_frag_shader.glsl, which reads it.
 	Reference<FrameBuffer> splat_saturation_mask_framebuffer;
@@ -1560,7 +1571,10 @@ private:
 	void markSaturatedSplatPixels(bool from_layer_count = false, bool from_layer_count_buffer = false, bool coverage_cap_threshold = false, bool build_coverage_pyramid = false);
 	void fillCappedSplatPixels(); // DIAGNOSTIC ONLY - rewrites the pixels the layer cap cut short as fully covered, see GaussianSplatRenderer::getLayerCapOpaque().
 	void estimateSplatLayerCapSaving(); // DIAGNOSTIC ONLY - reads the layer counter back and reports how much fill a per-pixel cap would remove.
-	void resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name); // Composites the splat accumulation buffer onto the buffer the frame is being drawn into, undoing the engine's display transform once.
+	// Composites the splat accumulation buffer onto the buffer the frame is being drawn into, undoing the engine's
+	// display transform once. write_weighted_depth is GaussianSplatRenderer::SplatDoFDepthMode_Weighted's flag for
+	// this frame - see drawSplatClouds(), which computes it and owns the depth-only Prepass mode alongside this.
+	void resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name, bool write_weighted_depth);
 
 	//----------------------------------------------------------------------------------------------------------------
 	// DIAGNOSTIC ONLY - the saturation-snapshot dump.  No part of the splat render path: nothing below is read by any

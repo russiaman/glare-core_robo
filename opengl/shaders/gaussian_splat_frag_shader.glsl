@@ -11,6 +11,7 @@ precision highp float; // Override the engine's default "precision mediump float
 in vec2 frag_screen_offset_px;
 in vec3 frag_conic;
 in vec4 frag_colour;
+in float frag_view_depth;
 
 // Debug view (GaussianSplatSettingsWidget, Qt only). 0 (default) = normal splat colour. Non-zero = every surviving
 // fragment writes a flat value into the red channel instead, additively blended (drawSplatClouds() switches to
@@ -50,6 +51,14 @@ uniform int splat_ablation_stage;
 uniform sampler2D splat_saturation_mask_texture; // The same mask the vertex shader tests; a sampler uniform is program-wide, so this is the same one, bound once by the draw path.
 layout(location = 1) out vec4 layer_count_out; // A flat 1 per surviving fragment, blended additively into the layer counter - see OpenGLScene::splat_layer_count_renderbuffer.
 
+// GaussianSplatRenderer::SplatDoFDepthMode_Weighted: (frag_view_depth * alpha, 0, 0, alpha), blended with the same
+// front-to-back "under" op as colour_out, into OpenGLScene::splat_dof_depth_renderbuffer. The resolve pass divides
+// the accumulated depth*alpha*T by the accumulated coverage (colour_out's own alpha channel - see the resolve
+// shader) to get the splat stack's mean depth, and writes gl_FragDepth from it, for Depth of Field (and fog) to
+// read afterwards. Written unconditionally, like layer_count_out - a declared output with no attachment bound to
+// it is simply not captured, so there is no need to gate this on the mode being active.
+layout(location = 2) out vec4 dof_depth_out;
+
 
 void main()
 {
@@ -64,6 +73,7 @@ void main()
 	if(splat_ablation_stage != 0)
 	{
 		layer_count_out = vec4(1.0, 0.0, 0.0, 0.0);
+		dof_depth_out = vec4(0.0); // Zero weight - the ablation ladder isn't meant to interact with DoF depth.
 
 		vec3 flat_col = (splat_ablation_stage <= 3) ? vec3(1.0) : clamp(frag_colour.rgb, 0.0, 1.0); // 2 and 3 are white; the splat's own colour is what 4 adds.
 
@@ -132,7 +142,13 @@ void main()
 	// Premultiplied by alpha: drawSplatClouds() blends with (GL_ONE_MINUS_DST_ALPHA, GL_ONE), the "under" operator, so
 	// the accumulation buffer ends up holding (sum of c_i * a_i * T_i, coverage), which is what the resolve pass wants.
 	if(splat_show_overdraw != 0)
+	{
 		colour_out = vec4((splat_show_overdraw == 2) ? alpha : 1.0, 0.0, 0.0, 1.0); // Alpha sum, or one layer - see the uniform comment above. 'alpha' is post-discard, so mode 2 sums exactly what the normal path would have blended.
+		dof_depth_out = vec4(0.0); // Debug view - leave DoF depth alone, as with the ablation ladder above.
+	}
 	else
+	{
 		colour_out = vec4(base_col * alpha, alpha);
+		dof_depth_out = vec4(frag_view_depth * alpha, 0.0, 0.0, alpha);
+	}
 }

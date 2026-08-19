@@ -277,6 +277,18 @@ public:
 	bool getSplitFilterEnabled() const { return split_filter_enabled; }
 	void setSplitFilterEnabled(bool v) { split_filter_enabled = v; }
 
+	// SESSION063 K3: live-tunable dilation of the per-orientation filter (see kickOffFilters()). The filter keeps nodes
+	// slightly outside the frustum so the edge doesn't trail during the filter's latency window; how far is these three.
+	// latency (s): the motion-prediction window - margin = motion_rate * latency, so bigger = wider edge coverage but more
+	// over-inclusion. rot/trans floors: the baseline rate assumed even from a standstill, so the static->moving transition
+	// is covered. Exposed so the owner can find the smallest values that hide the edge without paying for it.
+	float getFilterDilationLatency() const { return filter_dilation_latency; }
+	void setFilterDilationLatency(float v) { filter_dilation_latency = v; }
+	float getFilterMinRotRateDegPerS() const { return filter_min_rot_rate_deg_per_s; }
+	void setFilterMinRotRateDegPerS(float v) { filter_min_rot_rate_deg_per_s = v; }
+	float getFilterMinTransRateMPerS() const { return filter_min_trans_rate_m_per_s; }
+	void setFilterMinTransRateMPerS(float v) { filter_min_trans_rate_m_per_s = v; }
+
 	// Diagnostic tool, not a LoD parameter: culls any splat whose feature_size (2 * max scale axis, matching
 	// GaussianSplatLodNode::feature_size) falls outside [min, max], directly in the vertex shader, regardless of
 	// whether the cloud has a LoD tree. Used to locate abnormally large/degenerate splats (e.g. under-reconstructed
@@ -996,6 +1008,11 @@ private:
 
 	// SESSION063: see getSplitFilterEnabled() above. Off by default - the split path is opt-in for A/B while it's built out.
 	bool split_filter_enabled;
+
+	// SESSION063 K3: filter dilation knobs - see the getters above.
+	float filter_dilation_latency;      // s
+	float filter_min_rot_rate_deg_per_s;
+	float filter_min_trans_rate_m_per_s;
 
 	// SESSION055: camera-motion tracker for anisotropic frustum-cull dilation. think() diffs the current cam pose against
 	// the previous one to compute an instantaneous velocity and angular speed, feeds them through an EMA with a

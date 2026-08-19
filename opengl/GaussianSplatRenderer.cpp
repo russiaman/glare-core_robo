@@ -46,7 +46,7 @@ Copyright Glare Technologies Limited 2026 -
 // changes nothing about the order within one 500m away, and a single world-wide constant would re-sort every splat in
 // the world for the latter.  The floor is that old constant, so a cloud you are close to behaves exactly as before.
 static const float min_resort_move_threshold_ws = 0.1f;
-static const float resort_threshold_dist_fraction = 0.05f;
+static const float resort_threshold_dist_fraction = 0.01f; // SESSION063 K3 TEST: lowered 0.05->0.01 to re-kick U(P) ~5x more often on translation, to isolate whether translation holes are discrete-step staleness (helped) or the 450ms traversal latency under continuous motion (not helped). Revert if inconclusive.
 
 // How many depth sorts may be in flight at once.  Each holds a scratch allocation proportional to its cloud, so this
 // caps sort memory at roughly this many times the largest cloud, rather than letting it scale with the world.
@@ -161,7 +161,7 @@ public:
 		topology_generation(0), traversal_in_flight(false), have_last_traversal_cam_pos(false), last_traversal_cam_pos_ws(0.f), last_traversal_cam_forward_ws(0.f), last_traversal_kick_time_s(0.0),
 		last_traversal_kicked_topology_generation(0), last_traversal_hit_budget_cap(false), last_traversal_hit_density_cap(false), last_traversal_hit_depth_cap(false), last_traversal_dilation_elevated(false),
 		cached_traversal_geom_generation(0), importance_num_views(0),
-		filter_in_flight(false), ufrontier_needs_filter(false), have_last_filter_cam_forward(false), last_filter_cam_forward_ws(0.f) // SESSION063
+		filter_in_flight(false), ufrontier_needs_filter(false), have_last_filter_cam_forward(false), last_filter_cam_forward_ws(0.f), last_filter_dilation_elevated(false) // SESSION063
 	{}
 
 	uint64 cloud_id; // Stable, never reused.  Sort results carry it, so a result for a cloud that has since been merged away can be dropped.
@@ -219,6 +219,7 @@ public:
 	bool ufrontier_needs_filter;           // Set when a fresh U(P) lands, so kickOffFilters() produces the first S(P,R) for it even with no rotation.
 	bool have_last_filter_cam_forward;
 	Vec4f last_filter_cam_forward_ws;      // Camera forward at the last filter kick, so a rotation past threshold re-filters - see kickOffFilters().
+	bool last_filter_dilation_elevated;    // SESSION063 K3: last filter used above-baseline dilation, so once motion calms one final tight re-filter is due (mirrors the traversal's "settle" - see kickOffFilters()).
 
 	// SESSION059: true if the traversal just kicked for this cloud used a rotation_dilation_rate above the baseline
 	// floor (i.e. cam_angular_speed_ema/peak was elevated at kick time) - see kickOffTraversals()'s "settle" re-kick.
@@ -977,6 +978,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 :	opengl_engine(&opengl_engine_), next_handle(1), next_cloud_id(1), num_sorts_in_flight(0),
 	num_traversals_in_flight(0), num_filters_in_flight(0), lod_pixel_scale_limit(1.0f), lod_max_splats_budget(10000000), lod_resort_move_threshold_ws(0.1f),
 	lod_max_layer_density(0.0f), lod_max_tree_depth(0), lod_frustum_cull_enabled(true), split_filter_enabled(false),
+	filter_dilation_latency(0.6f), filter_min_rot_rate_deg_per_s(45.f), filter_min_trans_rate_m_per_s(2.0f), // SESSION063 K3
 	have_prev_think_cam_state(false), prev_think_cam_pos_ws(0.f), prev_think_cam_forward_ws(0.f), cam_velocity_ema_ws(0.f), cam_angular_speed_ema(0.f), cam_angular_speed_peak(0.f),
 	splat_size_clamp_min(0.0f), splat_size_clamp_max(0.0f), splat_size_clamp_invert(false),
 	splat_dist_clamp_min(0.0f), splat_dist_clamp_max(1000.0f), splat_dist_clamp_invert(false), splat_alpha_cutoff(1.0f / 255.0f),
@@ -1337,14 +1339,21 @@ static inline bool pointInFrustum(const Planef* frustum_clip_planes, int num_fru
 
 
 // SESSION063: the per-orientation frustum filter of the split architecture (session062 §9.3). Streams the SoA unculled
-// frontier U(P), keeps each node whose centre is inside every plane once that plane is pushed out by the node's own
-// cull_radius (the same base_margin the cull-traversal used - see the cull block in GaussianSplatLodTraversalTask::run()
-// - so a static view filters to the same selection the cull path would have picked, minus only the motion dilation,
-// which a static view doesn't need). Writes survivor indices in input order (a subsequence of a distance-sorted list
-// stays sorted, so no re-sort). 4 points at a time with SSE - the codebase's native width; measured ~13ms on a ~7.5M U(P),
-// near the 120MB memory-read floor (session063). Returns the survivor count. Cheap enough to run per-orientation instead
-// of a fresh ~450ms traversal, which is the whole point of the split.
-static size_t filterUnculledFrontier(const GaussianSplatUnculledFrontier& uf, const Planef* planes, int num_planes, js::Vector<uint32, 16>& out_indices)
+// frontier U(P), keeps each node whose centre is inside every plane once that plane is pushed out by three margins,
+// exactly mirroring the base_margin+translation+rotation dilation the old cull-traversal used (see the cull block in
+// GaussianSplatLodTraversalTask::run()), just computed for the filter's own (much shorter) latency in kickOffFilters():
+//   - radius            : the node's own cull_radius (its 3-sigma footprint), always applied.
+//   - trans_dilation[i] : per-plane world-space margin (metres) for camera translation during the filter latency window,
+//                         folded into each plane's d before the loop.
+//   - rate * dist       : rotational margin - a node at range r shifts r*theta tangentially when the camera rotates by
+//                         theta, so the plane is pushed out proportionally to the node's distance from the camera. K3
+//                         (session063): reintroduced so a rotation no longer trails a bare, undilated frustum edge - the
+//                         edge lag the split path had before this. dist needs one sqrt per 4 nodes.
+// Writes survivor indices in input order (a subsequence of a distance-sorted list stays sorted, so no re-sort). 4 points
+// at a time with SSE - the codebase's native width. Returns the survivor count. Cheap enough to run per-orientation
+// instead of a fresh ~450ms traversal, which is the whole point of the split.
+static size_t filterUnculledFrontier(const GaussianSplatUnculledFrontier& uf, const Planef* planes, int num_planes,
+	const Vec4f& cam_pos_ws, float rotation_dilation_rate, const float* trans_dilation, js::Vector<uint32, 16>& out_indices)
 {
 	const size_t n = uf.indices.size();
 	out_indices.resizeNoCopy(n); // Worst case every node survives.
@@ -1355,8 +1364,12 @@ static size_t filterUnculledFrontier(const GaussianSplatUnculledFrontier& uf, co
 	{
 		const Vec4f& nrm = planes[pl].getNormal();
 		pl_nx[pl] = _mm_set1_ps(nrm.x[0]); pl_ny[pl] = _mm_set1_ps(nrm.x[1]); pl_nz[pl] = _mm_set1_ps(nrm.x[2]);
-		pl_d[pl]  = _mm_set1_ps(planes[pl].getD());
+		pl_d[pl]  = _mm_set1_ps(planes[pl].getD() + (trans_dilation ? trans_dilation[pl] : 0.f)); // Translation dilation folds into d.
 	}
+	const __m128 cam_x = _mm_set1_ps(cam_pos_ws.x[0]);
+	const __m128 cam_y = _mm_set1_ps(cam_pos_ws.x[1]);
+	const __m128 cam_z = _mm_set1_ps(cam_pos_ws.x[2]);
+	const __m128 rate  = _mm_set1_ps(rotation_dilation_rate);
 
 	const float* const px = uf.px.data();
 	const float* const py = uf.py.data();
@@ -1373,12 +1386,16 @@ static size_t filterUnculledFrontier(const GaussianSplatUnculledFrontier& uf, co
 		const __m128 Y = _mm_loadu_ps(py + i);
 		const __m128 Z = _mm_loadu_ps(pz + i);
 		const __m128 R = _mm_loadu_ps(rad + i);
+		// Per-node margin common to every plane: radius + rate*dist_to_camera (rotation dilation).
+		const __m128 dx = _mm_sub_ps(X, cam_x), dy = _mm_sub_ps(Y, cam_y), dz = _mm_sub_ps(Z, cam_z);
+		const __m128 dist = _mm_sqrt_ps(_mm_add_ps(_mm_add_ps(_mm_mul_ps(dx, dx), _mm_mul_ps(dy, dy)), _mm_mul_ps(dz, dz)));
+		const __m128 sub = _mm_add_ps(R, _mm_mul_ps(rate, dist));
 		__m128 outside = _mm_setzero_ps();
 		for(int pl=0; pl<npl; ++pl)
 		{
-			// outside if dot(n,p) - radius >= d  (radius pushes the plane out by the node's own footprint).
+			// outside if dot(n,p) - (radius + rate*dist) >= d + trans_dilation[pl].
 			const __m128 dotv = _mm_add_ps(_mm_add_ps(_mm_mul_ps(X, pl_nx[pl]), _mm_mul_ps(Y, pl_ny[pl])), _mm_mul_ps(Z, pl_nz[pl]));
-			outside = _mm_or_ps(outside, _mm_cmpge_ps(_mm_sub_ps(dotv, R), pl_d[pl]));
+			outside = _mm_or_ps(outside, _mm_cmpge_ps(_mm_sub_ps(dotv, sub), pl_d[pl]));
 		}
 		const int m = _mm_movemask_ps(outside) & 0xF; // bit j set = point i+j is outside.
 		// Scalar compaction of the 4-lane result: rare enough (survivors run in contiguous spans) that a branchless
@@ -1390,11 +1407,14 @@ static size_t filterUnculledFrontier(const GaussianSplatUnculledFrontier& uf, co
 	}
 	for(size_t i=n4; i<n; ++i) // Tail (n not a multiple of 4).
 	{
+		const float ddx = px[i]-cam_pos_ws.x[0], ddy = py[i]-cam_pos_ws.x[1], ddz = pz[i]-cam_pos_ws.x[2];
+		const float sub = rad[i] + rotation_dilation_rate * std::sqrt(ddx*ddx + ddy*ddy + ddz*ddz);
 		bool inside = true;
 		for(int pl=0; pl<npl; ++pl)
 		{
 			const Vec4f& nrm = planes[pl].getNormal();
-			if((nrm.x[0]*px[i] + nrm.x[1]*py[i] + nrm.x[2]*pz[i]) - rad[i] >= planes[pl].getD()) { inside = false; break; }
+			const float d_dil = planes[pl].getD() + (trans_dilation ? trans_dilation[pl] : 0.f);
+			if((nrm.x[0]*px[i] + nrm.x[1]*py[i] + nrm.x[2]*pz[i]) - sub >= d_dil) { inside = false; break; }
 		}
 		if(inside) out[num_out++] = idx[i];
 	}
@@ -1422,13 +1442,17 @@ class GaussianSplatFilterTask : public glare::Task
 {
 public:
 	GaussianSplatFilterTask(uint64 cloud_id_, const Reference<GaussianSplatUnculledFrontier>& frontier_,
-		const Planef* planes_, int num_planes_, ThreadSafeQueue<Reference<ThreadMessage> >* result_queue_)
-	:	cloud_id(cloud_id_), frontier(frontier_), num_planes(num_planes_), result_queue(result_queue_)
+		const Planef* planes_, int num_planes_, const Vec4f& cam_pos_ws_, float rotation_dilation_rate_, const float* trans_dilation_,
+		ThreadSafeQueue<Reference<ThreadMessage> >* result_queue_)
+	:	cloud_id(cloud_id_), frontier(frontier_), num_planes(num_planes_), cam_pos_ws(cam_pos_ws_),
+		rotation_dilation_rate(rotation_dilation_rate_), result_queue(result_queue_)
 	{
 		if(num_planes < 0) num_planes = 0;
 		if(num_planes > (int)staticArrayNumElems(planes)) num_planes = (int)staticArrayNumElems(planes);
 		for(int i=0; i<num_planes; ++i)
 			planes[i] = planes_[i];
+		for(int i=0; i<(int)staticArrayNumElems(trans_dilation); ++i)
+			trans_dilation[i] = trans_dilation_ ? trans_dilation_[i] : 0.f;
 	}
 
 	virtual void run(size_t /*thread_index*/) override
@@ -1436,7 +1460,7 @@ public:
 		Reference<GaussianSplatFilterResultMsg> msg = new GaussianSplatFilterResultMsg();
 		msg->cloud_id = cloud_id;
 		msg->frontier = frontier;
-		filterUnculledFrontier(*frontier, planes, num_planes, msg->survivors);
+		filterUnculledFrontier(*frontier, planes, num_planes, cam_pos_ws, rotation_dilation_rate, trans_dilation, msg->survivors);
 		result_queue->enqueue(msg);
 	}
 
@@ -1445,6 +1469,9 @@ private:
 	Reference<GaussianSplatUnculledFrontier> frontier;
 	Planef planes[6];
 	int num_planes;
+	Vec4f cam_pos_ws;               // SESSION063 K3: for the per-node rotation dilation (rate * dist-to-camera).
+	float rotation_dilation_rate;   // rad; multiplied by dist-to-node in the filter.
+	float trans_dilation[6];        // per-plane translation margin (metres).
 	ThreadSafeQueue<Reference<ThreadMessage> >* result_queue;
 };
 
@@ -4251,9 +4278,15 @@ void GaussianSplatRenderer::drainTraversalResults()
 // SESSION063: the cheap half of the split architecture's per-frame work. For each cloud that has a cached U(P), kick an
 // async filter (GaussianSplatFilterTask) when either a fresh U(P) just landed (ufrontier_needs_filter) or the camera has
 // rotated past a small threshold since the last filter. A filter is ~13ms on the worker (measured session063) vs a
-// ~450ms traversal, so this is what lets a pure rotation refresh the draw list. No dilation margin here: a filter is
-// cheap enough to re-run at a tight angular threshold, so the stale-edge window is small (K3/§7.2's cone would remove it
-// entirely if fast spins show holes).
+// ~450ms traversal, so this is what lets a pure rotation refresh the draw list.
+//
+// K3 (session063): the filter carries the same anisotropic dilation the old cull-traversal used, so the frustum edge is
+// pushed out in the direction the camera is moving/turning and doesn't trail during the filter's own latency window (the
+// edge lag the split path had before this). Computed here, once per kick, from the per-frame motion trackers (think()):
+// translation from cam_velocity_ema_ws, rotation from max(cam_angular_speed_ema, cam_angular_speed_peak). The window is
+// filter_latency_estimate - far shorter than the traversal's 0.3s, since a filter lands in ~13ms - so the margins (and
+// the over-inclusion they cost) are correspondingly small. Baseline floors cover the static->moving transition, where
+// both trackers still read ~zero.
 void GaussianSplatRenderer::kickOffFilters()
 {
 	if(!split_filter_enabled)
@@ -4263,8 +4296,21 @@ void GaussianSplatRenderer::kickOffFilters()
 		return;
 
 	const OpenGLScene* const scene = opengl_engine->getCurrentScene();
+	const Vec4f cam_pos_ws = scene->cam_to_world.getColumn(3);
 	const Vec4f cam_forward_ws = normalise(scene->cam_to_world.getColumn(1)); // SESSION055: col 1 is forward - see kickOffTraversals().
 	const float rotation_cos_threshold = 0.99939f; // cos(2deg) - tighter than the traversal's 5deg re-kick since a filter is ~35x cheaper.
+
+	// Motion dilation, shared by every cloud kicked this pass (depends only on camera motion, not on the cloud). Knobs are
+	// live-tunable - see getFilterDilationLatency() etc.
+	const Vec4f ema_expected = cam_velocity_ema_ws * filter_dilation_latency;
+	const float min_trans_dilation_m = filter_min_trans_rate_m_per_s * filter_dilation_latency;
+	float trans_dilation[6] = { 0,0,0,0,0,0 };
+	for(int i=0; i<scene->num_frustum_clip_planes && i<6; ++i)
+		trans_dilation[i] = myMax(min_trans_dilation_m, myMax(0.f, dot(scene->frustum_clip_planes[i].getNormal(), ema_expected)));
+	const float w_effective = myMax(cam_angular_speed_ema, cam_angular_speed_peak);
+	const float min_rot_rate_rad_s = filter_min_rot_rate_deg_per_s * (3.14159265f / 180.f);
+	const bool rotating = w_effective > min_rot_rate_rad_s; // Camera is actively turning fast enough that dilation is above baseline.
+	const float rotation_dilation_rate = myMax(w_effective, min_rot_rate_rad_s) * filter_dilation_latency;
 
 	while(num_filters_in_flight < max_concurrent_filters)
 	{
@@ -4275,11 +4321,17 @@ void GaussianSplatRenderer::kickOffFilters()
 			if(cloud->cached_ufrontier.isNull() || cloud->filter_in_flight)
 				continue;
 
-			bool want = cloud->ufrontier_needs_filter;
-			if(!want && cloud->have_last_filter_cam_forward)
-				want = dot(cam_forward_ws, cloud->last_filter_cam_forward_ws) < rotation_cos_threshold;
-			else if(!want)
-				want = true; // Never filtered this U(P) yet.
+			// Want a filter when: a fresh U(P) needs its first one; the view rotated past the threshold; the camera is
+			// actively turning (re-filter every frame so the edge stays fresh under the dilation); or the last selection
+			// was dilated above baseline and motion has since calmed (one final tight re-filter - the "settle", so a fast
+			// spin doesn't leave an over-wide selection stuck on screen the way session059 found for the traversal).
+			bool want = cloud->ufrontier_needs_filter || !cloud->have_last_filter_cam_forward;
+			if(!want)
+			{
+				const bool rotated = dot(cam_forward_ws, cloud->last_filter_cam_forward_ws) < rotation_cos_threshold;
+				const bool settle  = cloud->last_filter_dilation_elevated && !rotating;
+				want = rotated || rotating || settle;
+			}
 
 			if(want) { best_cloud = cloud; break; } // First eligible - filters are cheap, no need to rank like traversals.
 		}
@@ -4290,10 +4342,12 @@ void GaussianSplatRenderer::kickOffFilters()
 		best_cloud->ufrontier_needs_filter = false;
 		best_cloud->have_last_filter_cam_forward = true;
 		best_cloud->last_filter_cam_forward_ws = cam_forward_ws;
+		best_cloud->last_filter_dilation_elevated = rotating; // This kick is above baseline iff the camera is turning; drives the settle above.
 		num_filters_in_flight++;
 
 		task_manager->addTask(new GaussianSplatFilterTask(best_cloud->cloud_id, best_cloud->cached_ufrontier,
-			scene->frustum_clip_planes, scene->num_frustum_clip_planes, &filter_result_queue));
+			scene->frustum_clip_planes, scene->num_frustum_clip_planes, cam_pos_ws, rotation_dilation_rate, trans_dilation,
+			&filter_result_queue));
 	}
 }
 

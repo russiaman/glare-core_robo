@@ -107,6 +107,13 @@ public:
 	js::Vector<float, 16> px, py, pz;     // SoA world positions parallel to indices.
 	js::Vector<float, 16> radius;         // Per-node cull_radius (world space), the filter's per-node plane margin.
 
+	// SESSION063 K4: 1.0 for a coarse-floor node, 0.0 for a fine node - parallel to indices. Fine and coarse are merged
+	// into ONE globally distance-sorted list (see the traversal), so the draw is front-to-back across both layers and a
+	// near coarse node correctly occludes a far fine one. The filter reads this per node to dilate coarse nodes wider than
+	// fine (coarse nodes are few/cheap, so a wide edge margin costs little) - which lets the dense fine set stay at a
+	// tight, cheap dilation without leaving holes on motion. See filterUnculledFrontier() / kickOffFilters().
+	js::Vector<float, 16> is_coarse;
+
 	// Key this frontier was built for; drainTraversalResults() checks these before reusing it, so a settings change that
 	// alters the selection can't be answered from a stale U(P).  Orientation is deliberately NOT here - that's the point.
 	uint64 topology_generation;
@@ -672,14 +679,16 @@ public:
 		const float* translation_dilation_, float rotation_dilation_rate_, // SESSION055: per-plane translation dilation (metres) + rotation dilation rate (rad, multiplied by dist-to-node inside cull) - see kickOffTraversals()'s anisotropic dilation block.
 		ThreadSafeQueue<Reference<ThreadMessage> >* result_queue_,
 		js::Vector<FrontierNodeRecord, 16>* frontier_record_ = NULL,
-		bool build_unculled_frontier_ = false) // SESSION063: also emit the SoA U(P) into the result msg, for the split filter path.
+		bool build_unculled_frontier_ = false, // SESSION063: also emit the SoA U(P) into the result msg, for the split filter path.
+		bool coarse_floor_enabled_ = false, float coarse_pixel_scale_ = 20.f) // SESSION063 K4: also capture a coarse floor into U(P) - see GaussianSplatUnculledFrontier::is_coarse.
 	:	cloud_id(cloud_id_), topology_generation(topology_generation_), scratch(scratch_), cam_pos_ws(cam_pos_ws_),
 		pixel_scale_limit(pixel_scale_limit_), max_splats_budget(max_splats_budget_), max_layer_density(max_layer_density_), max_tree_depth(max_tree_depth_), focal_px(focal_px_),
 		num_frustum_clip_planes(num_frustum_clip_planes_), frustum_cull_enabled(frustum_cull_enabled_),
 		rotation_dilation_rate(rotation_dilation_rate_),
 		result_queue(result_queue_),
 		frontier_record(frontier_record_),
-		build_unculled_frontier(build_unculled_frontier_)
+		build_unculled_frontier(build_unculled_frontier_),
+		coarse_floor_enabled(coarse_floor_enabled_), coarse_pixel_scale(coarse_pixel_scale_)
 	{
 		if(num_frustum_clip_planes < 0)
 			num_frustum_clip_planes = 0;
@@ -717,7 +726,12 @@ public:
 		struct DistIdxLess { inline bool operator () (const DistIdx& a, const DistIdx& b) const { return a.dist_sq < b.dist_sq; } }; // Nearest first (matches GaussianSplatSortResultMsg's convention for the front-to-back "under" blend). Used only by the small-N std::sort fallback inside floatKeyAscendingSort.
 		struct DistIdxKey  { inline float operator () (const DistIdx& x) const { return x.dist_sq; } }; // Sort::floatKeyAscendingSort keys on this float; squared distance is non-negative so FloatFlip's positive-branch monotone mapping applies.
 
+		// SESSION063 K4: fine frontier nodes (is_coarse bit 0) and coarse-floor nodes (bit 31 of idx set) go into the SAME
+		// list and are sorted together by distance, so the draw is globally front-to-back across both layers - a near coarse
+		// node correctly occludes a far fine one. The bit is packed into the top of idx (cloud indices are well under 2^31)
+		// so the radix sort, which keys only on dist_sq, carries it for free; it's unpacked when the output is built.
 		js::Vector<DistIdx, 16> decorated;
+		js::Vector<float, 16> coarse_flags; // SESSION063 K4: parallel to output after the sort - 1 per coarse-floor node, 0 per fine node.
 
 		for(size_t mi=0; mi<scratch->members_snapshot.size(); ++mi)
 		{
@@ -791,6 +805,31 @@ public:
 				}
 			}
 
+			// SESSION063 K4: complete coarse-floor cut. A node becomes its branch's single coarse representative if no
+			// ancestor already took the role AND it is either coarse enough (pixel_scale <= coarse_pixel_scale) or terminal
+			// (the branch stops here - converged/leaf/capped). So every branch contributes exactly one coarse node and the
+			// coarse layer covers the scene as fully as the fine set, only coarser. A branch that terminates finer than
+			// coarse_pixel_scale takes its own (coarsest-available) terminal node, duplicating the fine node there - fine:
+			// drawn after the fine set, the duplicate is gated wherever the fine node already covered. The terminal test
+			// mirrors the stop checks below (read-only, no side effects; the real branches still set the hit_*_cap flags).
+			bool captured_here = false;
+			if(coarse_floor_enabled && !top.coarse_captured)
+			{
+				const bool terminal =
+					(top.pixel_scale <= pixel_scale_limit) ||
+					(node.child_count == 0) ||
+					(max_layer_density > 0.f && node.layer_density > max_layer_density) ||
+					(max_tree_depth > 0 && top.depth >= (uint32)max_tree_depth) ||
+					(decorated.size() + stack.size() + node.child_count > max_splats_budget);
+				if(top.pixel_scale <= coarse_pixel_scale || terminal)
+				{
+					DistIdx cd; cd.dist_sq = top.dist_sq; cd.idx = cloud_idx_u32 | 0x80000000u; // Bit 31 marks a coarse-floor node.
+					decorated.push_back(cd);
+					captured_here = true;
+				}
+			}
+			const bool child_coarse_captured = top.coarse_captured || captured_here;
+
 			// Converged - already fine enough, no need to expand further.
 			if(top.pixel_scale <= pixel_scale_limit)
 			{
@@ -845,7 +884,11 @@ public:
 			}
 
 			for(uint32 c = node.child_start; c < (uint32)node.child_start + node.child_count; ++c)
-				stack.push_back(makeHeapItem(top.member_idx, c, m.offset, top.depth + 1, positions, feature_sizes));
+			{
+				HeapItem child = makeHeapItem(top.member_idx, c, m.offset, top.depth + 1, positions, feature_sizes);
+				child.coarse_captured = child_coarse_captured; // SESSION063 K4: propagate the once-per-branch capture flag.
+				stack.push_back(child);
+			}
 		}
 
 		// Sort the selection front-to-back by camera distance. Each node's dist_sq was computed once in makeHeapItem (or
@@ -856,12 +899,18 @@ public:
 		// whole-cloud sort off the main thread's critical path via a fast approximate first pass; a traversal's output is
 		// already budget-bounded, so one exact radix pass here is both simpler and fast enough - see kickOffSorts()'s
 		// cloudHasLodTree() guard, which leaves an LoD-active cloud to this sort instead of the old one.
+		// SESSION063 K4: one global front-to-back sort over fine + coarse nodes together (see the decorated declaration).
 		js::Vector<DistIdx, 16> sort_scratch(decorated.size());
 		Sort::floatKeyAscendingSort(decorated.data(), decorated.size(), DistIdxLess(), DistIdxKey(), sort_scratch.data(), /*put_result_in_working_space=*/false);
 
 		output.resizeNoCopy(decorated.size());
+		coarse_flags.resizeNoCopy(decorated.size());
 		for(size_t i=0; i<decorated.size(); ++i)
-			output[i] = decorated[i].idx;
+		{
+			const uint32 packed = decorated[i].idx;
+			output[i] = packed & 0x7FFFFFFFu;                  // Real cloud index (bit 31 stripped).
+			coarse_flags[i] = (packed >> 31) ? 1.f : 0.f;      // 1 = coarse-floor node, for the filter's per-node dilation.
+		}
 
 		scratch->hit_budget_cap = hit_budget_cap;
 		scratch->hit_density_cap = hit_density_cap;
@@ -886,6 +935,7 @@ public:
 				const size_t n = output.size();
 				uf->indices.resizeNoCopy(n);
 				uf->px.resizeNoCopy(n); uf->py.resizeNoCopy(n); uf->pz.resizeNoCopy(n); uf->radius.resizeNoCopy(n);
+				uf->is_coarse.resizeNoCopy(n);
 				for(size_t i=0; i<n; ++i)
 				{
 					const uint32 idx = output[i];
@@ -893,6 +943,7 @@ public:
 					uf->indices[i] = idx;
 					uf->px[i] = p.x; uf->py[i] = p.y; uf->pz[i] = p.z;
 					uf->radius[i] = cull_radii[idx];
+					uf->is_coarse[i] = coarse_flags[i];
 				}
 				uf->topology_generation = topology_generation;
 				uf->anchor_pos_ws = cam_pos_ws;
@@ -933,6 +984,7 @@ private:
 		uint32 member_idx;
 		uint32 tree_local_idx;
 		uint32 depth; // 0 for a tree root, parent's depth + 1 for each expansion - see max_tree_depth's use in run().
+		bool coarse_captured; // SESSION063 K4: true once some ancestor on this branch was recorded into the coarse floor, so it's captured once per branch (the first node fine enough at the coarse pixel_scale). Set false at the root by makeHeapItem, propagated to children in run().
 	};
 
 	HeapItem makeHeapItem(uint32 member_idx, uint32 tree_local_idx, size_t member_offset, uint32 depth, const js::Vector<Vec3f, 16>& positions, const js::Vector<float, 16>& feature_sizes) const
@@ -948,6 +1000,7 @@ private:
 		item.member_idx = member_idx;
 		item.tree_local_idx = tree_local_idx;
 		item.depth = depth;
+		item.coarse_captured = false; // SESSION063 K4: set by the caller for children; false at the root.
 		return item;
 	}
 
@@ -968,6 +1021,8 @@ private:
 	ThreadSafeQueue<Reference<ThreadMessage> >* result_queue;
 	js::Vector<FrontierNodeRecord, 16>* frontier_record; // Null (the normal case) means don't record anything - see recordFrontierNode().
 	bool build_unculled_frontier; // SESSION063: gather the SoA U(P) at the end of run() and hand it back on the result msg.
+	bool coarse_floor_enabled;    // SESSION063 K4: also capture the coarse floor.
+	float coarse_pixel_scale;     // SESSION063 K4: pixel_scale threshold for the coarse floor cut (>> pixel_scale_limit).
 };
 
 
@@ -978,7 +1033,8 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 :	opengl_engine(&opengl_engine_), next_handle(1), next_cloud_id(1), num_sorts_in_flight(0),
 	num_traversals_in_flight(0), num_filters_in_flight(0), lod_pixel_scale_limit(1.0f), lod_max_splats_budget(10000000), lod_resort_move_threshold_ws(0.1f),
 	lod_max_layer_density(0.0f), lod_max_tree_depth(0), lod_frustum_cull_enabled(true), split_filter_enabled(false),
-	filter_dilation_latency(0.6f), filter_min_rot_rate_deg_per_s(45.f), filter_min_trans_rate_m_per_s(2.0f), // SESSION063 K3
+	filter_dilation_latency(0.06f), filter_min_rot_rate_deg_per_s(45.f), filter_min_trans_rate_m_per_s(2.0f), // SESSION063 K3 (K4 defaults: coarse floor covers the edge, so the fine dilation can be tight/cheap)
+	split_coarse_floor_enabled(true), split_coarse_pixel_scale(30.f), filter_coarse_dilation_latency(0.9f), coarse_layer_debug(false), // SESSION063 K4
 	have_prev_think_cam_state(false), prev_think_cam_pos_ws(0.f), prev_think_cam_forward_ws(0.f), cam_velocity_ema_ws(0.f), cam_angular_speed_ema(0.f), cam_angular_speed_peak(0.f),
 	splat_size_clamp_min(0.0f), splat_size_clamp_max(0.0f), splat_size_clamp_invert(false),
 	splat_dist_clamp_min(0.0f), splat_dist_clamp_max(1000.0f), splat_dist_clamp_invert(false), splat_alpha_cutoff(1.0f / 255.0f),
@@ -1339,42 +1395,46 @@ static inline bool pointInFrustum(const Planef* frustum_clip_planes, int num_fru
 
 
 // SESSION063: the per-orientation frustum filter of the split architecture (session062 §9.3). Streams the SoA unculled
-// frontier U(P), keeps each node whose centre is inside every plane once that plane is pushed out by three margins,
-// exactly mirroring the base_margin+translation+rotation dilation the old cull-traversal used (see the cull block in
-// GaussianSplatLodTraversalTask::run()), just computed for the filter's own (much shorter) latency in kickOffFilters():
+// frontier U(P) - one globally distance-sorted list of fine + coarse nodes (K4) - and keeps each node whose centre is
+// inside every plane once that plane is pushed out by three margins, mirroring the base_margin+translation+rotation
+// dilation the old cull-traversal used (see the cull block in GaussianSplatLodTraversalTask::run()), computed for the
+// filter's own (much shorter) latency in kickOffFilters():
 //   - radius            : the node's own cull_radius (its 3-sigma footprint), always applied.
-//   - trans_dilation[i] : per-plane world-space margin (metres) for camera translation during the filter latency window,
-//                         folded into each plane's d before the loop.
-//   - rate * dist       : rotational margin - a node at range r shifts r*theta tangentially when the camera rotates by
-//                         theta, so the plane is pushed out proportionally to the node's distance from the camera. K3
-//                         (session063): reintroduced so a rotation no longer trails a bare, undilated frustum edge - the
-//                         edge lag the split path had before this. dist needs one sqrt per 4 nodes.
-// Writes survivor indices in input order (a subsequence of a distance-sorted list stays sorted, so no re-sort). 4 points
-// at a time with SSE - the codebase's native width. Returns the survivor count. Cheap enough to run per-orientation
-// instead of a fresh ~450ms traversal, which is the whole point of the split.
+//   - trans_dilation[i] : per-plane world-space margin (metres) for camera translation during the latency window.
+//   - rate * dist       : rotational margin - a node at range r shifts r*theta tangentially when the camera turns by
+//                         theta, so the plane is pushed out proportional to the node's distance from the camera.
+// SESSION063 K4: the rate is chosen PER NODE from uf.is_coarse - coarse-floor nodes get rate_coarse (wider) so their big
+// cheap splats catch motion-revealed edges, while the dense fine set stays at the tight, cheap rate_fine. Because fine and
+// coarse are one globally sorted list, survivors come out globally front-to-back (a near coarse node correctly occludes a
+// far fine one - the fix for the green bleed of the old draw-coarse-last approach). coarse_only_debug keeps only coarse
+// nodes, for the isolation view. Writes survivor indices in input order (no re-sort); shrinks out_indices to the count.
 static size_t filterUnculledFrontier(const GaussianSplatUnculledFrontier& uf, const Planef* planes, int num_planes,
-	const Vec4f& cam_pos_ws, float rotation_dilation_rate, const float* trans_dilation, js::Vector<uint32, 16>& out_indices)
+	const Vec4f& cam_pos_ws, float rate_fine, float rate_coarse, const float* trans_dilation, bool coarse_only_debug,
+	js::Vector<uint32, 16>& out_indices)
 {
 	const size_t n = uf.indices.size();
 	out_indices.resizeNoCopy(n); // Worst case every node survives.
 	const int npl = myMin(num_planes, 6);
 
-	__m128 pl_nx[6], pl_ny[6], pl_nz[6], pl_d[6];
+	__m128 pl_nx[6], pl_ny[6], pl_nz[6], pl_d[6], pl_d_raw[6];
 	for(int pl=0; pl<npl; ++pl)
 	{
 		const Vec4f& nrm = planes[pl].getNormal();
 		pl_nx[pl] = _mm_set1_ps(nrm.x[0]); pl_ny[pl] = _mm_set1_ps(nrm.x[1]); pl_nz[pl] = _mm_set1_ps(nrm.x[2]);
-		pl_d[pl]  = _mm_set1_ps(planes[pl].getD() + (trans_dilation ? trans_dilation[pl] : 0.f)); // Translation dilation folds into d.
+		pl_d[pl]     = _mm_set1_ps(planes[pl].getD() + (trans_dilation ? trans_dilation[pl] : 0.f)); // Dilated plane (translation dilation folds into d).
+		pl_d_raw[pl] = _mm_set1_ps(planes[pl].getD()); // SESSION063 K4: the tight (undilated) plane, for confining the coarse floor to the dilation band - see below.
 	}
 	const __m128 cam_x = _mm_set1_ps(cam_pos_ws.x[0]);
 	const __m128 cam_y = _mm_set1_ps(cam_pos_ws.x[1]);
 	const __m128 cam_z = _mm_set1_ps(cam_pos_ws.x[2]);
-	const __m128 rate  = _mm_set1_ps(rotation_dilation_rate);
+	const __m128 rate_fine_v = _mm_set1_ps(rate_fine);
+	const __m128 rate_diff_v = _mm_set1_ps(rate_coarse - rate_fine); // rate = rate_fine + is_coarse * (rate_coarse - rate_fine).
 
 	const float* const px = uf.px.data();
 	const float* const py = uf.py.data();
 	const float* const pz = uf.pz.data();
 	const float* const rad = uf.radius.data();
+	const float* const isc = uf.is_coarse.data();
 	const uint32* const idx = uf.indices.data();
 	uint32* const out = out_indices.data();
 	size_t num_out = 0;
@@ -1386,20 +1446,28 @@ static size_t filterUnculledFrontier(const GaussianSplatUnculledFrontier& uf, co
 		const __m128 Y = _mm_loadu_ps(py + i);
 		const __m128 Z = _mm_loadu_ps(pz + i);
 		const __m128 R = _mm_loadu_ps(rad + i);
-		// Per-node margin common to every plane: radius + rate*dist_to_camera (rotation dilation).
+		const __m128 IC = _mm_loadu_ps(isc + i); // 1.0 for coarse nodes, 0.0 for fine.
+		const __m128 rate = _mm_add_ps(rate_fine_v, _mm_mul_ps(IC, rate_diff_v)); // Per-node dilation rate.
 		const __m128 dx = _mm_sub_ps(X, cam_x), dy = _mm_sub_ps(Y, cam_y), dz = _mm_sub_ps(Z, cam_z);
 		const __m128 dist = _mm_sqrt_ps(_mm_add_ps(_mm_add_ps(_mm_mul_ps(dx, dx), _mm_mul_ps(dy, dy)), _mm_mul_ps(dz, dz)));
 		const __m128 sub = _mm_add_ps(R, _mm_mul_ps(rate, dist));
-		__m128 outside = _mm_setzero_ps();
+		__m128 outside = _mm_setzero_ps();      // Outside the DILATED frustum (the keep test).
+		__m128 outside_tight = _mm_setzero_ps(); // Outside the TIGHT (undilated, radius-only) frustum - for the coarse band test.
 		for(int pl=0; pl<npl; ++pl)
 		{
-			// outside if dot(n,p) - (radius + rate*dist) >= d + trans_dilation[pl].
 			const __m128 dotv = _mm_add_ps(_mm_add_ps(_mm_mul_ps(X, pl_nx[pl]), _mm_mul_ps(Y, pl_ny[pl])), _mm_mul_ps(Z, pl_nz[pl]));
-			outside = _mm_or_ps(outside, _mm_cmpge_ps(_mm_sub_ps(dotv, sub), pl_d[pl]));
+			outside       = _mm_or_ps(outside,       _mm_cmpge_ps(_mm_sub_ps(dotv, sub), pl_d[pl]));     // dot - (radius + rate*dist) >= d + trans.
+			outside_tight = _mm_or_ps(outside_tight, _mm_cmpge_ps(_mm_sub_ps(dotv, R),   pl_d_raw[pl])); // dot - radius >= d.
 		}
-		const int m = _mm_movemask_ps(outside) & 0xF; // bit j set = point i+j is outside.
-		// Scalar compaction of the 4-lane result: rare enough (survivors run in contiguous spans) that a branchless
-		// scatter isn't worth the complexity here.
+		if(coarse_only_debug)
+			outside = _mm_or_ps(outside, _mm_cmpeq_ps(IC, _mm_setzero_ps())); // Debug: keep only coarse nodes (show full coarse coverage, band restriction off).
+		else
+			// SESSION063 K4: confine the coarse floor to the dilation band. A coarse node INSIDE the tight frustum is
+			// rejected - there the fine set already covers, and letting the coarse layer draw over the whole visible frame
+			// slightly changed the image everywhere fine wasn't fully saturated. Coarse now survives only in the margin
+			// beyond the tight frustum (off-screen until motion reveals it), which is where it's actually needed.
+			outside = _mm_or_ps(outside, _mm_and_ps(_mm_cmpgt_ps(IC, _mm_setzero_ps()), _mm_cmpeq_ps(outside_tight, _mm_setzero_ps())));
+		const int m = _mm_movemask_ps(outside) & 0xF; // bit j set = point i+j is outside/rejected.
 		if((m & 1) == 0) out[num_out++] = idx[i+0];
 		if((m & 2) == 0) out[num_out++] = idx[i+1];
 		if((m & 4) == 0) out[num_out++] = idx[i+2];
@@ -1407,18 +1475,26 @@ static size_t filterUnculledFrontier(const GaussianSplatUnculledFrontier& uf, co
 	}
 	for(size_t i=n4; i<n; ++i) // Tail (n not a multiple of 4).
 	{
+		const bool is_coarse = isc[i] != 0.f;
+		if(coarse_only_debug && !is_coarse) continue;
+		const float rate = rate_fine + isc[i] * (rate_coarse - rate_fine);
 		const float ddx = px[i]-cam_pos_ws.x[0], ddy = py[i]-cam_pos_ws.x[1], ddz = pz[i]-cam_pos_ws.x[2];
-		const float sub = rad[i] + rotation_dilation_rate * std::sqrt(ddx*ddx + ddy*ddy + ddz*ddz);
-		bool inside = true;
+		const float sub = rad[i] + rate * std::sqrt(ddx*ddx + ddy*ddy + ddz*ddz);
+		bool inside = true, inside_tight = true;
 		for(int pl=0; pl<npl; ++pl)
 		{
 			const Vec4f& nrm = planes[pl].getNormal();
+			const float dpn = nrm.x[0]*px[i] + nrm.x[1]*py[i] + nrm.x[2]*pz[i];
 			const float d_dil = planes[pl].getD() + (trans_dilation ? trans_dilation[pl] : 0.f);
-			if((nrm.x[0]*px[i] + nrm.x[1]*py[i] + nrm.x[2]*pz[i]) - sub >= d_dil) { inside = false; break; }
+			if(dpn - sub    >= d_dil)              inside = false;
+			if(dpn - rad[i] >= planes[pl].getD())  inside_tight = false;
+			if(!inside) break;
 		}
-		if(inside) out[num_out++] = idx[i];
+		if(!inside) continue;
+		if(!coarse_only_debug && is_coarse && inside_tight) continue; // Band restriction: coarse only survives beyond the tight frustum.
+		out[num_out++] = idx[i];
 	}
-	out_indices.resize(num_out); // Shrink to the survivor count (keeps the written prefix, no realloc) so .size() is authoritative for callers that read it rather than the return value - see drainFilterResults().
+	out_indices.resize(num_out); // Shrink to survivor count (keeps prefix, no realloc) so .size() is authoritative.
 	return num_out;
 }
 
@@ -1430,7 +1506,7 @@ class GaussianSplatFilterResultMsg : public ThreadMessage
 public:
 	uint64 cloud_id;
 	Reference<GaussianSplatUnculledFrontier> frontier; // The U(P) this result was filtered from - staleness check on drain.
-	js::Vector<uint32, 16> survivors; // The draw list S(P,R), front-to-back.
+	js::Vector<uint32, 16> survivors; // The draw list S(P,R), globally front-to-back (fine + coarse interleaved by depth).
 };
 
 
@@ -1442,10 +1518,10 @@ class GaussianSplatFilterTask : public glare::Task
 {
 public:
 	GaussianSplatFilterTask(uint64 cloud_id_, const Reference<GaussianSplatUnculledFrontier>& frontier_,
-		const Planef* planes_, int num_planes_, const Vec4f& cam_pos_ws_, float rotation_dilation_rate_, const float* trans_dilation_,
-		ThreadSafeQueue<Reference<ThreadMessage> >* result_queue_)
+		const Planef* planes_, int num_planes_, const Vec4f& cam_pos_ws_, float rate_fine_, float rate_coarse_, const float* trans_dilation_,
+		bool coarse_only_debug_, ThreadSafeQueue<Reference<ThreadMessage> >* result_queue_)
 	:	cloud_id(cloud_id_), frontier(frontier_), num_planes(num_planes_), cam_pos_ws(cam_pos_ws_),
-		rotation_dilation_rate(rotation_dilation_rate_), result_queue(result_queue_)
+		rate_fine(rate_fine_), rate_coarse(rate_coarse_), coarse_only_debug(coarse_only_debug_), result_queue(result_queue_)
 	{
 		if(num_planes < 0) num_planes = 0;
 		if(num_planes > (int)staticArrayNumElems(planes)) num_planes = (int)staticArrayNumElems(planes);
@@ -1460,7 +1536,7 @@ public:
 		Reference<GaussianSplatFilterResultMsg> msg = new GaussianSplatFilterResultMsg();
 		msg->cloud_id = cloud_id;
 		msg->frontier = frontier;
-		filterUnculledFrontier(*frontier, planes, num_planes, cam_pos_ws, rotation_dilation_rate, trans_dilation, msg->survivors);
+		filterUnculledFrontier(*frontier, planes, num_planes, cam_pos_ws, rate_fine, rate_coarse, trans_dilation, coarse_only_debug, msg->survivors);
 		result_queue->enqueue(msg);
 	}
 
@@ -1470,7 +1546,8 @@ private:
 	Planef planes[6];
 	int num_planes;
 	Vec4f cam_pos_ws;               // SESSION063 K3: for the per-node rotation dilation (rate * dist-to-camera).
-	float rotation_dilation_rate;   // rad; multiplied by dist-to-node in the filter.
+	float rate_fine, rate_coarse;   // SESSION063 K4: rotation dilation rates for fine nodes and (wider) coarse nodes.
+	bool coarse_only_debug;         // SESSION063 K4: keep only coarse nodes (isolation view).
 	float trans_dilation[6];        // per-plane translation margin (metres).
 	ThreadSafeQueue<Reference<ThreadMessage> >* result_queue;
 };
@@ -4310,7 +4387,9 @@ void GaussianSplatRenderer::kickOffFilters()
 	const float w_effective = myMax(cam_angular_speed_ema, cam_angular_speed_peak);
 	const float min_rot_rate_rad_s = filter_min_rot_rate_deg_per_s * (3.14159265f / 180.f);
 	const bool rotating = w_effective > min_rot_rate_rad_s; // Camera is actively turning fast enough that dilation is above baseline.
-	const float rotation_dilation_rate = myMax(w_effective, min_rot_rate_rad_s) * filter_dilation_latency;
+	const float w_floored = myMax(w_effective, min_rot_rate_rad_s);
+	const float rate_fine   = w_floored * filter_dilation_latency;        // SESSION063 K4: tight dilation for the dense fine set.
+	const float rate_coarse = w_floored * filter_coarse_dilation_latency; // wider dilation for the cheap coarse floor (see filterUnculledFrontier).
 
 	while(num_filters_in_flight < max_concurrent_filters)
 	{
@@ -4346,8 +4425,8 @@ void GaussianSplatRenderer::kickOffFilters()
 		num_filters_in_flight++;
 
 		task_manager->addTask(new GaussianSplatFilterTask(best_cloud->cloud_id, best_cloud->cached_ufrontier,
-			scene->frustum_clip_planes, scene->num_frustum_clip_planes, cam_pos_ws, rotation_dilation_rate, trans_dilation,
-			&filter_result_queue));
+			scene->frustum_clip_planes, scene->num_frustum_clip_planes, cam_pos_ws, rate_fine, rate_coarse, trans_dilation,
+			coarse_layer_debug, &filter_result_queue));
 	}
 }
 
@@ -4383,6 +4462,8 @@ void GaussianSplatRenderer::drainFilterResults()
 		if(msg->frontier.ptr() != cloud->cached_ufrontier.ptr())
 			continue;
 
+		// SESSION063 K4: survivors is the globally sorted draw list (fine + coarse interleaved by depth, or coarse-only in
+		// the debug view - the filter already applied that). Upload as-is.
 		const js::Vector<uint32, 16>& survivors = msg->survivors;
 		cloud->instance_index_vbo->updateData(0, survivors.data(), survivors.size() * sizeof(uint32));
 		cloud->ob->num_instances_to_draw = (int)survivors.size();
@@ -4632,7 +4713,8 @@ void GaussianSplatRenderer::kickOffTraversals()
 			scene->frustum_clip_planes, scene->num_frustum_clip_planes, cull_active,
 			translation_dilation, rotation_dilation_rate,
 			&traversal_result_queue,
-			/*frontier_record=*/NULL, /*build_unculled_frontier=*/split_filter_enabled)); // SESSION063: cull-off traversal builds U(P) for the split filter.
+			/*frontier_record=*/NULL, /*build_unculled_frontier=*/split_filter_enabled, // SESSION063: cull-off traversal builds U(P) for the split filter.
+			/*coarse_floor_enabled=*/split_filter_enabled && split_coarse_floor_enabled, /*coarse_pixel_scale=*/split_coarse_pixel_scale)); // SESSION063 K4.
 	}
 
 	// SESSION055 diag: after the while-loop, detect *unmet* rotation demand - a cloud whose forward has shifted past the

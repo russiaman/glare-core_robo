@@ -289,6 +289,22 @@ public:
 	float getFilterMinTransRateMPerS() const { return filter_min_trans_rate_m_per_s; }
 	void setFilterMinTransRateMPerS(float v) { filter_min_trans_rate_m_per_s = v; }
 
+	// SESSION063 K4: coarse floor. The traversal also captures a low-detail cut (first node per branch at
+	// coarse_pixel_scale), drawn after the fine set; the filter dilates this cut with its own (wider) latency so cheap big
+	// splats plug motion-revealed edges/holes without the fine set paying for a wide dilation. See GaussianSplatUnculledFrontier.
+	bool getCoarseFloorEnabled() const { return split_coarse_floor_enabled; }
+	void setCoarseFloorEnabled(bool v) { split_coarse_floor_enabled = v; }
+	float getCoarsePixelScale() const { return split_coarse_pixel_scale; }
+	void setCoarsePixelScale(float v) { split_coarse_pixel_scale = v; }
+	float getFilterCoarseDilationLatency() const { return filter_coarse_dilation_latency; }
+	void setFilterCoarseDilationLatency(float v) { filter_coarse_dilation_latency = v; }
+
+	// SESSION063 K4 debug: draw ONLY the coarse floor (skip the fine set), so its screen coverage can be inspected in
+	// isolation - see drainFilterResults(). Off = normal (fine + coarse).
+	bool getCoarseLayerDebug() const { return coarse_layer_debug; }
+	void setCoarseLayerDebug(bool v) { coarse_layer_debug = v; }
+
+
 	// Diagnostic tool, not a LoD parameter: culls any splat whose feature_size (2 * max scale axis, matching
 	// GaussianSplatLodNode::feature_size) falls outside [min, max], directly in the vertex shader, regardless of
 	// whether the cloud has a LoD tree. Used to locate abnormally large/degenerate splats (e.g. under-reconstructed
@@ -1013,6 +1029,12 @@ private:
 	float filter_dilation_latency;      // s
 	float filter_min_rot_rate_deg_per_s;
 	float filter_min_trans_rate_m_per_s;
+
+	// SESSION063 K4: coarse floor knobs - see the getters above.
+	bool split_coarse_floor_enabled;
+	float split_coarse_pixel_scale;         // pixel_scale threshold for the coarse cut (>> pixel_scale_limit).
+	float filter_coarse_dilation_latency;   // s - the coarse tail's (wider) dilation window.
+	bool coarse_layer_debug;                // Draw only the coarse floor - see getCoarseLayerDebug().
 
 	// SESSION055: camera-motion tracker for anisotropic frustum-cull dilation. think() diffs the current cam pose against
 	// the previous one to compute an instantaneous velocity and angular speed, feeds them through an EMA with a

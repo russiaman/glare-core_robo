@@ -153,6 +153,45 @@ GaussianSplatLodNode makeGaussianSplatLodLeafNode(const Vec3f& centre_os, const 
 }
 
 
+// SESSION063: merged colour + opacity for a set of children. colour is the weight-averaged child RGB (weight = opacity *
+// volume); A is Kerbl et al.'s amplitude total_weight / area_parent. Two corrections vs the plain amplitude, both aimed at
+// merged nodes going dark as the LoD coarsens (e.g. a white stone bridge):
+//   1. When A_raw > 1 the clamp to 1 discards amplitude; multiply the excess into the colour instead, so the premultiplied
+//      contribution A*colour is preserved up to the colour clamp (the deferred Spark A>1 fix).
+//   2. Clamp the colour to [0,1] HERE, not only at render: a child colour from an SH DC term can undershoot below 0, and
+//      stored unclamped it propagates that darkness up through every merge above it. Clamping to the displayable range -
+//      exactly what the render does anyway - stops that propagation. This was the dominant fix in practice (session063).
+static Vec4f computeMergedColourAlpha(const GaussianSplatLodNode* children, size_t num_children, float area_parent)
+{
+	float total_weight = 0.f;
+	for(size_t i=0; i<num_children; ++i)
+	{
+		const Vec3f& s = children[i].scale;
+		total_weight += children[i].colour.x[3] * (s.x * s.y * s.z);
+	}
+	const bool degenerate = total_weight <= 1.0e-12f;
+	const float inv_w = 1.f / (degenerate ? (float)num_children : total_weight);
+
+	Vec4f colour_rgb(0.f, 0.f, 0.f, 0.f);
+	for(size_t i=0; i<num_children; ++i)
+	{
+		const Vec3f& s = children[i].scale;
+		const float w = degenerate ? 1.f : (children[i].colour.x[3] * (s.x * s.y * s.z));
+		colour_rgb += children[i].colour * w;
+	}
+	colour_rgb = colour_rgb * inv_w;
+
+	const float A_raw = total_weight / myMax(area_parent, 1.0e-12f);
+	const float A = myClamp(A_raw, 0.f, 1.f);
+	float r = colour_rgb.x[0], g = colour_rgb.x[1], b = colour_rgb.x[2];
+	if(A_raw > 1.f) // Correction 1: keep the amplitude the clamp would discard by folding it into the colour.
+	{
+		r *= A_raw; g *= A_raw; b *= A_raw;
+	}
+	return Vec4f(myClamp(r, 0.f, 1.f), myClamp(g, 0.f, 1.f), myClamp(b, 0.f, 1.f), A); // Correction 2: clamp colour to the displayable range.
+}
+
+
 GaussianSplatLodNode mergeGaussianSplatLodNodes(const GaussianSplatLodNode* children, size_t num_children)
 {
 	assert(num_children >= 1);
@@ -178,17 +217,6 @@ GaussianSplatLodNode mergeGaussianSplatLodNodes(const GaussianSplatLodNode* chil
 	}
 	centre = centre * inv_w;
 
-	// Weighted colour - rgb only. Opacity is NOT part of this average; it's derived separately below from how much total weight ends up packed into the parent's own (now-decomposed) footprint, not from averaging
-	// the children's opacities directly - see the comment further down.
-	Vec4f colour_rgb(0.f, 0.f, 0.f, 0.f);
-	for(size_t i = 0; i < num_children; ++i)
-	{
-		const Vec3f& s = children[i].scale;
-		const float w = degenerate ? 1.f : (children[i].colour.x[3] * (s.x * s.y * s.z));
-		colour_rgb += children[i].colour * w;
-	}
-	colour_rgb = colour_rgb * inv_w;
-
 	// Weighted covariance merge (moment matching / mixture-of-Gaussians collapse, as in Kerbl et al.): each child's own covariance PLUS the spread of its centre from the merged centre. The spread term is what
 	// makes e.g. two small, separated splats merge into one bigger, elongated blob spanning both of them, rather than one implausibly small blob sitting between them.
 	Matrix4f cov_sum;
@@ -211,12 +239,12 @@ GaussianSplatLodNode mergeGaussianSplatLodNodes(const GaussianSplatLodNode* chil
 	parent.centre_os = centre;
 	decomposeCovarianceToScaleRotation(cov_sum, parent.scale, parent.rotation);
 
-	// Opacity: A = total_weight / area_parent (Kerbl et al.'s amplitude), clamped to 1 rather than Spark's extended-D shifted-profile fix for A > 1 - see the header comment for why that's deferred.
-	// Using total_weight here (not the degenerate-case uniform per-child weight) matters: a group of near-fully-transparent children should merge into something with ~0 opacity, not jump to full opacity just
-	// because the degenerate fallback above used equal weights for the centre/colour/covariance averages.
+	// Colour + opacity: weight-averaged RGB, and Kerbl et al.'s amplitude A = total_weight / area_parent. Computed by the
+	// shared helper so recolorLodTree() can redo exactly this in place for the energy-preserving A/B toggle. The build path
+	// uses the plain (clamped) amplitude; the toggle's brighter variant is applied post-build by recolorLodTree(). See
+	// computeMergedColourAlpha() for the Spark A>1 note that used to live here.
 	const float area_parent = myMax(parent.scale.x * parent.scale.y * parent.scale.z, 1.0e-12f);
-	const float A = total_weight / area_parent;
-	parent.colour = Vec4f(colour_rgb.x[0], colour_rgb.x[1], colour_rgb.x[2], myClamp(A, 0.f, 1.f));
+	parent.colour = computeMergedColourAlpha(children, num_children, area_parent);
 
 	parent.feature_size = 2.f * myMax(parent.scale.x, myMax(parent.scale.y, parent.scale.z));
 

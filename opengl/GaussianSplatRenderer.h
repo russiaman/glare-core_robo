@@ -269,6 +269,14 @@ public:
 	bool getFrustumCullEnabled() const { return lod_frustum_cull_enabled; }
 	void setFrustumCullEnabled(bool v) { lod_frustum_cull_enabled = v; }
 
+	// SESSION063: split filter architecture (session062 §9.3). When on, the traversal runs cull-off and builds the
+	// orientation-independent unculled frontier U(P); a cheap per-orientation SSE frustum filter derives the actual draw
+	// list S(P,R) from it, so a pure rotation no longer needs a fresh ~450ms traversal. Mutually exclusive in effect with
+	// the in-traversal frustum cull above (kickOffTraversals() forces cull_active false when this is on). Live switch for
+	// A/B against the cull path. See GaussianSplatUnculledFrontier / filterUnculledFrontier() / drainTraversalResults().
+	bool getSplitFilterEnabled() const { return split_filter_enabled; }
+	void setSplitFilterEnabled(bool v) { split_filter_enabled = v; }
+
 	// Diagnostic tool, not a LoD parameter: culls any splat whose feature_size (2 * max scale axis, matching
 	// GaussianSplatLodNode::feature_size) falls outside [min, max], directly in the vertex shader, regardless of
 	// whether the cloud has a LoD tree. Used to locate abnormally large/degenerate splats (e.g. under-reconstructed
@@ -922,6 +930,8 @@ private:
 	void writePlaceholderSelection(SplatCloud& cloud); // Synchronous stand-in frontier (root-only per member with a tree, everything for a member without one), written after any structural change, until the next background traversal's result supersedes it.
 	void drainTraversalResults();
 	void kickOffTraversals();
+	void kickOffFilters();      // SESSION063: split architecture - see the .cpp.
+	void drainFilterResults();  // SESSION063
 
 	void noteDrawOrderForSlicing(SplatCloud& cloud, const uint32* draw_indices, size_t count); // Refreshes the sample of a cloud's draw order the frustum-aware slicing works from - see getVisibleSlicingEnabled().  Called from every place that writes the instance index VBO.
 	void buildVisibleSliceCDFs(); // Per-frame, from think(): re-tests each cloud's sample against the current frustum.  The one part of the draw order that depends on where the camera is looking rather than where it is.
@@ -957,6 +967,13 @@ private:
 	ThreadSafeQueue<Reference<ThreadMessage> > traversal_result_queue;
 	js::Vector<Reference<ThreadMessage>, 16> completed_traversal_msgs;
 
+	// SESSION063: per-orientation filter pipeline of the split architecture - independent of the traversal pipeline above.
+	// A filter is stateless apart from its input U(P) (held by the task via Reference), so no scratch pool is needed.
+	int num_filters_in_flight;
+	static const int max_concurrent_filters = 2; // A filter is ~13ms; a couple in flight covers multi-cloud scenes without oversubscribing the worker pool.
+	ThreadSafeQueue<Reference<ThreadMessage> > filter_result_queue;
+	js::Vector<Reference<ThreadMessage>, 16> completed_filter_msgs;
+
 	// Live-tunable via GaussianSplatSettingsWidget (Qt only); hardcoded defaults if that panel's saved settings are never
 	// applied (e.g. no UI). pixel_scale_limit is roughly "stop refining once a node projects to about this many pixels";
 	// max_splats_budget is a per-cloud cap on how many nodes one traversal may select, matched to what the old
@@ -976,6 +993,9 @@ private:
 
 	// See getFrustumCullEnabled() above. On by default from session055.
 	bool lod_frustum_cull_enabled;
+
+	// SESSION063: see getSplitFilterEnabled() above. Off by default - the split path is opt-in for A/B while it's built out.
+	bool split_filter_enabled;
 
 	// SESSION055: camera-motion tracker for anisotropic frustum-cull dilation. think() diffs the current cam pose against
 	// the previous one to compute an instantaneous velocity and angular speed, feeds them through an EMA with a

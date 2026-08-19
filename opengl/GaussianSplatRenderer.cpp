@@ -89,6 +89,36 @@ public:
 };
 
 
+// SESSION063: the orientation-independent unculled LoD frontier U(P), cached so a pure rotation can derive its draw list
+// with a cheap per-orientation frustum filter instead of a fresh ~450ms traversal (session062 §9.3 - the split follows
+// from S(P,R) = stable_frustum_filter(U(P), R), the traversal's split/keep decision and sort key depending only on
+// camera position P, orientation R only on the frustum test). Built by GaussianSplatLodTraversalTask with
+// frustum_cull_enabled = false, so `indices` is the full unculled frontier in front-to-back order; px/py/pz are the
+// parallel SoA world positions and `radius` the per-node cull_radius, both gathered on the worker (the scattered read
+// into the cloud's 30M-entry arrays costs ~50ms - measured session063 - and must stay off the main thread). The filter
+// tests each node's centre against the current frustum with its own radius as the only margin (mr.S point 5: an already
+// finally-selected node needs only its own 3-sigma footprint, not its whole subtree's bounding sphere), and a
+// subsequence of a distance-sorted list stays sorted, so no re-sort is needed. Immutable once built; validity is keyed
+// by the fields below (see drainTraversalResults()/GaussianSplatFilterTask).
+class GaussianSplatUnculledFrontier : public ThreadSafeRefCounted
+{
+public:
+	js::Vector<uint32, 16> indices;       // Frontier as cloud-array indices, front-to-back (nearest first).
+	js::Vector<float, 16> px, py, pz;     // SoA world positions parallel to indices.
+	js::Vector<float, 16> radius;         // Per-node cull_radius (world space), the filter's per-node plane margin.
+
+	// Key this frontier was built for; drainTraversalResults() checks these before reusing it, so a settings change that
+	// alters the selection can't be answered from a stale U(P).  Orientation is deliberately NOT here - that's the point.
+	uint64 topology_generation;
+	Vec4f anchor_pos_ws;
+	float pixel_scale_limit;
+	size_t max_splats_budget;
+	float max_layer_density;
+	int max_tree_depth;
+	float focal_px;
+};
+
+
 // One registered splat object, and the range of its owning cloud's arrays that it occupies.
 struct CloudMember
 {
@@ -130,7 +160,8 @@ public:
 		have_last_sort_cam_pos(false), last_sort_cam_pos_ws(0.f), aabb_ws(js::AABBox::emptyAABBox()), added_to_engine(false),
 		topology_generation(0), traversal_in_flight(false), have_last_traversal_cam_pos(false), last_traversal_cam_pos_ws(0.f), last_traversal_cam_forward_ws(0.f), last_traversal_kick_time_s(0.0),
 		last_traversal_kicked_topology_generation(0), last_traversal_hit_budget_cap(false), last_traversal_hit_density_cap(false), last_traversal_hit_depth_cap(false), last_traversal_dilation_elevated(false),
-		cached_traversal_geom_generation(0), importance_num_views(0)
+		cached_traversal_geom_generation(0), importance_num_views(0),
+		filter_in_flight(false), ufrontier_needs_filter(false), have_last_filter_cam_forward(false), last_filter_cam_forward_ws(0.f) // SESSION063
 	{}
 
 	uint64 cloud_id; // Stable, never reused.  Sort results carry it, so a result for a cloud that has since been merged away can be dropped.
@@ -179,6 +210,15 @@ public:
 	bool last_traversal_hit_budget_cap; // Copied from the most recently applied traversal result's GaussianSplatLodTraversalScratch::hit_budget_cap (which itself doesn't persist - the scratch goes back to the pool) - surfaced in getDiagnostics() as a "detail is being truncated by the budget" warning.
 	bool last_traversal_hit_density_cap; // As above, for GaussianSplatLodTraversalScratch::hit_density_cap.
 	bool last_traversal_hit_depth_cap; // As above, for GaussianSplatLodTraversalScratch::hit_depth_cap.
+
+	// SESSION063: the cached unculled frontier U(P) for the split filter architecture, when split_filter_enabled. Set by
+	// drainTraversalResults() from a cull-off traversal; a rotation re-filters this instead of re-traversing. Null until
+	// the first split-mode traversal for this cloud lands. See GaussianSplatUnculledFrontier.
+	Reference<GaussianSplatUnculledFrontier> cached_ufrontier;
+	bool filter_in_flight;                 // True from a filter kick until its result is applied/dropped - see kickOffFilters().
+	bool ufrontier_needs_filter;           // Set when a fresh U(P) lands, so kickOffFilters() produces the first S(P,R) for it even with no rotation.
+	bool have_last_filter_cam_forward;
+	Vec4f last_filter_cam_forward_ws;      // Camera forward at the last filter kick, so a rotation past threshold re-filters - see kickOffFilters().
 
 	// SESSION059: true if the traversal just kicked for this cloud used a rotation_dilation_rate above the baseline
 	// floor (i.e. cam_angular_speed_ema/peak was elevated at kick time) - see kickOffTraversals()'s "settle" re-kick.
@@ -532,6 +572,10 @@ public:
 	uint64 cloud_id;
 	uint64 topology_generation;
 	Reference<GaussianSplatLodTraversalScratch> scratch; // Holds the result buffer, and keeps it alive even if the renderer was torn down while the traversal ran.
+
+	// SESSION063: non-null when the task was asked to build the unculled frontier U(P) (split_filter_enabled). Carries the
+	// SoA copy the worker gathered, so drainTraversalResults() can adopt it as the cloud's cache with no main-thread copy.
+	Reference<GaussianSplatUnculledFrontier> unculled_frontier;
 };
 
 
@@ -626,13 +670,15 @@ public:
 		const Planef* frustum_clip_planes_, int num_frustum_clip_planes_, bool frustum_cull_enabled_, // SESSION055: planes are copied into num_frustum_clip_planes below rather than pointed at, because OpenGLScene's own array is mutated by the draw path each frame and a worker running across a frame boundary would otherwise read torn values.
 		const float* translation_dilation_, float rotation_dilation_rate_, // SESSION055: per-plane translation dilation (metres) + rotation dilation rate (rad, multiplied by dist-to-node inside cull) - see kickOffTraversals()'s anisotropic dilation block.
 		ThreadSafeQueue<Reference<ThreadMessage> >* result_queue_,
-		js::Vector<FrontierNodeRecord, 16>* frontier_record_ = NULL)
+		js::Vector<FrontierNodeRecord, 16>* frontier_record_ = NULL,
+		bool build_unculled_frontier_ = false) // SESSION063: also emit the SoA U(P) into the result msg, for the split filter path.
 	:	cloud_id(cloud_id_), topology_generation(topology_generation_), scratch(scratch_), cam_pos_ws(cam_pos_ws_),
 		pixel_scale_limit(pixel_scale_limit_), max_splats_budget(max_splats_budget_), max_layer_density(max_layer_density_), max_tree_depth(max_tree_depth_), focal_px(focal_px_),
 		num_frustum_clip_planes(num_frustum_clip_planes_), frustum_cull_enabled(frustum_cull_enabled_),
 		rotation_dilation_rate(rotation_dilation_rate_),
 		result_queue(result_queue_),
-		frontier_record(frontier_record_)
+		frontier_record(frontier_record_),
+		build_unculled_frontier(build_unculled_frontier_)
 	{
 		if(num_frustum_clip_planes < 0)
 			num_frustum_clip_planes = 0;
@@ -829,6 +875,34 @@ public:
 			msg->cloud_id = cloud_id;
 			msg->topology_generation = topology_generation;
 			msg->scratch = scratch;
+
+			// SESSION063: split filter path - gather the selected frontier's positions + cull_radius into an SoA U(P) here
+			// on the worker (never the main thread - the scattered read into the 30M-entry position array is ~50ms). The
+			// key fields let drainTraversalResults() reject a stale cache; orientation is deliberately absent.
+			if(build_unculled_frontier)
+			{
+				Reference<GaussianSplatUnculledFrontier> uf = new GaussianSplatUnculledFrontier();
+				const size_t n = output.size();
+				uf->indices.resizeNoCopy(n);
+				uf->px.resizeNoCopy(n); uf->py.resizeNoCopy(n); uf->pz.resizeNoCopy(n); uf->radius.resizeNoCopy(n);
+				for(size_t i=0; i<n; ++i)
+				{
+					const uint32 idx = output[i];
+					const Vec3f& p = positions[idx];
+					uf->indices[i] = idx;
+					uf->px[i] = p.x; uf->py[i] = p.y; uf->pz[i] = p.z;
+					uf->radius[i] = cull_radii[idx];
+				}
+				uf->topology_generation = topology_generation;
+				uf->anchor_pos_ws = cam_pos_ws;
+				uf->pixel_scale_limit = pixel_scale_limit;
+				uf->max_splats_budget = max_splats_budget;
+				uf->max_layer_density = max_layer_density;
+				uf->max_tree_depth = max_tree_depth;
+				uf->focal_px = focal_px;
+				msg->unculled_frontier = uf;
+			}
+
 			result_queue->enqueue(msg);
 		}
 	}
@@ -892,6 +966,7 @@ private:
 	float rotation_dilation_rate;  // SESSION055: rad; multiplied by dist-to-node inside cull so a rotation of theta at range r dilates the plane by r*theta.
 	ThreadSafeQueue<Reference<ThreadMessage> >* result_queue;
 	js::Vector<FrontierNodeRecord, 16>* frontier_record; // Null (the normal case) means don't record anything - see recordFrontierNode().
+	bool build_unculled_frontier; // SESSION063: gather the SoA U(P) at the end of run() and hand it back on the result msg.
 };
 
 
@@ -900,8 +975,8 @@ private:
 
 GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 :	opengl_engine(&opengl_engine_), next_handle(1), next_cloud_id(1), num_sorts_in_flight(0),
-	num_traversals_in_flight(0), lod_pixel_scale_limit(1.0f), lod_max_splats_budget(10000000), lod_resort_move_threshold_ws(0.1f),
-	lod_max_layer_density(0.0f), lod_max_tree_depth(0), lod_frustum_cull_enabled(true),
+	num_traversals_in_flight(0), num_filters_in_flight(0), lod_pixel_scale_limit(1.0f), lod_max_splats_budget(10000000), lod_resort_move_threshold_ws(0.1f),
+	lod_max_layer_density(0.0f), lod_max_tree_depth(0), lod_frustum_cull_enabled(true), split_filter_enabled(false),
 	have_prev_think_cam_state(false), prev_think_cam_pos_ws(0.f), prev_think_cam_forward_ws(0.f), cam_velocity_ema_ws(0.f), cam_angular_speed_ema(0.f), cam_angular_speed_peak(0.f),
 	splat_size_clamp_min(0.0f), splat_size_clamp_max(0.0f), splat_size_clamp_invert(false),
 	splat_dist_clamp_min(0.0f), splat_dist_clamp_max(1000.0f), splat_dist_clamp_invert(false), splat_alpha_cutoff(1.0f / 255.0f),
@@ -1259,6 +1334,119 @@ static inline bool pointInFrustum(const Planef* frustum_clip_planes, int num_fru
 			return false;
 	return true;
 }
+
+
+// SESSION063: the per-orientation frustum filter of the split architecture (session062 §9.3). Streams the SoA unculled
+// frontier U(P), keeps each node whose centre is inside every plane once that plane is pushed out by the node's own
+// cull_radius (the same base_margin the cull-traversal used - see the cull block in GaussianSplatLodTraversalTask::run()
+// - so a static view filters to the same selection the cull path would have picked, minus only the motion dilation,
+// which a static view doesn't need). Writes survivor indices in input order (a subsequence of a distance-sorted list
+// stays sorted, so no re-sort). 4 points at a time with SSE - the codebase's native width; measured ~13ms on a ~7.5M U(P),
+// near the 120MB memory-read floor (session063). Returns the survivor count. Cheap enough to run per-orientation instead
+// of a fresh ~450ms traversal, which is the whole point of the split.
+static size_t filterUnculledFrontier(const GaussianSplatUnculledFrontier& uf, const Planef* planes, int num_planes, js::Vector<uint32, 16>& out_indices)
+{
+	const size_t n = uf.indices.size();
+	out_indices.resizeNoCopy(n); // Worst case every node survives.
+	const int npl = myMin(num_planes, 6);
+
+	__m128 pl_nx[6], pl_ny[6], pl_nz[6], pl_d[6];
+	for(int pl=0; pl<npl; ++pl)
+	{
+		const Vec4f& nrm = planes[pl].getNormal();
+		pl_nx[pl] = _mm_set1_ps(nrm.x[0]); pl_ny[pl] = _mm_set1_ps(nrm.x[1]); pl_nz[pl] = _mm_set1_ps(nrm.x[2]);
+		pl_d[pl]  = _mm_set1_ps(planes[pl].getD());
+	}
+
+	const float* const px = uf.px.data();
+	const float* const py = uf.py.data();
+	const float* const pz = uf.pz.data();
+	const float* const rad = uf.radius.data();
+	const uint32* const idx = uf.indices.data();
+	uint32* const out = out_indices.data();
+	size_t num_out = 0;
+
+	const size_t n4 = n & ~size_t(3);
+	for(size_t i=0; i<n4; i+=4)
+	{
+		const __m128 X = _mm_loadu_ps(px + i);
+		const __m128 Y = _mm_loadu_ps(py + i);
+		const __m128 Z = _mm_loadu_ps(pz + i);
+		const __m128 R = _mm_loadu_ps(rad + i);
+		__m128 outside = _mm_setzero_ps();
+		for(int pl=0; pl<npl; ++pl)
+		{
+			// outside if dot(n,p) - radius >= d  (radius pushes the plane out by the node's own footprint).
+			const __m128 dotv = _mm_add_ps(_mm_add_ps(_mm_mul_ps(X, pl_nx[pl]), _mm_mul_ps(Y, pl_ny[pl])), _mm_mul_ps(Z, pl_nz[pl]));
+			outside = _mm_or_ps(outside, _mm_cmpge_ps(_mm_sub_ps(dotv, R), pl_d[pl]));
+		}
+		const int m = _mm_movemask_ps(outside) & 0xF; // bit j set = point i+j is outside.
+		// Scalar compaction of the 4-lane result: rare enough (survivors run in contiguous spans) that a branchless
+		// scatter isn't worth the complexity here.
+		if((m & 1) == 0) out[num_out++] = idx[i+0];
+		if((m & 2) == 0) out[num_out++] = idx[i+1];
+		if((m & 4) == 0) out[num_out++] = idx[i+2];
+		if((m & 8) == 0) out[num_out++] = idx[i+3];
+	}
+	for(size_t i=n4; i<n; ++i) // Tail (n not a multiple of 4).
+	{
+		bool inside = true;
+		for(int pl=0; pl<npl; ++pl)
+		{
+			const Vec4f& nrm = planes[pl].getNormal();
+			if((nrm.x[0]*px[i] + nrm.x[1]*py[i] + nrm.x[2]*pz[i]) - rad[i] >= planes[pl].getD()) { inside = false; break; }
+		}
+		if(inside) out[num_out++] = idx[i];
+	}
+	out_indices.resize(num_out); // Shrink to the survivor count (keeps the written prefix, no realloc) so .size() is authoritative for callers that read it rather than the return value - see drainFilterResults().
+	return num_out;
+}
+
+
+// SESSION063: result of a background filter pass (see GaussianSplatFilterTask). Carries a Reference to the exact U(P) it
+// filtered so drainFilterResults() can drop a result whose U(P) has since been replaced by a fresh traversal.
+class GaussianSplatFilterResultMsg : public ThreadMessage
+{
+public:
+	uint64 cloud_id;
+	Reference<GaussianSplatUnculledFrontier> frontier; // The U(P) this result was filtered from - staleness check on drain.
+	js::Vector<uint32, 16> survivors; // The draw list S(P,R), front-to-back.
+};
+
+
+// SESSION063: the cheap per-orientation half of the split architecture. Filters a cached, orientation-independent U(P)
+// against the current frustum on a worker thread (~13ms on ~7.5M, measured session063), so a pure rotation produces a
+// fresh draw list without the ~450ms traversal. The frontier is immutable and refcounted, so reading it here while the
+// main thread holds its own reference is safe.
+class GaussianSplatFilterTask : public glare::Task
+{
+public:
+	GaussianSplatFilterTask(uint64 cloud_id_, const Reference<GaussianSplatUnculledFrontier>& frontier_,
+		const Planef* planes_, int num_planes_, ThreadSafeQueue<Reference<ThreadMessage> >* result_queue_)
+	:	cloud_id(cloud_id_), frontier(frontier_), num_planes(num_planes_), result_queue(result_queue_)
+	{
+		if(num_planes < 0) num_planes = 0;
+		if(num_planes > (int)staticArrayNumElems(planes)) num_planes = (int)staticArrayNumElems(planes);
+		for(int i=0; i<num_planes; ++i)
+			planes[i] = planes_[i];
+	}
+
+	virtual void run(size_t /*thread_index*/) override
+	{
+		Reference<GaussianSplatFilterResultMsg> msg = new GaussianSplatFilterResultMsg();
+		msg->cloud_id = cloud_id;
+		msg->frontier = frontier;
+		filterUnculledFrontier(*frontier, planes, num_planes, msg->survivors);
+		result_queue->enqueue(msg);
+	}
+
+private:
+	uint64 cloud_id;
+	Reference<GaussianSplatUnculledFrontier> frontier;
+	Planef planes[6];
+	int num_planes;
+	ThreadSafeQueue<Reference<ThreadMessage> >* result_queue;
+};
 
 
 GaussianSplatRenderer::FrustumCounts GaussianSplatRenderer::countSplatsInFrustum() const
@@ -4023,6 +4211,22 @@ void GaussianSplatRenderer::drainTraversalResults()
 		// separate sort state on the cloud to invalidate here the way a structural change invalidates the old sort's.
 		const js::Vector<uint32, 16>& selected = msg->scratch->selected_indices;
 
+		// SESSION063: split filter path. When split_filter_enabled the traversal ran cull-off, so `selected` is the whole
+		// unculled frontier U(P) and the msg carries the SoA copy. Adopt it as this cloud's cache and mark it for filtering;
+		// kickOffFilters() then derives the draw list S(P,R) asynchronously and drainFilterResults() uploads THAT (never
+		// U(P), which is the ~7.5M unculled set). The VBO is deliberately left untouched here: the last filter's S(P,R)
+		// keeps drawing until the new one lands (~13ms), so a U(P) rebuild costs no main-thread hitch. The cap flags below
+		// are still copied out - the scratch is about to return to the pool.
+		if(split_filter_enabled && msg->unculled_frontier.nonNull())
+		{
+			cloud->cached_ufrontier = msg->unculled_frontier;
+			cloud->ufrontier_needs_filter = true; // Produce the first S(P,R) for this fresh U(P) even with no rotation.
+			cloud->last_traversal_hit_budget_cap = msg->scratch->hit_budget_cap;
+			cloud->last_traversal_hit_density_cap = msg->scratch->hit_density_cap;
+			cloud->last_traversal_hit_depth_cap = msg->scratch->hit_depth_cap;
+			continue;
+		}
+
 		// SESSION058 diag: measures the synchronous GL upload cost on drain, the second suspected contributor to the
 		// session057 §3 CPU cost alongside fillTraversalScratch() (see that function's [gsr-prof] instrumentation).
 		Timer prof_timer;
@@ -4041,6 +4245,97 @@ void GaussianSplatRenderer::drainTraversalResults()
 	}
 
 	completed_traversal_msgs.clear(); // Drop the references, so a scratch just returned to the pool isn't kept alive by a stale message.
+}
+
+
+// SESSION063: the cheap half of the split architecture's per-frame work. For each cloud that has a cached U(P), kick an
+// async filter (GaussianSplatFilterTask) when either a fresh U(P) just landed (ufrontier_needs_filter) or the camera has
+// rotated past a small threshold since the last filter. A filter is ~13ms on the worker (measured session063) vs a
+// ~450ms traversal, so this is what lets a pure rotation refresh the draw list. No dilation margin here: a filter is
+// cheap enough to re-run at a tight angular threshold, so the stale-edge window is small (K3/§7.2's cone would remove it
+// entirely if fast spins show holes).
+void GaussianSplatRenderer::kickOffFilters()
+{
+	if(!split_filter_enabled)
+		return;
+	glare::TaskManager* const task_manager = opengl_engine->getMainTaskManager();
+	if(task_manager == NULL)
+		return;
+
+	const OpenGLScene* const scene = opengl_engine->getCurrentScene();
+	const Vec4f cam_forward_ws = normalise(scene->cam_to_world.getColumn(1)); // SESSION055: col 1 is forward - see kickOffTraversals().
+	const float rotation_cos_threshold = 0.99939f; // cos(2deg) - tighter than the traversal's 5deg re-kick since a filter is ~35x cheaper.
+
+	while(num_filters_in_flight < max_concurrent_filters)
+	{
+		SplatCloud* best_cloud = NULL;
+		for(size_t i=0; i<clouds.size(); ++i)
+		{
+			SplatCloud* const cloud = clouds[i].ptr();
+			if(cloud->cached_ufrontier.isNull() || cloud->filter_in_flight)
+				continue;
+
+			bool want = cloud->ufrontier_needs_filter;
+			if(!want && cloud->have_last_filter_cam_forward)
+				want = dot(cam_forward_ws, cloud->last_filter_cam_forward_ws) < rotation_cos_threshold;
+			else if(!want)
+				want = true; // Never filtered this U(P) yet.
+
+			if(want) { best_cloud = cloud; break; } // First eligible - filters are cheap, no need to rank like traversals.
+		}
+		if(best_cloud == NULL)
+			break;
+
+		best_cloud->filter_in_flight = true;
+		best_cloud->ufrontier_needs_filter = false;
+		best_cloud->have_last_filter_cam_forward = true;
+		best_cloud->last_filter_cam_forward_ws = cam_forward_ws;
+		num_filters_in_flight++;
+
+		task_manager->addTask(new GaussianSplatFilterTask(best_cloud->cloud_id, best_cloud->cached_ufrontier,
+			scene->frustum_clip_planes, scene->num_frustum_clip_planes, &filter_result_queue));
+	}
+}
+
+
+// SESSION063: apply completed filter results. Uploads the survivor draw list S(P,R) to the instance VBO - the only GL
+// call in the filter pipeline, hence on the main thread. Drops a result whose U(P) has since been replaced by a fresh
+// traversal (pointer identity against the cloud's current cached_ufrontier).
+void GaussianSplatRenderer::drainFilterResults()
+{
+	filter_result_queue.dequeueAnyQueuedItems(completed_filter_msgs);
+
+	for(size_t i=0; i<completed_filter_msgs.size(); ++i)
+	{
+		const GaussianSplatFilterResultMsg* const msg = static_cast<const GaussianSplatFilterResultMsg*>(completed_filter_msgs[i].ptr());
+
+		SplatCloud* cloud = NULL;
+		for(size_t c=0; c<clouds.size(); ++c)
+			if(clouds[c]->cloud_id == msg->cloud_id) { cloud = clouds[c].ptr(); break; }
+
+		if(cloud)
+		{
+			num_filters_in_flight--;
+			cloud->filter_in_flight = false;
+		}
+		else
+		{
+			num_filters_in_flight--; // Cloud gone; still account for the slot.
+			continue;
+		}
+
+		// Drop if the U(P) this was filtered from is no longer the cloud's current one - a newer traversal has landed and
+		// its own filter is or will be in flight. Applying the stale survivors would flash an older selection.
+		if(msg->frontier.ptr() != cloud->cached_ufrontier.ptr())
+			continue;
+
+		const js::Vector<uint32, 16>& survivors = msg->survivors;
+		cloud->instance_index_vbo->updateData(0, survivors.data(), survivors.size() * sizeof(uint32));
+		cloud->ob->num_instances_to_draw = (int)survivors.size();
+		noteDrawOrderForSlicing(*cloud, survivors.data(), survivors.size());
+	}
+
+	completed_filter_msgs.clear();
 }
 
 
@@ -4082,7 +4377,11 @@ void GaussianSplatRenderer::kickOffTraversals()
 	// constant rather than a live knob: the trade is not scene-dependent, it's about how large a stale frustum edge is
 	// tolerable, and 5deg was chosen to be well under what a first-person turn perceives as a hitch. cos(5deg) ~= 0.99619.
 	const float rotation_cos_threshold = 0.99619f;
-	const bool cull_active = lod_frustum_cull_enabled;
+	// SESSION063: in split_filter mode the traversal is deliberately run cull-off (it builds the orientation-independent
+	// U(P)), so cull_active goes false here - which also turns off the rotation/settle re-kick triggers and the dilation
+	// block below, because a rotation no longer needs a fresh traversal: the async filter re-derives S(P,R) from the
+	// cached U(P) instead (see drainTraversalResults()/GaussianSplatFilterTask). Position/topology triggers still fire.
+	const bool cull_active = lod_frustum_cull_enabled && !split_filter_enabled;
 
 	// SESSION055: anisotropic frustum-cull dilation. Async traversal takes ~150-500ms per session054; during that window
 	// the camera keeps moving/rotating, so nodes that were outside at kick time can be inside by the time the result
@@ -4278,7 +4577,8 @@ void GaussianSplatRenderer::kickOffTraversals()
 			lod_pixel_scale_limit, lod_max_splats_budget, lod_max_layer_density, lod_max_tree_depth, focal_px,
 			scene->frustum_clip_planes, scene->num_frustum_clip_planes, cull_active,
 			translation_dilation, rotation_dilation_rate,
-			&traversal_result_queue));
+			&traversal_result_queue,
+			/*frontier_record=*/NULL, /*build_unculled_frontier=*/split_filter_enabled)); // SESSION063: cull-off traversal builds U(P) for the split filter.
 	}
 
 	// SESSION055 diag: after the while-loop, detect *unmet* rotation demand - a cloud whose forward has shifted past the
@@ -4327,6 +4627,7 @@ void GaussianSplatRenderer::think()
 	// here on the main thread rather than in the worker tasks.
 	drainSortResults();
 	drainTraversalResults();
+	drainFilterResults(); // SESSION063: apply completed per-orientation filters (split architecture).
 
 	if(clouds.empty())
 		return;
@@ -4409,6 +4710,7 @@ void GaussianSplatRenderer::think()
 
 	kickOffSorts();
 	kickOffTraversals();
+	kickOffFilters(); // SESSION063: derive S(P,R) from cached U(P) on rotation / after a fresh U(P) (split architecture).
 }
 
 

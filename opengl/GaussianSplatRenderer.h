@@ -159,7 +159,10 @@ public:
 	// world); meant to be triggered once by a button click, not called per-frame. Returns in_frustum and total (leaves +
 	// merged internal nodes summed across all clouds) so callers can report both the absolute number and the fraction -
 	// used to size the ceiling for traversal frustum-cull work (session054 §2A).
-	struct FrustumCounts { size_t in_frustum; size_t total; };
+	// SESSION066: 'drawn' is the current LoD draw-list size S(P,R) (sum of num_instances_to_draw), i.e. what the LoD
+	// selection/filter actually picked this frame - unlike in_frustum, it DOES respond to pixel_scale limit and camera
+	// position, so the button now shows both the geometric-in-frustum node count and the LoD-selected draw count.
+	struct FrustumCounts { size_t in_frustum; size_t total; size_t drawn; };
 	FrustumCounts countSplatsInFrustum() const;
 
 	// One-off diagnostic (GaussianSplatSettingsWidget's "Frustum report" button, Qt only): a multi-line breakdown of what

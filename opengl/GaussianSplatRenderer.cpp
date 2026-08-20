@@ -1552,10 +1552,12 @@ GaussianSplatRenderer::FrustumCounts GaussianSplatRenderer::countSplatsInFrustum
 	FrustumCounts result;
 	result.in_frustum = 0;
 	result.total = 0;
+	result.drawn = 0;
 	for(size_t c=0; c<clouds.size(); ++c)
 	{
 		const SplatCloud& cloud = *clouds[c];
 		result.total += cloud.total_splats; // Leaves + merged internal nodes - matches what the traversal iterates over.
+		result.drawn += (size_t)myMax(0, cloud.ob->num_instances_to_draw); // SESSION066: the live LoD draw list S(P,R) - what pixel_scale limit / camera position actually select this frame.
 		for(size_t i=0; i<cloud.total_splats; ++i)
 		{
 			const Vec3f& pos = cloud.positions[i];

@@ -1369,20 +1369,6 @@ void GaussianSplatRenderer::forceTraversalRefresh()
 }
 
 
-void GaussianSplatRenderer::resetImportanceAccumulator()
-{
-	for(size_t i=0; i<clouds.size(); ++i)
-	{
-		// Freed rather than zeroed: the arrays are tens of megabytes on a large capture, and the next report reallocates
-		// them anyway when it finds them the wrong size.
-		clouds[i]->importance_best_contribution.clearAndFreeMem();
-		clouds[i]->importance_sum_fill.clearAndFreeMem();
-		clouds[i]->importance_views_drawn.clearAndFreeMem();
-		clouds[i]->importance_num_views = 0;
-	}
-}
-
-
 // Point-in-frustum test, same accept/reject convention as OpenGLEngine.cpp's AABBIntersectsFrustum() (outside if
 // dot(normal, point) >= plane.getD() for any plane), just for one point rather than an AABB's 8 corners.
 static inline bool pointInFrustum(const Planef* frustum_clip_planes, int num_frustum_clip_planes, const Vec4f& pos_ws)

@@ -180,8 +180,9 @@ public:
 	// One deliberate exception to "changes no renderer state": each run folds its per-splat importance into a running
 	// record on the cloud, so that the pruning ceiling - a single-camera figure by construction, since a splat hidden from
 	// here may be the front layer from there - can also be reported over every viewpoint visited so far. Accumulating on
-	// the button press rather than continuously is what keeps the set of viewpoints a deliberate choice. Cleared by
-	// resetImportanceAccumulator(), and thrown away by itself if the cloud's node numbering changes underneath it.
+	// the button press rather than continuously is what keeps the set of viewpoints a deliberate choice. Persists for the
+	// life of the cloud (no reset control - see session log for removal rationale), and thrown away by itself if the
+	// cloud's node numbering changes underneath it.
 	// merge_colour_tol and merge_angle_tol_deg govern only the merge section: how alike two splats' colours and facings
 	// have to be before the report is willing to call them the same surface seen twice. They are arguments rather than
 	// renderer state because nothing outside the report reads them, and the point of them is to be swept - the honest
@@ -211,11 +212,6 @@ public:
 	// Puts every merged cloud back to the splats it was loaded with, rebuilding the trees again. The point of it is
 	// eyes-on A/B at a fixed camera: a merge that changes the picture is only visible against the picture it changed.
 	std::string restoreUnmergedSplats();
-
-	// Throws away the per-splat importance getFrustumStructureReport() has accumulated, so the next run starts a fresh set
-	// of viewpoints. Needed because the record is only meaningful for viewpoints chosen on purpose: a stray report taken
-	// while walking through a wall would mark a swathe of the cloud as mattering and quietly raise the floor for good.
-	void resetImportanceAccumulator();
 
 	// Forces every cloud's LoD frontier to be recomputed on the next think()/kickOffTraversals(), bypassing the normal
 	// camera-movement threshold - for GaussianSplatSettingsWidget's live traversal parameters (pixel_scale_limit,

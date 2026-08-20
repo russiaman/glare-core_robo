@@ -64,6 +64,7 @@ static const int max_slice_samples = 4096;
 // print site (some of which - e.g. fillTraversalScratch() - are defined earlier in the file than kickOffTraversals()),
 // so every timestamp shares the same zero point and lines from different sites stay chronologically comparable.
 static Timer diag_timer;
+static const bool filter_debug_log = true; // SESSION064 DIAG: [gsr-filter-kick] / [gsr-filter-drain] traces to localise the post-stop boiling. Set false once diagnosed.
 
 // SESSION058: toggle for [gsr-prof] stdout traces around fillTraversalScratch() and the traversal-result VBO upload -
 // see session058 snapshot §3. Measures whether the memcpy-per-kick over the whole cloud (not just the visible subset)
@@ -168,7 +169,7 @@ public:
 		topology_generation(0), traversal_in_flight(false), have_last_traversal_cam_pos(false), last_traversal_cam_pos_ws(0.f), last_traversal_cam_forward_ws(0.f), last_traversal_kick_time_s(0.0),
 		last_traversal_kicked_topology_generation(0), last_traversal_hit_budget_cap(false), last_traversal_hit_density_cap(false), last_traversal_hit_depth_cap(false), last_traversal_dilation_elevated(false),
 		cached_traversal_geom_generation(0), importance_num_views(0),
-		filter_in_flight(false), ufrontier_needs_filter(false), have_last_filter_cam_forward(false), last_filter_cam_forward_ws(0.f), last_filter_dilation_elevated(false) // SESSION063
+		filter_in_flight(false), ufrontier_needs_filter(false), have_last_filter_cam_forward(false), last_filter_cam_forward_ws(0.f) // SESSION063
 	{}
 
 	uint64 cloud_id; // Stable, never reused.  Sort results carry it, so a result for a cloud that has since been merged away can be dropped.
@@ -226,7 +227,6 @@ public:
 	bool ufrontier_needs_filter;           // Set when a fresh U(P) lands, so kickOffFilters() produces the first S(P,R) for it even with no rotation.
 	bool have_last_filter_cam_forward;
 	Vec4f last_filter_cam_forward_ws;      // Camera forward at the last filter kick, so a rotation past threshold re-filters - see kickOffFilters().
-	bool last_filter_dilation_elevated;    // SESSION063 K3: last filter used above-baseline dilation, so once motion calms one final tight re-filter is due (mirrors the traversal's "settle" - see kickOffFilters()).
 
 	// SESSION059: true if the traversal just kicked for this cloud used a rotation_dilation_rate above the baseline
 	// floor (i.e. cam_angular_speed_ema/peak was elevated at kick time) - see kickOffTraversals()'s "settle" re-kick.
@@ -1035,7 +1035,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	lod_max_layer_density(0.0f), lod_max_tree_depth(0), lod_frustum_cull_enabled(true), split_filter_enabled(false),
 	filter_dilation_latency(0.06f), filter_min_rot_rate_deg_per_s(45.f), filter_min_trans_rate_m_per_s(2.0f), // SESSION063 K3 (K4 defaults: coarse floor covers the edge, so the fine dilation can be tight/cheap)
 	split_coarse_floor_enabled(true), split_coarse_pixel_scale(30.f), filter_coarse_dilation_latency(0.9f), coarse_layer_debug(false), // SESSION063 K4
-	have_prev_think_cam_state(false), prev_think_cam_pos_ws(0.f), prev_think_cam_forward_ws(0.f), cam_velocity_ema_ws(0.f), cam_angular_speed_ema(0.f), cam_angular_speed_peak(0.f),
+	have_prev_think_cam_state(false), prev_think_cam_pos_ws(0.f), prev_think_cam_forward_ws(0.f), cam_velocity_ema_ws(0.f), cam_angular_speed_ema(0.f), cam_angular_speed_peak(0.f), cam_inst_angular_speed(0.f),
 	splat_size_clamp_min(0.0f), splat_size_clamp_max(0.0f), splat_size_clamp_invert(false),
 	splat_dist_clamp_min(0.0f), splat_dist_clamp_max(1000.0f), splat_dist_clamp_invert(false), splat_alpha_cutoff(1.0f / 255.0f),
 	splat_alpha_gain(1.0f), splat_alpha_gamma(1.0f), // Identity: the cloud as captured - see getAlphaGain().
@@ -4384,13 +4384,26 @@ void GaussianSplatRenderer::kickOffFilters()
 	float trans_dilation[6] = { 0,0,0,0,0,0 };
 	for(int i=0; i<scene->num_frustum_clip_planes && i<6; ++i)
 		trans_dilation[i] = myMax(min_trans_dilation_m, myMax(0.f, dot(scene->frustum_clip_planes[i].getNormal(), ema_expected)));
-	const float w_effective = myMax(cam_angular_speed_ema, cam_angular_speed_peak);
 	const float min_rot_rate_rad_s = filter_min_rot_rate_deg_per_s * (3.14159265f / 180.f);
-	const bool rotating = w_effective > min_rot_rate_rad_s; // Camera is actively turning fast enough that dilation is above baseline.
+
+	// SESSION064: the per-frame re-filter trigger follows THIS frame's raw rotation (cam_inst_angular_speed), which is 0
+	// the moment the camera stops - NOT the smoothed ema/peak, which coast down over ~2s. Using the decaying trackers
+	// here re-filtered a *static* camera every frame with an ever-shrinking dilation band (rate_fine below), so S(P,R)
+	// churned by ~1.4% for ~2s after every stop; invisible without the saturation gate, but the gate amplified the
+	// membership churn into visible "boiling" in dense regions - see session064 snapshot. Now: rotating stops with the
+	// camera, we stop re-filtering, and the last (in-motion-band) selection is simply held.
+	const bool rotating = cam_inst_angular_speed > min_rot_rate_rad_s;
+
+	// Band WIDTH, on the other hand, still uses the predictive max(ema, peak): a kick issued during motion must dilate
+	// wide enough to cover where the edge will be by the time this async filter lands (~13ms), and peak keeps that margin
+	// up through a burst. Only the *decision to re-filter at all* moved to the instantaneous signal above; the width of a
+	// filter that does run is unchanged.
+	const float w_effective = myMax(cam_angular_speed_ema, cam_angular_speed_peak);
 	const float w_floored = myMax(w_effective, min_rot_rate_rad_s);
 	const float rate_fine   = w_floored * filter_dilation_latency;        // SESSION063 K4: tight dilation for the dense fine set.
 	const float rate_coarse = w_floored * filter_coarse_dilation_latency; // wider dilation for the cheap coarse floor (see filterUnculledFrontier).
 
+	const char* filter_kick_reason = "?"; // SESSION064 DIAG
 	while(num_filters_in_flight < max_concurrent_filters)
 	{
 		SplatCloud* best_cloud = NULL;
@@ -4400,19 +4413,22 @@ void GaussianSplatRenderer::kickOffFilters()
 			if(cloud->cached_ufrontier.isNull() || cloud->filter_in_flight)
 				continue;
 
-			// Want a filter when: a fresh U(P) needs its first one; the view rotated past the threshold; the camera is
-			// actively turning (re-filter every frame so the edge stays fresh under the dilation); or the last selection
-			// was dilated above baseline and motion has since calmed (one final tight re-filter - the "settle", so a fast
-			// spin doesn't leave an over-wide selection stuck on screen the way session059 found for the traversal).
+			// Want a filter when: a fresh U(P) needs its first one; the view rotated past the threshold since the last kick;
+			// or the camera is turning THIS frame (re-filter every frame so the edge stays fresh under the dilation).
+			// SESSION064 removed the "settle" re-kick: it existed to replace a stuck over-wide selection with a tight one
+			// once motion calmed, but it fired off the decaying trackers and so kept shrinking S for ~2s (the boiling).
+			// Holding the last in-motion selection instead is both cheaper (no per-frame work on a static camera) and safer
+			// on re-move (its band carries margin the tight settle threw away) - see the member's comment and the snapshot.
 			bool want = cloud->ufrontier_needs_filter || !cloud->have_last_filter_cam_forward;
+			const char* reason = (cloud->ufrontier_needs_filter || !cloud->have_last_filter_cam_forward) ? "first/U(P)" : "?"; // SESSION064 DIAG
 			if(!want)
 			{
 				const bool rotated = dot(cam_forward_ws, cloud->last_filter_cam_forward_ws) < rotation_cos_threshold;
-				const bool settle  = cloud->last_filter_dilation_elevated && !rotating;
-				want = rotated || rotating || settle;
+				want = rotated || rotating;
+				reason = rotating ? "rotating" : (rotated ? "rotated" : "?"); // SESSION064 DIAG
 			}
 
-			if(want) { best_cloud = cloud; break; } // First eligible - filters are cheap, no need to rank like traversals.
+			if(want) { best_cloud = cloud; filter_kick_reason = reason; break; } // First eligible - filters are cheap, no need to rank like traversals.
 		}
 		if(best_cloud == NULL)
 			break;
@@ -4421,12 +4437,17 @@ void GaussianSplatRenderer::kickOffFilters()
 		best_cloud->ufrontier_needs_filter = false;
 		best_cloud->have_last_filter_cam_forward = true;
 		best_cloud->last_filter_cam_forward_ws = cam_forward_ws;
-		best_cloud->last_filter_dilation_elevated = rotating; // This kick is above baseline iff the camera is turning; drives the settle above.
 		num_filters_in_flight++;
 
 		task_manager->addTask(new GaussianSplatFilterTask(best_cloud->cloud_id, best_cloud->cached_ufrontier,
 			scene->frustum_clip_planes, scene->num_frustum_clip_planes, cam_pos_ws, rate_fine, rate_coarse, trans_dilation,
 			coarse_layer_debug, &filter_result_queue));
+
+		if(filter_debug_log) // SESSION064 DIAG: how long do filter kicks continue after the camera stops, and with what band?
+			conPrint("[gsr-filter-kick] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms reason=" + std::string(filter_kick_reason) +
+				" ema=" + doubleToStringNDecimalPlaces(cam_angular_speed_ema * (180.0 / 3.14159265), 1) + "deg/s" +
+				" peak=" + doubleToStringNDecimalPlaces(cam_angular_speed_peak * (180.0 / 3.14159265), 1) + "deg/s" +
+				" rate_fine=" + doubleToStringNDecimalPlaces(rate_fine, 3));
 	}
 }
 
@@ -4468,6 +4489,9 @@ void GaussianSplatRenderer::drainFilterResults()
 		cloud->instance_index_vbo->updateData(0, survivors.data(), survivors.size() * sizeof(uint32));
 		cloud->ob->num_instances_to_draw = (int)survivors.size();
 		noteDrawOrderForSlicing(*cloud, survivors.data(), survivors.size());
+
+		if(filter_debug_log) // SESSION064 DIAG: does the applied survivor count keep changing after the camera stops? That churn is what the gate turns into boiling.
+			conPrint("[gsr-filter-drain] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms surv=" + uInt64ToStringCommaSeparated(survivors.size()));
 	}
 
 	completed_filter_msgs.clear();
@@ -4815,12 +4839,14 @@ void GaussianSplatRenderer::think()
 		const Vec4f cur_cam_forward = normalise(scene->cam_to_world.getColumn(1)); // SESSION055: col 1 is forward in Substrata, col 2 is up - see the parallel note in kickOffTraversals(). Normalise so tiny non-unit drift can't clamp acos() to zero at small angles.
 		const double dt_raw = prev_think_timer.elapsed();
 		prev_think_timer.reset();
+		cam_inst_angular_speed = 0.f; // SESSION064: default to "not rotating this frame" - overwritten below when a valid dt lets us measure it. A guarded-out frame (first post-load, tab-out) must not leave a stale non-zero value re-triggering the filter.
 		if(have_prev_think_cam_state && dt_raw > 1.0e-4 && dt_raw < 0.5) // Guard against zero/huge dt (first frame post-load, breakpoint, tab-out).
 		{
 			const float dt = (float)dt_raw;
 			const Vec4f inst_vel = (cur_cam_pos - prev_think_cam_pos_ws) * (1.f / dt); // Vec4f arithmetic gives .w = 0 (positions differ, w cancels), correct for a velocity vector.
 			const float dot_fw = myClamp(dot(cur_cam_forward, prev_think_cam_forward_ws), -1.f, 1.f);
 			const float inst_ang = std::acos(dot_fw) / dt;
+			cam_inst_angular_speed = inst_ang; // SESSION064: raw, un-smoothed - see the member's comment and kickOffFilters().
 			const float alpha = 0.15f;
 			// SESSION055: plain EMA for velocity vector - the per-axis abs-max used earlier kept the STALE direction on
 			// reversal (e.g. long east motion followed by short west step held ema pointing east, so kickOff dilated

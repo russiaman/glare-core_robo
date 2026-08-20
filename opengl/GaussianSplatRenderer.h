@@ -1049,6 +1049,7 @@ private:
 	Vec4f cam_velocity_ema_ws;               // World-space linear velocity (m/s), EMA-smoothed.
 	float cam_angular_speed_ema;             // Scalar angular speed (rad/s), max(inst, blended).
 	float cam_angular_speed_peak;            // SESSION055: slow-decay peak of angular speed, so a mouse flick keeps rotation dilation elevated for the next ~1s of kicks - covers subsequent bursts that neither EMA nor empirical predict in time.
+	float cam_inst_angular_speed;            // SESSION064: this frame's raw instantaneous angular speed (rad/s), NOT smoothed. Drives the filter's per-frame re-filter trigger (kickOffFilters()): it is 0 the moment the camera stops, whereas the EMA/peak above coast down over ~2s and would keep re-filtering (and boiling) a static camera - see session064 snapshot.
 
 	// See getSizeClampMin()/getSizeClampMax() above. Defaults (0, 0) disable both bounds, so never exclude a real splat.
 	float splat_size_clamp_min;

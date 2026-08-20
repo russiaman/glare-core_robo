@@ -1049,7 +1049,6 @@ private:
 	float cam_angular_speed_ema;             // Scalar angular speed (rad/s), max(inst, blended).
 	float cam_angular_speed_peak;            // SESSION055: slow-decay peak of angular speed, so a mouse flick keeps rotation dilation elevated for the next ~1s of kicks - covers subsequent bursts that neither EMA nor empirical predict in time.
 	float cam_inst_angular_speed;            // SESSION064: this frame's raw instantaneous angular speed (rad/s), NOT smoothed. Drives the filter's per-frame re-filter trigger (kickOffFilters()): it is 0 the moment the camera stops, whereas the EMA/peak above coast down over ~2s and would keep re-filtering (and boiling) a static camera - see session064 snapshot.
-	bool filter_prev_frame_rotating;         // SESSION066: was the camera rotating (cam_inst_angular_speed above floor) on the previous kickOffFilters() pass, so a true->false edge can fire exactly one tight "settle" re-filter to release the held in-motion band - see kickOffFilters().
 
 	// See getSizeClampMin()/getSizeClampMax() above. Defaults (0, 0) disable both bounds, so never exclude a real splat.
 	float splat_size_clamp_min;

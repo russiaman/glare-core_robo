@@ -48,6 +48,14 @@ uniform int splat_saturation_mask_max_level; // Coarsest level of the mask's min
 // nearly all of them overlap an unmarked edge and survive.
 uniform int splat_mask_centre_test;
 
+// SESSION066 DIAGNOSTIC - the "Clip" cull. Its own full-resolution per-pixel overdraw count (the counting pre-pass copied
+// to a texture of its own, NOT the gate's mask, so Clip no longer stands the gate down). A splat whose centre pixel has
+// reached splat_hide_count_threshold (the red-zone value) is dropped. splat_hide_count_active 0 = off, no sample -
+// costs nothing when Clip is off. See GaussianSplatRenderer::setHideCountCull().
+uniform sampler2D splat_hide_count_texture;
+uniform int splat_hide_count_active;
+uniform float splat_hide_count_threshold;
+
 uniform float splat_alpha_cutoff; // GaussianSplatSettingsWidget, Qt only. Sets the per-splat quad radius to exactly where alpha decays to this value, instead of the fixed 3-sigma bound below - see the derivation where it's used. Default 1/255 matches the fragment shader's own discard threshold exactly (lossless); raising it trims low-opacity splats' quads further, trading a sliver of their faint edge for less overdraw.
 
 // (gain, gamma) of the live opacity adjustment alpha' = gain * alpha^gamma - see adjustSplatAlpha() in
@@ -487,6 +495,21 @@ void main()
 		}
 
 		} // end of the conservative branch
+	}
+
+	// SESSION066 DIAGNOSTIC - the "Clip" cull: drop this splat if the per-pixel overdraw count at its screen centre has
+	// reached the red-zone threshold. Own count texture, independent of the gate's mask above (see the uniform's comment).
+	if(splat_hide_count_active != 0)
+	{
+		vec2 centre_px = ((clip_pos.xy / clip_pos.w) * 0.5 + 0.5) * viewport_dims_px;
+		ivec2 c = clamp(ivec2(floor(centre_px)), ivec2(0), textureSize(splat_hide_count_texture, /*mip level=*/0) - ivec2(1));
+		if(texelFetch(splat_hide_count_texture, c, /*mip level=*/0).r >= splat_hide_count_threshold)
+		{
+			gl_Position = vec4(2.0, 2.0, 2.0, 1.0); // Push outside the clip volume.
+			frag_conic = vec3(0.0);
+			frag_screen_offset_px = vec2(0.0);
+			return;
+		}
 	}
 
 	// DIAGNOSTIC ONLY - shrinks the quad continuously by how covered the composite already is under it, rather than the

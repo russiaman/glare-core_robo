@@ -205,7 +205,8 @@ enum TextureUnitIndices
 	PREPASS_DEPTH_COPY_TEXTURE_UNIT_INDEX,
 
 	SPLAT_SATURATION_MASK_TEXTURE_UNIT_INDEX, // The splat program's second texture, after the packed splat data - see drawSplatClouds().
-	SPLAT_COVERAGE_MASK_TEXTURE_UNIT_INDEX // The splat program's third texture - see GaussianSplatRenderer::getCoverageShrinkStrength().
+	SPLAT_COVERAGE_MASK_TEXTURE_UNIT_INDEX, // The splat program's third texture - see GaussianSplatRenderer::getCoverageShrinkStrength().
+	SPLAT_HIDE_COUNT_TEXTURE_UNIT_INDEX // SESSION066 - the "Clip" diagnostic's own overdraw-count texture - see drawSplatClouds().
 };
 
 
@@ -10419,6 +10420,7 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 		// No slices and no mask test - this pass has to see every splat, or what it counts would depend on what it had
 		// already culled.
 		splat_renderer->setSplatMaskBlockSize(0, 0);
+		splat_renderer->setHideCountCull(false, 0.f); // SESSION066: Clip's own cull off here - the count it reads is being built by this very pass.
 
 		// Set explicitly rather than inherited: this pass runs before the block below that establishes the state the slice
 		// draws use, so whatever the previous pass of the frame happened to leave is what would apply.  Blending in
@@ -10447,6 +10449,10 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 				if(mask_tex_loc >= 0)
 					bindTextureUnitToSampler(*current_scene->splat_saturation_mask_texture, /*texture_unit_index=*/SPLAT_SATURATION_MASK_TEXTURE_UNIT_INDEX,
 						/*sampler_uniform_location=*/mask_tex_loc);
+				const int hide_count_loc = splat_renderer->getHideCountTexUniformLoc(); // SESSION066 - keep the sampler bound (WebGL); this pass has the cull off anyway.
+				if(hide_count_loc >= 0)
+					bindTextureUnitToSampler(current_scene->splat_hide_count_copy_texture.nonNull() ? *current_scene->splat_hide_count_copy_texture : *current_scene->splat_accum_copy_texture,
+						/*texture_unit_index=*/SPLAT_HIDE_COUNT_TEXTURE_UNIT_INDEX, /*sampler_uniform_location=*/hide_count_loc);
 			}
 			bindMeshData(*ob);
 #if DO_INDIVIDUAL_VAO_ALLOC
@@ -10455,8 +10461,13 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 			drawBatchWithDenormalisedData(*ob, ob->batch_draw_info[batch_i], batch_i);
 		}
 
-		// Turn the count into the mask, thresholded at the same value the overdraw ramp paints red at.
-		markSaturatedSplatPixels(/*from_layer_count=*/true);
+		// SESSION066: copy the overdraw count into Clip's OWN full-res texture, not the gate's mask - so the vertex shader
+		// culls red-zone splats per-pixel (splat_hide_count_texture) while the gate keeps running on its own mask. The
+		// counting draws are still buffered, so flush before the blit; rebind the accum for drawing afterwards for the clear.
+		flushDrawCommandsAndUnbindPrograms();
+		blitFrameBuffer(*current_scene->splat_accum_framebuffer, *current_scene->splat_hide_count_copy_framebuffer,
+			/*num_buffers_to_copy=*/1, /*copy_buf0_colour=*/true, /*copy_buf0_depth=*/false);
+		current_scene->splat_accum_framebuffer->bindForDrawing();
 
 		for(size_t i=num_visible; i-- > 0; )
 		{
@@ -10487,7 +10498,7 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 	// the cap happens to be idle - a gate that switches itself on is exactly the kind of thing a measurement cannot have.
 	const bool coverage_cap_requested = splat_renderer->getCoverageCap() > 0.f;
 
-	const bool use_saturation_gate = splat_renderer->getSaturationGateEnabled() && !coverage_cap_requested && (num_slices > 1) && !show_overdraw && !hide_overdraw && splat_accum_gate_available &&
+	const bool use_saturation_gate = splat_renderer->getSaturationGateEnabled() && !coverage_cap_requested && (num_slices > 1) && !show_overdraw && /*SESSION066: Clip no longer stands the gate down - it owns a separate count texture*/ splat_accum_gate_available &&
 		splat_renderer->getSaturationMaskProgram().nonNull() && splat_renderer->getSaturationMaskProgram()->isBuilt() &&
 		splat_renderer->getMaskReduceProgram().nonNull() && splat_renderer->getMaskReduceProgram()->isBuilt();
 
@@ -10530,9 +10541,9 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 	// "layers" are the thing being displayed rather than a count to cut against.
 	//
 	// The estimating frame deliberately draws uncapped - it is measuring what the scene has, not what a cap left of it.
-	const bool estimating_layer_cap = splat_renderer->layerEstimateRequested() && have_layer_count && !show_overdraw && !hide_overdraw;
+	const bool estimating_layer_cap = splat_renderer->layerEstimateRequested() && have_layer_count && !show_overdraw;
 	const bool use_layer_cap = (splat_renderer->getLayerCap() > 0) && have_layer_count && (num_slices > 1) && !estimating_layer_cap &&
-		!show_overdraw && !hide_overdraw && splat_accum_gate_available &&
+		!show_overdraw && /*SESSION066: Clip owns a separate texture now*/ splat_accum_gate_available &&
 		splat_renderer->getSaturationMaskProgram().nonNull() && splat_renderer->getSaturationMaskProgram()->isBuilt() &&
 		splat_renderer->getMaskReduceProgram().nonNull() && splat_renderer->getMaskReduceProgram()->isBuilt();
 
@@ -10540,7 +10551,7 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 	// minus the layer counter, which is the point of it: it thresholds the coverage the accumulation buffer already
 	// carries, so the frame needs no second attachment.  Yields to the layer cap when both are set - one mask.
 	const bool use_coverage_cap = coverage_cap_requested && !use_layer_cap && (num_slices > 1) && !estimating_layer_cap &&
-		!show_overdraw && !hide_overdraw && splat_accum_gate_available &&
+		!show_overdraw && /*SESSION066: Clip owns a separate texture now*/ splat_accum_gate_available &&
 		splat_renderer->getSaturationMaskProgram().nonNull() && splat_renderer->getSaturationMaskProgram()->isBuilt() &&
 		splat_renderer->getMaskReduceProgram().nonNull() && splat_renderer->getMaskReduceProgram()->isBuilt();
 
@@ -10576,12 +10587,14 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 	// The diagnostic wants the non-conservative centre test, which is what actually opens a hole where the marked region
 	// was; the gate wants the conservative one, which never drops a splat that could still have shown - see
 	// GaussianSplatRenderer::setSplatMaskBlockSize().
-	splat_renderer->setSplatMaskBlockSize((use_saturation_gate || hide_overdraw) ? splat_saturation_mask_block : 0, splat_saturation_mask_num_levels - 1,
-		// The conservative test is the gate's, and is also what the layer cap wants: a splat is dropped only where every
-		// pixel it could touch has already had its layers, so nothing it would still have shown is lost and no hole can
-		// open.  The centre test is the other reading, which cuts through the marked region and shows what it was
-		// carrying - see GaussianSplatRenderer::getHideTestConservative().
-		/*centre_test=*/hide_overdraw && !splat_renderer->getHideTestConservative());
+	// SESSION066: the shared mask now serves only the gate/caps - Clip owns splat_hide_count_texture and is set just below,
+	// so hide_overdraw no longer feeds this test (nor the centre-test flag, which was only Clip's).
+	splat_renderer->setSplatMaskBlockSize(use_saturation_gate ? splat_saturation_mask_block : 0, splat_saturation_mask_num_levels - 1,
+		/*centre_test=*/false);
+
+	// SESSION066: Clip's per-splat cull - reads its own overdraw-count texture (bound in the draw loop) and drops a splat
+	// whose centre pixel has reached the red-zone threshold. Off (no sample) when Clip is off, so it costs nothing then.
+	splat_renderer->setHideCountCull(hide_overdraw, splat_renderer->getOverdrawRangeMax());
 
 	if(use_saturation_gate || use_layer_cap || use_coverage_cap)
 	{
@@ -10636,6 +10649,13 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 	// Overdraw debug mode: pure additive (GL_ONE, GL_ONE), so each surviving fragment's flat increment just sums,
 	// unweighted by alpha, and is order-independent either way.
 	glBlendFunc(show_overdraw ? GL_ONE : GL_ONE_MINUS_DST_ALPHA, GL_ONE);
+	// SESSION066: enable depth testing explicitly rather than inheriting it. Splats are occluded by the opaque geometry
+	// already in the depth buffer - the counting pre-pass above enables GL_DEPTH_TEST for exactly this reason ("not drawn
+	// in the real pass either"), but the real pass never set it itself, so whether occluded splats were culled depended on
+	// leftover state: with the Clip diagnostic (hide-overdraw) on, its pre-pass/mark left depth testing enabled, so occluded
+	// splats vanished; with it off the real pass inherited whatever the frame last left, giving a different picture from an
+	// unrelated toggle. Setting it here makes the occlusion the same regardless of Clip.
+	glEnable(GL_DEPTH_TEST);
 	glDepthMask(GL_FALSE); // Disable writing to depth buffer - splats must not occlude each other or other transparent objects.
 
 	// Walked in reverse of the order orderSplatCloudsBackToFront() produced, since splats now composite front-to-back
@@ -10714,6 +10734,14 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 				if(coverage_tex_loc >= 0)
 					bindTextureUnitToSampler(*current_scene->splat_coverage_mask_texture, /*texture_unit_index=*/SPLAT_COVERAGE_MASK_TEXTURE_UNIT_INDEX,
 						/*sampler_uniform_location=*/coverage_tex_loc);
+
+				// SESSION066 - Clip's own overdraw-count sampler. Its texture exists only while Clip is on; otherwise bind the
+				// always-present accum copy as a harmless placeholder (the shader never samples it when splat_hide_count_active
+				// is 0), so a declared sampler is never left unbound (invalid in WebGL).
+				const int hide_count_loc = splat_renderer->getHideCountTexUniformLoc();
+				if(hide_count_loc >= 0)
+					bindTextureUnitToSampler(current_scene->splat_hide_count_copy_texture.nonNull() ? *current_scene->splat_hide_count_copy_texture : *current_scene->splat_accum_copy_texture,
+						/*texture_unit_index=*/SPLAT_HIDE_COUNT_TEXTURE_UNIT_INDEX, /*sampler_uniform_location=*/hide_count_loc);
 			}
 
 			ob->instance_vbo_offset_B = (uint32)(slice_begin * sizeof(uint32)); // One uint32 splat index per instance - see GaussianSplatRenderer::rebuildVAO().
@@ -10813,6 +10841,10 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 				if(coverage_tex_loc >= 0)
 					bindTextureUnitToSampler(*current_scene->splat_coverage_mask_texture, /*texture_unit_index=*/SPLAT_COVERAGE_MASK_TEXTURE_UNIT_INDEX,
 						/*sampler_uniform_location=*/coverage_tex_loc);
+				const int hide_count_loc = splat_renderer->getHideCountTexUniformLoc(); // SESSION066 - see the slice-loop bind above.
+				if(hide_count_loc >= 0)
+					bindTextureUnitToSampler(current_scene->splat_hide_count_copy_texture.nonNull() ? *current_scene->splat_hide_count_copy_texture : *current_scene->splat_accum_copy_texture,
+						/*texture_unit_index=*/SPLAT_HIDE_COUNT_TEXTURE_UNIT_INDEX, /*sampler_uniform_location=*/hide_count_loc);
 			}
 			bindMeshData(*ob);
 #if DO_INDIVIDUAL_VAO_ALLOC
@@ -10913,6 +10945,7 @@ void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffe
 	// GaussianSplatRenderer::getLayerCap().
 	const bool want_layer_count = splat_renderer->wantsLayerCountBuffer();
 	const bool want_dof_depth = splat_renderer->wantsDoFDepthBuffer();
+	const bool want_hide_count = splat_renderer->wantsHideCountBuffer(); // SESSION066 - Clip's own overdraw-count texture, allocated only while Clip is on.
 
 	const bool share_scene_depth = current_scene->render_to_main_render_framebuffer && current_scene->main_depth_renderbuffer.nonNull();
 
@@ -10965,7 +10998,8 @@ void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffe
 		current_scene->splat_saturation_mask_texture->yRes() == mask_yres &&
 		current_scene->splat_accum_depth_renderbuffer.isNull() == share_scene_depth && // Also reallocate if the scene gained or lost a depth buffer we can share.
 		current_scene->splat_layer_count_renderbuffer.nonNull() == want_layer_count && // Switching the layer cap or its estimate on adds a second colour attachment, so it rebuilds.
-		current_scene->splat_dof_depth_renderbuffer.nonNull() == want_dof_depth) // Likewise for switching DoF depth mode to/from Weighted.
+		current_scene->splat_dof_depth_renderbuffer.nonNull() == want_dof_depth && // Likewise for switching DoF depth mode to/from Weighted.
+		current_scene->splat_hide_count_copy_texture.nonNull() == want_hide_count) // SESSION066 - and for turning Clip on/off.
 		return; // Already allocated, in the right size and configuration.
 
 	splat_accum_buffer_format = splat_accum_format;
@@ -10986,6 +11020,8 @@ void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffe
 	current_scene->splat_coverage_mask_texture      = NULL;
 	current_scene->splat_saturation_mask_framebuffer = NULL;
 	current_scene->splat_mask_reduce_framebuffer    = NULL;
+	current_scene->splat_hide_count_copy_texture     = NULL; // SESSION066
+	current_scene->splat_hide_count_copy_framebuffer = NULL;
 
 	conPrint("Allocating splat accumulation buffer with width " + toString(xres) + " and height " + toString(yres) +
 		", format " + std::string(textureFormatString(splat_accum_format)) + ", MSAA samples " + toString(msaa_samples) +
@@ -11085,6 +11121,18 @@ void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffe
 
 	current_scene->splat_accum_copy_framebuffer = new FrameBuffer();
 	current_scene->splat_accum_copy_framebuffer->attachTexture(*current_scene->splat_accum_copy_texture, GL_COLOR_ATTACHMENT0);
+
+	// SESSION066 DIAGNOSTIC - Clip's own full-res overdraw-count copy, only while Clip is on. Half float (a dense pixel
+	// reaches several hundred layers, which 8-bit normalised to [0,1] cannot hold), nearest, single-sampled (it is a blit
+	// target). Sampled per-splat in gaussian_splat_vert_shader.glsl - see the members' comment.
+	if(want_hide_count)
+	{
+		current_scene->splat_hide_count_copy_texture = new OpenGLTexture(xres, yres, this,
+			ArrayRef<uint8>(), OpenGLTextureFormat::Format_RGBA_Linear_Half,
+			OpenGLTexture::Filtering_Nearest, OpenGLTexture::Wrapping_Clamp, false, /*MSAA_samples=*/1);
+		current_scene->splat_hide_count_copy_framebuffer = new FrameBuffer();
+		current_scene->splat_hide_count_copy_framebuffer->attachTexture(*current_scene->splat_hide_count_copy_texture, GL_COLOR_ATTACHMENT0);
+	}
 
 	// DIAGNOSTIC ONLY - see the members' comment.  Half float rather than 8-bit: this counts layers, and a dense pixel of
 	// this scene reaches several hundred of them, which an 8-bit buffer normalised to [0, 1] cannot represent at all.

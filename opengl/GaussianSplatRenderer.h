@@ -154,15 +154,18 @@ public:
 	std::string getDiagnostics() const;
 
 	// One-off diagnostic (GaussianSplatSettingsWidget's "Count in frustum" button, Qt only): counts splats, across every
-	// cloud, that are both in the camera's current frustum and pass the size clamp above (same test as the shader's,
-	// including the invert flag - if the clamp is disabled, every in-frustum splat counts). O(total splats in the
-	// world); meant to be triggered once by a button click, not called per-frame. Returns in_frustum and total (leaves +
+	// cloud, that are in the camera's current frustum AND pass both the size clamp and the distance slice above (same tests
+	// as the shader's, including the invert flags - if a slice is at its keep-everything default, it excludes nothing).
+	// SESSION066: the distance slice is now mirrored here too, so cutting with dist_clamp moves the count. O(total splats in
+	// the world); meant to be triggered once by a button click, not called per-frame. Returns in_frustum and total (leaves +
 	// merged internal nodes summed across all clouds) so callers can report both the absolute number and the fraction -
 	// used to size the ceiling for traversal frustum-cull work (session054 §2A).
-	// SESSION066: 'drawn' is the current LoD draw-list size S(P,R) (sum of num_instances_to_draw), i.e. what the LoD
-	// selection/filter actually picked this frame - unlike in_frustum, it DOES respond to pixel_scale limit and camera
-	// position, so the button now shows both the geometric-in-frustum node count and the LoD-selected draw count.
-	struct FrustumCounts { size_t in_frustum; size_t total; size_t drawn; };
+	// SESSION066: 'drawn' is the current LoD draw-list size S(P,R) (sum of num_instances_to_draw) - the pre-slice selection,
+	// including the dilation band that sits just outside the tight frustum. 'visible' iterates that same draw list and
+	// counts only the splats that pass the frustum + size/distance slices this frame - i.e. what really reaches the screen;
+	// it is the number that drops when the pixel_scale limit or the distance slice tighten. So the button reports the
+	// geometric-in-frustum ceiling (in_frustum/total), the raw draw count (drawn), and the real on-screen count (visible).
+	struct FrustumCounts { size_t in_frustum; size_t total; size_t drawn; size_t visible; };
 	FrustumCounts countSplatsInFrustum() const;
 
 	// One-off diagnostic (GaussianSplatSettingsWidget's "Frustum report" button, Qt only): a multi-line breakdown of what
@@ -657,6 +660,18 @@ public:
 	// to leave this attachment off is most of the reason it exists.
 	bool wantsLayerCountBuffer() const { return (splat_layer_cap > 0) || splat_layer_estimate_requested; }
 
+	// SESSION066 - whether the "Clip" diagnostic wants its own overdraw-count buffer this frame (i.e. Clip is on). Kept
+	// separate from the gate's mask so Clip no longer stands the gate down - see OpenGLScene::splat_hide_count_copy_texture.
+	bool wantsHideCountBuffer() const { return getHideMode() != 0; }
+
+	// Sampler location for that Clip overdraw-count texture in the main splat program, resolved on first use - mirrors
+	// getSplatMaskTexUniformLoc(). See gaussian_splat_vert_shader.glsl.
+	int getHideCountTexUniformLoc();
+
+	// SESSION066 - the Clip per-splat cull uniforms, set by the draw path each frame (like setSplatMaskBlockSize): active
+	// turns the vertex test on and off (0 = off, no sample), threshold is the red-zone value (getOverdrawRangeMax()).
+	void setHideCountCull(bool active, float threshold);
+
 	// Asks the next frame to measure how much fill a per-pixel cap would remove, and report it - see
 	// OpenGLEngine::estimateSplatLayerCapSaving().  The frame that does it draws uncapped, so the counts it reads are
 	// what the scene has rather than what the cap left.
@@ -1133,6 +1148,7 @@ private:
 	// See getSplatMaskTexUniformLoc(). -2 means "not looked up yet", which -1 cannot mean, that being GL's answer for
 	// a uniform the linker dropped.
 	int splat_mask_tex_uniform_loc;
+	int splat_hide_count_tex_uniform_loc; // SESSION066 - sampler loc for splat_hide_count_texture; -2 = not looked up yet, as with splat_mask_tex_uniform_loc.
 
 	// See getAccumBuffer8Bit() above. Off by default, i.e. the RGBA16F buffer this pass has always used.
 	bool splat_accum_buffer_8bit;

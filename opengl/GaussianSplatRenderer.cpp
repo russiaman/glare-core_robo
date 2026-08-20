@@ -261,6 +261,12 @@ public:
 	js::Vector<Vec3f, 16> slice_sample_positions;
 	int slice_sample_draw_count; // num_instances_to_draw the samples above were taken from, so sample j can be mapped back to a draw index.
 
+	// SESSION066: full CPU copy of the instance index VBO's current contents (the LoD draw list S(P,R) actually being
+	// drawn), kept by noteDrawOrderForSlicing() alongside the slice sample. Only countSplatsInFrustum() reads it - to
+	// report how many of the actually-drawn splats pass the frustum + size/distance slices this frame, i.e. what really
+	// reaches the screen (unlike num_instances_to_draw, which is the pre-slice, dilation-band-inclusive selection size).
+	js::Vector<uint32, 16> current_draw_indices;
+
 	// Cumulative count of in-frustum samples, one entry per sample, rebuilt each frame by think() while the frustum-aware
 	// slicing is on.  Empty when it is off, or when the samples cannot be used.
 	js::Vector<int, 16> slice_visible_cdf;
@@ -1043,7 +1049,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	splat_alpha_gain(1.0f), splat_alpha_gamma(1.0f), // Identity: the cloud as captured - see getAlphaGain().
 	last_report_reached_rasteriser(0), last_report_in_frustum(0),
 	splat_num_draw_slices(1), splat_draw_slice_limit(0), splat_layer_cap(0), splat_layer_cap_opaque(true), splat_coverage_cap(0.f), splat_ablation_stage(0), splat_quad_radius_scale(1.f), cap_fill_mask_tex_uniform_loc(-2), splat_area_scale_gamma(1.f), splat_area_scale_ref_px(20.f), splat_coverage_shrink_strength(0.f), splat_coverage_shrink_mode(0), splat_coverage_reduce_mode(0), splat_show_coverage_map_level(-1), coverage_mask_tex_uniform_loc(-2), splat_ewa_fix_enabled(true), splat_near_fade_width(0.3f), splat_near_epsilon(0.1f), splat_dof_depth_mode(0), splat_dof_depth_prepass_alpha_min(0.3f), splat_hide_test_conservative(true), splat_layer_estimate_requested(false), splat_slice_growth(1.0f), splat_visible_slicing(false), splat_saturation_gate_enabled(false), splat_saturation_threshold(1.0f - 1.0f / 255.0f),
-	splat_saturation_mask_downscale(4), splat_mask_tex_uniform_loc(-2),
+	splat_saturation_mask_downscale(4), splat_mask_tex_uniform_loc(-2), splat_hide_count_tex_uniform_loc(-2),
 	splat_accum_buffer_8bit(false),
 	splat_show_overdraw_mode(0), splat_hide_overdraw_enabled(false), splat_hide_alpha_enabled(false),
 	splat_hide_overdraw_mask_valid(false), splat_hide_overdraw_mask_view(Matrix4f::identity()),
@@ -1104,6 +1110,8 @@ void GaussianSplatRenderer::buildShadersIfNeeded()
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_near_fade_width"); // See getNearFadeWidth().
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "splat_coverage_shrink_mode"); // DIAGNOSTIC ONLY - see getCoverageShrinkMode().
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_near_epsilon"); // See getNearEpsilon().  NOTE: user_uniform_vals is sized to match this list in allocCloud().
+	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "splat_hide_count_active");    // SESSION066 DIAGNOSTIC - the "Clip" per-splat cull, see setHideCountCull(). 0 = off (no sample).
+	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_hide_count_threshold"); // SESSION066 DIAGNOSTIC - red-zone threshold (getOverdrawRangeMax()).
 
 
 	// Splats blend into an accumulation buffer of their own rather than straight onto the main colour buffer, so that
@@ -1234,6 +1242,27 @@ int GaussianSplatRenderer::getCoverageMaskTexUniformLoc()
 		coverage_mask_tex_uniform_loc = shader_prog->getUniformLocation("splat_coverage_mask_texture");
 	}
 	return coverage_mask_tex_uniform_loc;
+}
+
+
+int GaussianSplatRenderer::getHideCountTexUniformLoc() // SESSION066 - mirrors getSplatMaskTexUniformLoc().
+{
+	if(splat_hide_count_tex_uniform_loc == -2)
+	{
+		assert(shader_prog.nonNull() && shader_prog->isBuilt());
+		splat_hide_count_tex_uniform_loc = shader_prog->getUniformLocation("splat_hide_count_texture");
+	}
+	return splat_hide_count_tex_uniform_loc;
+}
+
+
+void GaussianSplatRenderer::setHideCountCull(bool active, float threshold) // SESSION066 - the Clip per-splat cull, indices 23/24.
+{
+	for(size_t i=0; i<clouds.size(); ++i)
+	{
+		clouds[i]->ob->materials[0].user_uniform_vals[23].intval   = active ? 1 : 0;
+		clouds[i]->ob->materials[0].user_uniform_vals[24].floatval = threshold;
+	}
 }
 
 
@@ -1553,31 +1582,54 @@ GaussianSplatRenderer::FrustumCounts GaussianSplatRenderer::countSplatsInFrustum
 	result.in_frustum = 0;
 	result.total = 0;
 	result.drawn = 0;
+	result.visible = 0;
 	for(size_t c=0; c<clouds.size(); ++c)
 	{
 		const SplatCloud& cloud = *clouds[c];
-		result.total += cloud.total_splats; // Leaves + merged internal nodes - matches what the traversal iterates over.
-		result.drawn += (size_t)myMax(0, cloud.ob->num_instances_to_draw); // SESSION066: the live LoD draw list S(P,R) - what pixel_scale limit / camera position actually select this frame.
-		for(size_t i=0; i<cloud.total_splats; ++i)
+
+		// One splat's on-screen test: in frustum AND passing both slices, mirroring the vertex shader (size and distance
+		// slices, gaussian_splat_vert_shader.glsl / user_uniform_vals[9,10]) including the invert flags. dist_to_cam is the
+		// length of the view-space position, exactly as the shader takes it. A slice at its keep-everything default
+		// (size 0/0; distance min 0 / max 1000) excludes nothing.
+		const auto passesFrustumAndSlices = [&](uint32 idx) -> bool
 		{
-			const Vec3f& pos = cloud.positions[i];
+			const Vec3f& pos = cloud.positions[idx];
 			if(!pointInFrustum(frustum_clip_planes, num_frustum_clip_planes, Vec4f(pos.x, pos.y, pos.z, 1.f)))
-				continue;
+				return false;
 
 			if(clamp_active)
 			{
-				const Vec3f& scale = cloud.scales[i];
+				const Vec3f& scale = cloud.scales[idx];
 				const float feature_size = 2.f * myMax(scale.x, myMax(scale.y, scale.z));
 				const bool below_min = (splat_size_clamp_min > 0.f) && (feature_size < splat_size_clamp_min);
 				const bool above_max = (splat_size_clamp_max > 0.f) && (feature_size > splat_size_clamp_max);
 				const bool outside_range = below_min || above_max;
-				const bool excluded = splat_size_clamp_invert ? !outside_range : outside_range;
-				if(excluded)
-					continue;
+				if(splat_size_clamp_invert ? !outside_range : outside_range)
+					return false;
 			}
 
-			result.in_frustum++;
-		}
+			const Vec4f pos_vs = scene->last_view_matrix * Vec4f(pos.x, pos.y, pos.z, 1.f);
+			const float dist_to_cam = Vec4f(pos_vs[0], pos_vs[1], pos_vs[2], 0.f).length();
+			const bool inside_dist_range = (dist_to_cam >= splat_dist_clamp_min) && (dist_to_cam <= splat_dist_clamp_max);
+			if(splat_dist_clamp_invert ? inside_dist_range : !inside_dist_range)
+				return false;
+
+			return true;
+		};
+
+		result.total += cloud.total_splats; // Leaves + merged internal nodes - matches what the traversal iterates over.
+		result.drawn += (size_t)myMax(0, cloud.ob->num_instances_to_draw); // SESSION066: the live LoD draw list S(P,R) size - the pre-slice, dilation-band-inclusive selection the pixel_scale limit / camera position pick this frame.
+
+		// in_frustum: over the whole baked tree (the geometric ceiling, LoD-independent).
+		for(size_t i=0; i<cloud.total_splats; ++i)
+			if(passesFrustumAndSlices((uint32)i))
+				result.in_frustum++;
+
+		// visible: over the LoD draw list actually being drawn (current_draw_indices), so this is what really reaches the
+		// screen this frame - it drops as the LoD/pixel_scale, frustum, or slices tighten, unlike drawn/in_frustum.
+		for(size_t i=0; i<cloud.current_draw_indices.size(); ++i)
+			if(passesFrustumAndSlices(cloud.current_draw_indices[i]))
+				result.visible++;
 	}
 	return result;
 }
@@ -3250,7 +3302,7 @@ Reference<SplatCloud> GaussianSplatRenderer::allocCloud()
 	// walks the program's uniforms and indexes this array by the same i, so a slot short is an out-of-bounds read there
 	// and an out-of-bounds write in think(). All but splat_tex_width below are set by think(), or by the draw path for the
 	// saturation mask ones.
-	mat.user_uniform_vals.resize(23);
+	mat.user_uniform_vals.resize(25); // SESSION066: +2 for splat_hide_count_active/threshold (indices 23, 24).
 	mat.user_uniform_vals[2].intval = (int)splat_tex_width;
 
 	// Build a real (if minimal) texture and VAO up front: adding the object to the engine before it has those would
@@ -3518,6 +3570,13 @@ static inline int sliceSampleDrawIndex(int j, int num_samples, int draw_count)
 void GaussianSplatRenderer::noteDrawOrderForSlicing(SplatCloud& cloud, const uint32* draw_indices, size_t count)
 {
 	cloud.slice_visible_cdf.clear(); // Built against the previous sample, so it does not describe this one.  think() rebuilds it.
+
+	// SESSION066: retain the full draw order so the "Count in frustum" button can report the really-drawn count (draw list
+	// tested against the current frustum + slices). A single memcpy of the same indices just uploaded to the VBO; happens
+	// only on a draw-order write (traversal/filter land), not per frame.
+	cloud.current_draw_indices.resizeNoCopy(count);
+	if(count > 0)
+		std::memcpy(cloud.current_draw_indices.data(), draw_indices, count * sizeof(uint32));
 
 	const int draw_count = (int)count;
 	const int num_samples = myMin(draw_count, max_slice_samples);

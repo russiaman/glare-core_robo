@@ -698,6 +698,13 @@ public:
 	Reference<FrameBuffer> splat_accum_copy_framebuffer;
 	OpenGLTextureRef splat_accum_copy_texture;
 
+	// DIAGNOSTIC ONLY (SESSION066) - the "Clip" diagnostic's own per-pixel overdraw count, kept separate from the gate's
+	// mask so Clip can cull red-zone splats WITHOUT standing the saturation gate down (they no longer share one mask).
+	// A full-resolution copy of the overdraw counting pre-pass, sampled per-splat in gaussian_splat_vert_shader.glsl.
+	// Allocated only while Clip is on (GaussianSplatRenderer::wantsHideCountBuffer()), so it costs nothing when off.
+	Reference<FrameBuffer> splat_hide_count_copy_framebuffer;
+	OpenGLTextureRef splat_hide_count_copy_texture;
+
 	// DIAGNOSTIC ONLY - a running count of how many splat fragments have blended into each pixel this frame, as a second
 	// colour attachment on the accumulation framebuffer.  Only allocated while the per-pixel layer cap or its estimate
 	// asks for it - see GaussianSplatRenderer::getLayerCap().  RGBA rather than a single channel because the splat

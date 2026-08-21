@@ -10335,6 +10335,13 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 	time_splat_mark_pass_this_frame = !time_splat_mark_pass_this_frame;
 	const bool time_splat_draw = query_profiling_enabled && current_scene->collect_stats && time_individual_passes && !time_splat_mark_pass_this_frame;
 
+	// SESSION067 - the accumulation buffer's own size, which is the frame's unless GaussianSplatRenderer::getAccumBufferScale()
+	// is below 1.  Everything from here to the resolve works in these, not in frame pixels: the slice draws, the mark
+	// pass (which restores this same viewport - see markSaturatedSplatPixels()), and the shader's own pixel-space
+	// uniforms, which think() already scaled to match.
+	const GLsizei splat_accum_w = (GLsizei)current_scene->splat_accum_renderbuffer->xRes();
+	const GLsizei splat_accum_h = (GLsizei)current_scene->splat_accum_renderbuffer->yRes();
+
 	if(current_scene->splat_accum_depth_renderbuffer.nonNull() && splat_depth_copy_works)
 	{
 		// There was no scene depth renderbuffer to attach to our framebuffer alongside the accumulation buffer, so copy
@@ -10343,14 +10350,60 @@ void OpenGLEngine::drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& 
 		if(query_profiling_enabled && current_scene->collect_stats && time_individual_passes && splat_depth_blit_gpu_timer->isIdle())
 			splat_depth_blit_gpu_timer->beginTimerQuery();
 
-		blitDepthBuffer(scene_target_framebuffer_name, *current_scene->splat_accum_framebuffer, (GLsizei)current_scene->splat_accum_depth_renderbuffer->xRes(),
-			(GLsizei)current_scene->splat_accum_depth_renderbuffer->yRes(), /*check_for_errors=*/false); // Already established at allocation time that the driver accepts this blit.
+		if(current_scene->splat_depth_src_texture.nonNull())
+		{
+			// SESSION067 - the attachment is smaller than the scene's depth buffer, so the copy is done in two steps: a
+			// 1:1 blit into a sampleable texture (a depth blit cannot scale), then a pass that reduces it onto the
+			// attachment by taking the farthest sample of each footprint.  See
+			// gaussian_splat_depth_downsample_frag_shader.glsl for why farthest is the safe direction.
+			blitDepthBuffer(scene_target_framebuffer_name, *current_scene->splat_depth_src_framebuffer, (GLsizei)current_scene->splat_depth_src_texture->xRes(),
+				(GLsizei)current_scene->splat_depth_src_texture->yRes(), /*check_for_errors=*/false); // Established at allocation time that the driver accepts this blit.
+
+			const Reference<OpenGLProgram>& depth_downsample_prog = splat_renderer->getDepthDownsampleProgram();
+			if(depth_downsample_prog.nonNull() && depth_downsample_prog->isBuilt())
+			{
+				DebugGroup depth_reduce_debug_group("splat depth downsample");
+
+				current_scene->splat_accum_framebuffer->bindForDrawing();
+				glViewport(0, 0, splat_accum_w, splat_accum_h);
+
+				// Depth only: the colour attachment holds the accumulation this pass must not touch, and it has not been
+				// cleared yet in any case.  GL_ALWAYS because there is nothing to test against - the attachment's
+				// contents are being replaced outright, and a depth *write* only happens as part of a depth test.
+				setSingleDrawBuffer(GL_COLOR_ATTACHMENT0);
+				glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+				glDisable(GL_BLEND);
+				glEnable(GL_DEPTH_TEST);
+				glDepthFunc(GL_ALWAYS);
+				glDepthMask(GL_TRUE);
+
+				depth_downsample_prog->useProgram();
+				splat_renderer->setDepthDownsampleUniforms(Vec2i((int)current_scene->splat_depth_src_texture->xRes(), (int)current_scene->splat_depth_src_texture->yRes()),
+					Vec2i((int)splat_accum_w, (int)splat_accum_h));
+				bindMeshData(*unit_quad_meshdata);
+				bindTextureUnitToSampler(*current_scene->splat_depth_src_texture, /*texture_unit_index=*/0, /*sampler_uniform_location=*/depth_downsample_prog->albedo_texture_loc);
+
+				drawElementsBaseVertex(GL_TRIANGLES, (GLsizei)unit_quad_meshdata->batches[0].num_indices, unit_quad_meshdata->getIndexType(),
+					(void*)unit_quad_meshdata->getBatch0IndicesTotalBufferOffset(), unit_quad_meshdata->vbo_handle.base_vertex);
+
+				unbindTextureFromTextureUnit(*current_scene->splat_depth_src_texture, /*texture_unit_index=*/0); // Otherwise Chrome reports a feedback loop between the framebuffer and the active texture.
+				OpenGLProgram::useNoPrograms();
+
+				// Back to the states the rest of this function expects to start from.
+				glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+				glDepthFunc(use_reverse_z ? GL_GREATER : GL_LESS);
+			}
+		}
+		else
+			blitDepthBuffer(scene_target_framebuffer_name, *current_scene->splat_accum_framebuffer, (GLsizei)current_scene->splat_accum_depth_renderbuffer->xRes(),
+				(GLsizei)current_scene->splat_accum_depth_renderbuffer->yRes(), /*check_for_errors=*/false); // Already established at allocation time that the driver accepts this blit.
 
 		if(query_profiling_enabled && splat_depth_blit_gpu_timer->isRunning())
 			splat_depth_blit_gpu_timer->endTimerQuery();
 	}
 
 	current_scene->splat_accum_framebuffer->bindForDrawing();
+	glViewport(0, 0, splat_accum_w, splat_accum_h); // SESSION067 - see splat_accum_w above.  At scale 1 this is the viewport that was already set, so it changes nothing.
 
 	// GaussianSplatRenderer::SplatDoFDepthMode - see the enum's own comment.  Computed once here, used for the draw
 	// buffer selection immediately below, the Prepass pass at the end of this function, and passed on to
@@ -10947,7 +11000,17 @@ void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffe
 	const bool want_dof_depth = splat_renderer->wantsDoFDepthBuffer();
 	const bool want_hide_count = splat_renderer->wantsHideCountBuffer(); // SESSION066 - Clip's own overdraw-count texture, allocated only while Clip is on.
 
-	const bool share_scene_depth = current_scene->render_to_main_render_framebuffer && current_scene->main_depth_renderbuffer.nonNull();
+	// SESSION067 - the accumulation buffer can be allocated smaller than the frame, see
+	// GaussianSplatRenderer::getAccumBufferScale().  Sizes come from the renderer's own rounding rule rather than being
+	// recomputed here, so that the buffer, the splat shader's pixel-space uniforms and the resolve's upsample can never
+	// disagree about what a fractional scale meant this frame.
+	const Vec2i splat_viewport_dims(myMax(16, current_scene->viewport_w), myMax(16, current_scene->viewport_h));
+	const Vec2i splat_accum_dims = splat_renderer->accumBufferDimsForViewport(splat_viewport_dims);
+	const bool downscaled_accum = (splat_accum_dims.x != splat_viewport_dims.x) || (splat_accum_dims.y != splat_viewport_dims.y);
+
+	// Sharing the scene's depth renderbuffer requires agreeing with it on size, so a downscaled buffer cannot: it takes
+	// a smaller depth attachment of its own, filled by the reduce pass instead.  At scale 1 this is unchanged.
+	const bool share_scene_depth = current_scene->render_to_main_render_framebuffer && current_scene->main_depth_renderbuffer.nonNull() && !downscaled_accum;
 
 	size_t xres, yres;
 	int msaa_samples;
@@ -10960,9 +11023,9 @@ void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffe
 	}
 	else
 	{
-		xres = (size_t)myMax(16, current_scene->viewport_w);
-		yres = (size_t)myMax(16, current_scene->viewport_h);
-		msaa_samples = 1; // Single-sampled: our depth buffer is filled by a blit, and glBlitFramebuffer can't write into a multisampled draw framebuffer.
+		xres = (size_t)splat_accum_dims.x;
+		yres = (size_t)splat_accum_dims.y;
+		msaa_samples = 1; // Single-sampled: our depth buffer is filled by a blit (or, when downscaled, by a pass writing gl_FragDepth), and neither can write into a multisampled draw framebuffer.
 	}
 
 	// RGBA rather than the main colour buffer's format, which has no alpha channel on desktop: the resolve pass needs
@@ -11014,6 +11077,8 @@ void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffe
 	current_scene->splat_dof_depth_copy_framebuffer = NULL;
 	current_scene->splat_accum_renderbuffer         = NULL;
 	current_scene->splat_accum_depth_renderbuffer   = NULL;
+	current_scene->splat_depth_src_texture          = NULL; // SESSION067 - only ever allocated at scales below 1; freeing it here is what stops it outliving a return to full resolution.
+	current_scene->splat_depth_src_framebuffer      = NULL;
 	current_scene->splat_accum_framebuffer          = NULL;
 	current_scene->splat_accum_copy_framebuffer     = NULL;
 	current_scene->splat_saturation_mask_texture    = NULL;
@@ -11037,6 +11102,58 @@ void OpenGLEngine::allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffe
 	{
 		current_scene->splat_accum_framebuffer->attachRenderBuffer(*current_scene->main_depth_renderbuffer, GL_DEPTH_ATTACHMENT);
 		splat_depth_copy_works = false; // Nothing to copy: the buffer is shared, not duplicated.
+	}
+	else if(downscaled_accum)
+	{
+		// SESSION067 - the depth attachment is smaller than the scene's, so it cannot be filled by a blit: depth blits
+		// cannot scale.  Instead the scene's depth is copied 1:1 into a sampleable texture, and a pass reduces that onto
+		// this attachment, taking the farthest sample of each footprint - see
+		// gaussian_splat_depth_downsample_frag_shader.glsl.
+		//
+		// The 1:1 copy still needs a format the driver will accept a blit into, and for the same reason as below that
+		// can only be found by trying - so the candidate loop is kept, just testing the full-resolution copy rather than
+		// the reduced attachment.  The reduced attachment then takes the format that won, so the two agree by
+		// construction and the reduce pass never has to convert between depth encodings.
+		OpenGLTextureFormat candidates[4];
+		const int num_candidates = depthFormatCandidatesForFrameBuffer(scene_target_framebuffer_name, candidates);
+
+		splat_depth_copy_works = false;
+		for(int i=0; i<num_candidates; ++i)
+		{
+			current_scene->splat_depth_src_texture = NULL; // Free the previous attempt's before allocating the next, as the full-resolution path below does.
+			current_scene->splat_depth_src_framebuffer = NULL;
+
+			current_scene->splat_depth_src_texture = new OpenGLTexture(splat_viewport_dims.x, splat_viewport_dims.y, this,
+				ArrayRef<uint8>(), // data
+				candidates[i],
+				OpenGLTexture::Filtering_Nearest, // Read with texelFetch only: a filtered depth would be a depth that exists nowhere in the scene.
+				OpenGLTexture::Wrapping_Clamp,
+				false, // has_mipmaps
+				/*MSAA_samples=*/1
+			);
+			current_scene->splat_depth_src_framebuffer = new FrameBuffer();
+			current_scene->splat_depth_src_framebuffer->attachTexture(*current_scene->splat_depth_src_texture, attachmentPointForDepthFormat(candidates[i]));
+
+			if(blitDepthBuffer(scene_target_framebuffer_name, *current_scene->splat_depth_src_framebuffer, (GLsizei)splat_viewport_dims.x, (GLsizei)splat_viewport_dims.y, /*check_for_errors=*/true))
+			{
+				current_scene->splat_accum_depth_renderbuffer = new RenderBuffer(xres, yres, msaa_samples, candidates[i]);
+				current_scene->splat_accum_framebuffer->attachRenderBuffer(*current_scene->splat_accum_depth_renderbuffer, attachmentPointForDepthFormat(candidates[i]));
+
+				conPrint("Splat accumulation depth buffer format: " + std::string(textureFormatString(candidates[i])) + " (reduced from a " +
+					toString(splat_viewport_dims.x) + " x " + toString(splat_viewport_dims.y) + " copy)");
+				splat_depth_copy_works = true;
+				break;
+			}
+		}
+
+		if(!splat_depth_copy_works)
+		{
+			// Leave nothing half-built: without the copy the reduce pass has no source, and the draw path decides which
+			// of the two depth mechanisms to run by whether this texture exists.
+			current_scene->splat_depth_src_texture = NULL;
+			current_scene->splat_depth_src_framebuffer = NULL;
+			conPrint("Error: found no depth format the scene's depth buffer can be copied into, so splats will not be occluded by scene geometry.");
+		}
 	}
 	else
 	{
@@ -11631,6 +11748,16 @@ void OpenGLEngine::resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name,
 	if(scene_target_framebuffer_name != 0)
 		setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer (not normal buffer).  The default framebuffer has no such attachment, and the draw buffer set for it already is the right one.
 
+	// SESSION067 - back to the frame's own resolution.  drawSplatClouds() ran the accumulation passes at the buffer's
+	// size, which is smaller whenever GaussianSplatRenderer::getAccumBufferScale() is below 1; from here on everything -
+	// this composite, the DoF depth prepass after it, and the rest of draw() - is full resolution again.  At scale 1 the
+	// two are equal and this is a no-op.
+	const Vec2i resolve_dims(myMax(16, current_scene->viewport_w), myMax(16, current_scene->viewport_h));
+	const Vec2i accum_dims((int)current_scene->splat_accum_copy_texture->xRes(), (int)current_scene->splat_accum_copy_texture->yRes());
+	glViewport(0, 0, (GLsizei)resolve_dims.x, (GLsizei)resolve_dims.y);
+
+	const bool accum_downscaled = (accum_dims.x != resolve_dims.x) || (accum_dims.y != resolve_dims.y);
+
 	// write_weighted_depth's gl_FragDepth write only actually happens (in the shader) at pixels with non-zero
 	// coverage, which are guaranteed at or in front of whatever opaque depth was already there - see the shader's
 	// own comment. Depth *write* is enabled only for that mode; every other mode (and every pixel a splat didn't
@@ -11658,9 +11785,23 @@ void OpenGLEngine::resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name,
 	resolve_prog->useProgram();
 	splat_renderer->setResolveOverdrawUniforms(splat_saturation_mask_block); // Overdraw debug view uniforms - see the method's own comment for why this can't go through the generic per-object uniform path.
 	splat_renderer->setResolveDoFDepthUniforms(write_weighted_depth, (float)current_scene->near_draw_dist);
+	splat_renderer->setResolveUpsampleUniforms(accum_dims, resolve_dims); // SESSION067 - how to read a smaller accumulation buffer back up to the frame.
 	bindMeshData(*unit_quad_meshdata);
 
 	bindTextureUnitToSampler(*current_scene->splat_accum_copy_texture, /*texture_unit_index=*/0, /*sampler_uniform_location=*/resolve_prog->albedo_texture_loc);
+
+	// SESSION067 - the upsample filter lives on the texture rather than in the shader, so both modes take the same fetch
+	// there - see sampleSplatAccum() in gaussian_splat_resolve_frag_shader.glsl.  Set here each frame, the same way the
+	// mask pyramid's level range is set in markSaturatedSplatPixels(), rather than at allocation time: the bilinear
+	// switch is a live knob and must not cost a framebuffer rebuild, unlike the scale itself.  The texture is allocated
+	// Filtering_Nearest, which is what the full-resolution path wants and keeps, so this only ever changes anything
+	// while the buffer really is smaller.
+	if(accum_downscaled)
+	{
+		const GLenum filter = splat_renderer->getAccumUpsampleBilinear() ? GL_LINEAR : GL_NEAREST;
+		glTexParameteri(current_scene->splat_accum_copy_texture->getTextureTarget(), GL_TEXTURE_MIN_FILTER, filter);
+		glTexParameteri(current_scene->splat_accum_copy_texture->getTextureTarget(), GL_TEXTURE_MAG_FILTER, filter);
+	}
 
 	// DIAGNOSTIC ONLY - the coverage map view's source, see GaussianSplatRenderer::getShowCoverageMapLevel().  Bound
 	// whether or not the view is on, for the same reason the splat program's masks are: a declared sampler with no

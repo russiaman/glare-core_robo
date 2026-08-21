@@ -698,6 +698,15 @@ public:
 	Reference<FrameBuffer> splat_accum_copy_framebuffer;
 	OpenGLTextureRef splat_accum_copy_texture;
 
+	// SESSION067 - a full-resolution, *sampleable* copy of the scene's depth, and the framebuffer it is blitted into.
+	// Only allocated while the accumulation buffer is smaller than the frame (GaussianSplatRenderer::getAccumBufferScale()
+	// below 1), because that is the only case that needs it: a depth blit cannot scale, so the scene's depth is copied
+	// here at 1:1 and then reduced onto the smaller depth attachment by a pass - see
+	// gaussian_splat_depth_downsample_frag_shader.glsl.  A texture rather than a renderbuffer precisely because that pass
+	// has to read it.
+	Reference<FrameBuffer> splat_depth_src_framebuffer;
+	OpenGLTextureRef splat_depth_src_texture;
+
 	// DIAGNOSTIC ONLY (SESSION066) - the "Clip" diagnostic's own per-pixel overdraw count, kept separate from the gate's
 	// mask so Clip can cull red-zone splats WITHOUT standing the saturation gate down (they no longer share one mask).
 	// A full-resolution copy of the overdraw counting pre-pass, sampled per-splat in gaussian_splat_vert_shader.glsl.

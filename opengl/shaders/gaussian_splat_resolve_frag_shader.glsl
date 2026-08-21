@@ -34,7 +34,48 @@ uniform int splat_write_weighted_depth;
 uniform float splat_dof_near_clip_dist;
 uniform sampler2D splat_dof_depth_texture;
 
+// SESSION067 - the accumulation buffer can be smaller than the frame, see GaussianSplatRenderer::getAccumBufferScale().
+// splat_accum_upsample: 0 = the buffer is the same size as the frame and is indexed one-to-one, exactly as this pass
+// always did; 1 = nearest; 2 = bilinear.  Both sizes are given because at fractional scales the buffer's size is a
+// *rounded* scaling of the viewport, so neither can be recovered from the other and the scale factor alone would put
+// the last row and column slightly wrong.
+uniform int splat_accum_upsample;
+uniform vec2 splat_accum_dims_px;    // Size the accumulation buffer was actually allocated at.
+uniform vec2 splat_resolve_dims_px;  // Size of the frame this pass is drawing into, i.e. the viewport.
+
 out vec4 colour_out;
+
+
+// Reads one of the accumulation buffers at this fragment, honouring the mode above.
+//
+// Bilinear rather than nearest is what makes a downscaled buffer usable: a splat is a Gaussian, so its screen footprint
+// is band-limited by construction (that is what the +0.3 low-pass in the vertex shader guarantees), and a smooth
+// reconstruction of a band-limited signal is close to lossless - far more forgiving than the same downscale would be on
+// ordinary geometry with real edges in it.  Both channels of interest ride along: the colour is premultiplied by
+// coverage and the coverage is in alpha, so interpolating the vec4 interpolates a premultiplied pair, which is the form
+// that composites correctly.  Interpolating a *straight* colour by the same weights would not.
+//
+// Nearest is not a fallback but a diagnostic: seeing the blocks is how one confirms the buffer really is smaller, and
+// it is the honest baseline the bilinear cost is compared against.  It is selected by the sampler's own filter state,
+// set by OpenGLEngine::resolveSplatAccumBuffer(), which is why both modes take the same fetch here.
+vec4 sampleSplatAccum(sampler2D tex)
+{
+	if(splat_accum_upsample == 0)
+		return texelFetch(tex, ivec2(gl_FragCoord.xy), /*mip level=*/0); // Same size as the frame: bit-for-bit the pre-SESSION067 path.
+
+	// The buffer covers the same screen area at a lower resolution, so the normalised position within the frame is
+	// also the normalised position within the buffer, whatever its size.  gl_FragCoord is at pixel centres, which is
+	// what makes this land on texel centres rather than half a texel off.
+	return texture(tex, gl_FragCoord.xy / splat_resolve_dims_px);
+}
+
+
+// This fragment's position in accumulation-buffer pixels.  The saturation and coverage masks are sized and blocked in
+// those, not in frame pixels, so the diagnostic views that index them have to convert - at scale 1 this is the identity.
+vec2 accumCoordPx()
+{
+	return (splat_accum_upsample == 0) ? gl_FragCoord.xy : (gl_FragCoord.xy * splat_accum_dims_px / splat_resolve_dims_px);
+}
 
 
 #if DO_POST_PROCESSING
@@ -59,11 +100,12 @@ vec3 inverseACESFilm(vec3 y)
 
 void main()
 {
-	// The accumulation buffer has the same dimensions as the buffer being drawn to, and this quad covers the whole
-	// viewport, so the fragment's own coordinates index it directly.  Any MSAA samples were already resolved into it by
-	// the blit, which averages the premultiplied colour and the coverage together - the right order, since dividing
-	// per-sample and then averaging would weight sparsely covered samples equally with fully covered ones.
-	vec4 accum = texelFetch(albedo_texture, ivec2(gl_FragCoord.xy), /*mip level=*/0);
+	// This quad covers the whole viewport, so the fragment's own coordinates locate it in the accumulation buffer -
+	// directly when that buffer is the same size (the default), through sampleSplatAccum()'s filter when it is smaller.
+	// Any MSAA samples were already resolved into it by the blit, which averages the premultiplied colour and the
+	// coverage together - the right order, since dividing per-sample and then averaging would weight sparsely covered
+	// samples equally with fully covered ones.
+	vec4 accum = sampleSplatAccum(albedo_texture);
 
 	// DIAGNOSTIC ONLY - see splat_show_coverage_map_level above.  Written before the overdraw view and the resolve
 	// proper, since it replaces both: this is a view of what the shrink reads, not of what the splats produced.
@@ -75,7 +117,7 @@ void main()
 		int level = splat_show_coverage_map_level;
 		int texels_per_px = splat_coverage_map_block << level;
 		ivec2 level_max = max(textureSize(splat_coverage_map_texture, level) - ivec2(1), ivec2(0));
-		ivec2 texel = min(ivec2(gl_FragCoord.xy) / ivec2(texels_per_px), level_max);
+		ivec2 texel = min(ivec2(accumCoordPx()) / ivec2(texels_per_px), level_max); // The block size is in accumulation-buffer pixels, so the fragment has to be expressed in them too - see accumCoordPx().
 
 		// Grey, straight through: 0 = nothing covered, 1 = finished.  No ramp, because the question this view answers is
 		// "how far off 1 is this number", and a colour ramp makes near-equal values look further apart than they are.
@@ -139,7 +181,7 @@ void main()
 	// identical to albedo_texture's, and `coverage` (already known > 0, from the discard above) serves both.
 	if(splat_write_weighted_depth != 0)
 	{
-		float depth_accum = texelFetch(splat_dof_depth_texture, ivec2(gl_FragCoord.xy), 0).r;
+		float depth_accum = sampleSplatAccum(splat_dof_depth_texture).r; // Same buffer shape and the same filter as the colour above - see the identical-alpha argument in the comment.
 		float mean_view_depth = depth_accum / coverage;
 		gl_FragDepth = getDeviceDepthFromLinearDepth(splat_dof_near_clip_dist, mean_view_depth);
 	}

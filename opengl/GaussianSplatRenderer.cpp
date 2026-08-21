@@ -1051,6 +1051,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	splat_num_draw_slices(1), splat_draw_slice_limit(0), splat_layer_cap(0), splat_layer_cap_opaque(true), splat_coverage_cap(0.f), splat_ablation_stage(0), splat_quad_radius_scale(1.f), cap_fill_mask_tex_uniform_loc(-2), splat_area_scale_gamma(1.f), splat_area_scale_ref_px(20.f), splat_coverage_shrink_strength(0.f), splat_coverage_shrink_mode(0), splat_coverage_reduce_mode(0), splat_show_coverage_map_level(-1), coverage_mask_tex_uniform_loc(-2), splat_ewa_fix_enabled(true), splat_near_fade_width(0.3f), splat_near_epsilon(0.1f), splat_dof_depth_mode(0), splat_dof_depth_prepass_alpha_min(0.3f), splat_hide_test_conservative(true), splat_layer_estimate_requested(false), splat_slice_growth(1.0f), splat_visible_slicing(false), splat_saturation_gate_enabled(false), splat_saturation_threshold(1.0f - 1.0f / 255.0f),
 	splat_saturation_mask_downscale(4), splat_mask_tex_uniform_loc(-2), splat_hide_count_tex_uniform_loc(-2),
 	splat_accum_buffer_8bit(false),
+	splat_accum_buffer_scale(1.f), splat_accum_upsample_bilinear(true), // SESSION067 - 1 = full resolution, i.e. exactly the pre-knob behaviour; the upsample setting is not consulted at that scale.
 	splat_show_overdraw_mode(0), splat_hide_overdraw_enabled(false), splat_hide_alpha_enabled(false),
 	splat_hide_overdraw_mask_valid(false), splat_hide_overdraw_mask_view(Matrix4f::identity()),
 	splat_hide_overdraw_mask_viewport_w(0), splat_hide_overdraw_mask_viewport_h(0), splat_hide_overdraw_mask_block(0),
@@ -1147,6 +1148,12 @@ void GaussianSplatRenderer::buildShadersIfNeeded()
 	resolve_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_dof_near_clip_dist");
 	resolve_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "splat_dof_depth_texture");
 
+	// SESSION067 - the downscaled accumulation buffer's upsample, see setResolveUpsampleUniforms(). Indices 9-11, read
+	// back there in this same order.
+	resolve_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "splat_accum_upsample");
+	resolve_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Vec2,  "splat_accum_dims_px");
+	resolve_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Vec2,  "splat_resolve_dims_px");
+
 
 	// Marks the pixels the composite has already finished with, between draw slices - see
 	// OpenGLEngine::markSaturatedSplatPixels().  Shares the resolve pass's full-viewport quad vertex shader, since it is
@@ -1191,6 +1198,24 @@ void GaussianSplatRenderer::buildShadersIfNeeded()
 		/*wait_for_build_to_complete=*/!opengl_engine->parallel_shader_compile_support
 	);
 	opengl_engine->addProgram(mask_reduce_prog);
+
+
+	// SESSION067 - reduces the scene's depth buffer onto the (smaller) accumulation buffer's depth attachment, taking the
+	// farthest sample of each footprint - see getDepthDownsampleProgram() for why this is a pass and not a blit.  Same
+	// full-viewport quad vertex shader again.  Built unconditionally alongside the rest, but only run at scales below 1.
+	depth_downsample_prog = new OpenGLProgram(
+		"gaussian splat depth downsample prog",
+		new OpenGLShader(shader_dir + "/gaussian_splat_resolve_vert_shader.glsl", version_directive, key_defs + preprocessor_defines, GL_VERTEX_SHADER),
+		new OpenGLShader(shader_dir + "/gaussian_splat_depth_downsample_frag_shader.glsl", version_directive, key_defs + preprocessor_defines, GL_FRAGMENT_SHADER),
+		opengl_engine->getAndIncrNextProgramIndex(),
+		/*wait_for_build_to_complete=*/!opengl_engine->parallel_shader_compile_support
+	);
+	opengl_engine->addProgram(depth_downsample_prog);
+
+	// Same reason as the programs above: the build may still be in flight here, so the locations are resolved by
+	// appendUserUniformInfo() once it completes.  Read back by setDepthDownsampleUniforms(), in this order.
+	depth_downsample_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Vec2, "splat_depth_src_dims_px");
+	depth_downsample_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Vec2, "splat_depth_dst_dims_px");
 
 
 	// Halves the coverage pyramid by mean instead of minimum, once per level - see getCoverageShrinkStrength() and
@@ -1366,6 +1391,28 @@ void GaussianSplatRenderer::setResolveDoFDepthUniforms(bool write_weighted_depth
 int GaussianSplatRenderer::getResolveDoFDepthTexUniformLoc() const
 {
 	return (resolve_prog.nonNull() && (resolve_prog->user_uniform_info.size() >= 9)) ? resolve_prog->user_uniform_info[8].loc : -1;
+}
+
+
+// SESSION067 - see the declaration.  The upsample mode is decided here rather than in the shader from the two sizes,
+// because "the buffer is full resolution" has to mean bit-for-bit the old path: at equal sizes the shader takes its
+// texelFetch branch, so a frame at scale 1 is not merely visually but numerically what it was before this existed.
+void GaussianSplatRenderer::setResolveUpsampleUniforms(const Vec2i& accum_dims, const Vec2i& viewport_dims) const
+{
+	const bool downscaled = (accum_dims.x != viewport_dims.x) || (accum_dims.y != viewport_dims.y);
+
+	glUniform1i(resolve_prog->user_uniform_info[9].loc, downscaled ? (splat_accum_upsample_bilinear ? 2 : 1) : 0); // 0 = one-to-one, 1 = nearest, 2 = bilinear - see the shader.
+	glUniform2f(resolve_prog->user_uniform_info[10].loc, (float)accum_dims.x, (float)accum_dims.y);
+	glUniform2f(resolve_prog->user_uniform_info[11].loc, (float)viewport_dims.x, (float)viewport_dims.y);
+}
+
+
+// SESSION067 - see getDepthDownsampleProgram().  Both sizes are passed for the same reason the resolve's are: the
+// destination is a rounded scaling of the source, so the ratio has to be formed from the sizes actually allocated.
+void GaussianSplatRenderer::setDepthDownsampleUniforms(const Vec2i& src_dims, const Vec2i& dst_dims) const
+{
+	glUniform2f(depth_downsample_prog->user_uniform_info[0].loc, (float)src_dims.x, (float)src_dims.y);
+	glUniform2f(depth_downsample_prog->user_uniform_info[1].loc, (float)dst_dims.x, (float)dst_dims.y);
 }
 
 
@@ -4853,15 +4900,26 @@ void GaussianSplatRenderer::think()
 	const Vec2i viewport_dims = opengl_engine->getViewportDims();
 	const OpenGLScene* const scene = opengl_engine->getCurrentScene();
 
+	// SESSION067 - the splat vertex shader works entirely in accumulation-buffer pixels: it sizes the quad in them, maps
+	// it back to clip space by dividing by viewport_dims_px, and indexes the saturation mask through them.  So when the
+	// accumulation buffer is smaller than the frame, these two uniforms have to describe *it*, not the window - the
+	// shader is self-consistent either way, and every pixel-space quantity in it then scales together.
+	//
+	// This is the only place the scale touches the projection, and deliberately so.  The LoD traversal keeps its own
+	// full-viewport focal length (see kickOffTraversals()'s focalPxForScene() call), so the selection is unchanged and
+	// only the buffer the selected splats land in gets smaller - see getAccumBufferScale() for the measurement that says
+	// letting the selection coarsen too would cost detail and buy nothing.
+	const Vec2i accum_dims = accumBufferDimsForViewport(viewport_dims);
+
 	// Focal length in pixels, derived the same way as the engine's own screen-space projections:
 	// focal_px = viewport_px * (lens_sensor_dist / sensor_size).
-	const float focal_x = (float)viewport_dims.x * scene->lens_sensor_dist / scene->use_sensor_width;
-	const float focal_y = (float)viewport_dims.y * scene->lens_sensor_dist / scene->use_sensor_height;
+	const float focal_x = (float)accum_dims.x * scene->lens_sensor_dist / scene->use_sensor_width;
+	const float focal_y = (float)accum_dims.y * scene->lens_sensor_dist / scene->use_sensor_height;
 
 	for(size_t i=0; i<clouds.size(); ++i)
 	{
 		OpenGLMaterial& mat = clouds[i]->ob->materials[0];
-		mat.user_uniform_vals[0].vec2 = Vec2f((float)viewport_dims.x, (float)viewport_dims.y);
+		mat.user_uniform_vals[0].vec2 = Vec2f((float)accum_dims.x, (float)accum_dims.y);
 		mat.user_uniform_vals[1].vec2 = Vec2f(focal_x, focal_y);
 		// user_uniform_vals[2] (splat_tex_width) is constant, and was set in allocCloud().
 		mat.user_uniform_vals[3].vec2 = Vec2f(splat_size_clamp_min, splat_size_clamp_max);

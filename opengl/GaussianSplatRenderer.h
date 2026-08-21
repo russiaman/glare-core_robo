@@ -11,6 +11,8 @@ Copyright Glare Technologies Limited 2026 -
 #include "../maths/Matrix4f.h" // For the frozen hide-overdraw mask's view matrix.
 #include "../maths/Quat.h"
 #include "../maths/Vec4f.h"
+#include "../maths/mathstypes.h" // For myClamp() in accumBufferDimsForViewport().
+#include "../maths/vec2.h" // For the Vec2i viewport/accumulation-buffer dimensions accumBufferDimsForViewport() works in.
 #include "../physics/jscol_aabbox.h"
 #include "../utils/Platform.h"
 #include "../utils/Reference.h"
@@ -800,6 +802,63 @@ public:
 	bool getAccumBuffer8Bit() const { return splat_accum_buffer_8bit; }
 	void setAccumBuffer8Bit(bool v) { splat_accum_buffer_8bit = v; }
 
+	/*
+	SESSION067 - Linear scale the splat accumulation buffer is allocated at, relative to the viewport. 1 (default) = full
+	resolution, i.e. exactly the behaviour that existed before this knob, down every path.
+
+	Why this is the biggest lever left. The frame decomposes (measured on the interior + bridge scene, ~1.1M splats drawn
+	of ~17M) into about 6.3 ms of fixed per-splat work - instance issue and the vertex stage - 1.7 ms of rasterisation
+	and shading, and 9.0 ms of blending. Only the last two scale with pixels, and the blend is more than half the whole
+	frame: this pass is bound by the read-modify-write bandwidth of the accumulation buffer, not by splat count or by
+	any of the maths. Quartering the pixels therefore takes ~17 ms to ~9 ms, which no count-side lever has come close to.
+
+	The 6.3 ms is untouched by this - the same splats are still issued and projected - so ~6.3 ms is the floor of this
+	direction whatever the scale, and the returns visibly bend as it is approached. The other thing that bends them is
+	the +0.3 covariance low-pass in gaussian_splat_vert_shader.glsl: with pixel_scale_limit at 2 the LoD deliberately
+	brings splats to about 2 px, so at half scale they land on that half-pixel floor and area falls by about 3.3x rather
+	than 4x. Both are expected, not defects.
+
+	The LoD selection deliberately does NOT follow this. think() scales only the shader's viewport_dims_px/focal_len_px;
+	the traversal keeps focalPxForScene() at the full viewport, so the same splats are selected and only the buffer they
+	land in gets smaller. Measured directly: at a halved window, restoring the full-window splat set (pixel_scale_limit
+	2 -> 1) cost no time at all, so letting the LoD coarsen with the buffer would give up detail for nothing.
+
+	Changing this reallocates the accumulation framebuffer, like the 8-bit switch above, so it is not free per frame.
+	*/
+	float getAccumBufferScale() const { return splat_accum_buffer_scale; }
+	void setAccumBufferScale(float v) { splat_accum_buffer_scale = v; }
+
+	// The scale above, clamped to what the allocator will actually honour. One place, so that the buffer allocation, the
+	// shader's pixel-space uniforms and the resolve's upsample can never disagree about what "half" meant this frame.
+	float getEffectiveAccumBufferScale() const { return myClamp(splat_accum_buffer_scale, 0.1f, 1.f); }
+
+	// Accumulation buffer dimensions for a given viewport, at the scale above. The single rounding rule: rounded to
+	// nearest and floored at 16, so that a fractional scale (the point of a free-form spin box rather than powers of two)
+	// gives one answer everywhere rather than one per caller.
+	Vec2i accumBufferDimsForViewport(const Vec2i& viewport_dims) const
+	{
+		const float s = getEffectiveAccumBufferScale();
+		return Vec2i(myMax(16, (int)(viewport_dims.x * s + 0.5f)), myMax(16, (int)(viewport_dims.y * s + 0.5f)));
+	}
+
+	// SESSION067 - How the resolve pass reads a downscaled accumulation buffer back up to the full-resolution frame.
+	// True (default) = bilinear, which is what makes the downscale usable at all: splats are band-limited blobs by
+	// construction (that is what the +0.3 low-pass guarantees), so a smooth reconstruction of them loses far less than
+	// the same downscale would on ordinary geometry. False = nearest, i.e. visibly blocky - kept as a switch because
+	// seeing the blocks is how one tells the buffer really is smaller, and how the two costs are compared honestly.
+	// Ignored entirely at scale 1, where the resolve indexes the buffer one-to-one exactly as it always has.
+	bool getAccumUpsampleBilinear() const { return splat_accum_upsample_bilinear; }
+	void setAccumUpsampleBilinear(bool v) { splat_accum_upsample_bilinear = v; }
+
+	// SESSION067 - Reduces the scene's depth buffer to the accumulation buffer's size, taking the farthest sample of
+	// each footprint, so splats are still occluded by opaque geometry when the buffer is smaller than the frame.
+	// A pass rather than a blit because glBlitFramebuffer cannot scale a depth buffer: the source and destination
+	// rectangles must match for GL_DEPTH_BUFFER_BIT. Farthest rather than nearest is the conservative direction - a
+	// splat that should have been hidden may survive, but one that should be visible is never cut. Null until the
+	// first addObject(), like the programs above.
+	const Reference<OpenGLProgram>& getDepthDownsampleProgram() const { return depth_downsample_prog; }
+	void setDepthDownsampleUniforms(const Vec2i& src_dims, const Vec2i& dst_dims) const;
+
 	// The program OpenGLEngine::markSaturatedSplatPixels() marks finished pixels with. Null until the first addObject(),
 	// like the splat program itself.
 	const Reference<OpenGLProgram>& getSaturationMaskProgram() const { return saturation_mask_prog; }
@@ -947,6 +1006,14 @@ public:
 	static const int RESOLVE_DOF_DEPTH_TEXTURE_UNIT_INDEX = 2;
 	int getResolveDoFDepthTexUniformLoc() const;
 
+	// SESSION067 - tells the resolve pass how to map a full-resolution fragment back into a smaller accumulation buffer,
+	// and whether to read it smoothly - see getAccumBufferScale() / getAccumUpsampleBilinear(). Set alongside the two
+	// setters above, for the same reason they exist: this pass is a manual quad with no material behind it.
+	//
+	// Passing both sizes rather than a ratio is deliberate: the accumulation buffer's size is a rounded scaling of the
+	// viewport, so the shader has to be told the size that was actually allocated, not the size that was asked for.
+	void setResolveUpsampleUniforms(const Vec2i& accum_dims, const Vec2i& viewport_dims) const;
+
 private:
 	GLARE_DISABLE_COPY(GaussianSplatRenderer);
 
@@ -986,6 +1053,10 @@ private:
 	int cap_fill_mask_tex_uniform_loc;
 
 	Reference<OpenGLProgram> mask_reduce_prog; // Halves the mask, by minimum, to build its pyramid.  Built alongside shader_prog.
+
+	// SESSION067 - see getDepthDownsampleProgram().  Built alongside shader_prog, but only ever run while the
+	// accumulation buffer is smaller than the frame.
+	Reference<OpenGLProgram> depth_downsample_prog;
 
 	OpenGLEngine* opengl_engine;
 
@@ -1152,6 +1223,11 @@ private:
 
 	// See getAccumBuffer8Bit() above. Off by default, i.e. the RGBA16F buffer this pass has always used.
 	bool splat_accum_buffer_8bit;
+
+	// SESSION067 - see getAccumBufferScale() / getAccumUpsampleBilinear() above. 1 and true by default: at scale 1 every
+	// path behaves exactly as it did before the knob existed, and the upsample setting is then not consulted at all.
+	float splat_accum_buffer_scale;
+	bool splat_accum_upsample_bilinear;
 
 	// See getShowOverdrawMode() above. 0 = off.
 	int splat_show_overdraw_mode;

@@ -850,6 +850,38 @@ public:
 	bool getAccumUpsampleBilinear() const { return splat_accum_upsample_bilinear; }
 	void setAccumUpsampleBilinear(bool v) { splat_accum_upsample_bilinear = v; }
 
+	/*
+	SESSION067 DIAGNOSTIC - splits the cloud by each splat's own projected screen area, drawing only one side of it.
+	0 = off (the whole cloud), 1 = only splats at or above the threshold, 2 = only those below it.  The threshold is in
+	frame pixels, the unit getFrustumStructureReport()'s "Fill by splat size" histogram reports in; think() converts it
+	to the accumulation buffer's pixels, so the same setting selects the same splats at any getAccumBufferScale().
+
+	Projected area, rather than the world-space size getSizeClampMin() slices on or the distance getDistClampMin() does:
+	this pass is paid for in blended pixels, and of the three only this one is that quantity.
+
+	Why the split is worth having.  A splat's screen size *is* its frequency content - a Gaussian's spectrum is a
+	Gaussian, so a wide splat is a smooth one and a narrow splat is the detail - which means the large side downscales
+	almost losslessly and the small side does not.  Measured on the interior + bridge scene at the canonical viewpoint:
+
+	    threshold    splats above it    share of the fill
+	      64 px           30.8%               93.9%
+	     256 px           13.1%               85.0%
+	      1K px            4.5%               67.4%
+
+	So cost and safety point the same way: at 256 px, 13% of the splats carry 85% of the fill and are exactly the ones
+	that can be rendered at a fraction of the resolution, while the 87% that carry the detail cost 15% and can be kept
+	sharp nearly for free.  This slice is the instrument that checks that claim - draw each side alone, at its own buffer
+	scale, and look - before the two-layer version that needs a second buffer and a per-pixel ordered merge is built.
+
+	Note it applies from the point in the vertex shader where the real radii exist, so ablation stages 2-4 (which emit a
+	one-pixel quad and return earlier) are unaffected; stage 5 onward, where fill is what is being measured, all honour it.
+	*/
+	int getAreaSliceMode() const { return splat_area_slice_mode; }
+	void setAreaSliceMode(int v) { splat_area_slice_mode = v; }
+
+	float getAreaSlicePx() const { return splat_area_slice_px; }
+	void setAreaSlicePx(float v) { splat_area_slice_px = v; }
+
 	// SESSION067 - Reduces the scene's depth buffer to the accumulation buffer's size, taking the farthest sample of
 	// each footprint, so splats are still occluded by opaque geometry when the buffer is smaller than the frame.
 	// A pass rather than a blit because glBlitFramebuffer cannot scale a depth buffer: the source and destination
@@ -1228,6 +1260,10 @@ private:
 	// path behaves exactly as it did before the knob existed, and the upsample setting is then not consulted at all.
 	float splat_accum_buffer_scale;
 	bool splat_accum_upsample_bilinear;
+
+	// SESSION067 DIAGNOSTIC - see getAreaSliceMode() above. 0 = off, i.e. the whole cloud, and the threshold is unread.
+	int splat_area_slice_mode;
+	float splat_area_slice_px;
 
 	// See getShowOverdrawMode() above. 0 = off.
 	int splat_show_overdraw_mode;

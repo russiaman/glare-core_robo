@@ -1052,6 +1052,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	splat_saturation_mask_downscale(4), splat_mask_tex_uniform_loc(-2), splat_hide_count_tex_uniform_loc(-2),
 	splat_accum_buffer_8bit(false),
 	splat_accum_buffer_scale(1.f), splat_accum_upsample_bilinear(true), // SESSION067 - 1 = full resolution, i.e. exactly the pre-knob behaviour; the upsample setting is not consulted at that scale.
+	splat_area_slice_mode(0), splat_area_slice_px(256.f), // SESSION067 DIAGNOSTIC - off; 256 px is the threshold the measured histogram puts 85% of the fill above - see getAreaSliceMode().
 	splat_show_overdraw_mode(0), splat_hide_overdraw_enabled(false), splat_hide_alpha_enabled(false),
 	splat_hide_overdraw_mask_valid(false), splat_hide_overdraw_mask_view(Matrix4f::identity()),
 	splat_hide_overdraw_mask_viewport_w(0), splat_hide_overdraw_mask_viewport_h(0), splat_hide_overdraw_mask_block(0),
@@ -1113,6 +1114,8 @@ void GaussianSplatRenderer::buildShadersIfNeeded()
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_near_epsilon"); // See getNearEpsilon().  NOTE: user_uniform_vals is sized to match this list in allocCloud().
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "splat_hide_count_active");    // SESSION066 DIAGNOSTIC - the "Clip" per-splat cull, see setHideCountCull(). 0 = off (no sample).
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_hide_count_threshold"); // SESSION066 DIAGNOSTIC - red-zone threshold (getOverdrawRangeMax()).
+	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "splat_area_slice_mode"); // SESSION067 DIAGNOSTIC - the projected-area slice, see getAreaSliceMode().
+	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_area_slice_px");   // SESSION067 DIAGNOSTIC - its threshold, converted to buffer pixels in think().  NOTE: user_uniform_vals is sized to match this list in allocCloud().
 
 
 	// Splats blend into an accumulation buffer of their own rather than straight onto the main colour buffer, so that
@@ -3349,7 +3352,7 @@ Reference<SplatCloud> GaussianSplatRenderer::allocCloud()
 	// walks the program's uniforms and indexes this array by the same i, so a slot short is an out-of-bounds read there
 	// and an out-of-bounds write in think(). All but splat_tex_width below are set by think(), or by the draw path for the
 	// saturation mask ones.
-	mat.user_uniform_vals.resize(25); // SESSION066: +2 for splat_hide_count_active/threshold (indices 23, 24).
+	mat.user_uniform_vals.resize(27); // SESSION066: +2 for splat_hide_count_active/threshold (indices 23, 24). SESSION067: +2 for splat_area_slice_mode/_px (25, 26).
 	mat.user_uniform_vals[2].intval = (int)splat_tex_width;
 
 	// Build a real (if minimal) texture and VAO up front: adding the object to the engine before it has those would
@@ -4942,6 +4945,17 @@ void GaussianSplatRenderer::think()
 		mat.user_uniform_vals[20].floatval = splat_near_fade_width; // See getNearFadeWidth().
 		mat.user_uniform_vals[21].intval = splat_coverage_shrink_mode; // DIAGNOSTIC ONLY - see getCoverageShrinkMode().
 		mat.user_uniform_vals[22].floatval = splat_near_epsilon; // See getNearEpsilon().
+
+		// SESSION067 DIAGNOSTIC - the projected-area slice, see getAreaSliceMode().  The threshold is typed in frame
+		// pixels (that is the unit getFrustumStructureReport()'s "Fill by splat size" histogram is in, which is where
+		// the number comes from), but the shader measures area in accumulation-buffer pixels, since think() scaled its
+		// focal length to that buffer just above.  Area goes as the square of a linear scale, so the conversion is the
+		// ratio of the two pixel counts - and with it the same setting selects the same splats at any buffer scale,
+		// which is the whole point of being able to A/B the two halves at different resolutions.
+		const double frame_px = (double)viewport_dims.x * (double)viewport_dims.y;
+		const double buffer_px = (double)accum_dims.x * (double)accum_dims.y;
+		mat.user_uniform_vals[25].intval = splat_area_slice_mode;
+		mat.user_uniform_vals[26].floatval = (frame_px > 0) ? (float)(splat_area_slice_px * (buffer_px / frame_px)) : splat_area_slice_px;
 	}
 
 	buildVisibleSliceCDFs();

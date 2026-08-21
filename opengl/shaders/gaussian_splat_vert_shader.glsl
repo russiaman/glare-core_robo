@@ -80,6 +80,13 @@ uniform float splat_quad_radius_scale;
 // DIAGNOSTIC ONLY - makes splat_quad_radius_scale's reduction area-dependent instead of flat, see
 // GaussianSplatRenderer::getAreaScaleGamma()/getAreaScaleRefPx(). Both are inert (reduction stays flat, as before these
 // existed) while splat_quad_radius_scale is 1, since the formula below then reduces to 1 regardless of area_weight.
+// SESSION067 DIAGNOSTIC - the projected-area slice, see the use site below and GaussianSplatRenderer::getAreaSliceMode().
+// 0 = off (the whole cloud, and nothing below is read), 1 = keep only splats at or above the threshold, 2 = keep only
+// those below it.  The threshold is in *this buffer's* pixels: the CPU converts it from the frame-pixel figure the user
+// typed, so the slice picks the same splats at any accumulation buffer scale.
+uniform int splat_area_slice_mode;
+uniform float splat_area_slice_px;
+
 uniform float splat_area_scale_gamma; // 1 (default) = weight is linear in the splat's own screen-space area.  Raising it
                                        // concentrates the reduction on splats with more area than splat_area_scale_ref_px;
                                        // lowering it spreads a partial reduction onto smaller splats too.
@@ -404,6 +411,36 @@ void main()
 
 	float radius1 = radius1_raw * effective_quad_scale;
 	float radius2 = radius2_raw * effective_quad_scale;
+
+	// SESSION067 - the projected-area slice, see GaussianSplatRenderer::getAreaSliceMode().  Keeps only the splats above
+	// or only those below a threshold on their own screen area, so each half of the cloud can be drawn, timed and looked
+	// at alone.
+	//
+	// Projected area, not the world-space size splat_size_clamp_min_max slices on, and not distance: the pass is paid for
+	// in blended pixels, and this is the only one of the three that is that quantity.  Measured on the interior + bridge
+	// scene, the splats above 256 px of area are 13% of the cloud and 85% of the fill - so the two halves are very nearly
+	// "almost all of the cost" and "almost all of the detail", which is what makes rendering them at different buffer
+	// resolutions worth doing at all.
+	//
+	// pi*r1*r2 is the ellipse the fragment shader actually keeps, matching splatFootprint()'s ellipse_area_px so the
+	// threshold can be read straight off that report's histogram.  Unclipped, unlike the report's, which scales its area
+	// by the on-screen fraction: clipping would make a splat's side of the threshold depend on where it sits in the
+	// frame, and so make it flip as the camera pans - the one thing a layer assignment must not do.
+	//
+	// The threshold arrives already converted into this buffer's pixels (see think()), so the same setting selects the
+	// same splats whatever the accumulation buffer is scaled to.
+	if(splat_area_slice_mode != 0)
+	{
+		float area_px = 3.14159265 * radius1 * radius2;
+		bool is_large = area_px >= splat_area_slice_px;
+		if((splat_area_slice_mode == 1) != is_large) // Mode 1 keeps the large side, mode 2 the small side.
+		{
+			gl_Position = vec4(2.0, 2.0, 2.0, 1.0); // Push outside the clip volume, as the culls above do.
+			frag_conic = vec3(0.0);
+			frag_screen_offset_px = vec2(0.0);
+			return;
+		}
+	}
 
 	vec4 clip_pos = proj_matrix * pos_vs;
 

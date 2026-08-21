@@ -851,6 +851,41 @@ public:
 	void setAccumUpsampleBilinear(bool v) { splat_accum_upsample_bilinear = v; }
 
 	/*
+	SESSION068 - Post-processing enhancers applied inside the resolve, on the upscaled splat buffer.  Independent on/off
+	switches so each can be A/B'd against the other.  All inert at scale 1 (the resolve setter forces the shader flags to
+	0 when the accum buffer is 1:1 with the frame): both filters exist to undo losses that only appear while the buffer
+	is smaller.
+
+	getDeconvEnabled() - matched deconvolution of the KNOWN blur.  The buffer is smeared by exactly two things, both ours
+	and both Gaussian: the +0.3 low-pass on the 2D covariance diagonal (variance 0.3 in accum-texel^2) and the triangular
+	bilinear-tent upsample kernel (variance 1/6).  A Gaussian blur of variance v to first order is col + (v/2)*laplacian,
+	so a discrete 5-point laplacian scaled by the EXCESS-over-scale-1 variance is its inverse.  The scale factor almost
+	cancels after folding in the laplacian step, and the strength collapses to a = (0.3 + 1/6 - 0.3*s*s)/2 - one line,
+	no per-scene tuning.  See session068 snapshot §4.1 for the full derivation.
+
+	getDeconvGain() - A/B multiplier on that derived strength; 1.0 = as derived.  Only a diagnostic - if the eye picks a
+	very different value, the derivation is off, not the default.
+
+	getRCASEnabled() - AMD FidelityFX RCAS (MIT).  A contrast-adaptive sharpen whose output is bounded by the
+	neighbourhood min/max by construction, so it cannot ring or halo - a safety net on top of the deconvolution above.
+	getRCASSharpness() is its own strength, 0..1, fraction of the algorithm's safe maximum lobe.
+
+	Order in the shader when both are on: deconvolution first (physical inverse, restores lost contrast), RCAS second
+	(perceptual, adds apparent sharpness on top).  Reversing them applies RCAS to a still-blurred input.
+	*/
+	bool getDeconvEnabled() const { return splat_deconv_enabled; }
+	void setDeconvEnabled(bool v) { splat_deconv_enabled = v; }
+
+	float getDeconvGain() const { return splat_deconv_gain; }
+	void setDeconvGain(float v) { splat_deconv_gain = v; }
+
+	bool getRCASEnabled() const { return splat_rcas_enabled; }
+	void setRCASEnabled(bool v) { splat_rcas_enabled = v; }
+
+	float getRCASSharpness() const { return splat_rcas_sharpness; }
+	void setRCASSharpness(float v) { splat_rcas_sharpness = v; }
+
+	/*
 	SESSION067 DIAGNOSTIC - splits the cloud by each splat's own projected screen area, drawing only one side of it.
 	0 = off (the whole cloud), 1 = only splats at or above the threshold, 2 = only those below it.  The threshold is in
 	frame pixels, the unit getFrustumStructureReport()'s "Fill by splat size" histogram reports in; think() converts it
@@ -1045,6 +1080,12 @@ public:
 	// Passing both sizes rather than a ratio is deliberate: the accumulation buffer's size is a rounded scaling of the
 	// viewport, so the shader has to be told the size that was actually allocated, not the size that was asked for.
 	void setResolveUpsampleUniforms(const Vec2i& accum_dims, const Vec2i& viewport_dims) const;
+
+	// SESSION068 - Post-processing enhancer uniforms.  Same call shape and same reasoning as setResolveUpsampleUniforms:
+	// this pass is a manual quad with no material behind it.  Both enable flags are forced to 0 whenever the accum
+	// buffer is 1:1 with the frame - the enhancers only exist to undo losses that appear while the buffer is smaller,
+	// and the scale-1 path must remain bit-for-bit unchanged (session067 rule).
+	void setResolveEnhanceUniforms(const Vec2i& accum_dims, const Vec2i& viewport_dims) const;
 
 private:
 	GLARE_DISABLE_COPY(GaussianSplatRenderer);
@@ -1264,6 +1305,14 @@ private:
 	// SESSION067 DIAGNOSTIC - see getAreaSliceMode() above. 0 = off, i.e. the whole cloud, and the threshold is unread.
 	int splat_area_slice_mode;
 	float splat_area_slice_px;
+
+	// SESSION068 - post-processing enhancers on the upscaled splat buffer, see getDeconvEnabled() / getRCASEnabled() etc.
+	// All off by default and forced inert by the resolve setter whenever the buffer is 1:1 with the frame, so at scale 1
+	// every path behaves exactly as it did before this knob existed.
+	bool splat_deconv_enabled;
+	float splat_deconv_gain;
+	bool splat_rcas_enabled;
+	float splat_rcas_sharpness;
 
 	// See getShowOverdrawMode() above. 0 = off.
 	int splat_show_overdraw_mode;

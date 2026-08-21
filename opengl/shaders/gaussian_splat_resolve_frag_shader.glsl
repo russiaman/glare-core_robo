@@ -43,6 +43,15 @@ uniform int splat_accum_upsample;
 uniform vec2 splat_accum_dims_px;    // Size the accumulation buffer was actually allocated at.
 uniform vec2 splat_resolve_dims_px;  // Size of the frame this pass is drawing into, i.e. the viewport.
 
+// SESSION068 - post-processing enhancers on the upscaled splat buffer. See GaussianSplatRenderer::setResolveEnhanceUniforms().
+// Both are independent on/off switches so the owner can A/B either alone or both together.  All four uniforms are
+// forced inert (enabled=0) by the setter whenever the accumulation buffer is 1:1 with the frame - the whole point of
+// this pass is to undo losses that only exist while the buffer is smaller.
+uniform int splat_deconv_enabled;    // 0 = off, 1 = on.  Matched deconvolution of the +0.3 low-pass + bilinear tent, see applyMatchedDeconv().
+uniform float splat_deconv_gain;     // A/B multiplier on the analytically-derived strength.  1.0 = as derived; higher/lower is a knob to verify the derivation by eye.
+uniform int splat_rcas_enabled;      // 0 = off, 1 = on.  AMD FidelityFX RCAS (MIT), see applyRCAS().
+uniform float splat_rcas_sharpness;  // 0..1, RCAS sharpness (fraction of its safe maximum lobe).
+
 out vec4 colour_out;
 
 
@@ -75,6 +84,65 @@ vec4 sampleSplatAccum(sampler2D tex)
 vec2 accumCoordPx()
 {
 	return (splat_accum_upsample == 0) ? gl_FragCoord.xy : (gl_FragCoord.xy * splat_accum_dims_px / splat_resolve_dims_px);
+}
+
+
+// SESSION068 - straight (un-premultiplied) colour of a neighbour texel of the accumulation buffer, offset by
+// offset_texels texels of THAT buffer.  Falls back to centre_col where the neighbour is empty, so that the edge of a
+// cloud is not pulled toward black: an empty texel is "no data here", not "black here".
+//
+// Stepping in ACCUM-BUFFER texels (not frame pixels) is essential: real information exists only at that spacing, and
+// any finer step would sharpen the bilinear interpolant itself rather than the underlying signal.
+vec3 sampleSplatColourOffset(vec2 offset_texels, vec3 centre_col)
+{
+	vec2 uv = gl_FragCoord.xy / splat_resolve_dims_px + offset_texels / splat_accum_dims_px;
+	vec4 a = texture(albedo_texture, uv);
+	return (a.a > 0.0) ? clamp(a.rgb / a.a, 0.0, 1.0) : centre_col;
+}
+
+
+// SESSION068 - matched deconvolution: approximate inverse of the KNOWN blur applied to this buffer, not a hand-tuned
+// sharpen.  Two sources of blur, both ours: the +0.3 low-pass on the 2D covariance diagonal
+// (gaussian_splat_vert_shader.glsl, variance 0.3 in accum-buffer texels squared) and the triangular bilinear-tent kernel
+// used to upsample (variance 1/6).  Gaussian variances add, and a blur of variance v to first order is
+// col + (v/2)*laplacian - so its inverse subtracts the same term.
+//
+// Only the EXCESS over scale 1 is undone: the +0.3 at scale 1 is legitimate anti-aliasing that prevents sub-pixel splats
+// from flickering as the camera moves; taking it out would bring that flicker back.  After the laplacian's step
+// (1 accum-texel = 1/s frame pixels) is folded in, the scale factor almost cancels and the strength collapses to
+// a = (0.3 + 1/6 - 0.3*s*s) / 2.  Full derivation: session068 snapshot §4.1.
+//
+// The neighbourhood clamp at the end is not cosmetic: an unclamped laplacian rings on sharp transitions, and this
+// clamp makes the filter incapable of producing a new local extremum by construction.
+vec3 applyMatchedDeconv(vec3 e, vec3 b, vec3 d, vec3 f, vec3 h, float scale, float gain)
+{
+	float a = max((0.3 + (1.0/6.0) - 0.3 * scale * scale) * 0.5, 0.0) * gain;
+	vec3 laplacian = b + d + f + h - 4.0 * e;
+	vec3 sharp = e - a * laplacian;
+	return clamp(sharp, min(min(b, d), min(f, h)), max(max(b, d), max(f, h)));
+}
+
+
+// SESSION068 - AMD FidelityFX RCAS (MIT).  Locally-contrast-adaptive sharpen: the result is bounded by the neighbourhood
+// min/max by construction, so this filter cannot produce ringing or halos - unlike an ordinary unsharp mask.  Applied
+// in display-referred [0, 1] (see the call site in main(), which is where main() puts col at the moment RCAS wants).
+//
+// sharpness: 0 = mild, 1 = the maximum the algorithm considers safe.
+vec3 applyRCAS(vec3 e, vec3 b, vec3 d, vec3 f, vec3 h, float sharpness)
+{
+	vec3 mn = min(min(b, d), min(f, h));
+	vec3 mx = max(max(b, d), max(f, h));
+
+	// How far the centre lobe can be pushed without leaving the neighbourhood - taken per channel, then the tightest.
+	vec3 hit_min = mn / (4.0 * mx + 1.0e-6);
+	vec3 hit_max = (1.0 - mx) / (4.0 * mn - 4.0 - 1.0e-6);
+	vec3 lobe_rgb = max(-hit_min, hit_max);
+	float lobe = max(lobe_rgb.r, max(lobe_rgb.g, lobe_rgb.b));
+
+	// -0.1875 is the point beyond which RCAS begins to ring; sharpness scales the safe cap down from there.
+	lobe = clamp(lobe, -0.1875, 0.0) * sharpness;
+
+	return (lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0);
 }
 
 
@@ -156,6 +224,32 @@ void main()
 	// pushing a convex combination of values in [0, 1] just outside it, which would take inverseACESFilm() outside the
 	// range it is conditioned for.
 	vec3 col = clamp(accum.rgb / coverage, 0.0, 1.0);
+
+	// SESSION068 - post-processing enhancers.  Placed HERE, between the un-premultiplying divide above and the display
+	// transform inversion below, for three reasons that all matter:
+	//   1. col is display-referred sRGB in [0, 1] at this point - the space both filters below are derived for.
+	//      After inverseACESFilm() values leave [0, 1] into linear HDR, where the same coefficients ring differently.
+	//   2. col is straight (un-premultiplied).  Sharpening the premultiplied accum.rgb would chase the alpha gradient,
+	//      not the colour gradient.
+	//   3. The diagnostic branches (coverage map, overdraw) returned earlier - they show raw data and are left alone.
+	// Both enable flags are forced to 0 by setResolveEnhanceUniforms() whenever the accum buffer is 1:1 with the frame,
+	// so the scale-1 path is bit-for-bit unchanged.  See session068 snapshot §2.
+	if(splat_deconv_enabled != 0 || splat_rcas_enabled != 0)
+	{
+		// One shared set of four neighbour samples for both filters - they read the same cross of texels.
+		vec3 b = sampleSplatColourOffset(vec2( 0.0, -1.0), col);
+		vec3 d = sampleSplatColourOffset(vec2(-1.0,  0.0), col);
+		vec3 f = sampleSplatColourOffset(vec2( 1.0,  0.0), col);
+		vec3 h = sampleSplatColourOffset(vec2( 0.0,  1.0), col);
+
+		// Deconvolution first, then RCAS: the deconvolution is the physical inverse (restores contrast the blur took
+		// away), RCAS is perceptual on top (adds apparent sharpness).  Reversing them applies RCAS to a still-blurred
+		// input and buys less at the same cost.  See session068 snapshot §4.2.
+		if(splat_deconv_enabled != 0)
+			col = applyMatchedDeconv(col, b, d, f, h, splat_accum_dims_px.x / splat_resolve_dims_px.x, splat_deconv_gain);
+		if(splat_rcas_enabled != 0)
+			col = clamp(applyRCAS(col, b, d, f, h, splat_rcas_sharpness), 0.0, 1.0);
+	}
 
 #if DO_POST_PROCESSING
 	// col is what the splats should look like on screen, but the engine will apply toneMapToNonLinear() - that is,

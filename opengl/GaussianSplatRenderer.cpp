@@ -1053,6 +1053,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	splat_accum_buffer_8bit(false),
 	splat_accum_buffer_scale(1.f), splat_accum_upsample_bilinear(true), // SESSION067 - 1 = full resolution, i.e. exactly the pre-knob behaviour; the upsample setting is not consulted at that scale.
 	splat_area_slice_mode(0), splat_area_slice_px(256.f), // SESSION067 DIAGNOSTIC - off; 256 px is the threshold the measured histogram puts 85% of the fill above - see getAreaSliceMode().
+	splat_deconv_enabled(false), splat_deconv_gain(1.f), splat_rcas_enabled(false), splat_rcas_sharpness(0.5f), // SESSION068 - both off; gain 1.0 = the analytically derived strength; sharpness 0.5 = mid of RCAS's safe range.
 	splat_show_overdraw_mode(0), splat_hide_overdraw_enabled(false), splat_hide_alpha_enabled(false),
 	splat_hide_overdraw_mask_valid(false), splat_hide_overdraw_mask_view(Matrix4f::identity()),
 	splat_hide_overdraw_mask_viewport_w(0), splat_hide_overdraw_mask_viewport_h(0), splat_hide_overdraw_mask_block(0),
@@ -1156,6 +1157,13 @@ void GaussianSplatRenderer::buildShadersIfNeeded()
 	resolve_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "splat_accum_upsample");
 	resolve_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Vec2,  "splat_accum_dims_px");
 	resolve_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Vec2,  "splat_resolve_dims_px");
+
+	// SESSION068 - post-processing enhancers on the upscaled buffer, see setResolveEnhanceUniforms(). Indices 12-15,
+	// read back there in this same order.  Independent on/off flags for A/B testing either filter alone or both together.
+	resolve_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "splat_deconv_enabled");
+	resolve_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_deconv_gain");
+	resolve_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "splat_rcas_enabled");
+	resolve_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_rcas_sharpness");
 
 
 	// Marks the pixels the composite has already finished with, between draw slices - see
@@ -1407,6 +1415,21 @@ void GaussianSplatRenderer::setResolveUpsampleUniforms(const Vec2i& accum_dims, 
 	glUniform1i(resolve_prog->user_uniform_info[9].loc, downscaled ? (splat_accum_upsample_bilinear ? 2 : 1) : 0); // 0 = one-to-one, 1 = nearest, 2 = bilinear - see the shader.
 	glUniform2f(resolve_prog->user_uniform_info[10].loc, (float)accum_dims.x, (float)accum_dims.y);
 	glUniform2f(resolve_prog->user_uniform_info[11].loc, (float)viewport_dims.x, (float)viewport_dims.y);
+}
+
+
+// SESSION068 - see setResolveEnhanceUniforms() in the header.  Both enable flags are forced to 0 at scale 1 so the
+// default kadr stays bit-for-bit identical to the pre-enhancer path, whatever is checked in the UI.  gain/sharpness
+// still ride along - harmless with the flags off, and matches how the upsample setter above passes its dimensions
+// unconditionally.
+void GaussianSplatRenderer::setResolveEnhanceUniforms(const Vec2i& accum_dims, const Vec2i& viewport_dims) const
+{
+	const bool downscaled = (accum_dims.x != viewport_dims.x) || (accum_dims.y != viewport_dims.y);
+
+	glUniform1i(resolve_prog->user_uniform_info[12].loc, (downscaled && splat_deconv_enabled) ? 1 : 0);
+	glUniform1f(resolve_prog->user_uniform_info[13].loc, splat_deconv_gain);
+	glUniform1i(resolve_prog->user_uniform_info[14].loc, (downscaled && splat_rcas_enabled) ? 1 : 0);
+	glUniform1f(resolve_prog->user_uniform_info[15].loc, splat_rcas_sharpness);
 }
 
 

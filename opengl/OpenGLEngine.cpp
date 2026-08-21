@@ -11786,6 +11786,7 @@ void OpenGLEngine::resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name,
 	splat_renderer->setResolveOverdrawUniforms(splat_saturation_mask_block); // Overdraw debug view uniforms - see the method's own comment for why this can't go through the generic per-object uniform path.
 	splat_renderer->setResolveDoFDepthUniforms(write_weighted_depth, (float)current_scene->near_draw_dist);
 	splat_renderer->setResolveUpsampleUniforms(accum_dims, resolve_dims); // SESSION067 - how to read a smaller accumulation buffer back up to the frame.
+	splat_renderer->setResolveEnhanceUniforms(accum_dims, resolve_dims);  // SESSION068 - matched deconvolution / RCAS on top of that upsample.  Inert at scale 1 by construction of the setter itself.
 	bindMeshData(*unit_quad_meshdata);
 
 	bindTextureUnitToSampler(*current_scene->splat_accum_copy_texture, /*texture_unit_index=*/0, /*sampler_uniform_location=*/resolve_prog->albedo_texture_loc);

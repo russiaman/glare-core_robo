@@ -317,13 +317,19 @@ public:
 	// SESSION071: which formulation derives a merged LoD node's colour + opacity - see GaussianSplatMergeColourMode. The
 	// setter re-derives every loaded cloud's merged colours in place and re-uploads them, so the two can be compared live
 	// on the same scene without a reload: a colour pass over the tree, no traversal, no re-bake of pose data.
-	GaussianSplatMergeColourMode getMergeColourMode() const { return splat_merge_colour_mode; }
+	GaussianSplatMergeColourMode getMergeColourMode() const { return splat_merge_colour_params.mode; }
 	void setMergeColourMode(GaussianSplatMergeColourMode v);
 
-	// SESSION071 DIAGNOSTIC: multiplier on merged (non-leaf) node opacity - see recolorLodTree()'s alpha_boost comment for
-	// what it is meant to distinguish. 1 = off. Re-derives colours in place like setMergeColourMode() does.
-	float getMergeAlphaBoost() const { return splat_merge_alpha_boost; }
-	void setMergeAlphaBoost(float v);
+
+	// SESSION071: how much wider than moment-matching a MERGED node's Gaussian is drawn, along the spread of its children
+	// only (leaves keep their authored size, and a flat surface keeps its thickness). sqrt(3) is the analytic default that
+	// makes neighbouring merged nodes meet instead of leaving a lattice of gaps - see widenedMergedScale() for the
+	// derivation, the ablation-ladder measurement behind it, and why 1 (plain moment-matching) darkens bright surfaces.
+	// Unlike the colour settings this changes geometry, so the setter re-bakes rather than only recolouring - still no
+	// traversal, and the draw list is unaffected.
+	float getMergeSpreadWiden() const { return splat_merge_spread_widen; }
+	void setMergeSpreadWiden(float v);
+
 
 
 	// Diagnostic tool, not a LoD parameter: culls any splat whose feature_size (2 * max scale axis, matching
@@ -974,6 +980,15 @@ public:
 	float getAreaSlicePx() const { return splat_area_slice_px; }
 	void setAreaSlicePx(float v) { splat_area_slice_px = v; }
 
+	// SESSION071 DIAGNOSTIC: side of the point quad the ablation stages 2-5 emit, in accumulation-buffer pixels. Those
+	// stages deliberately collapse the splat to a single pixel so the fill drops out of the measurement, which makes the
+	// result too sparse to read colour off. Widening it trades the timing meaning of those stages (area is no longer
+	// negligible) for a readable picture of what colour each splat carries with blending out of the way - which is what
+	// separates "the bright splats are gone from the selection" from "the bright splats are there but the blend loses
+	// them". 1 (default) is the original one-pixel behaviour.
+	float getPointSizePx() const { return splat_point_size_px; }
+	void setPointSizePx(float v) { splat_point_size_px = v; }
+
 	// SESSION067 - Reduces the scene's depth buffer to the accumulation buffer's size, taking the farthest sample of
 	// each footprint, so splats are still occluded by opaque geometry when the buffer is smaller than the frame.
 	// A pass rather than a blit because glBlitFramebuffer cannot scale a depth buffer: the source and destination
@@ -1208,7 +1223,9 @@ private:
 	void rebuildVAO(SplatCloud& cloud); // Rebuilds vert_vao against the current instance index VBO - needed whenever that VBO is replaced.
 	void uploadTexelRowsForSplatRange(SplatCloud& cloud, size_t first_splat, size_t num_splats_to_upload); // Repacks and re-uploads just the texture rows spanning the given splat range.
 	void writeIdentityIndices(SplatCloud& cloud, size_t first_splat, size_t num_splats); // Writes an identity draw order over the given range of the instance index VBO.
+	void rebakeAllClouds();  // SESSION071: re-bakes every member (pose + colours) and re-uploads - needed when merged-node GEOMETRY changes, which recolourAllClouds() cannot express.
 	void recolourAllClouds(); // SESSION071: re-derives merged-node colours on every loaded cloud under the current mode/boost and re-uploads them - see the .cpp.
+	std::string mergeColourByDepthReport(); // SESSION071: per-depth merged-colour drift table appended to getFrustumStructureReport() - see the .cpp.
 	void rebuildCloudAABB(SplatCloud& cloud); // Recomputes the cloud AABB as the union of its members' bounds.  O(num members), not O(num splats).
 
 	void appendMemberToCloud(SplatCloud& cloud, const CloudMember& member); // Fast path: bakes one member onto the tail and uploads only the affected rows.  member.offset is assigned here.
@@ -1309,8 +1326,8 @@ private:
 	float filter_max_rot_rate_deg_per_s; // SESSION071: see getFilterMaxRotRateDegPerS() above.
 	float filter_min_trans_rate_m_per_s;
 
-	GaussianSplatMergeColourMode splat_merge_colour_mode; // SESSION071 - see getMergeColourMode() above.
-	float splat_merge_alpha_boost;                        // SESSION071 diagnostic - see getMergeAlphaBoost() above.
+	GaussianSplatMergeColourParams splat_merge_colour_params; // SESSION071 - see the getters above.
+	float splat_merge_spread_widen;                           // SESSION071 - see getMergeSpreadWiden() above.
 
 	// SESSION063 K4: coarse floor knobs - see the getters above.
 	bool split_coarse_floor_enabled;
@@ -1429,6 +1446,7 @@ private:
 	// SESSION067 DIAGNOSTIC - see getAreaSliceMode() above. 0 = off, i.e. the whole cloud, and the threshold is unread.
 	int splat_area_slice_mode;
 	float splat_area_slice_px;
+	float splat_point_size_px; // SESSION071 DIAGNOSTIC - see getPointSizePx() above.
 
 	// SESSION068 - post-processing enhancers on the upscaled splat buffer, see getDeconvEnabled() / getRCASEnabled() etc.
 	// All off by default and forced inert by the resolve setter whenever the buffer is 1:1 with the frame, so at scale 1

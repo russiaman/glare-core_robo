@@ -289,7 +289,7 @@ static Vec4f computeMergedColourAlphaLegacyArrays(const Vec4f* child_colours, co
 }
 
 
-void recolorLodTree(const std::vector<GaussianSplatLodNode>& tree, const Vec3f* scales, Vec4f* colours, GaussianSplatMergeColourMode mode, float alpha_boost)
+void recolorLodTree(const std::vector<GaussianSplatLodNode>& tree, const Vec3f* scales, Vec4f* colours, const GaussianSplatMergeColourParams& params)
 {
 	std::vector<Vec4f> child_colours; // Hoisted out of the loop so the per-node gather reuses one allocation.
 	std::vector<Vec3f> child_scales;
@@ -311,12 +311,9 @@ void recolorLodTree(const std::vector<GaussianSplatLodNode>& tree, const Vec3f* 
 			child_scales [c] = scales [ci];
 		}
 
-		Vec4f merged = (mode == GaussianSplatMergeColourMode_Energy) ?
+		const Vec4f merged = (params.mode == GaussianSplatMergeColourMode_Energy) ?
 			computeMergedColourAlphaEnergy      (child_colours.data(), child_scales.data(), num_children, scales[i]) :
 			computeMergedColourAlphaLegacyArrays(child_colours.data(), child_scales.data(), num_children, scales[i]);
-
-		if(alpha_boost != 1.f) // SESSION071 diagnostic - see the header comment.
-			merged.x[3] = myClamp(merged.x[3] * alpha_boost, 0.f, 1.f);
 
 		colours[i] = merged;
 	}
@@ -832,13 +829,16 @@ void test()
 		std::vector<Vec4f> tree_colours(tree.size());
 		for(size_t i=0; i<tree.size(); ++i) { tree_scales[i] = tree[i].scale; tree_colours[i] = tree[i].colour; }
 
-		recolorLodTree(tree, tree_scales.data(), tree_colours.data(), GaussianSplatMergeColourMode_Legacy);
+		GaussianSplatMergeColourParams legacy_params; legacy_params.mode = GaussianSplatMergeColourMode_Legacy;
+		GaussianSplatMergeColourParams energy_params; energy_params.mode = GaussianSplatMergeColourMode_Energy;
+
+		recolorLodTree(tree, tree_scales.data(), tree_colours.data(), legacy_params);
 		for(size_t i=0; i<tree.size(); ++i)
 			for(int c=0; c<4; ++c)
 				testAssert(epsEqual(tree_colours[i].x[c], tree[i].colour.x[c], 1.0e-4f));
 
 		// Energy mode must stay in range everywhere, and must leave leaves untouched (their colour is ground truth).
-		recolorLodTree(tree, tree_scales.data(), tree_colours.data(), GaussianSplatMergeColourMode_Energy);
+		recolorLodTree(tree, tree_scales.data(), tree_colours.data(), energy_params);
 		for(size_t i=0; i<tree.size(); ++i)
 		{
 			for(int c=0; c<4; ++c)
@@ -850,7 +850,7 @@ void test()
 
 		// Switching back to Legacy must restore the build's colours bit-for-bit-ish - i.e. the toggle is reversible, not
 		// a one-way accumulation onto whatever the previous mode left behind.
-		recolorLodTree(tree, tree_scales.data(), tree_colours.data(), GaussianSplatMergeColourMode_Legacy);
+		recolorLodTree(tree, tree_scales.data(), tree_colours.data(), legacy_params);
 		for(size_t i=0; i<tree.size(); ++i)
 			for(int c=0; c<4; ++c)
 				testAssert(epsEqual(tree_colours[i].x[c], tree[i].colour.x[c], 1.0e-4f));

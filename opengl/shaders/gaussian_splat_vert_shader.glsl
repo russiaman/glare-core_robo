@@ -103,6 +103,12 @@ uniform vec2 splat_jitter_px;
 // in the first place.  See think()'s own comment for the replacement value and its floor.
 uniform float splat_low_pass_variance;
 
+// SESSION071 DIAGNOSTIC - side of the point quad emitted by ablation stages 2-5, in accumulation-buffer pixels.  1 is
+// the original one-pixel behaviour those stages were built with.  Larger only to make the point cloud legible: at one
+// pixel the splats are too sparse to read colour off, and the question those stages answer here is not timing but
+// whether the bright splats are present in the selection at all before blending has a chance to lose them.
+uniform float splat_point_size_px;
+
 uniform float splat_area_scale_gamma; // 1 (default) = weight is linear in the splat's own screen-space area.  Raising it
                                        // concentrates the reduction on splats with more area than splat_area_scale_ref_px;
                                        // lowering it spreads a partial reduction onto smaller splats too.
@@ -157,7 +163,7 @@ ivec2 splatTexelCoord(int texel_index)
 void emitSplatPoint(vec3 pos_os)
 {
 	vec4 clip_pos = proj_matrix * (view_matrix * (model_matrix * vec4(pos_os, 1.0)));
-	clip_pos.xy += (position_in.xy / viewport_dims_px) * clip_pos.w; // One pixel across, in the same clip-space form the full path below uses.
+	clip_pos.xy += (position_in.xy * splat_point_size_px / viewport_dims_px) * clip_pos.w; // One pixel across by default (SESSION071: splat_point_size_px widens it), in the same clip-space form the full path below uses.
 	gl_Position = clip_pos;
 	frag_conic = vec3(0.0);
 	frag_screen_offset_px = vec2(0.0);
@@ -480,7 +486,7 @@ void main()
 			frag_screen_offset_px = vec2(0.0);
 			return;
 		}
-		clip_pos.xy += (position_in.xy / viewport_dims_px) * clip_pos.w; // One pixel across, as in emitSplatPoint().
+		clip_pos.xy += (position_in.xy * splat_point_size_px / viewport_dims_px) * clip_pos.w; // One pixel across by default, as in emitSplatPoint() - SESSION071: splat_point_size_px widens it.
 		gl_Position = clip_pos;
 		frag_conic = vec3(0.0);
 		frag_screen_offset_px = vec2(0.0);

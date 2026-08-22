@@ -1043,7 +1043,9 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	lod_max_layer_density(0.0f), lod_max_tree_depth(0), lod_frustum_cull_enabled(true), split_filter_enabled(false),
 	filter_dilation_latency(0.06f), filter_min_rot_rate_deg_per_s(45.f), filter_max_rot_rate_deg_per_s(40.f), filter_min_trans_rate_m_per_s(2.0f), // SESSION063 K3 (K4 defaults: coarse floor covers the edge, so the fine dilation can be tight/cheap); SESSION071 max: 40deg/s default, owner-confirmed no visible holes at the canonical test scene
 	split_coarse_floor_enabled(true), split_coarse_pixel_scale(30.f), filter_coarse_dilation_latency(0.9f), coarse_layer_debug(false), // SESSION063 K4
-	splat_merge_colour_mode(GaussianSplatMergeColourMode_Energy), splat_merge_alpha_boost(1.f), // SESSION071: owner-confirmed better at every pixel scale limit tested - Legacy is kept only as the A/B comparison.
+	splat_point_size_px(1.f),
+	splat_merge_spread_widen(1.7320508f), // SESSION071: sqrt(3) - the analytic value that makes merged nodes' Gaussians meet, see widenedMergedScale().
+	// SESSION071: GaussianSplatMergeColourParams defaults to Energy - owner-confirmed better at every pixel scale limit tested; Legacy is kept only as the A/B comparison.
 	have_prev_think_cam_state(false), prev_think_cam_pos_ws(0.f), prev_think_cam_forward_ws(0.f), cam_velocity_ema_ws(0.f), cam_angular_speed_ema(0.f), cam_angular_speed_peak(0.f), cam_inst_angular_speed(0.f),
 	splat_size_clamp_min(0.0f), splat_size_clamp_max(0.0f), splat_size_clamp_invert(false),
 	splat_dist_clamp_min(0.0f), splat_dist_clamp_max(1000.0f), splat_dist_clamp_invert(false), splat_alpha_cutoff(1.0f / 255.0f),
@@ -1124,6 +1126,7 @@ void GaussianSplatRenderer::buildShadersIfNeeded()
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_area_slice_px");   // SESSION067 DIAGNOSTIC - its threshold, converted to buffer pixels in think().  NOTE: user_uniform_vals is sized to match this list in allocCloud().
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Vec2,  "splat_jitter_px");       // SESSION069 - subpixel jitter in accum-buffer pixels.  NOTE: user_uniform_vals is sized to match this list in allocCloud().
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_low_pass_variance"); // SESSION069 fix - replaces the hardcoded +0.3 anti-alias low-pass; shrunk while TAA is active, see think(). NOTE: user_uniform_vals is sized to match this list in allocCloud().
+	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_point_size_px");   // SESSION071 DIAGNOSTIC - size of the point quad the ablation stages 2-5 emit, see getPointSizePx(). NOTE: user_uniform_vals is sized to match this list in allocCloud().
 
 
 	// Splats blend into an accumulation buffer of their own rather than straight onto the main colour buffer, so that
@@ -2430,6 +2433,172 @@ void GaussianSplatRenderer::fillTraversalScratch(SplatCloud& cloud, GaussianSpla
 }
 
 
+// SESSION071: how faithfully the LoD nodes THAT ARE ACTUALLY BEING DRAWN stand in for the splats beneath them.
+//
+// Measured over the live draw list (SplatCloud::current_draw_indices), not over the whole tree. The first version of this
+// walked every node, and the answer was dominated by the deepest levels simply because that is where almost all the nodes
+// live (~3.6M of 4.1M sat at depth 19+) - while what the camera selects once it pulls back is a few thousand coarse nodes
+// several levels up. The table was therefore describing nodes that were not in the frame at all.
+//
+// Three columns, because the previous round ruled out two candidate causes and the remaining suspect is geometric:
+//
+//   ratio  - node brightness over the alpha*area-weighted mean brightness of the original leaves beneath it. Each node is
+//            scored against ITS OWN subtree, so the number is not confounded by which part of the scene sits at which
+//            depth. 1.00 = the merge carried the colour up faithfully. Split dark/bright because the observed defect is
+//            asymmetric - foliage came out clean, bright stone did not.
+//   mean A - to be read against the leaves row below, not against 1: a merged node standing in for near-opaque leaves
+//            should not itself be half transparent. The saturated column says where the alpha boost knob is inert by
+//            construction, since clamp(1 * boost) is still 1.
+//   cover  - the node's own drawn silhouette radius (3 sigma along its largest axis) over bounding_radius_os, the exact
+//            enclosing radius of every leaf beneath it. A leaf scores exactly 1.00 by construction, which calibrates the
+//            column. Below 1 means the node is drawn SMALLER than the descendants it replaces, so neighbouring nodes
+//            leave gaps for the background through - which would show up as patches of lightening when opacity is raised
+//            rather than a uniform lift, and would hurt bright surfaces against a dark background far more than foliage.
+std::string GaussianSplatRenderer::mergeColourByDepthReport()
+{
+	const int max_depth_rows = 24;
+	std::vector<size_t> nodes(max_depth_rows, 0), saturated(max_depth_rows, 0), dark_n(max_depth_rows, 0), bright_n(max_depth_rows, 0);
+	std::vector<double> alpha_sum(max_depth_rows, 0.0), dark_ratio_sum(max_depth_rows, 0.0), bright_ratio_sum(max_depth_rows, 0.0), cover_sum(max_depth_rows, 0.0);
+	size_t leaves_drawn = 0, total_drawn = 0;
+	double leaves_alpha_sum = 0.0;
+	bool any_tree = false;
+
+	std::vector<uint32> depth;
+	std::vector<double> leaf_w, leaf_lw;
+
+	for(size_t c=0; c<clouds.size(); ++c)
+	{
+		const SplatCloud& cloud = *clouds[c];
+		if(cloud.current_draw_indices.empty())
+			continue;
+
+		for(size_t m=0; m<cloud.members.size(); ++m)
+		{
+			const CloudMember& member = cloud.members[m];
+			const std::vector<GaussianSplatLodNode>& tree = member.splat_data->lod_tree;
+			if(tree.empty())
+				continue;
+
+			const size_t n = tree.size();
+			const size_t off = member.offset;
+
+			// Is any of this member's range drawn at all?  Skip the O(tree) prep below entirely if not.
+			bool member_drawn = false;
+			for(size_t k=0; k<cloud.current_draw_indices.size(); ++k)
+			{
+				const uint32 idx = cloud.current_draw_indices[k];
+				if(idx >= off && idx < off + n) { member_drawn = true; break; }
+			}
+			if(!member_drawn)
+				continue;
+			any_tree = true;
+
+			// Depth, forward pass: a node's children are always linearised after it, so the parent's depth is known by the
+			// time its children are reached.
+			depth.assign(n, 0);
+			for(size_t i=0; i<n; ++i)
+				for(uint32 k=0; k<tree[i].child_count; ++k)
+					depth[tree[i].child_start + k] = depth[i] + 1;
+
+			// Leaf brightness beneath each node, reverse pass (= bottom-up, same ordering argument). Weighted by
+			// alpha*area at LEAF level - the merge's own weights are re-derived per level, so this is an independent
+			// reference rather than something the merge trivially reproduces.
+			leaf_w .assign(n, 0.0);
+			leaf_lw.assign(n, 0.0);
+			for(size_t i = n; i-- > 0; )
+			{
+				if(tree[i].child_count == 0)
+				{
+					const Vec3f& sc = cloud.scales[off + i];
+					float s0 = sc.x, s1 = sc.y, s2 = sc.z;
+					if(s0 < s1) mySwap(s0, s1);
+					if(s1 < s2) mySwap(s1, s2);
+					if(s0 < s1) mySwap(s0, s1);
+					const Vec4f& col = cloud.colours[off + i];
+					const double w = (double)col.x[3] * (double)s0 * (double)s1; // Constant factors cancel in the ratio.
+					leaf_w [i] = w;
+					leaf_lw[i] = w * (0.2126 * col.x[0] + 0.7152 * col.x[1] + 0.0722 * col.x[2]); // Rec.709 luma.
+				}
+				else
+					for(uint32 k=0; k<tree[i].child_count; ++k)
+					{
+						leaf_w [i] += leaf_w [tree[i].child_start + k];
+						leaf_lw[i] += leaf_lw[tree[i].child_start + k];
+					}
+			}
+
+			for(size_t k=0; k<cloud.current_draw_indices.size(); ++k)
+			{
+				const uint32 gidx = cloud.current_draw_indices[k];
+				if(gidx < off || gidx >= off + n)
+					continue; // Belongs to another member; that member's own pass picks it up.
+				const size_t i = (size_t)gidx - off;
+				total_drawn++;
+
+				const Vec4f& col = cloud.colours[gidx];
+				if(tree[i].child_count == 0)
+				{
+					// Leaves are ground truth - nothing was derived, so there is no drift to measure - but their mean
+					// opacity is the reference the merged rows have to be read against.
+					leaves_drawn++;
+					leaves_alpha_sum += col.x[3];
+					continue;
+				}
+
+				const int d = (int)myMin<uint32>(depth[i], (uint32)(max_depth_rows - 1));
+				nodes[d]++;
+				alpha_sum[d] += col.x[3];
+				if(col.x[3] >= 0.99f) saturated[d]++;
+
+				// Drawn silhouette against the true enclosing radius of the descendants. cull_radius is bounding_radius_os
+				// already baked to world space, and for a leaf it is exactly 3 * max_scale - the same quantity the
+				// numerator forms - which is what makes 1.00 the meaningful reference point here.
+				const Vec3f& sc = cloud.scales[gidx];
+				const float max_scale = myMax(sc.x, myMax(sc.y, sc.z));
+				const float bound = cloud.cull_radius[gidx];
+				if(bound > 1.0e-9f)
+					cover_sum[d] += (double)(3.f * max_scale) / (double)bound;
+
+				if(leaf_w[i] <= 0.0)
+					continue;
+				const double ref = leaf_lw[i] / leaf_w[i];
+				if(ref < 1.0e-4) continue; // Reference is black; the ratio carries no information.
+				const double ratio = (0.2126 * col.x[0] + 0.7152 * col.x[1] + 0.0722 * col.x[2]) / ref;
+				if(ref < 0.5) { dark_n[d]++;   dark_ratio_sum[d]   += ratio; }
+				else          { bright_n[d]++; bright_ratio_sum[d] += ratio; }
+			}
+		}
+	}
+
+	if(!any_tree)
+		return "\nDrawn LoD nodes: no LoD-tree cloud has a live draw list to measure.\n";
+
+	std::string s = "\nDrawn LoD nodes by tree depth (SESSION071 - depth 0 = root, i.e. the coarsest stand-in):\n";
+	s += "  Measured over the LIVE DRAW LIST, so these are the nodes actually in the frame right now.\n";
+	s += "  ratio = node brightness / alpha*area-weighted mean brightness of the original leaves beneath it (1.00 = faithful).\n";
+	s += "  cover = drawn silhouette radius / exact enclosing radius of those leaves.  Below 1 = drawn smaller than what it\n";
+	s += "          replaces, so neighbouring nodes leave gaps.  A leaf scores exactly 1.00, which calibrates the column.\n";
+	s += "  depth      nodes    mean A   saturated     cover   ratio (dark ref)   ratio (bright ref)\n";
+	for(int d=0; d<max_depth_rows; ++d)
+	{
+		if(nodes[d] == 0)
+			continue;
+		s += "  " + leftPad(toString(d), ' ', 5) +
+			leftPad(uInt64ToStringCommaSeparated(nodes[d]), ' ', 11) +
+			leftPad(doubleToStringNDecimalPlaces(alpha_sum[d] / (double)nodes[d], 3), ' ', 10) +
+			leftPad(doubleToStringNDecimalPlaces(100.0 * (double)saturated[d] / (double)nodes[d], 1), ' ', 11) + "%" +
+			leftPad(doubleToStringNDecimalPlaces(cover_sum[d] / (double)nodes[d], 3), ' ', 10) +
+			leftPad(dark_n[d]   ? doubleToStringNDecimalPlaces(dark_ratio_sum[d]   / (double)dark_n[d],   3) : std::string("-"), ' ', 19) +
+			leftPad(bright_n[d] ? doubleToStringNDecimalPlaces(bright_ratio_sum[d] / (double)bright_n[d], 3) : std::string("-"), ' ', 21) + "\n";
+	}
+	s += "  leaves" + leftPad(uInt64ToStringCommaSeparated(leaves_drawn), ' ', 11) +
+		leftPad(leaves_drawn ? doubleToStringNDecimalPlaces(leaves_alpha_sum / (double)leaves_drawn, 3) : std::string("-"), ' ', 10) +
+		"          -     1.000                  -                    -\n";
+	s += "  Drawn nodes counted: " + uInt64ToStringCommaSeparated(total_drawn) + " (leaves row is the reference, not a defect).\n";
+	return s;
+}
+
+
 std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_tol, float merge_angle_tol_deg)
 {
 	if(clouds.empty())
@@ -3333,6 +3502,8 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 		s += histogramLines("    ", labels, counts);
 	}
 
+	s += mergeColourByDepthReport();
+
 	s += "\nReport took " + doubleToStringNDecimalPlaces(timer.elapsed() * 1.0e3, 1) + " ms (one full traversal per cloud, on the main thread).\n";
 	// Kept for the diagnostics panel - see the members' comment.  Set from the world-wide roll-up whether or not the
 	// per-world section above was printed, since that one is only printed when there is more than one cloud.
@@ -3671,7 +3842,7 @@ Reference<SplatCloud> GaussianSplatRenderer::allocCloud()
 	// walks the program's uniforms and indexes this array by the same i, so a slot short is an out-of-bounds read there
 	// and an out-of-bounds write in think(). All but splat_tex_width below are set by think(), or by the draw path for the
 	// saturation mask ones.
-	mat.user_uniform_vals.resize(29); // SESSION066: +2 for splat_hide_count_active/threshold (indices 23, 24). SESSION067: +2 for splat_area_slice_mode/_px (25, 26). SESSION069: +1 for splat_jitter_px (27), +1 for splat_low_pass_variance (28).
+	mat.user_uniform_vals.resize(30); // SESSION066: +2 for splat_hide_count_active/threshold (indices 23, 24). SESSION067: +2 for splat_area_slice_mode/_px (25, 26). SESSION069: +1 for splat_jitter_px (27), +1 for splat_low_pass_variance (28). SESSION071: +1 for splat_point_size_px (29).
 	mat.user_uniform_vals[2].intval = (int)splat_tex_width;
 
 	// Build a real (if minimal) texture and VAO up front: adding the object to the engine before it has those would
@@ -3815,6 +3986,72 @@ void GaussianSplatRenderer::ensureGpuCapacity(SplatCloud& cloud, size_t needed_s
 }
 
 
+// SESSION071: widen a merged node's Gaussian so neighbouring merged nodes actually meet, instead of leaving a lattice of
+// gaps between their peaks.
+//
+// The defect, isolated on the ablation ladder: stage 7 (flat alpha across the quad) keeps the bridge's brightness at
+// pixel_scale_limit 15, and stage 8 - which differs by nothing except the Gaussian falloff exp(power) - immediately shows
+// darkened regions with a visible blurred lattice on flat surfaces. At limit 1, where almost every drawn node is a leaf,
+// the lattice is absent. So it is the merged nodes' Gaussians that fail to overlap.
+//
+// Why: the merge moment-matches its children, and a Gaussian matched to the spread of children uniformly filling a cell
+// of width L has sigma = L/sqrt(12) = 0.289*L, while smooth coverage of a lattice of spacing d needs sigma/d >~ 0.5. The
+// ripple amplitude of a sum of Gaussians on a lattice goes as 2*exp(-2*pi^2*sigma^2/d^2): 1.4% at 0.5, 8% at 0.4, ~30% at
+// 0.289 - so the merge lands squarely in the bad regime. It reads as darkening rather than as ripple because compositing
+// is concave (1-(1-a)^n): the peaks lose their excess to saturation while the troughs let the background through, so the
+// mean brightness over the area is preserved (measured: mergeColourByDepthReport()'s ratio column sat at 1.00 throughout
+// the hunt) while the visible brightness drops. It hits bright surfaces hardest because what shows through a trough is
+// the dark forest behind them.
+//
+// The correction widens ONLY the spread part of the covariance, not the children's own size. Merge builds
+// cov = sum(w * (child_cov + outer(d))) / sum(w), i.e. sigma^2 = sigma_own^2 + sigma_spread^2 per axis; the ripple comes
+// from the spread term alone, so scaling the whole node isotropically would also inflate a flat surface's thickness and
+// turn a wall into fog. Recovering the spread term needs no eigen-decomposition: the parent's covariance is diagonal in
+// its own frame, so projecting sum(w * outer(d)) onto each parent axis gives that axis's sigma_spread^2 directly, and
+// sigma_new^2 = sigma^2 + (k^2 - 1) * sigma_spread^2.
+//
+// k = sqrt(3) is analytic, not tuned: children uniformly filling a half-width h have sigma_spread = h/sqrt(3), the
+// neighbouring node sits at d = 2h, and sigma >= 0.5*d = h gives k = sqrt(3). The owner independently found the lattice
+// stops being visible at about 1.5, which is where the ripple formula puts it at ~5%, right at the threshold of
+// visibility - so the measurement and the derivation agree.
+static Vec3f widenedMergedScale(const std::vector<GaussianSplatLodNode>& tree, size_t node_idx, float k)
+{
+	const GaussianSplatLodNode& node = tree[node_idx];
+	if((node.child_count == 0) || (k == 1.f))
+		return node.scale; // A leaf is an original splat - its size is authored, never re-fitted, so there is nothing to correct.
+
+	const Matrix4f R = Quat<float>(node.rotation[0], node.rotation[1], node.rotation[2], node.rotation[3]).toMatrix(); // Parent axes.
+
+	// Same weights the merge itself used (opacity * volume - see mergeGaussianSplatLodNodes()), so the spread recovered
+	// here is the spread that actually went into the parent's covariance, not a differently-weighted estimate of it.
+	float spread_var[3] = { 0.f, 0.f, 0.f };
+	float w_sum = 0.f;
+	for(uint32 c=0; c<node.child_count; ++c)
+	{
+		const GaussianSplatLodNode& child = tree[node.child_start + c];
+		const float w = child.colour.x[3] * (child.scale.x * child.scale.y * child.scale.z);
+		const Vec3f dv = child.centre_os - node.centre_os;
+		const Vec4f d(dv.x, dv.y, dv.z, 0.f);
+		for(int a=0; a<3; ++a)
+		{
+			const float proj = dot(R.getColumn(a), d);
+			spread_var[a] += w * proj * proj;
+		}
+		w_sum += w;
+	}
+
+	if(w_sum <= 1.0e-12f)
+		return node.scale; // Degenerate group (every child ~transparent or ~zero volume); the merge fell back to equal weights and there is no meaningful spread to widen.
+
+	const float kk = k * k - 1.f;
+	const float inv_w = 1.f / w_sum;
+	return Vec3f(
+		std::sqrt(myMax(0.f, node.scale.x * node.scale.x + kk * spread_var[0] * inv_w)),
+		std::sqrt(myMax(0.f, node.scale.y * node.scale.y + kk * spread_var[1] * inv_w)),
+		std::sqrt(myMax(0.f, node.scale.z * node.scale.z + kk * spread_var[2] * inv_w)));
+}
+
+
 // Bakes member.splat_data into cloud's arrays at member.offset, using member's stored pose, and sets member.aabb_ws.
 //
 // The bounds are grown by each splat's own radius, rather than just holding the splat centres.  A splat is drawn as a
@@ -3822,11 +4059,14 @@ void GaussianSplatRenderer::ensureGpuCapacity(SplatCloud& cloud, size_t needed_s
 // disjoint still have their fringe splats interpenetrating - and the partitioning would then leave them in separate
 // clouds with no separating plane between them, which is the one failure that produces a wrong compositing order.
 //
-// SESSION071: merge_colour_mode (and the merge_alpha_boost diagnostic) re-derive the merged (non-leaf) nodes' colours
-// after the pose bake - see recolorLodTree(). Done here rather than at the call sites because this is the only writer of
-// cloud.colours, so a bake from any path (add, re-add, pose change) always leaves the colours matching the current
-// settings.
-static void bakeMember(SplatCloud& cloud, CloudMember& member, GaussianSplatMergeColourMode merge_colour_mode, float merge_alpha_boost)
+// SESSION071: merge_colour_mode re-derives the merged (non-leaf) nodes' colours after the pose bake - see
+// recolorLodTree(). Done here rather than at the call sites because this is the only writer of cloud.colours, so a bake
+// from any path (add, re-add, pose change) always leaves the colours matching the current settings.
+//
+// SESSION071: spread_widen is applied to MERGED nodes only (leaves are original splats and are never touched) - see
+// widenedMergedScale() for the maths and the measurement behind it.
+static void bakeMember(SplatCloud& cloud, CloudMember& member, const GaussianSplatMergeColourParams& merge_colour_params,
+	float spread_widen)
 {
 	const GaussianSplatData& splat_data = *member.splat_data;
 	const Vec4f translation_ws = member.translation_ws;
@@ -3875,7 +4115,6 @@ static void bakeMember(SplatCloud& cloud, CloudMember& member, GaussianSplatMerg
 		for(size_t i=0; i<tree.size(); ++i)
 		{
 			const Vec3f& os_pos   = tree[i].centre_os;
-			const Vec3f& os_scale = tree[i].scale;
 			const Vec4f& os_rot   = tree[i].rotation; // (x, y, z, w)
 
 			const Vec4f rotated = rotation_ws.rotateVector(Vec4f(uniform_scale_ws * os_pos.x, uniform_scale_ws * os_pos.y, uniform_scale_ws * os_pos.z, 0.f));
@@ -3884,7 +4123,8 @@ static void bakeMember(SplatCloud& cloud, CloudMember& member, GaussianSplatMerg
 			const Quat<float> os_quat(os_rot[0], os_rot[1], os_rot[2], os_rot[3]);
 			const Quat<float> world_quat = rotation_ws * os_quat;
 
-			const Vec3f world_scale = os_scale * uniform_scale_ws;
+			// SESSION071: merged nodes only - a leaf is an original splat and must keep its authored size exactly.
+			const Vec3f world_scale = widenedMergedScale(tree, i, spread_widen) * uniform_scale_ws;
 
 			const size_t dest = member.offset + i;
 			cloud.positions[dest] = toVec3f(world_pos);
@@ -3894,17 +4134,24 @@ static void bakeMember(SplatCloud& cloud, CloudMember& member, GaussianSplatMerg
 
 			const float max_scale = myMax(world_scale.x, myMax(world_scale.y, world_scale.z));
 			cloud.feature_size[dest] = 2.f * max_scale; // SESSION055 - see SplatCloud::feature_size.
-			cloud.cull_radius[dest] = uniform_scale_ws * tree[i].bounding_radius_os; // SESSION059: rigid + uniform-scale bake preserves lengths up to uniform_scale_ws, same reasoning as feature_size above - see GaussianSplatLodNode::bounding_radius_os's comment for why this (not feature_size) is what the traversal's frustum-cull margin needs.
 			const float radius = splat_cutoff_sigmas * max_scale;
+			// SESSION059: rigid + uniform-scale bake preserves lengths up to uniform_scale_ws, same reasoning as feature_size above - see GaussianSplatLodNode::bounding_radius_os's comment for why this (not feature_size) is what the traversal's frustum-cull margin needs.
+			// SESSION071: max() with the node's own drawn radius, because spread_widen can widen a merged node past its
+			// descendants' enclosing sphere - at which point the bound would no longer bound what is actually drawn, and the
+			// cull would clip a node whose quad still reaches the screen. Identical to the old value at spread_widen 1.
+			cloud.cull_radius[dest] = myMax(uniform_scale_ws * tree[i].bounding_radius_os, radius);
 			aabb_ws.enlargeToHoldPoint(world_pos - Vec4f(radius, radius, radius, 0.f));
 			aabb_ws.enlargeToHoldPoint(world_pos + Vec4f(radius, radius, radius, 0.f));
 		}
 
 		// SESSION071: re-derive the merged nodes' colours under the selected formulation, over the just-baked world-space
 		// arrays (both formulations are ratio-based, so the uniform world scale cancels - see recolorLodTree()). Skipped
-		// only when the result would be exactly what the tree already carries: Legacy with no alpha boost.
-		if(merge_colour_mode != GaussianSplatMergeColourMode_Legacy || merge_alpha_boost != 1.f)
-			recolorLodTree(tree, &cloud.scales[member.offset], &cloud.colours[member.offset], merge_colour_mode, merge_alpha_boost);
+		// only when the result would be exactly what the tree already carries: Legacy with no widening.
+		//
+		// Running this AFTER the widening above is deliberate: the widened parent area feeds straight into the opacity
+		// term, so a widened node spreads the same optical mass over more pixels instead of getting brighter.
+		if(merge_colour_params.mode != GaussianSplatMergeColourMode_Legacy || spread_widen != 1.f)
+			recolorLodTree(tree, &cloud.scales[member.offset], &cloud.colours[member.offset], merge_colour_params);
 	}
 
 	member.aabb_ws = aabb_ws;
@@ -3913,19 +4160,38 @@ static void bakeMember(SplatCloud& cloud, CloudMember& member, GaussianSplatMerg
 
 void GaussianSplatRenderer::setMergeColourMode(GaussianSplatMergeColourMode v)
 {
-	if(v == splat_merge_colour_mode)
+	if(v == splat_merge_colour_params.mode)
 		return;
-	splat_merge_colour_mode = v;
+	splat_merge_colour_params.mode = v;
 	recolourAllClouds();
 }
 
 
-void GaussianSplatRenderer::setMergeAlphaBoost(float v)
+void GaussianSplatRenderer::setMergeSpreadWiden(float v)
 {
-	if(v == splat_merge_alpha_boost)
+	if(v == splat_merge_spread_widen)
 		return;
-	splat_merge_alpha_boost = v;
-	recolourAllClouds();
+	splat_merge_spread_widen = v;
+	rebakeAllClouds();
+}
+
+
+// SESSION071: geometry changed, so unlike recolourAllClouds() this has to go back through bakeMember() - scale drives
+// feature_size, cull_radius and the member bounds as well as the colour re-derivation. Still cheap next to a traversal:
+// a flat pass over the nodes with no tree walk and no sort, and the draw list is untouched, so what is on screen is the
+// same selection drawn at a different size.
+void GaussianSplatRenderer::rebakeAllClouds()
+{
+	for(size_t c=0; c<clouds.size(); ++c)
+	{
+		SplatCloud& cloud = *clouds[c];
+		if(cloud.members.empty())
+			continue;
+		for(size_t m=0; m<cloud.members.size(); ++m)
+			bakeMember(cloud, cloud.members[m], splat_merge_colour_params, splat_merge_spread_widen);
+		uploadTexelRowsForSplatRange(cloud, 0, cloud.total_splats);
+		rebuildCloudAABB(cloud);
+	}
 }
 
 
@@ -3955,7 +4221,7 @@ void GaussianSplatRenderer::recolourAllClouds()
 			// Legacy is what the tree itself carries, so restoring it means re-deriving from the (untouched) leaves rather
 			// than reading tree[i].colour back - which would be equivalent here, but only for as long as Legacy stays the
 			// formulation the build path bakes in. Going through recolorLodTree() keeps that assumption out of this code.
-			recolorLodTree(tree, &cloud.scales[member.offset], &cloud.colours[member.offset], splat_merge_colour_mode, splat_merge_alpha_boost);
+			recolorLodTree(tree, &cloud.scales[member.offset], &cloud.colours[member.offset], splat_merge_colour_params);
 			any_recoloured = true;
 		}
 
@@ -4069,7 +4335,7 @@ void GaussianSplatRenderer::appendMemberToCloud(SplatCloud& cloud, const CloudMe
 	cloud.members.push_back(member_in);
 	CloudMember& member = cloud.members.back();
 	member.offset = old_total;
-	bakeMember(cloud, member, splat_merge_colour_mode, splat_merge_alpha_boost);
+	bakeMember(cloud, member, splat_merge_colour_params, splat_merge_spread_widen);
 
 	cloud.total_splats = new_total;
 
@@ -4114,7 +4380,7 @@ void GaussianSplatRenderer::rebuildCloud(SplatCloud& cloud)
 	cloud.cull_radius.resize(total); // SESSION059 - see SplatCloud::cull_radius.
 
 	for(size_t m=0; m<cloud.members.size(); ++m)
-		bakeMember(cloud, cloud.members[m], splat_merge_colour_mode, splat_merge_alpha_boost);
+		bakeMember(cloud, cloud.members[m], splat_merge_colour_params, splat_merge_spread_widen);
 
 	ensureGpuCapacity(cloud, total);
 
@@ -4451,7 +4717,7 @@ bool GaussianSplatRenderer::updateObjectTransform(Handle handle, const Vec4f& tr
 			member.rotation_ws = rotation_ws;
 			member.uniform_scale_ws = uniform_scale_ws;
 
-			bakeMember(cloud, member, splat_merge_colour_mode, splat_merge_alpha_boost); // Re-bakes in place: offsets and counts are unchanged.
+			bakeMember(cloud, member, splat_merge_colour_params, splat_merge_spread_widen); // Re-bakes in place: offsets and counts are unchanged.
 			uploadTexelRowsForSplatRange(cloud, member.offset, member.count);
 			rebuildCloudAABB(cloud);
 
@@ -5381,6 +5647,7 @@ void GaussianSplatRenderer::think()
 		// scale 1); the vertex shader's shift is then a no-op.
 		mat.user_uniform_vals[27].vec2 = splat_taa_current_jitter_px;
 		mat.user_uniform_vals[28].floatval = splat_low_pass_variance_current; // SESSION069 fix - see above.
+		mat.user_uniform_vals[29].floatval = splat_point_size_px; // SESSION071 DIAGNOSTIC - see getPointSizePx().
 	}
 
 	buildVisibleSliceCDFs();

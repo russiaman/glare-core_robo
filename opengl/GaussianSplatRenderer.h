@@ -995,7 +995,6 @@ public:
 	// SESSION069 fix - this frame's jitter offset, in accum-buffer pixels, same value written to the vertex shader's
 	// splat_jitter_px.  OpenGLEngine::resolveSplatAccumBuffer() passes it to setResolveTAAJitterUniform() above.
 	const Vec2f& getCurrentTAAJitterPx() const { return splat_taa_current_jitter_px; }
-	int getResolveTAAJitterUniformLoc() const; // DIAGNOSTIC ONLY
 
 	// SESSION069 fix - this frame's actual per-splat low-pass variance (splat_low_pass_variance in the vertex shader -
 	// 0.3 outside TAA, shrunk while TAA is running).  applyMatchedDeconv() in the resolve shader has to invert THIS

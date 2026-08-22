@@ -1566,24 +1566,6 @@ void GaussianSplatRenderer::updateTAAState(const Vec2i& accum_dims)
 {
 	const bool active = isTAAActiveForResolve();
 
-	// SESSION069 DIAGNOSTIC (root-cause hunt) - one heartbeat per second regardless of active state, so we can see
-	// WHY TAA might be inactive (setting, downscale, DoF).  The "steady/reset" diag further below only fires while
-	// active, so if isTAAActiveForResolve() is silently false forever nothing prints.
-	{
-		static int hb_ticks = 0;
-		if(hb_ticks++ % 60 == 0)
-		{
-			const Vec2i vp = opengl_engine ? opengl_engine->getViewportDims() : Vec2i(0,0);
-			const Vec2i ad = accum_dims;
-			conPrint("[TAA-hb] active=" + toString(active ? 1 : 0) +
-				" enabled=" + toString(splat_taa_enabled ? 1 : 0) +
-				" viewport=(" + toString(vp.x) + "," + toString(vp.y) + ")" +
-				" accum=(" + toString(ad.x) + "," + toString(ad.y) + ")" +
-				" downscaled=" + toString(ad == vp ? 0 : 1) +
-				" dof_weighted=" + toString(splat_dof_depth_mode == SplatDoFDepthMode_Weighted ? 1 : 0));
-		}
-	}
-
 	if(!active)
 	{
 		splat_taa_current_jitter_px.set(0.f, 0.f);
@@ -1665,21 +1647,6 @@ void GaussianSplatRenderer::updateTAAState(const Vec2i& accum_dims)
 	const int k = splat_taa_frame_count;
 	splat_taa_current_jitter_px.set(halton(k, 2) - 0.5f, halton(k, 3) - 0.5f);
 
-	// SESSION069 DIAGNOSTIC - one line every 60 active frames, or immediately when a reset fires, so we can tell whether
-	// the accumulation actually grows (frame_count going up) or is being kicked back to 0 by one of the six conditions
-	// above.  Named which condition, so a spurious reset (LoD kick, sort completion, etc.) is easy to spot.
-	static int taa_diag_ticks = 0;
-	if(reset || (taa_diag_ticks++ % 60 == 0))
-	{
-		const char* reason = reset
-			? (view_changed ? "view" : viewport_changed ? "viewport" : accum_changed ? "accum" :
-			   settings_changed ? "settings" : clouds_changed ? "clouds" : content_applied ? "content" : "?")
-			: "steady";
-		conPrint("[TAA] " + std::string(reason) + " count=" + toString(splat_taa_frame_count) + "/" + toString(numJitterSamples()) +
-			" jitter_px=(" + doubleToStringNSigFigs(splat_taa_current_jitter_px.x, 3) + ", " + doubleToStringNSigFigs(splat_taa_current_jitter_px.y, 3) + ")" +
-			" write=" + toString(splat_taa_write_index));
-	}
-
 	// Flip the write index for next frame's accumulate pass - the freshly written history becomes next frame's read.
 	splat_taa_write_index = 1 - splat_taa_write_index;
 
@@ -1704,12 +1671,6 @@ void GaussianSplatRenderer::setResolveTAAActiveUniform(int taa_active) const
 void GaussianSplatRenderer::setResolveTAAJitterUniform(const Vec2f& jitter_accum_px) const
 {
 	glUniform2f(resolve_prog->user_uniform_info[17].loc, jitter_accum_px.x, jitter_accum_px.y);
-}
-
-
-int GaussianSplatRenderer::getResolveTAAJitterUniformLoc() const // DIAGNOSTIC ONLY
-{
-	return resolve_prog->user_uniform_info[17].loc;
 }
 
 

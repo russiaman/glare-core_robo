@@ -11858,15 +11858,6 @@ void OpenGLEngine::resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name,
 	splat_renderer->setResolveTAAJitterUniform(resolve_jitter_px); // SESSION069 fix - registers this frame's read against the same jitter the vertex shader applied.
 	splat_renderer->setResolveLowPassVarianceUniform(splat_renderer->getCurrentLowPassVariance()); // SESSION069 fix - applyMatchedDeconv() must invert the blur actually applied this frame, not a hardcoded 0.3.
 
-	// SESSION069 fix DIAGNOSTIC ONLY - one line per active frame for the first few, showing the jitter uniform's
-	// resolved location and the value actually pushed.  If loc is -1 the shader never sees it and the fix is a no-op.
-	if(taa_active)
-	{
-		static int taa_jitter_apply_ticks = 0;
-		if(taa_jitter_apply_ticks++ < 5)
-			conPrint("[TAA-jitter-apply] loc=" + toString(splat_renderer->getResolveTAAJitterUniformLoc()) +
-				" jitter_px=(" + doubleToStringNSigFigs(resolve_jitter_px.x, 4) + ", " + doubleToStringNSigFigs(resolve_jitter_px.y, 4) + ")");
-	}
 	bindMeshData(*unit_quad_meshdata);
 
 	bindTextureUnitToSampler(*current_scene->splat_accum_copy_texture, /*texture_unit_index=*/0, /*sampler_uniform_location=*/resolve_prog->albedo_texture_loc);
@@ -11913,23 +11904,6 @@ void OpenGLEngine::resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name,
 	{
 		const int write = splat_renderer->getTAAWriteIndex();
 		const int read = 1 - write;
-
-		// SESSION069 DIAGNOSTIC (root-cause hunt for "no visible TAA effect") - one line per active frame for the first
-		// few, showing the sampler locations and the weight actually used.  If either sampler loc is -1 the shader reads
-		// through its default (unit 0), which would make BOTH samplers pull the same texture - producing "TAA looks
-		// identical to non-TAA" exactly as reported.  Also prints the weight in case it is stuck at 1.0.
-		{
-			static int taa_apply_ticks = 0;
-			if(taa_apply_ticks++ < 5 || (taa_apply_ticks % 120 == 0))
-			{
-				conPrint("[TAA-apply] write=" + toString(write) +
-					" read=" + toString(read) +
-					" weight=" + doubleToStringNSigFigs(splat_renderer->getTAAAccumulateWeight(), 4) +
-					" accum_curr_loc=" + toString(splat_renderer->getTAAAccumulateCurrentTexUniformLoc()) +
-					" accum_hist_loc=" + toString(splat_renderer->getTAAAccumulateHistoryTexUniformLoc()) +
-					" comp_hist_loc=" + toString(splat_renderer->getTAACompositeHistoryTexUniformLoc()));
-			}
-		}
 
 		// The current texture we just wrote is bound to unit 0 with the resolve program's albedo_texture_loc.  Unbind
 		// it before we start binding samplers of the next programs to unit 0 as well.

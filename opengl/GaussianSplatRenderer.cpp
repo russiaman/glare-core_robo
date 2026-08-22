@@ -1041,7 +1041,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 :	opengl_engine(&opengl_engine_), next_handle(1), next_cloud_id(1), num_sorts_in_flight(0),
 	num_traversals_in_flight(0), num_filters_in_flight(0), lod_pixel_scale_limit(1.0f), lod_max_splats_budget(10000000), lod_resort_move_threshold_ws(0.1f),
 	lod_max_layer_density(0.0f), lod_max_tree_depth(0), lod_frustum_cull_enabled(true), split_filter_enabled(false),
-	filter_dilation_latency(0.06f), filter_min_rot_rate_deg_per_s(45.f), filter_min_trans_rate_m_per_s(2.0f), // SESSION063 K3 (K4 defaults: coarse floor covers the edge, so the fine dilation can be tight/cheap)
+	filter_dilation_latency(0.06f), filter_min_rot_rate_deg_per_s(45.f), filter_max_rot_rate_deg_per_s(40.f), filter_min_trans_rate_m_per_s(2.0f), // SESSION063 K3 (K4 defaults: coarse floor covers the edge, so the fine dilation can be tight/cheap); SESSION071 max: 40deg/s default, owner-confirmed no visible holes at the canonical test scene
 	split_coarse_floor_enabled(true), split_coarse_pixel_scale(30.f), filter_coarse_dilation_latency(0.9f), coarse_layer_debug(false), // SESSION063 K4
 	have_prev_think_cam_state(false), prev_think_cam_pos_ws(0.f), prev_think_cam_forward_ws(0.f), cam_velocity_ema_ws(0.f), cam_angular_speed_ema(0.f), cam_angular_speed_peak(0.f), cam_inst_angular_speed(0.f),
 	splat_size_clamp_min(0.0f), splat_size_clamp_max(0.0f), splat_size_clamp_invert(false),
@@ -4828,7 +4828,11 @@ void GaussianSplatRenderer::kickOffFilters()
 	// between frames mid-drag, so a floor-width kick on such a frame would trail the moving edge and open a hole (SESSION066
 	// regression, reverted here). Tightening happens only via the decayed-peak "settle" below, never by narrowing the band a
 	// live kick uses.
-	const float w_effective = myMax(cam_angular_speed_ema, cam_angular_speed_peak);
+	// SESSION071: measurement cap - see getFilterMaxRotRateDegPerS(). Clamps only the WIDTH the dilation band uses; does
+	// not affect `rotating`/`motion_calmed` (still driven by the raw, uncapped trackers), so capping cannot suppress a
+	// re-filter or the settle transition - it only bounds how wide a kick's band gets.
+	const float max_rot_rate_rad_s = filter_max_rot_rate_deg_per_s * (3.14159265f / 180.f);
+	const float w_effective = myMin(myMax(cam_angular_speed_ema, cam_angular_speed_peak), max_rot_rate_rad_s);
 	const float w_floored = myMax(w_effective, min_rot_rate_rad_s);
 	// SESSION066: the camera has come to rest once even the slow-decay peak has fallen back to the floor (~2s after a stop) -
 	// distinct from `rotating` (this frame's raw speed), which goes false instantly. A cloud still carrying an above-floor

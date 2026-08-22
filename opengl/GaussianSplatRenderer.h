@@ -292,6 +292,12 @@ public:
 	void setFilterMinRotRateDegPerS(float v) { filter_min_rot_rate_deg_per_s = v; }
 	float getFilterMinTransRateMPerS() const { return filter_min_trans_rate_m_per_s; }
 	void setFilterMinTransRateMPerS(float v) { filter_min_trans_rate_m_per_s = v; }
+	// SESSION071: measurement knob - the rotational dilation is currently isotropic (same rate*dist margin on all 6
+	// frustum planes), so a violent flick can multiply the draw list several-fold (session067 §8/§15). Clamping
+	// w_effective before it feeds rate_fine/rate_coarse bounds that cost, at the price of edge holes on the fastest
+	// flicks - see kickOffFilters(). A large value (e.g. 100000) is effectively "no cap" (today's behaviour).
+	float getFilterMaxRotRateDegPerS() const { return filter_max_rot_rate_deg_per_s; }
+	void setFilterMaxRotRateDegPerS(float v) { filter_max_rot_rate_deg_per_s = v; }
 
 	// SESSION063 K4: coarse floor. The traversal also captures a low-detail cut (first node per branch at
 	// coarse_pixel_scale), drawn after the fine set; the filter dilates this cut with its own (wider) latency so cheap big
@@ -1288,6 +1294,7 @@ private:
 	// SESSION063 K3: filter dilation knobs - see the getters above.
 	float filter_dilation_latency;      // s
 	float filter_min_rot_rate_deg_per_s;
+	float filter_max_rot_rate_deg_per_s; // SESSION071: see getFilterMaxRotRateDegPerS() above.
 	float filter_min_trans_rate_m_per_s;
 
 	// SESSION063 K4: coarse floor knobs - see the getters above.

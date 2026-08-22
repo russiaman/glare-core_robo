@@ -707,6 +707,17 @@ public:
 	Reference<FrameBuffer> splat_depth_src_framebuffer;
 	OpenGLTextureRef splat_depth_src_texture;
 
+	// SESSION069 - TAA (temporal accumulation with subpixel jitter) buffers, all at FULL frame resolution.
+	// splat_taa_current_*: destination the resolve draws into this frame (instead of the frame's colour buffer) when
+	// TAA is active.  History textures ping-pong: the accumulate pass reads history[1 - write] + current and writes
+	// history[write]; the composite pass then reads history[write] and blends it onto the frame.  Format matches the
+	// accum buffer (Format_RGBA_Linear_Half) - the payload is premultiplied (colour * coverage, coverage), same shape
+	// as what the resolve outputs before composite.  Allocated only while the renderer's isTAAActiveForResolve() is true.
+	Reference<FrameBuffer> splat_taa_current_framebuffer;
+	OpenGLTextureRef       splat_taa_current_texture;
+	Reference<FrameBuffer> splat_taa_history_framebuffer[2];
+	OpenGLTextureRef       splat_taa_history_texture[2];
+
 	// DIAGNOSTIC ONLY (SESSION066) - the "Clip" diagnostic's own per-pixel overdraw count, kept separate from the gate's
 	// mask so Clip can cull red-zone splats WITHOUT standing the saturation gate down (they no longer share one mask).
 	// A full-resolution copy of the overdraw counting pre-pass, sampled per-splat in gaussian_splat_vert_shader.glsl.
@@ -1591,6 +1602,9 @@ private:
 	// display transform once. write_weighted_depth is GaussianSplatRenderer::SplatDoFDepthMode_Weighted's flag for
 	// this frame - see drawSplatClouds(), which computes it and owns the depth-only Prepass mode alongside this.
 	void resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name, bool write_weighted_depth);
+	// SESSION069 - Allocates the three full-resolution RGBA16F textures TAA uses (current + history*2) whenever the
+	// renderer wants TAA active and either they don't exist yet or the frame size changed under them.
+	void allocSplatTAABuffersIfNeeded();
 
 	//----------------------------------------------------------------------------------------------------------------
 	// DIAGNOSTIC ONLY - the saturation-snapshot dump.  No part of the splat render path: nothing below is read by any

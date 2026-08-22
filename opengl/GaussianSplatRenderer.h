@@ -876,6 +876,46 @@ public:
 	bool getDeconvEnabled() const { return splat_deconv_enabled; }
 	void setDeconvEnabled(bool v) { splat_deconv_enabled = v; }
 
+	/*
+	SESSION069 - Temporal accumulation with subpixel jitter (TAA super-resolution) on top of the downscaled accumulation
+	buffer.  Rendered once per frame with the projection jittered by a fraction of an accum-buffer pixel; the resolved
+	splat layer is written into a full-resolution history buffer and averaged with previous frames' resolves.  In stillness
+	the history converges to a full-frame-resolution reconstruction over N = ceil(1/s)^2 frames (~4 at s=0.5).  Ghosting
+	is impossible by construction: the scene is static (no reprojection is ever needed) and the history counter is reset
+	on ANY of the invalidation conditions in updateTAAState().  See snapshots/2026-08-21-session068-...-plan.md §6.
+
+	Inert at accumulation-buffer scale 1: at that scale there is no sub-frame-pixel information to reconstruct, and the
+	setter path in resolveSplatAccumBuffer() falls back to the pre-TAA code.
+	*/
+	bool getTAAEnabled() const { return splat_taa_enabled; }
+	void setTAAEnabled(bool v) { splat_taa_enabled = v; }
+
+	// Whether TAA actually runs this frame.  Distinct from the setting: at accum scale 1, or with DoF weighted depth on
+	// (which needs the resolve to write gl_FragDepth to the frame, not into a TAA target - see snapshot §6.6), TAA is
+	// silently off.
+	bool isTAAActiveForResolve() const;
+
+	// Where the resolve should DRAW the splat layer this frame.  0 = the frame's own draw framebuffer (the pre-TAA
+	// behaviour); 1 = the TAA "current" texture, from which the accumulate + composite passes then run.  Read by
+	// OpenGLEngine::resolveSplatAccumBuffer() and reflected in the resolve shader via setResolveTAAActiveUniform().
+	int getResolveTAADrawTarget() const { return isTAAActiveForResolve() ? 1 : 0; }
+
+	// Zero-based frame index in the current accumulation window, before any invalidation would have reset it - used to
+	// pick the current jitter offset from the Halton sequence.  Advances every frame TAA is active.
+	int getTAAFrameCount() const { return splat_taa_frame_count; }
+
+	// Number of distinct jitter positions in the Halton sequence at the current buffer scale, ceil(1/s)^2 clamped to
+	// [1, 16] - see the .cpp for why exactly this: enough to cover the frame-pixel grid under an accum-scale-s buffer,
+	// no more.  1 at scale 1 (i.e. inert).
+	int numJitterSamples() const;
+
+	// Blend weight for THIS frame's accumulate pass: 1 / (frame_count + 1), a running mean over all accumulated frames.
+	// Exposed rather than let the shader compute it, so that the reset in updateTAAState() is a single point of truth.
+	float getTAAAccumulateWeight() const { return 1.0f / (float)(splat_taa_frame_count + 1); }
+
+	// Which of splat_taa_history_texture[] is written this frame.  Ping-pong: current write becomes next frame's read.
+	int getTAAWriteIndex() const { return splat_taa_write_index; }
+
 	float getDeconvGain() const { return splat_deconv_gain; }
 	void setDeconvGain(float v) { splat_deconv_gain = v; }
 
@@ -925,6 +965,48 @@ public:
 	// first addObject(), like the programs above.
 	const Reference<OpenGLProgram>& getDepthDownsampleProgram() const { return depth_downsample_prog; }
 	void setDepthDownsampleUniforms(const Vec2i& src_dims, const Vec2i& dst_dims) const;
+
+	// SESSION069 - TAA accumulate pass: reads the just-resolved splat layer (splat_taa_current_texture) plus the previous
+	// history, writes the new history.  A tiny 1-sample-per-pixel pass; the whole cost of TAA outside the extra memory
+	// is roughly 2x this.  Null until the first addObject(), like the resolve.  Uniform locations resolved via the
+	// same appendUserUniformInfo() defer-until-linked mechanism as the other programs; the indices are:
+	//   0 = current_texture (sampler2D), 1 = history_texture (sampler2D), 2 = taa_weight (float).
+	const Reference<OpenGLProgram>& getTAAAccumulateProgram() const { return taa_accumulate_prog; }
+	int getTAAAccumulateCurrentTexUniformLoc() const;
+	int getTAAAccumulateHistoryTexUniformLoc() const;
+	void setTAAAccumulateWeight(float weight) const; // Renamed from setTAAAccumulateUniform for clarity.
+
+	// SESSION069 - TAA composite pass: reads the freshly written history and draws it into the frame with the same
+	// front-to-back "under" blend the resolve used to do directly.  Splits out because the write and the blend need two
+	// different draw framebuffers.  Only uniform is history_texture (sampler2D) at index 0.
+	const Reference<OpenGLProgram>& getTAACompositeProgram() const { return taa_composite_prog; }
+	int getTAACompositeHistoryTexUniformLoc() const;
+
+	// SESSION069 - Tell the resolve shader whether it is writing into the frame (0 = the old path, blended over the
+	// frame) or into the TAA current texture (1 = no blend, no discard - see the shader).  Called by
+	// OpenGLEngine::resolveSplatAccumBuffer() to switch the program's behaviour without a second variant.
+	void setResolveTAAActiveUniform(int taa_active) const;
+
+	// SESSION069 fix - the resolve's accum-buffer read has to be un-shifted by this frame's vertex jitter, or every
+	// jittered acquisition lands on the exact same full-res pixels and TAA only denoises the low-res estimate instead
+	// of actually recovering resolution.  (jitter_accum_px, 0,0) when TAA is inactive.  See sampleSplatAccum()'s comment.
+	void setResolveTAAJitterUniform(const Vec2f& jitter_accum_px) const;
+
+	// SESSION069 fix - this frame's jitter offset, in accum-buffer pixels, same value written to the vertex shader's
+	// splat_jitter_px.  OpenGLEngine::resolveSplatAccumBuffer() passes it to setResolveTAAJitterUniform() above.
+	const Vec2f& getCurrentTAAJitterPx() const { return splat_taa_current_jitter_px; }
+	int getResolveTAAJitterUniformLoc() const; // DIAGNOSTIC ONLY
+
+	// SESSION069 fix - this frame's actual per-splat low-pass variance (splat_low_pass_variance in the vertex shader -
+	// 0.3 outside TAA, shrunk while TAA is running).  applyMatchedDeconv() in the resolve shader has to invert THIS
+	// value, not a hardcoded 0.3, or it over-estimates the blur it is undoing whenever TAA is active.
+	float getCurrentLowPassVariance() const { return splat_low_pass_variance_current; }
+	void setResolveLowPassVarianceUniform(float variance) const;
+
+	// SESSION069 - Called by drainSortResults()/drainTraversalResults()/drainFilterResults() when they applied something
+	// this frame.  updateTAAState() reads and clears the counter to decide whether to reset the accumulation - if the
+	// draw list changed at all, the history is stale for the affected pixels and must be started over.
+	void noteContentApplied() { splat_taa_content_apply_counter++; }
 
 	// The program OpenGLEngine::markSaturatedSplatPixels() marks finished pixels with. Null until the first addObject(),
 	// like the splat program itself.
@@ -1115,6 +1197,10 @@ private:
 	void kickOffFilters();      // SESSION063: split architecture - see the .cpp.
 	void drainFilterResults();  // SESSION063
 
+	// SESSION069 - Per-frame TAA bookkeeping.  Called from think(), before the per-cloud loop writes the jitter uniform.
+	// See the .cpp for the exact reset condition list.
+	void updateTAAState(const Vec2i& accum_dims);
+
 	void noteDrawOrderForSlicing(SplatCloud& cloud, const uint32* draw_indices, size_t count); // Refreshes the sample of a cloud's draw order the frustum-aware slicing works from - see getVisibleSlicingEnabled().  Called from every place that writes the instance index VBO.
 	void buildVisibleSliceCDFs(); // Per-frame, from think(): re-tests each cloud's sample against the current frustum.  The one part of the draw order that depends on where the camera is looking rather than where it is.
 	void fillTraversalScratch(SplatCloud& cloud, GaussianSplatLodTraversalScratch& scratch) const; // Freezes a cloud's world-space node data and member layout into a scratch, ready for a traversal to read without touching the live arrays. SESSION058: non-const - may cache the snapshot on the cloud (see SplatCloud::cached_traversal_geom) so repeated kicks against an unchanged cloud reuse it instead of re-copying.
@@ -1130,6 +1216,12 @@ private:
 	// SESSION067 - see getDepthDownsampleProgram().  Built alongside shader_prog, but only ever run while the
 	// accumulation buffer is smaller than the frame.
 	Reference<OpenGLProgram> depth_downsample_prog;
+
+	// SESSION069 - TAA passes.  Built alongside shader_prog, run only while TAA is active (see isTAAActiveForResolve()).
+	// Both use the resolve's vertex shader (a full-viewport quad), same trick as saturation_mask_prog.  Uniforms resolved
+	// via appendUserUniformInfo() defer-until-linked, same as depth_downsample_prog.
+	Reference<OpenGLProgram> taa_accumulate_prog;
+	Reference<OpenGLProgram> taa_composite_prog;
 
 	OpenGLEngine* opengl_engine;
 
@@ -1313,6 +1405,24 @@ private:
 	float splat_deconv_gain;
 	bool splat_rcas_enabled;
 	float splat_rcas_sharpness;
+
+	// SESSION069 - Temporal accumulation state.  See getTAAEnabled() and updateTAAState().
+	bool splat_taa_enabled;
+	int splat_taa_frame_count;             // 0 = a fresh accumulation starts THIS frame (weight 1.0 - the current replaces the history outright).
+	int splat_taa_frame_index_monotonic;   // Wraps at 1<<30, purely to pick a distinct jitter offset per frame regardless of resets.
+	int splat_taa_write_index;             // Which of the two history textures this frame writes.  Flipped every active frame.
+	Vec2f splat_taa_current_jitter_px;     // Halton-picked jitter offset applied this frame, in accum-buffer pixels.
+	float splat_low_pass_variance_current; // SESSION069 fix - this frame's splat_low_pass_variance, see the getter's own comment.
+
+	// Invalidation memory - each reset condition compares the current frame's value against these last-frame values.
+	// A single mismatch on ANY of them zeroes splat_taa_frame_count and picks a fresh Halton offset from index 0.
+	Matrix4f splat_taa_last_view_matrix;   // Bitwise-compared: half a pixel of camera dither is exactly what would give a smear if it were tolerated.
+	Vec2i splat_taa_last_viewport_dims;    // Viewport resize reallocates the accum + TAA buffers; the history is then a different size and unusable.
+	Vec2i splat_taa_last_accum_dims;       // buffer scale change - same reason.
+	uint64 splat_taa_last_settings_hash;   // FNV-1a over the block of splat settings that affect the picture.  A hash, not a list of compares, so it can't fall behind next time a knob is added.
+	size_t splat_taa_last_num_clouds;      // Cheap proxy for "a cloud came or went".  Full per-cloud dirtiness lives in the content-apply counter below.
+	int splat_taa_last_content_apply_snapshot; // Counter value seen at last frame's reset check - see noteContentApplied().
+	int splat_taa_content_apply_counter;   // Bumped by the drain*Results() functions when they actually applied a change to any cloud.
 
 	// See getShowOverdrawMode() above. 0 = off.
 	int splat_show_overdraw_mode;

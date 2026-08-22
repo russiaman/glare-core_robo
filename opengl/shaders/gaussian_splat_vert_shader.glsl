@@ -87,6 +87,22 @@ uniform float splat_quad_radius_scale;
 uniform int splat_area_slice_mode;
 uniform float splat_area_slice_px;
 
+// SESSION069 - subpixel jitter of the full splat projection, in accumulation-buffer pixels.  (0, 0) = off.  See
+// GaussianSplatRenderer::updateTAAState() for the sequence (Halton (2,3) inside [-0.5, 0.5)) and the reset conditions.
+// Applied to clip_pos right after the projection multiply so it moves the splat's centre (as used by the saturation
+// gate) with the quad, keeping the whole cloud on one consistent grid per frame.
+uniform vec2 splat_jitter_px;
+
+// SESSION069 fix - replaces the hardcoded +0.3 anti-alias low-pass on the 2D covariance diagonal below.  0.3 (accum-
+// buffer texels²) outside TAA - bit-identical to the pre-fix behaviour.  While TAA is running, GaussianSplatRenderer::
+// think() shrinks this to what a full-frame render would use instead: at accum scale s, that low-pass's *effective*
+// width in FULL-FRAME pixels is 0.3/s² wider than it needs to be, because it is defined in accum-texel units and s<1
+// makes an accum-texel span multiple frame pixels - so every single frame, jittered or not, was already band-limited
+// to the accum grid's own Nyquist limit, which is exactly the sub-texel structure TAA's jittered accumulation exists
+// to recover.  No amount of temporal averaging can reconstruct information a single frame's rasteriser never captured
+// in the first place.  See think()'s own comment for the replacement value and its floor.
+uniform float splat_low_pass_variance;
+
 uniform float splat_area_scale_gamma; // 1 (default) = weight is linear in the splat's own screen-space area.  Raising it
                                        // concentrates the reduction on splats with more area than splat_area_scale_ref_px;
                                        // lowering it spreads a partial reduction onto smaller splats too.
@@ -336,9 +352,9 @@ void main()
 	vec3 cov_vs_j0 = cov_vs * j_row0;
 	vec3 cov_vs_j1 = cov_vs * j_row1;
 
-	float cov2d_a = dot(j_row0, cov_vs_j0) + 0.3; // The +0.3 is a low-pass filter on the diagonal, which avoids degenerate sub-pixel splats aliasing.  Standard 3DGS technique.
+	float cov2d_a = dot(j_row0, cov_vs_j0) + splat_low_pass_variance; // Low-pass filter on the diagonal, which avoids degenerate sub-pixel splats aliasing.  Standard 3DGS technique, base value 0.3 - see splat_low_pass_variance's own comment for why it shrinks under TAA.
 	float cov2d_b = dot(j_row0, cov_vs_j1);
-	float cov2d_c = dot(j_row1, cov_vs_j1) + 0.3;
+	float cov2d_c = dot(j_row1, cov_vs_j1) + splat_low_pass_variance;
 
 	float det = cov2d_a * cov2d_c - cov2d_b * cov2d_b;
 	if(det <= 0.0)
@@ -443,6 +459,13 @@ void main()
 	}
 
 	vec4 clip_pos = proj_matrix * pos_vs;
+
+	// SESSION069 - temporal jitter.  Here, not at the end of the shader: clip_pos below is used as the splat's CENTRE
+	// for the saturation gate and the coverage-shrink budget - so shifting the centre here makes the whole quad snap to
+	// one consistent per-frame grid.  Shift in clip space is pre-multiplied by w to survive the perspective divide,
+	// same trick as the final vertex offset below.  splat_jitter_px is in accum-buffer pixels; viewport_dims_px was set
+	// to those same accum dims by GaussianSplatRenderer::think() (session067), so this division is dimensionally right.
+	clip_pos.xy += (splat_jitter_px / viewport_dims_px) * 2.0 * clip_pos.w;
 
 	// DIAGNOSTIC ONLY - stage 5: every bit of the projection maths above has run - covariance, Jacobian,
 	// eigen-decomposition, radii - and the quad is still one pixel.  It exists because the step from points to full quads

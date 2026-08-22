@@ -1054,6 +1054,10 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	splat_accum_buffer_scale(1.f), splat_accum_upsample_bilinear(true), // SESSION067 - 1 = full resolution, i.e. exactly the pre-knob behaviour; the upsample setting is not consulted at that scale.
 	splat_area_slice_mode(0), splat_area_slice_px(256.f), // SESSION067 DIAGNOSTIC - off; 256 px is the threshold the measured histogram puts 85% of the fill above - see getAreaSliceMode().
 	splat_deconv_enabled(false), splat_deconv_gain(1.f), splat_rcas_enabled(false), splat_rcas_sharpness(0.5f), // SESSION068 - both off; gain 1.0 = the analytically derived strength; sharpness 0.5 = mid of RCAS's safe range.
+	splat_taa_enabled(false), splat_taa_frame_count(0), splat_taa_frame_index_monotonic(0), splat_taa_write_index(0), splat_taa_current_jitter_px(0.f, 0.f), // SESSION069 - off; every last-* below is (re)set the first time updateTAAState() sees an active frame, so their initial values don't matter as long as they don't misidentify frame 0 as unchanged.
+	splat_low_pass_variance_current(0.3f), // SESSION069 fix - matches the pre-fix hardcoded value until think() runs once.
+	splat_taa_last_view_matrix(Matrix4f::identity()), splat_taa_last_viewport_dims(0, 0), splat_taa_last_accum_dims(0, 0),
+	splat_taa_last_settings_hash(0), splat_taa_last_num_clouds(0), splat_taa_last_content_apply_snapshot(0), splat_taa_content_apply_counter(0),
 	splat_show_overdraw_mode(0), splat_hide_overdraw_enabled(false), splat_hide_alpha_enabled(false),
 	splat_hide_overdraw_mask_valid(false), splat_hide_overdraw_mask_view(Matrix4f::identity()),
 	splat_hide_overdraw_mask_viewport_w(0), splat_hide_overdraw_mask_viewport_h(0), splat_hide_overdraw_mask_block(0),
@@ -1117,6 +1121,8 @@ void GaussianSplatRenderer::buildShadersIfNeeded()
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_hide_count_threshold"); // SESSION066 DIAGNOSTIC - red-zone threshold (getOverdrawRangeMax()).
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "splat_area_slice_mode"); // SESSION067 DIAGNOSTIC - the projected-area slice, see getAreaSliceMode().
 	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_area_slice_px");   // SESSION067 DIAGNOSTIC - its threshold, converted to buffer pixels in think().  NOTE: user_uniform_vals is sized to match this list in allocCloud().
+	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Vec2,  "splat_jitter_px");       // SESSION069 - subpixel jitter in accum-buffer pixels.  NOTE: user_uniform_vals is sized to match this list in allocCloud().
+	shader_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_low_pass_variance"); // SESSION069 fix - replaces the hardcoded +0.3 anti-alias low-pass; shrunk while TAA is active, see think(). NOTE: user_uniform_vals is sized to match this list in allocCloud().
 
 
 	// Splats blend into an accumulation buffer of their own rather than straight onto the main colour buffer, so that
@@ -1164,6 +1170,21 @@ void GaussianSplatRenderer::buildShadersIfNeeded()
 	resolve_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_deconv_gain");
 	resolve_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "splat_rcas_enabled");
 	resolve_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_rcas_sharpness");
+
+	// SESSION069 - see setResolveTAAActiveUniform().  1 = the resolve is writing into the TAA current texture (blending
+	// off, discard replaced by vec4(0) so history knows this pixel was empty this frame); 0 = the pre-TAA path,
+	// writing straight into the frame's colour buffer with the front-to-back "under" blend.  Index 16.
+	resolve_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "splat_taa_active");
+
+	// SESSION069 fix - see setResolveTAAJitterUniform().  Same value as the vertex shader's splat_jitter_px this frame,
+	// used to un-shift the accum-buffer read so the reconstruction is registered per-frame instead of always landing on
+	// the same full-res pixels.  (0,0) whenever TAA is inactive.  Index 17.
+	resolve_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Vec2,  "splat_jitter_px");
+
+	// SESSION069 fix - see setResolveLowPassVarianceUniform().  Same value as the vertex shader's splat_low_pass_variance
+	// this frame - applyMatchedDeconv() has to invert the blur that was ACTUALLY applied, not a hardcoded 0.3, or it
+	// over-sharpens whenever TAA has shrunk the low-pass.  Index 18.
+	resolve_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_low_pass_variance");
 
 
 	// Marks the pixels the composite has already finished with, between draw slices - see
@@ -1227,6 +1248,37 @@ void GaussianSplatRenderer::buildShadersIfNeeded()
 	// appendUserUniformInfo() once it completes.  Read back by setDepthDownsampleUniforms(), in this order.
 	depth_downsample_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Vec2, "splat_depth_src_dims_px");
 	depth_downsample_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Vec2, "splat_depth_dst_dims_px");
+
+
+	// SESSION069 - TAA accumulate: running-mean blend of this frame's resolved splat layer into the history texture.
+	// Full-viewport quad, shares the same vertex shader as the resolve.
+	taa_accumulate_prog = new OpenGLProgram(
+		"gaussian splat taa accumulate prog",
+		new OpenGLShader(shader_dir + "/gaussian_splat_resolve_vert_shader.glsl", version_directive, key_defs + preprocessor_defines, GL_VERTEX_SHADER),
+		new OpenGLShader(shader_dir + "/gaussian_splat_taa_accum_frag_shader.glsl", version_directive, key_defs + preprocessor_defines, GL_FRAGMENT_SHADER),
+		opengl_engine->getAndIncrNextProgramIndex(),
+		/*wait_for_build_to_complete=*/!opengl_engine->parallel_shader_compile_support
+	);
+	opengl_engine->addProgram(taa_accumulate_prog);
+
+	// Order of appendUserUniformInfo is the contract with the getters above - do not reorder.
+	taa_accumulate_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "current_texture");
+	taa_accumulate_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "history_texture");
+	taa_accumulate_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "taa_weight");
+
+
+	// SESSION069 - TAA composite: draws the freshly accumulated history onto the frame with (GL_ONE, GL_ONE_MINUS_SRC_ALPHA),
+	// exactly as the pre-TAA resolve did directly.
+	taa_composite_prog = new OpenGLProgram(
+		"gaussian splat taa composite prog",
+		new OpenGLShader(shader_dir + "/gaussian_splat_resolve_vert_shader.glsl", version_directive, key_defs + preprocessor_defines, GL_VERTEX_SHADER),
+		new OpenGLShader(shader_dir + "/gaussian_splat_taa_composite_frag_shader.glsl", version_directive, key_defs + preprocessor_defines, GL_FRAGMENT_SHADER),
+		opengl_engine->getAndIncrNextProgramIndex(),
+		/*wait_for_build_to_complete=*/!opengl_engine->parallel_shader_compile_support
+	);
+	opengl_engine->addProgram(taa_composite_prog);
+
+	taa_composite_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int, "history_texture");
 
 
 	// Halves the coverage pyramid by mean instead of minimum, once per level - see getCoverageShrinkStrength() and
@@ -1439,6 +1491,258 @@ void GaussianSplatRenderer::setDepthDownsampleUniforms(const Vec2i& src_dims, co
 {
 	glUniform2f(depth_downsample_prog->user_uniform_info[0].loc, (float)src_dims.x, (float)src_dims.y);
 	glUniform2f(depth_downsample_prog->user_uniform_info[1].loc, (float)dst_dims.x, (float)dst_dims.y);
+}
+
+
+//========================================================================================================
+// SESSION069 - TAA (temporal accumulation with subpixel jitter).  See getTAAEnabled().
+//========================================================================================================
+
+// Halton (2, 3) - a low-discrepancy sequence used to pick subpixel offsets in TAA.  Preferred over a regular grid because
+// it works for fractional buffer scales (any k, not only powers of two) and degrades gracefully when fewer than
+// numJitterSamples() frames have accumulated - the picture converges rather than snapping into place at frame N.
+static float halton(int index, int base)
+{
+	float f = 1.f, r = 0.f;
+	int i = index + 1; // Halton is defined from 1; index 0 would give zero shift, i.e. a wasted "no jitter" frame in every reset cycle.
+	while(i > 0) { f /= (float)base; r += (float)(i % base) * f; i /= base; }
+	return r;
+}
+
+
+// FNV-1a 64-bit over a raw byte range.  Used only to detect whether ANY splat setting affecting the picture has changed
+// since the last frame - the actual values are meaningless.  A hash rather than an explicit compare list so it can't
+// silently fall behind next time a knob is added; the trade-off is the theoretical possibility of a collision leaving a
+// changed setting undetected, which for our two-word-per-setting inputs is negligible in practice.
+static uint64 fnv1a64(const void* data, size_t len)
+{
+	const unsigned char* p = static_cast<const unsigned char*>(data);
+	uint64 h = 0xcbf29ce484222325ULL;
+	for(size_t i = 0; i < len; ++i) { h ^= (uint64)p[i]; h *= 0x100000001b3ULL; }
+	return h;
+}
+
+
+int GaussianSplatRenderer::numJitterSamples() const
+{
+	// Enough jitter positions to cover the frame-pixel grid at accum scale s: each frame pixel row/column falls into
+	// ceil(1/s) accum texels, and the 2D combination is that squared.  More than that adds latency to full quality with
+	// no gain; fewer leaves subpixel gaps that will never fill in.  Clamped to a hard cap of 16 in case s dips very low
+	// (0.1) and the sequence length would otherwise be 100 - beyond ~16 the eye doesn't tell the difference between
+	// "still resolving" and "resolved" anyway, and the diminishing 1/N weight makes newer samples imperceptible.
+	const float s = getEffectiveAccumBufferScale();
+	const int n = myMax(1, (int)std::ceil(1.f / s));
+	return myClamp(n * n, 1, 16);
+}
+
+
+bool GaussianSplatRenderer::isTAAActiveForResolve() const
+{
+	// Off if the setting is off.  Off if the accumulation buffer is 1:1 with the frame - there is no sub-frame-pixel
+	// information to reconstruct at that scale, and the pre-TAA path is bit-for-bit correct there.
+	//
+	// (Session069) An earlier draft of this method also required !SplatDoFDepthMode_Weighted, on the theory that the
+	// resolve's gl_FragDepth write would need the frame's depth attachment - but that turned out to gate TAA off in
+	// practice, because DoF weighted mode is persisted and the owner had it on.  Since the resolve in TAA mode writes
+	// to a colour-only framebuffer, gl_FragDepth simply has nowhere to land and is dropped by the driver (per the GL
+	// spec: depth writes to a framebuffer without a depth attachment are no-ops, and depth test with no depth buffer
+	// always passes).  The visible cost is that DoF blur no longer receives per-splat depth while TAA is on - a
+	// graceful degradation, not a crash.  If both need to coexist properly, the composite pass (which does write into
+	// the frame's real depth buffer via a target-and-blend switch) is the right place to route the weighted depth.
+	if(!splat_taa_enabled) return false;
+	if(!opengl_engine) return false;
+	const Vec2i viewport_dims = opengl_engine->getViewportDims();
+	const Vec2i accum_dims = accumBufferDimsForViewport(viewport_dims);
+	if(accum_dims == viewport_dims) return false;
+	return true;
+}
+
+
+// Called from think() once per frame, right before the per-cloud loop writes user_uniform_vals[27].  Decides whether
+// the accumulation window has to be reset, then picks the jitter offset the vertex shader will use this frame.  The
+// counter and jitter are both zeroed when TAA is inactive so any resume-with-scale-1 frame lands the vertex shader's
+// shift at (0, 0).
+void GaussianSplatRenderer::updateTAAState(const Vec2i& accum_dims)
+{
+	const bool active = isTAAActiveForResolve();
+
+	// SESSION069 DIAGNOSTIC (root-cause hunt) - one heartbeat per second regardless of active state, so we can see
+	// WHY TAA might be inactive (setting, downscale, DoF).  The "steady/reset" diag further below only fires while
+	// active, so if isTAAActiveForResolve() is silently false forever nothing prints.
+	{
+		static int hb_ticks = 0;
+		if(hb_ticks++ % 60 == 0)
+		{
+			const Vec2i vp = opengl_engine ? opengl_engine->getViewportDims() : Vec2i(0,0);
+			const Vec2i ad = accum_dims;
+			conPrint("[TAA-hb] active=" + toString(active ? 1 : 0) +
+				" enabled=" + toString(splat_taa_enabled ? 1 : 0) +
+				" viewport=(" + toString(vp.x) + "," + toString(vp.y) + ")" +
+				" accum=(" + toString(ad.x) + "," + toString(ad.y) + ")" +
+				" downscaled=" + toString(ad == vp ? 0 : 1) +
+				" dof_weighted=" + toString(splat_dof_depth_mode == SplatDoFDepthMode_Weighted ? 1 : 0));
+		}
+	}
+
+	if(!active)
+	{
+		splat_taa_current_jitter_px.set(0.f, 0.f);
+		splat_taa_frame_count = 0;
+		// last_* memory left alone: the next active frame will reset by comparing to whatever was current at that
+		// time, which is exactly the semantics we want across an on/off toggle.
+		return;
+	}
+
+	const OpenGLScene* const scene = opengl_engine->getCurrentScene();
+	const Matrix4f cur_view = scene ? scene->last_view_matrix : Matrix4f::identity();
+	const Vec2i viewport_dims = opengl_engine->getViewportDims();
+
+	// Settings hash - EVERY splat setting that affects the picture goes in, plus the buffer scale itself (a scale change
+	// is already caught by accum_dims below, but included here to make the hash self-contained for future callers).
+	// New knobs added to the class must be appended here or the accumulation will smear across their changes.
+	struct SettingsBlob {
+		float alpha_cutoff, quad_radius_scale, area_scale_gamma, area_scale_ref_px, coverage_shrink_strength, near_fade_width, near_epsilon;
+		float size_clamp_min, size_clamp_max, dist_clamp_min, dist_clamp_max, alpha_gain, alpha_gamma;
+		float slice_growth, saturation_threshold, area_slice_px;
+		float accum_buffer_scale, deconv_gain, rcas_sharpness;
+		int   ablation_stage, coverage_shrink_mode, coverage_reduce_mode, show_overdraw_mode, dof_depth_mode;
+		int   size_clamp_invert, dist_clamp_invert, area_slice_mode, ewa_fix_enabled, saturation_gate_enabled;
+		int   accum_buffer_8bit, accum_upsample_bilinear, deconv_enabled, rcas_enabled;
+		int   layer_cap, layer_cap_opaque, saturation_mask_downscale;
+	} blob = {};
+	blob.alpha_cutoff = splat_alpha_cutoff; blob.quad_radius_scale = splat_quad_radius_scale;
+	blob.area_scale_gamma = splat_area_scale_gamma; blob.area_scale_ref_px = splat_area_scale_ref_px;
+	blob.coverage_shrink_strength = splat_coverage_shrink_strength; blob.near_fade_width = splat_near_fade_width;
+	blob.near_epsilon = splat_near_epsilon;
+	blob.size_clamp_min = splat_size_clamp_min; blob.size_clamp_max = splat_size_clamp_max;
+	blob.dist_clamp_min = splat_dist_clamp_min; blob.dist_clamp_max = splat_dist_clamp_max;
+	blob.alpha_gain = splat_alpha_gain; blob.alpha_gamma = splat_alpha_gamma;
+	blob.slice_growth = splat_slice_growth; blob.saturation_threshold = splat_saturation_threshold;
+	blob.area_slice_px = splat_area_slice_px;
+	blob.accum_buffer_scale = splat_accum_buffer_scale;
+	blob.deconv_gain = splat_deconv_gain; blob.rcas_sharpness = splat_rcas_sharpness;
+	blob.ablation_stage = splat_ablation_stage;
+	blob.coverage_shrink_mode = splat_coverage_shrink_mode; blob.coverage_reduce_mode = splat_coverage_reduce_mode;
+	blob.show_overdraw_mode = splat_show_overdraw_mode; blob.dof_depth_mode = splat_dof_depth_mode;
+	blob.size_clamp_invert = splat_size_clamp_invert ? 1 : 0; blob.dist_clamp_invert = splat_dist_clamp_invert ? 1 : 0;
+	blob.area_slice_mode = splat_area_slice_mode; blob.ewa_fix_enabled = splat_ewa_fix_enabled ? 1 : 0;
+	blob.saturation_gate_enabled = splat_saturation_gate_enabled ? 1 : 0;
+	blob.accum_buffer_8bit = splat_accum_buffer_8bit ? 1 : 0; blob.accum_upsample_bilinear = splat_accum_upsample_bilinear ? 1 : 0;
+	blob.deconv_enabled = splat_deconv_enabled ? 1 : 0; blob.rcas_enabled = splat_rcas_enabled ? 1 : 0;
+	blob.layer_cap = splat_layer_cap; blob.layer_cap_opaque = splat_layer_cap_opaque ? 1 : 0;
+	blob.saturation_mask_downscale = splat_saturation_mask_downscale;
+	const uint64 settings_hash = fnv1a64(&blob, sizeof(blob));
+
+	// Any single one of these being different from last frame invalidates the accumulation.  Bitwise view compare is
+	// deliberate: half a pixel of camera dither is exactly what would show up as a smear if it were tolerated, and a
+	// spurious reset costs nothing (4 frames back to full quality).
+	const bool view_changed     = !(cur_view == splat_taa_last_view_matrix);
+	const bool viewport_changed = (viewport_dims != splat_taa_last_viewport_dims);
+	const bool accum_changed    = (accum_dims != splat_taa_last_accum_dims);
+	const bool settings_changed = (settings_hash != splat_taa_last_settings_hash);
+	const bool clouds_changed   = (clouds.size() != splat_taa_last_num_clouds);
+	const bool content_applied  = (splat_taa_content_apply_counter != splat_taa_last_content_apply_snapshot);
+
+	const bool reset = view_changed || viewport_changed || accum_changed || settings_changed || clouds_changed || content_applied;
+
+	if(reset)
+	{
+		splat_taa_frame_count = 0;
+		// splat_taa_write_index is NOT reset - keeping it ping-ponging avoids a case where the composite pass reads
+		// history[write] on the very first frame after a reset (weight = 1, so the read is discarded anyway, but we
+		// still need a valid texture bound to satisfy WebGL's sampler validation).
+	}
+	else
+	{
+		splat_taa_frame_count = myMin(splat_taa_frame_count + 1, numJitterSamples() - 1);
+		// After N frames the weight 1/(N+1) is small enough that new frames barely register; capping the counter keeps
+		// it stable and avoids stagnation when the sequence has repeated all its offsets.
+	}
+
+	// Pick this frame's jitter offset from the Halton sequence.  Indexed by the accumulated frame count (not the
+	// monotonic index) so that a reset restarts the sequence from 0 and every accumulation window sees the same,
+	// well-distributed set of offsets.  In [-0.5, +0.5) accum-buffer pixels.
+	const int k = splat_taa_frame_count;
+	splat_taa_current_jitter_px.set(halton(k, 2) - 0.5f, halton(k, 3) - 0.5f);
+
+	// SESSION069 DIAGNOSTIC - one line every 60 active frames, or immediately when a reset fires, so we can tell whether
+	// the accumulation actually grows (frame_count going up) or is being kicked back to 0 by one of the six conditions
+	// above.  Named which condition, so a spurious reset (LoD kick, sort completion, etc.) is easy to spot.
+	static int taa_diag_ticks = 0;
+	if(reset || (taa_diag_ticks++ % 60 == 0))
+	{
+		const char* reason = reset
+			? (view_changed ? "view" : viewport_changed ? "viewport" : accum_changed ? "accum" :
+			   settings_changed ? "settings" : clouds_changed ? "clouds" : content_applied ? "content" : "?")
+			: "steady";
+		conPrint("[TAA] " + std::string(reason) + " count=" + toString(splat_taa_frame_count) + "/" + toString(numJitterSamples()) +
+			" jitter_px=(" + doubleToStringNSigFigs(splat_taa_current_jitter_px.x, 3) + ", " + doubleToStringNSigFigs(splat_taa_current_jitter_px.y, 3) + ")" +
+			" write=" + toString(splat_taa_write_index));
+	}
+
+	// Flip the write index for next frame's accumulate pass - the freshly written history becomes next frame's read.
+	splat_taa_write_index = 1 - splat_taa_write_index;
+
+	// Snapshot for next frame's compares.
+	splat_taa_last_view_matrix = cur_view;
+	splat_taa_last_viewport_dims = viewport_dims;
+	splat_taa_last_accum_dims = accum_dims;
+	splat_taa_last_settings_hash = settings_hash;
+	splat_taa_last_num_clouds = clouds.size();
+	splat_taa_last_content_apply_snapshot = splat_taa_content_apply_counter;
+
+	splat_taa_frame_index_monotonic++;
+}
+
+
+void GaussianSplatRenderer::setResolveTAAActiveUniform(int taa_active) const
+{
+	glUniform1i(resolve_prog->user_uniform_info[16].loc, taa_active);
+}
+
+
+void GaussianSplatRenderer::setResolveTAAJitterUniform(const Vec2f& jitter_accum_px) const
+{
+	glUniform2f(resolve_prog->user_uniform_info[17].loc, jitter_accum_px.x, jitter_accum_px.y);
+}
+
+
+int GaussianSplatRenderer::getResolveTAAJitterUniformLoc() const // DIAGNOSTIC ONLY
+{
+	return resolve_prog->user_uniform_info[17].loc;
+}
+
+
+void GaussianSplatRenderer::setResolveLowPassVarianceUniform(float variance) const
+{
+	glUniform1f(resolve_prog->user_uniform_info[18].loc, variance);
+}
+
+
+void GaussianSplatRenderer::setTAAAccumulateWeight(float weight) const
+{
+	// Only the weight is set per-frame; sampler bindings are handled by resolveSplatAccumBuffer() via the sampler-loc
+	// getters exposed above.  Index 2 in the same order as the appendUserUniformInfo() list below (0 = current, 1 = history).
+	if(taa_accumulate_prog.nonNull())
+		glUniform1f(taa_accumulate_prog->user_uniform_info[2].loc, weight);
+}
+
+
+int GaussianSplatRenderer::getTAAAccumulateCurrentTexUniformLoc() const
+{
+	return taa_accumulate_prog.nonNull() ? taa_accumulate_prog->user_uniform_info[0].loc : -1;
+}
+
+
+int GaussianSplatRenderer::getTAAAccumulateHistoryTexUniformLoc() const
+{
+	return taa_accumulate_prog.nonNull() ? taa_accumulate_prog->user_uniform_info[1].loc : -1;
+}
+
+
+int GaussianSplatRenderer::getTAACompositeHistoryTexUniformLoc() const
+{
+	return taa_composite_prog.nonNull() ? taa_composite_prog->user_uniform_info[0].loc : -1;
 }
 
 
@@ -3375,7 +3679,7 @@ Reference<SplatCloud> GaussianSplatRenderer::allocCloud()
 	// walks the program's uniforms and indexes this array by the same i, so a slot short is an out-of-bounds read there
 	// and an out-of-bounds write in think(). All but splat_tex_width below are set by think(), or by the draw path for the
 	// saturation mask ones.
-	mat.user_uniform_vals.resize(27); // SESSION066: +2 for splat_hide_count_active/threshold (indices 23, 24). SESSION067: +2 for splat_area_slice_mode/_px (25, 26).
+	mat.user_uniform_vals.resize(29); // SESSION066: +2 for splat_hide_count_active/threshold (indices 23, 24). SESSION067: +2 for splat_area_slice_mode/_px (25, 26). SESSION069: +1 for splat_jitter_px (27), +1 for splat_low_pass_variance (28).
 	mat.user_uniform_vals[2].intval = (int)splat_tex_width;
 
 	// Build a real (if minimal) texture and VAO up front: adding the object to the engine before it has those would
@@ -4231,6 +4535,11 @@ void GaussianSplatRenderer::drainSortResults()
 {
 	sort_result_queue.dequeueAnyQueuedItems(completed_msgs);
 
+	// SESSION069 - any completed sort changed at least one cloud's draw order this frame, so the TAA history is stale
+	// for whichever pixels those splats moved through and must be reset.  A spurious reset (all msgs referenced dropped
+	// clouds) costs 4 frames back to full quality, cheap vs. the visible smear a missed reset would cause.
+	if(!completed_msgs.empty()) noteContentApplied();
+
 	for(size_t i=0; i<completed_msgs.size(); ++i)
 	{
 		const GaussianSplatSortResultMsg* const msg = static_cast<const GaussianSplatSortResultMsg*>(completed_msgs[i].ptr());
@@ -4407,6 +4716,12 @@ void GaussianSplatRenderer::kickOffSorts()
 void GaussianSplatRenderer::drainTraversalResults()
 {
 	traversal_result_queue.dequeueAnyQueuedItems(completed_traversal_msgs);
+
+	// SESSION069 - see drainSortResults() above.  Traversal results change which splats are selected for drawing; the
+	// LoD-settle mechanism (session066) applies exactly one of these ~0.3s after the camera stops, i.e. right in the
+	// middle of a TAA accumulation window - and without this reset the two LoD sets would smear together for the
+	// remaining frames of the window ("top layer peeled" from session053).
+	if(!completed_traversal_msgs.empty()) noteContentApplied();
 
 	for(size_t i=0; i<completed_traversal_msgs.size(); ++i)
 	{
@@ -4589,6 +4904,10 @@ void GaussianSplatRenderer::kickOffFilters()
 void GaussianSplatRenderer::drainFilterResults()
 {
 	filter_result_queue.dequeueAnyQueuedItems(completed_filter_msgs);
+
+	// SESSION069 - see drainSortResults() above.  Per-orientation filter (session063 split architecture) also revises
+	// the draw list, so TAA must reset when it lands.
+	if(!completed_filter_msgs.empty()) noteContentApplied();
 
 	for(size_t i=0; i<completed_filter_msgs.size(); ++i)
 	{
@@ -4942,6 +5261,24 @@ void GaussianSplatRenderer::think()
 	const float focal_x = (float)accum_dims.x * scene->lens_sensor_dist / scene->use_sensor_width;
 	const float focal_y = (float)accum_dims.y * scene->lens_sensor_dist / scene->use_sensor_height;
 
+	// SESSION069 - Pick this frame's TAA jitter offset (or reset the accumulation if anything invalidated it) BEFORE
+	// the per-cloud loop below writes user_uniform_vals[27], so all clouds share one consistent offset for the frame.
+	updateTAAState(accum_dims);
+
+	// SESSION069 fix - the vertex shader's per-splat anti-alias low-pass (+0.3, historically hardcoded) is sized in
+	// ACCUM-BUFFER texels, which band-limits every single frame's render to the accum grid's own Nyquist limit -
+	// exactly the sub-texel structure TAA's jittered accumulation is supposed to recover.  A single frame can never
+	// contain more than the low-pass allows, no matter how many differently-phased frames are later averaged.  While
+	// TAA is running, shrink the low-pass to what a FULL-FRAME render would use (0.3 full-res-pixels², expressed in
+	// accum-pixels² by the scale-squared factor below) - the temporal average supplies the anti-aliasing instead, the
+	// same trade every jittered-supersampling scheme makes.  Floored well above 0 so the covariance never gets close
+	// enough to singular to matter (see the "shouldn't normally happen" comment at the 2D covariance's own inversion).
+	{
+		const bool taa_active_now = isTAAActiveForResolve();
+		const float accum_scale = (viewport_dims.x > 0) ? ((float)accum_dims.x / (float)viewport_dims.x) : 1.f;
+		splat_low_pass_variance_current = taa_active_now ? myMax(0.3f * accum_scale * accum_scale, 0.02f) : 0.3f;
+	}
+
 	for(size_t i=0; i<clouds.size(); ++i)
 	{
 		OpenGLMaterial& mat = clouds[i]->ob->materials[0];
@@ -4979,6 +5316,10 @@ void GaussianSplatRenderer::think()
 		const double buffer_px = (double)accum_dims.x * (double)accum_dims.y;
 		mat.user_uniform_vals[25].intval = splat_area_slice_mode;
 		mat.user_uniform_vals[26].floatval = (frame_px > 0) ? (float)(splat_area_slice_px * (buffer_px / frame_px)) : splat_area_slice_px;
+		// SESSION069 - subpixel jitter picked by updateTAAState() before this loop.  Zero when TAA is inert (off or
+		// scale 1); the vertex shader's shift is then a no-op.
+		mat.user_uniform_vals[27].vec2 = splat_taa_current_jitter_px;
+		mat.user_uniform_vals[28].floatval = splat_low_pass_variance_current; // SESSION069 fix - see above.
 	}
 
 	buildVisibleSliceCDFs();

@@ -52,6 +52,24 @@ uniform float splat_deconv_gain;     // A/B multiplier on the analytically-deriv
 uniform int splat_rcas_enabled;      // 0 = off, 1 = on.  AMD FidelityFX RCAS (MIT), see applyRCAS().
 uniform float splat_rcas_sharpness;  // 0..1, RCAS sharpness (fraction of its safe maximum lobe).
 
+// SESSION069 - draw target.  0 = the frame's colour buffer, blended with (GL_ONE, GL_ONE_MINUS_SRC_ALPHA); 1 = the TAA
+// current-frame texture (blending off), where empty pixels must be written as vec4(0) rather than discarded so the
+// history knows this pixel had no splat this frame.
+uniform int splat_taa_active;
+
+// SESSION069 fix - this frame's vertex-shader jitter (splat_jitter_px in gaussian_splat_vert_shader.glsl), in
+// accum-buffer pixels.  (0,0) whenever splat_taa_active is 0.  Shifting all splat centres by +J in the vertex shader
+// moves texel i's content to what would, unjittered, have rendered at i-J; so recovering the true value at a fixed
+// continuous position p needs texel p+J of THIS frame's buffer, not texel p.  Without this, every jittered
+// acquisition reads back through the exact same fixed UV and TAA only denoises the low-res estimate instead of
+// actually registering different sub-texel phases at different full-res pixels - see sampleSplatAccum().
+uniform vec2 splat_jitter_px;
+
+// SESSION069 fix - this frame's ACTUAL splat_low_pass_variance from the vertex shader (0.3 outside TAA, shrunk while
+// TAA is running - see that uniform's own comment there).  applyMatchedDeconv() below inverts this value instead of
+// a hardcoded 0.3, so it keeps inverting the blur that was really applied instead of over-estimating it under TAA.
+uniform float splat_low_pass_variance;
+
 out vec4 colour_out;
 
 
@@ -74,8 +92,9 @@ vec4 sampleSplatAccum(sampler2D tex)
 
 	// The buffer covers the same screen area at a lower resolution, so the normalised position within the frame is
 	// also the normalised position within the buffer, whatever its size.  gl_FragCoord is at pixel centres, which is
-	// what makes this land on texel centres rather than half a texel off.
-	return texture(tex, gl_FragCoord.xy / splat_resolve_dims_px);
+	// what makes this land on texel centres rather than half a texel off.  The + splat_jitter_px term (0,0 outside
+	// TAA) re-registers the read against this frame's vertex-shader jitter - see the uniform's own comment.
+	return texture(tex, gl_FragCoord.xy / splat_resolve_dims_px + splat_jitter_px / splat_accum_dims_px);
 }
 
 
@@ -95,28 +114,30 @@ vec2 accumCoordPx()
 // any finer step would sharpen the bilinear interpolant itself rather than the underlying signal.
 vec3 sampleSplatColourOffset(vec2 offset_texels, vec3 centre_col)
 {
-	vec2 uv = gl_FragCoord.xy / splat_resolve_dims_px + offset_texels / splat_accum_dims_px;
+	vec2 uv = gl_FragCoord.xy / splat_resolve_dims_px + (offset_texels + splat_jitter_px) / splat_accum_dims_px;
 	vec4 a = texture(albedo_texture, uv);
 	return (a.a > 0.0) ? clamp(a.rgb / a.a, 0.0, 1.0) : centre_col;
 }
 
 
 // SESSION068 - matched deconvolution: approximate inverse of the KNOWN blur applied to this buffer, not a hand-tuned
-// sharpen.  Two sources of blur, both ours: the +0.3 low-pass on the 2D covariance diagonal
-// (gaussian_splat_vert_shader.glsl, variance 0.3 in accum-buffer texels squared) and the triangular bilinear-tent kernel
-// used to upsample (variance 1/6).  Gaussian variances add, and a blur of variance v to first order is
-// col + (v/2)*laplacian - so its inverse subtracts the same term.
+// sharpen.  Two sources of blur, both ours: splat_low_pass_variance on the 2D covariance diagonal
+// (gaussian_splat_vert_shader.glsl - 0.3 accum-buffer texels squared normally, shrunk while TAA is running, see its own
+// comment there) and the triangular bilinear-tent kernel used to upsample (variance 1/6).  Gaussian variances add, and
+// a blur of variance v to first order is col + (v/2)*laplacian - so its inverse subtracts the same term.
 //
-// Only the EXCESS over scale 1 is undone: the +0.3 at scale 1 is legitimate anti-aliasing that prevents sub-pixel splats
-// from flickering as the camera moves; taking it out would bring that flicker back.  After the laplacian's step
-// (1 accum-texel = 1/s frame pixels) is folded in, the scale factor almost cancels and the strength collapses to
-// a = (0.3 + 1/6 - 0.3*s*s) / 2.  Full derivation: session068 snapshot §4.1.
+// Only the EXCESS over scale 1 is undone: splat_low_pass_variance at scale 1 is legitimate anti-aliasing that prevents
+// sub-pixel splats from flickering as the camera moves; taking it out would bring that flicker back.  After the
+// laplacian's step (1 accum-texel = 1/s frame pixels) is folded in, the scale factor almost cancels and the strength
+// collapses to a = (splat_low_pass_variance + 1/6 - splat_low_pass_variance*s*s) / 2.  SESSION069 fix - this used to
+// hardcode 0.3 in place of splat_low_pass_variance, which over-estimated the blur (and so over-sharpened) on any frame
+// where TAA had shrunk it.  Full derivation of the base formula: session068 snapshot §4.1.
 //
 // The neighbourhood clamp at the end is not cosmetic: an unclamped laplacian rings on sharp transitions, and this
 // clamp makes the filter incapable of producing a new local extremum by construction.
 vec3 applyMatchedDeconv(vec3 e, vec3 b, vec3 d, vec3 f, vec3 h, float scale, float gain)
 {
-	float a = max((0.3 + (1.0/6.0) - 0.3 * scale * scale) * 0.5, 0.0) * gain;
+	float a = max((splat_low_pass_variance + (1.0/6.0) - splat_low_pass_variance * scale * scale) * 0.5, 0.0) * gain;
 	vec3 laplacian = b + d + f + h - 4.0 * e;
 	vec3 sharp = e - a * laplacian;
 	return clamp(sharp, min(min(b, d), min(f, h)), max(max(b, d), max(f, h)));
@@ -204,7 +225,13 @@ void main()
 		// alpha = 1 does exactly that).
 		float accum_sum = accum.r;
 		if(accum_sum <= 0.0)
+		{
+			// SESSION069 - in TAA mode we draw into a texture and cannot discard (the target texel would retain last
+			// frame's TAA value or garbage); write vec4(0) so the accumulate pass sees "no splat at this pixel".  The
+			// non-TAA path is bit-for-bit as before.
+			if(splat_taa_active != 0) { colour_out = vec4(0.0); return; }
 			discard; // No splat reached this pixel - leave the background alone, same as the coverage check below.
+		}
 
 		float range = max(splat_overdraw_range_max - splat_overdraw_range_min, 1.0e-4);
 		float t = clamp((accum_sum - splat_overdraw_range_min) / range, 0.0, 1.0);
@@ -217,7 +244,12 @@ void main()
 
 	float coverage = accum.a; // = 1 - product of (1 - a_i), i.e. how much of this pixel the splat stack covers.
 	if(coverage <= 0.0)
+	{
+		// SESSION069 - see the overdraw branch above.  In TAA mode write vec4(0) instead of discarding, so the accumulate
+		// pass sees an explicit "empty this frame" for the running mean.
+		if(splat_taa_active != 0) { colour_out = vec4(0.0); return; }
 		discard; // No splat reached this pixel, so leave the background alone.  Also avoids the 0/0 below.
+	}
 
 	// Divide out the alpha to recover the straight (non-premultiplied) colour of the splat stack: the colour the
 	// capture says this pixel should be where the splats cover it.  The clamp only guards against half-float rounding

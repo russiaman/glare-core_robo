@@ -8076,6 +8076,9 @@ void OpenGLEngine::draw()
 			cur_scene->transparent_accum_copy_texture = NULL;
 			cur_scene->total_transmittance_copy_texture = NULL;
 			cur_scene->splat_accum_copy_texture = NULL;
+			cur_scene->splat_taa_current_texture = NULL; // SESSION069 - reallocated by resolveSplatAccumBuffer() when TAA is active.
+			cur_scene->splat_taa_history_texture[0] = NULL;
+			cur_scene->splat_taa_history_texture[1] = NULL;
 
 			cur_scene->main_colour_renderbuffer = NULL;
 			cur_scene->main_normal_renderbuffer = NULL;
@@ -8089,6 +8092,9 @@ void OpenGLEngine::draw()
 			cur_scene->main_render_copy_framebuffer = NULL;
 			cur_scene->splat_accum_framebuffer = NULL; // Attaches main_depth_renderbuffer, which is about to be replaced, so it can't outlive it.
 			cur_scene->splat_accum_copy_framebuffer = NULL;
+			cur_scene->splat_taa_current_framebuffer = NULL; // SESSION069
+			cur_scene->splat_taa_history_framebuffer[0] = NULL;
+			cur_scene->splat_taa_history_framebuffer[1] = NULL;
 
 			main_texture_size_changed = true;
 		}
@@ -11714,6 +11720,43 @@ order: the samples hold premultiplied colour and coverage, so averaging them and
 how much of it the splats actually covered, whereas dividing per-sample first would weight a barely covered sample the
 same as a fully covered one.
 */
+// SESSION069 - Three full-resolution RGBA16F textures for TAA: the current-frame resolve target and the two ping-ponging
+// history buffers.  Allocated on demand and reallocated when the frame size changes under them.  All Filtering_Nearest -
+// this pass reads them by texelFetch, one-to-one with the frame.
+void OpenGLEngine::allocSplatTAABuffersIfNeeded()
+{
+	const int xres = myMax(16, current_scene->viewport_w);
+	const int yres = myMax(16, current_scene->viewport_h);
+
+	const bool need_realloc =
+		current_scene->splat_taa_current_texture.isNull() ||
+		(int)current_scene->splat_taa_current_texture->xRes() != xres ||
+		(int)current_scene->splat_taa_current_texture->yRes() != yres;
+
+	if(!need_realloc)
+		return;
+
+	for(int i = 0; i < 3; ++i)
+	{
+		OpenGLTextureRef& tex = (i == 0) ? current_scene->splat_taa_current_texture : current_scene->splat_taa_history_texture[i - 1];
+		Reference<FrameBuffer>& fb = (i == 0) ? current_scene->splat_taa_current_framebuffer : current_scene->splat_taa_history_framebuffer[i - 1];
+
+		tex = new OpenGLTexture(xres, yres, this,
+			ArrayRef<uint8>(), // data
+			OpenGLTextureFormat::Format_RGBA_Linear_Half,
+			OpenGLTexture::Filtering_Nearest,
+			OpenGLTexture::Wrapping_Clamp,
+			false, // has_mipmaps
+			/*MSAA_samples=*/1
+		);
+		fb = new FrameBuffer();
+		fb->attachTexture(*tex, GL_COLOR_ATTACHMENT0);
+	}
+
+	conPrint("Allocated splat TAA buffers, width " + toString(xres) + " height " + toString(yres));
+}
+
+
 void OpenGLEngine::resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name, bool write_weighted_depth)
 {
 	DebugGroup debug_group("resolveSplatAccumBuffer()");
@@ -11743,9 +11786,23 @@ void OpenGLEngine::resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name,
 		glReadBuffer(GL_COLOR_ATTACHMENT0);
 	}
 
+	// SESSION069 - TAA rewires the composite: the resolve here draws its splat layer into a full-resolution TAA current
+	// texture (blending off) instead of blending directly into the frame; two extra polymorphic passes then run below
+	// (accumulate + composite) to average it with history and blend the result onto the frame the way the resolve used
+	// to do in one shot.  isTAAActiveForResolve() already gates on scale-<1 and !write_weighted_depth, so taa_active
+	// implies both.
+	const bool taa_active = splat_renderer->isTAAActiveForResolve();
+	if(taa_active)
+		allocSplatTAABuffersIfNeeded();
+
 	//----------------------- Composite onto the buffer the frame is being drawn into -----------------------
-	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, scene_target_framebuffer_name);
-	if(scene_target_framebuffer_name != 0)
+	// TAA path draws into splat_taa_current_texture's framebuffer instead of the scene target - the actual scene target
+	// is written by the composite pass below.
+	const GLuint resolve_target_fb = taa_active
+		? current_scene->splat_taa_current_framebuffer->buffer_name
+		: scene_target_framebuffer_name;
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, resolve_target_fb);
+	if(resolve_target_fb != 0)
 		setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Just draw to colour buffer (not normal buffer).  The default framebuffer has no such attachment, and the draw buffer set for it already is the right one.
 
 	// SESSION067 - back to the frame's own resolution.  drawSplatClouds() ran the accumulation passes at the buffer's
@@ -11777,8 +11834,17 @@ void OpenGLEngine::resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name,
 	}
 	else
 		glDisable(GL_DEPTH_TEST); // Don't depth test
-	glEnable(GL_BLEND);
-	glBlendFunc(/*source factor=*/GL_ONE, /*destination factor=*/GL_ONE_MINUS_SRC_ALPHA); // The resolve shader outputs colour premultiplied by the accumulated coverage.
+	if(taa_active)
+	{
+		// SESSION069 - resolve into the TAA current texture, RAW - no blend.  The current texture is (colour*coverage,
+		// coverage) exactly as the resolve outputs, ready for the accumulate pass to average with history.
+		glDisable(GL_BLEND);
+	}
+	else
+	{
+		glEnable(GL_BLEND);
+		glBlendFunc(/*source factor=*/GL_ONE, /*destination factor=*/GL_ONE_MINUS_SRC_ALPHA); // The resolve shader outputs colour premultiplied by the accumulated coverage.
+	}
 
 	const Reference<OpenGLProgram>& resolve_prog = splat_renderer->getResolveProgram();
 	assert(resolve_prog.nonNull()); // Non-null since a cloud was drawn, which means GaussianSplatRenderer built its shaders.
@@ -11787,6 +11853,20 @@ void OpenGLEngine::resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name,
 	splat_renderer->setResolveDoFDepthUniforms(write_weighted_depth, (float)current_scene->near_draw_dist);
 	splat_renderer->setResolveUpsampleUniforms(accum_dims, resolve_dims); // SESSION067 - how to read a smaller accumulation buffer back up to the frame.
 	splat_renderer->setResolveEnhanceUniforms(accum_dims, resolve_dims);  // SESSION068 - matched deconvolution / RCAS on top of that upsample.  Inert at scale 1 by construction of the setter itself.
+	splat_renderer->setResolveTAAActiveUniform(taa_active ? 1 : 0);       // SESSION069 - tells the resolve shader to write vec4(0) instead of discarding when the current pixel is empty, so TAA history sees an explicit zero.
+	const Vec2f resolve_jitter_px = taa_active ? splat_renderer->getCurrentTAAJitterPx() : Vec2f(0.f, 0.f);
+	splat_renderer->setResolveTAAJitterUniform(resolve_jitter_px); // SESSION069 fix - registers this frame's read against the same jitter the vertex shader applied.
+	splat_renderer->setResolveLowPassVarianceUniform(splat_renderer->getCurrentLowPassVariance()); // SESSION069 fix - applyMatchedDeconv() must invert the blur actually applied this frame, not a hardcoded 0.3.
+
+	// SESSION069 fix DIAGNOSTIC ONLY - one line per active frame for the first few, showing the jitter uniform's
+	// resolved location and the value actually pushed.  If loc is -1 the shader never sees it and the fix is a no-op.
+	if(taa_active)
+	{
+		static int taa_jitter_apply_ticks = 0;
+		if(taa_jitter_apply_ticks++ < 5)
+			conPrint("[TAA-jitter-apply] loc=" + toString(splat_renderer->getResolveTAAJitterUniformLoc()) +
+				" jitter_px=(" + doubleToStringNSigFigs(resolve_jitter_px.x, 4) + ", " + doubleToStringNSigFigs(resolve_jitter_px.y, 4) + ")");
+	}
 	bindMeshData(*unit_quad_meshdata);
 
 	bindTextureUnitToSampler(*current_scene->splat_accum_copy_texture, /*texture_unit_index=*/0, /*sampler_uniform_location=*/resolve_prog->albedo_texture_loc);
@@ -11825,11 +11905,74 @@ void OpenGLEngine::resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name,
 	//----------------------- Draw the quad -----------------------
 	drawElementsBaseVertex(GL_TRIANGLES, (GLsizei)unit_quad_meshdata->batches[0].num_indices, unit_quad_meshdata->getIndexType(), (void*)unit_quad_meshdata->getBatch0IndicesTotalBufferOffset(), unit_quad_meshdata->vbo_handle.base_vertex);
 
+	// SESSION069 - Two TAA follow-up passes, only when the resolve above went into the TAA current texture.  Both are
+	// full-viewport quads (mesh already bound above); the first averages current + history and writes into history[write],
+	// the second blends history[write] into the actual scene framebuffer with the same (GL_ONE, GL_ONE_MINUS_SRC_ALPHA)
+	// blend the pre-TAA resolve did directly.
+	if(taa_active)
+	{
+		const int write = splat_renderer->getTAAWriteIndex();
+		const int read = 1 - write;
+
+		// SESSION069 DIAGNOSTIC (root-cause hunt for "no visible TAA effect") - one line per active frame for the first
+		// few, showing the sampler locations and the weight actually used.  If either sampler loc is -1 the shader reads
+		// through its default (unit 0), which would make BOTH samplers pull the same texture - producing "TAA looks
+		// identical to non-TAA" exactly as reported.  Also prints the weight in case it is stuck at 1.0.
+		{
+			static int taa_apply_ticks = 0;
+			if(taa_apply_ticks++ < 5 || (taa_apply_ticks % 120 == 0))
+			{
+				conPrint("[TAA-apply] write=" + toString(write) +
+					" read=" + toString(read) +
+					" weight=" + doubleToStringNSigFigs(splat_renderer->getTAAAccumulateWeight(), 4) +
+					" accum_curr_loc=" + toString(splat_renderer->getTAAAccumulateCurrentTexUniformLoc()) +
+					" accum_hist_loc=" + toString(splat_renderer->getTAAAccumulateHistoryTexUniformLoc()) +
+					" comp_hist_loc=" + toString(splat_renderer->getTAACompositeHistoryTexUniformLoc()));
+			}
+		}
+
+		// The current texture we just wrote is bound to unit 0 with the resolve program's albedo_texture_loc.  Unbind
+		// it before we start binding samplers of the next programs to unit 0 as well.
+		unbindTextureFromTextureUnit(*current_scene->splat_accum_copy_texture, /*texture_unit_index=*/0);
+		OpenGLProgram::useNoPrograms();
+
+		//----- Accumulate pass -----
+		const Reference<OpenGLProgram>& accum_prog = splat_renderer->getTAAAccumulateProgram();
+		assert(accum_prog.nonNull());
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, current_scene->splat_taa_history_framebuffer[write]->buffer_name);
+		setSingleDrawBuffer(GL_COLOR_ATTACHMENT0);
+		glViewport(0, 0, (GLsizei)resolve_dims.x, (GLsizei)resolve_dims.y);
+		glDisable(GL_BLEND); // Overwrite the target - the pass IS the mean.
+		accum_prog->useProgram();
+		splat_renderer->setTAAAccumulateWeight(splat_renderer->getTAAAccumulateWeight());
+		bindTextureUnitToSampler(*current_scene->splat_taa_current_texture,      /*unit=*/0, splat_renderer->getTAAAccumulateCurrentTexUniformLoc());
+		bindTextureUnitToSampler(*current_scene->splat_taa_history_texture[read], /*unit=*/1, splat_renderer->getTAAAccumulateHistoryTexUniformLoc());
+		drawElementsBaseVertex(GL_TRIANGLES, (GLsizei)unit_quad_meshdata->batches[0].num_indices, unit_quad_meshdata->getIndexType(), (void*)unit_quad_meshdata->getBatch0IndicesTotalBufferOffset(), unit_quad_meshdata->vbo_handle.base_vertex);
+		unbindTextureFromTextureUnit(*current_scene->splat_taa_current_texture,      /*unit=*/0);
+		unbindTextureFromTextureUnit(*current_scene->splat_taa_history_texture[read], /*unit=*/1);
+
+		//----- Composite pass -----
+		const Reference<OpenGLProgram>& comp_prog = splat_renderer->getTAACompositeProgram();
+		assert(comp_prog.nonNull());
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, scene_target_framebuffer_name);
+		if(scene_target_framebuffer_name != 0)
+			setSingleDrawBuffer(GL_COLOR_ATTACHMENT0);
+		glViewport(0, 0, (GLsizei)resolve_dims.x, (GLsizei)resolve_dims.y);
+		glEnable(GL_BLEND);
+		glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA); // History is premultiplied, same as the resolve output was; composite exactly as the pre-TAA resolve did.
+		comp_prog->useProgram();
+		bindTextureUnitToSampler(*current_scene->splat_taa_history_texture[write], /*unit=*/0, splat_renderer->getTAACompositeHistoryTexUniformLoc());
+		drawElementsBaseVertex(GL_TRIANGLES, (GLsizei)unit_quad_meshdata->batches[0].num_indices, unit_quad_meshdata->getIndexType(), (void*)unit_quad_meshdata->getBatch0IndicesTotalBufferOffset(), unit_quad_meshdata->vbo_handle.base_vertex);
+		unbindTextureFromTextureUnit(*current_scene->splat_taa_history_texture[write], /*unit=*/0);
+	}
+
 	//----------------------- Cleanup -----------------------
 	OpenGLProgram::useNoPrograms();
 
 	// Unbind the texture from its texture unit.  Otherwise we get errors in Chrome: "GL_INVALID_OPERATION: Feedback loop formed between Framebuffer and active Texture."
-	unbindTextureFromTextureUnit(*current_scene->splat_accum_copy_texture, /*texture_unit_index=*/0);
+	// In the TAA path this texture was already unbound above before the accumulate/composite passes ran, so this is a no-op there.
+	if(!taa_active)
+		unbindTextureFromTextureUnit(*current_scene->splat_accum_copy_texture, /*texture_unit_index=*/0);
 
 	glDisable(GL_BLEND);
 	glEnable(GL_DEPTH_TEST);

@@ -289,7 +289,7 @@ static Vec4f computeMergedColourAlphaLegacyArrays(const Vec4f* child_colours, co
 }
 
 
-void recolorLodTree(const std::vector<GaussianSplatLodNode>& tree, const Vec3f* scales, Vec4f* colours, GaussianSplatMergeColourMode mode)
+void recolorLodTree(const std::vector<GaussianSplatLodNode>& tree, const Vec3f* scales, Vec4f* colours, GaussianSplatMergeColourMode mode, float alpha_boost)
 {
 	std::vector<Vec4f> child_colours; // Hoisted out of the loop so the per-node gather reuses one allocation.
 	std::vector<Vec3f> child_scales;
@@ -311,9 +311,14 @@ void recolorLodTree(const std::vector<GaussianSplatLodNode>& tree, const Vec3f* 
 			child_scales [c] = scales [ci];
 		}
 
-		colours[i] = (mode == GaussianSplatMergeColourMode_Energy) ?
+		Vec4f merged = (mode == GaussianSplatMergeColourMode_Energy) ?
 			computeMergedColourAlphaEnergy      (child_colours.data(), child_scales.data(), num_children, scales[i]) :
 			computeMergedColourAlphaLegacyArrays(child_colours.data(), child_scales.data(), num_children, scales[i]);
+
+		if(alpha_boost != 1.f) // SESSION071 diagnostic - see the header comment.
+			merged.x[3] = myClamp(merged.x[3] * alpha_boost, 0.f, 1.f);
+
+		colours[i] = merged;
 	}
 }
 

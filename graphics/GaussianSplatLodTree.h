@@ -110,7 +110,14 @@ enum GaussianSplatMergeColourMode
 //
 // Re-running this is idempotent per mode and safe to switch back and forth: each merged node is fully rederived from its
 // children, never accumulated onto its previous value.
-void recolorLodTree(const std::vector<GaussianSplatLodNode>& tree, const Vec3f* scales, Vec4f* colours, GaussianSplatMergeColourMode mode);
+//
+// SESSION071 alpha_boost is a DIAGNOSTIC multiplier on a merged node's opacity (clamped to 1), for separating the two
+// candidate causes of the residual darkening of bright dense surfaces that survived the Energy formulation: either the
+// merged opacity is still too low there and the dark background shows through (in which case boosting it removes the
+// darkening), or the colour itself is being averaged with interior splats that real front-to-back compositing never
+// shows (in which case boosting only flattens the image and the grey stays). 1 = no change. Applies to merged nodes only,
+// never to leaves, and compounds up the tree exactly as the merge itself does - so it is a probe, not a calibration knob.
+void recolorLodTree(const std::vector<GaussianSplatLodNode>& tree, const Vec3f* scales, Vec4f* colours, GaussianSplatMergeColourMode mode, float alpha_boost = 1.f);
 
 
 // Builds a leaf node directly from one splat's un-merged attributes (e.g. from GaussianSplatData's parallel arrays). child_count = 0, feature_size computed from scale.

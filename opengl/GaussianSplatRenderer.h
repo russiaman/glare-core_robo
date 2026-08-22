@@ -320,6 +320,11 @@ public:
 	GaussianSplatMergeColourMode getMergeColourMode() const { return splat_merge_colour_mode; }
 	void setMergeColourMode(GaussianSplatMergeColourMode v);
 
+	// SESSION071 DIAGNOSTIC: multiplier on merged (non-leaf) node opacity - see recolorLodTree()'s alpha_boost comment for
+	// what it is meant to distinguish. 1 = off. Re-derives colours in place like setMergeColourMode() does.
+	float getMergeAlphaBoost() const { return splat_merge_alpha_boost; }
+	void setMergeAlphaBoost(float v);
+
 
 	// Diagnostic tool, not a LoD parameter: culls any splat whose feature_size (2 * max scale axis, matching
 	// GaussianSplatLodNode::feature_size) falls outside [min, max], directly in the vertex shader, regardless of
@@ -1203,6 +1208,7 @@ private:
 	void rebuildVAO(SplatCloud& cloud); // Rebuilds vert_vao against the current instance index VBO - needed whenever that VBO is replaced.
 	void uploadTexelRowsForSplatRange(SplatCloud& cloud, size_t first_splat, size_t num_splats_to_upload); // Repacks and re-uploads just the texture rows spanning the given splat range.
 	void writeIdentityIndices(SplatCloud& cloud, size_t first_splat, size_t num_splats); // Writes an identity draw order over the given range of the instance index VBO.
+	void recolourAllClouds(); // SESSION071: re-derives merged-node colours on every loaded cloud under the current mode/boost and re-uploads them - see the .cpp.
 	void rebuildCloudAABB(SplatCloud& cloud); // Recomputes the cloud AABB as the union of its members' bounds.  O(num members), not O(num splats).
 
 	void appendMemberToCloud(SplatCloud& cloud, const CloudMember& member); // Fast path: bakes one member onto the tail and uploads only the affected rows.  member.offset is assigned here.
@@ -1304,6 +1310,7 @@ private:
 	float filter_min_trans_rate_m_per_s;
 
 	GaussianSplatMergeColourMode splat_merge_colour_mode; // SESSION071 - see getMergeColourMode() above.
+	float splat_merge_alpha_boost;                        // SESSION071 diagnostic - see getMergeAlphaBoost() above.
 
 	// SESSION063 K4: coarse floor knobs - see the getters above.
 	bool split_coarse_floor_enabled;

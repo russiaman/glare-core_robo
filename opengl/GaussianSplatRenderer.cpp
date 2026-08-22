@@ -1043,7 +1043,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	lod_max_layer_density(0.0f), lod_max_tree_depth(0), lod_frustum_cull_enabled(true), split_filter_enabled(false),
 	filter_dilation_latency(0.06f), filter_min_rot_rate_deg_per_s(45.f), filter_max_rot_rate_deg_per_s(40.f), filter_min_trans_rate_m_per_s(2.0f), // SESSION063 K3 (K4 defaults: coarse floor covers the edge, so the fine dilation can be tight/cheap); SESSION071 max: 40deg/s default, owner-confirmed no visible holes at the canonical test scene
 	split_coarse_floor_enabled(true), split_coarse_pixel_scale(30.f), filter_coarse_dilation_latency(0.9f), coarse_layer_debug(false), // SESSION063 K4
-	splat_merge_colour_mode(GaussianSplatMergeColourMode_Legacy), // SESSION071: default to the existing behaviour so the new formulation is opt-in for A/B.
+	splat_merge_colour_mode(GaussianSplatMergeColourMode_Energy), splat_merge_alpha_boost(1.f), // SESSION071: owner-confirmed better at every pixel scale limit tested - Legacy is kept only as the A/B comparison.
 	have_prev_think_cam_state(false), prev_think_cam_pos_ws(0.f), prev_think_cam_forward_ws(0.f), cam_velocity_ema_ws(0.f), cam_angular_speed_ema(0.f), cam_angular_speed_peak(0.f), cam_inst_angular_speed(0.f),
 	splat_size_clamp_min(0.0f), splat_size_clamp_max(0.0f), splat_size_clamp_invert(false),
 	splat_dist_clamp_min(0.0f), splat_dist_clamp_max(1000.0f), splat_dist_clamp_invert(false), splat_alpha_cutoff(1.0f / 255.0f),
@@ -3822,10 +3822,11 @@ void GaussianSplatRenderer::ensureGpuCapacity(SplatCloud& cloud, size_t needed_s
 // disjoint still have their fringe splats interpenetrating - and the partitioning would then leave them in separate
 // clouds with no separating plane between them, which is the one failure that produces a wrong compositing order.
 //
-// SESSION071: merge_colour_mode re-derives the merged (non-leaf) nodes' colours after the pose bake - see
-// recolorLodTree(). Done here rather than at the call sites because this is the only writer of cloud.colours, so a bake
-// from any path (add, re-add, pose change) always leaves the colours matching the selected mode.
-static void bakeMember(SplatCloud& cloud, CloudMember& member, GaussianSplatMergeColourMode merge_colour_mode)
+// SESSION071: merge_colour_mode (and the merge_alpha_boost diagnostic) re-derive the merged (non-leaf) nodes' colours
+// after the pose bake - see recolorLodTree(). Done here rather than at the call sites because this is the only writer of
+// cloud.colours, so a bake from any path (add, re-add, pose change) always leaves the colours matching the current
+// settings.
+static void bakeMember(SplatCloud& cloud, CloudMember& member, GaussianSplatMergeColourMode merge_colour_mode, float merge_alpha_boost)
 {
 	const GaussianSplatData& splat_data = *member.splat_data;
 	const Vec4f translation_ws = member.translation_ws;
@@ -3901,31 +3902,45 @@ static void bakeMember(SplatCloud& cloud, CloudMember& member, GaussianSplatMerg
 
 		// SESSION071: re-derive the merged nodes' colours under the selected formulation, over the just-baked world-space
 		// arrays (both formulations are ratio-based, so the uniform world scale cancels - see recolorLodTree()). Skipped
-		// for Legacy, which is by construction what the tree already carries.
-		if(merge_colour_mode != GaussianSplatMergeColourMode_Legacy)
-			recolorLodTree(tree, &cloud.scales[member.offset], &cloud.colours[member.offset], merge_colour_mode);
+		// only when the result would be exactly what the tree already carries: Legacy with no alpha boost.
+		if(merge_colour_mode != GaussianSplatMergeColourMode_Legacy || merge_alpha_boost != 1.f)
+			recolorLodTree(tree, &cloud.scales[member.offset], &cloud.colours[member.offset], merge_colour_mode, merge_alpha_boost);
 	}
 
 	member.aabb_ws = aabb_ws;
 }
 
 
-// SESSION071: swap the merged-node colour formulation on every loaded cloud, in place.
-//
-// Only colours change, so this deliberately does NOT re-bake: pose data (positions/scales/rotations/bounds) is unaffected
-// by the formulation, and re-baking 17M splats to change a colour array would make the A/B toggle unusable. A leaf's
-// colour is ground truth and is never rewritten, and every merged node is fully re-derived from its children rather than
-// accumulated onto its current value, so switching modes back and forth is exactly reversible - covered by test 10 in
-// GaussianSplatLodTreeTests.
-//
-// Skips the LoD traversal entirely: the draw list selects WHICH nodes are drawn, which is unchanged; only the colour each
-// selected node carries is different, and that lives in the splat texture the upload below refreshes.
 void GaussianSplatRenderer::setMergeColourMode(GaussianSplatMergeColourMode v)
 {
 	if(v == splat_merge_colour_mode)
 		return;
 	splat_merge_colour_mode = v;
+	recolourAllClouds();
+}
 
+
+void GaussianSplatRenderer::setMergeAlphaBoost(float v)
+{
+	if(v == splat_merge_alpha_boost)
+		return;
+	splat_merge_alpha_boost = v;
+	recolourAllClouds();
+}
+
+
+// SESSION071: re-derive every loaded cloud's merged-node colours under the current formulation + alpha boost, in place.
+//
+// Only colours change, so this deliberately does NOT re-bake: pose data (positions/scales/rotations/bounds) is unaffected
+// by the formulation, and re-baking 17M splats to change a colour array would make the A/B toggle unusable. A leaf's
+// colour is ground truth and is never rewritten, and every merged node is fully re-derived from its children rather than
+// accumulated onto its current value, so switching settings back and forth is exactly reversible - covered by test 10 in
+// GaussianSplatLodTreeTests.
+//
+// Skips the LoD traversal entirely: the draw list selects WHICH nodes are drawn, which is unchanged; only the colour each
+// selected node carries is different, and that lives in the splat texture the upload below refreshes.
+void GaussianSplatRenderer::recolourAllClouds()
+{
 	for(size_t c=0; c<clouds.size(); ++c)
 	{
 		SplatCloud& cloud = *clouds[c];
@@ -3940,7 +3955,7 @@ void GaussianSplatRenderer::setMergeColourMode(GaussianSplatMergeColourMode v)
 			// Legacy is what the tree itself carries, so restoring it means re-deriving from the (untouched) leaves rather
 			// than reading tree[i].colour back - which would be equivalent here, but only for as long as Legacy stays the
 			// formulation the build path bakes in. Going through recolorLodTree() keeps that assumption out of this code.
-			recolorLodTree(tree, &cloud.scales[member.offset], &cloud.colours[member.offset], splat_merge_colour_mode);
+			recolorLodTree(tree, &cloud.scales[member.offset], &cloud.colours[member.offset], splat_merge_colour_mode, splat_merge_alpha_boost);
 			any_recoloured = true;
 		}
 
@@ -4054,7 +4069,7 @@ void GaussianSplatRenderer::appendMemberToCloud(SplatCloud& cloud, const CloudMe
 	cloud.members.push_back(member_in);
 	CloudMember& member = cloud.members.back();
 	member.offset = old_total;
-	bakeMember(cloud, member, splat_merge_colour_mode);
+	bakeMember(cloud, member, splat_merge_colour_mode, splat_merge_alpha_boost);
 
 	cloud.total_splats = new_total;
 
@@ -4099,7 +4114,7 @@ void GaussianSplatRenderer::rebuildCloud(SplatCloud& cloud)
 	cloud.cull_radius.resize(total); // SESSION059 - see SplatCloud::cull_radius.
 
 	for(size_t m=0; m<cloud.members.size(); ++m)
-		bakeMember(cloud, cloud.members[m], splat_merge_colour_mode);
+		bakeMember(cloud, cloud.members[m], splat_merge_colour_mode, splat_merge_alpha_boost);
 
 	ensureGpuCapacity(cloud, total);
 
@@ -4436,7 +4451,7 @@ bool GaussianSplatRenderer::updateObjectTransform(Handle handle, const Vec4f& tr
 			member.rotation_ws = rotation_ws;
 			member.uniform_scale_ws = uniform_scale_ws;
 
-			bakeMember(cloud, member, splat_merge_colour_mode); // Re-bakes in place: offsets and counts are unchanged.
+			bakeMember(cloud, member, splat_merge_colour_mode, splat_merge_alpha_boost); // Re-bakes in place: offsets and counts are unchanged.
 			uploadTexelRowsForSplatRange(cloud, member.offset, member.count);
 			rebuildCloudAABB(cloud);
 

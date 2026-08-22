@@ -192,6 +192,132 @@ static Vec4f computeMergedColourAlpha(const GaussianSplatLodNode* children, size
 }
 
 
+// SESSION071: silhouette area of a splat's 3-sigma ellipse - pi * r1 * r2 over the two LARGEST scale axes. This, not the
+// volume, is what a splat covers on screen, and 3DGS splats are near-planar discs, so the silhouette seen from a general
+// direction is dominated by their two major axes. The 3-sigma factor matches splatCrossSectionArea() further down (and
+// the renderer's own cutoff), though every use below is a ratio of two such areas, where the constant cancels.
+static float splatSilhouetteArea(const Vec3f& scale)
+{
+	float s0 = scale.x, s1 = scale.y, s2 = scale.z;
+	if(s0 < s1) mySwap(s0, s1);
+	if(s1 < s2) mySwap(s1, s2);
+	if(s0 < s1) mySwap(s0, s1); // s0 >= s1 >= s2; only s0 and s1 (the two largest) are used.
+	return (float)NICKMATHS_PI * (3.f * s0) * (3.f * s1);
+}
+
+
+// SESSION071: the GaussianSplatMergeColourMode_Energy formulation - see the enum's comment in the header for the
+// derivation. Reads children through parallel arrays so recolorLodTree() can drive it over the renderer's world-baked
+// copy; mergeGaussianSplatLodNodes() has its children as nodes and passes their fields the same way.
+static Vec4f computeMergedColourAlphaEnergy(const Vec4f* child_colours, const Vec3f* child_scales, size_t num_children, const Vec3f& parent_scale)
+{
+	float area_sum = 0.f, alpha_area_sum = 0.f;
+	Vec4f col_acc(0.f, 0.f, 0.f, 0.f);
+	for(size_t i=0; i<num_children; ++i)
+	{
+		const float area  = splatSilhouetteArea(child_scales[i]);
+		const float alpha = child_colours[i].x[3];
+		area_sum       += area;
+		alpha_area_sum += alpha * area;
+		col_acc        += child_colours[i] * (alpha * area);
+	}
+
+	// Every child ~fully transparent and/or ~zero size: there is no energy to preserve and no meaningful colour to carry
+	// up, so fall back to a plain unweighted colour average at zero opacity rather than dividing by ~0.
+	if(alpha_area_sum <= 1.0e-12f || area_sum <= 1.0e-12f)
+	{
+		Vec4f avg(0.f, 0.f, 0.f, 0.f);
+		for(size_t i=0; i<num_children; ++i)
+			avg += child_colours[i];
+		avg = avg * (1.f / (float)num_children);
+		return Vec4f(myClamp(avg.x[0], 0.f, 1.f), myClamp(avg.x[1], 0.f, 1.f), myClamp(avg.x[2], 0.f, 1.f), 0.f);
+	}
+
+	const Vec4f colour_rgb = col_acc * (1.f / alpha_area_sum); // Weighted by opacity * area - the child's actual share of the covered pixels.
+
+	const float n          = area_sum / myMax(splatSilhouetteArea(parent_scale), 1.0e-12f); // Layers of child coverage over the parent's own footprint.
+	const float mean_alpha = myClamp(alpha_area_sum / area_sum, 0.f, 1.f);
+
+	// Opacity from n layers of mean_alpha. Split at n = 1, because a single saturating composite is only correct for
+	// n >= 1: at n < 1 the children do not cover the parent's footprint at all, and 1 - (1 - a)^n would still report a
+	// fully opaque parent for a = 1 no matter how little of it is actually covered (a = 1, n = 0.1 gives 1.0, not 0.1).
+	//   coverage = min(n, 1)  - the fraction of the parent's footprint the children actually cover.
+	//   n / coverage          - how deep the layers stack *within* the covered part (1 when n < 1).
+	// So A = coverage * (1 - (1 - a)^(n/coverage)): the plain area ratio a*n below 1, a saturating stack above it, and
+	// the two agree exactly at n = 1, so the result is continuous. Bounded by 1 for any n either way, which is what
+	// removes Legacy's A > 1 branch and with it the colour-into-the-clamp blowout.
+	const float coverage = myMin(n, 1.f);
+	const float A = (coverage <= 0.f) ? 0.f :
+		coverage * (1.f - std::pow(myMax(1.f - mean_alpha, 0.f), n / coverage));
+
+	return Vec4f(myClamp(colour_rgb.x[0], 0.f, 1.f), myClamp(colour_rgb.x[1], 0.f, 1.f), myClamp(colour_rgb.x[2], 0.f, 1.f), myClamp(A, 0.f, 1.f));
+}
+
+
+// SESSION071: the Legacy formulation (see the enum comment), reading children through parallel arrays so recolorLodTree()
+// can reproduce exactly what the build path baked in. Kept byte-for-byte equivalent to computeMergedColourAlpha() above -
+// that one stays as the build path's entry point, this one is what the A/B toggle re-derives with.
+static Vec4f computeMergedColourAlphaLegacyArrays(const Vec4f* child_colours, const Vec3f* child_scales, size_t num_children, const Vec3f& parent_scale)
+{
+	float total_weight = 0.f;
+	for(size_t i=0; i<num_children; ++i)
+	{
+		const Vec3f& s = child_scales[i];
+		total_weight += child_colours[i].x[3] * (s.x * s.y * s.z);
+	}
+	const bool degenerate = total_weight <= 1.0e-12f;
+	const float inv_w = 1.f / (degenerate ? (float)num_children : total_weight);
+
+	Vec4f colour_rgb(0.f, 0.f, 0.f, 0.f);
+	for(size_t i=0; i<num_children; ++i)
+	{
+		const Vec3f& s = child_scales[i];
+		const float w = degenerate ? 1.f : (child_colours[i].x[3] * (s.x * s.y * s.z));
+		colour_rgb += child_colours[i] * w;
+	}
+	colour_rgb = colour_rgb * inv_w;
+
+	const float area_parent = myMax(parent_scale.x * parent_scale.y * parent_scale.z, 1.0e-12f);
+	const float A_raw = total_weight / area_parent;
+	const float A = myClamp(A_raw, 0.f, 1.f);
+	float r = colour_rgb.x[0], g = colour_rgb.x[1], b = colour_rgb.x[2];
+	if(A_raw > 1.f)
+	{
+		r *= A_raw; g *= A_raw; b *= A_raw;
+	}
+	return Vec4f(myClamp(r, 0.f, 1.f), myClamp(g, 0.f, 1.f), myClamp(b, 0.f, 1.f), A);
+}
+
+
+void recolorLodTree(const std::vector<GaussianSplatLodNode>& tree, const Vec3f* scales, Vec4f* colours, GaussianSplatMergeColourMode mode)
+{
+	std::vector<Vec4f> child_colours; // Hoisted out of the loop so the per-node gather reuses one allocation.
+	std::vector<Vec3f> child_scales;
+
+	// Reverse pass = bottom-up, see the header comment: children are always linearised after their parent.
+	for(size_t i = tree.size(); i-- > 0; )
+	{
+		const GaussianSplatLodNode& node = tree[i];
+		if(node.child_count == 0)
+			continue; // Leaf - an original splat, its colour is ground truth and is never re-derived.
+
+		const size_t num_children = node.child_count;
+		child_colours.resize(num_children);
+		child_scales .resize(num_children);
+		for(size_t c=0; c<num_children; ++c)
+		{
+			const size_t ci = (size_t)node.child_start + c;
+			child_colours[c] = colours[ci]; // Already recomputed under this mode - the reverse order is what guarantees it.
+			child_scales [c] = scales [ci];
+		}
+
+		colours[i] = (mode == GaussianSplatMergeColourMode_Energy) ?
+			computeMergedColourAlphaEnergy      (child_colours.data(), child_scales.data(), num_children, scales[i]) :
+			computeMergedColourAlphaLegacyArrays(child_colours.data(), child_scales.data(), num_children, scales[i]);
+	}
+}
+
+
 GaussianSplatLodNode mergeGaussianSplatLodNodes(const GaussianSplatLodNode* children, size_t num_children)
 {
 	assert(num_children >= 1);
@@ -677,6 +803,94 @@ void test()
 
 		const std::vector<GaussianSplatLodNode> tree = buildGaussianSplatLodTree(centres.data(), scales.data(), rotations.data(), colours.data(), centres.size());
 		checkTreeIsValid(tree, /*expected_num_leaves=*/50);
+	}
+
+	// SESSION071 Test 10: recolorLodTree() in Legacy mode must reproduce exactly what the build path already baked into the
+	// tree. This is the load-bearing check on the reverse-pass ordering: if children were NOT all recomputed before their
+	// parent, a parent would be rederived from stale child colours and the result would drift from the build's own answer.
+	{
+		const int N = 200;
+		std::vector<Vec3f> centres(N), scales(N);
+		std::vector<Vec4f> rotations(N), colours(N);
+		for(int i=0; i<N; ++i)
+		{
+			centres[i]   = Vec3f(std::sin(i * 0.7f) * 3.f, std::cos(i * 1.3f) * 3.f, (float)i * 0.05f); // Deterministic scatter - no RNG dependency.
+			scales[i]    = Vec3f(0.05f + 0.03f * std::fabs(std::sin(i * 0.4f)), 0.05f + 0.03f * std::fabs(std::cos(i * 0.9f)), 0.02f);
+			rotations[i] = Vec4f(0, 0, 0, 1);
+			colours[i]   = Vec4f(std::fabs(std::sin(i * 0.11f)), std::fabs(std::cos(i * 0.23f)), std::fabs(std::sin(i * 0.37f)), 0.2f + 0.7f * std::fabs(std::cos(i * 0.5f)));
+		}
+
+		const std::vector<GaussianSplatLodNode> tree = buildGaussianSplatLodTree(centres.data(), scales.data(), rotations.data(), colours.data(), N);
+
+		// Parallel arrays in lockstep with the tree, exactly as the renderer holds its world-baked copy.
+		std::vector<Vec3f> tree_scales(tree.size());
+		std::vector<Vec4f> tree_colours(tree.size());
+		for(size_t i=0; i<tree.size(); ++i) { tree_scales[i] = tree[i].scale; tree_colours[i] = tree[i].colour; }
+
+		recolorLodTree(tree, tree_scales.data(), tree_colours.data(), GaussianSplatMergeColourMode_Legacy);
+		for(size_t i=0; i<tree.size(); ++i)
+			for(int c=0; c<4; ++c)
+				testAssert(epsEqual(tree_colours[i].x[c], tree[i].colour.x[c], 1.0e-4f));
+
+		// Energy mode must stay in range everywhere, and must leave leaves untouched (their colour is ground truth).
+		recolorLodTree(tree, tree_scales.data(), tree_colours.data(), GaussianSplatMergeColourMode_Energy);
+		for(size_t i=0; i<tree.size(); ++i)
+		{
+			for(int c=0; c<4; ++c)
+				testAssert(tree_colours[i].x[c] >= 0.f && tree_colours[i].x[c] <= 1.f);
+			if(tree[i].child_count == 0)
+				for(int c=0; c<4; ++c)
+					testAssert(epsEqual(tree_colours[i].x[c], tree[i].colour.x[c], 1.0e-6f));
+		}
+
+		// Switching back to Legacy must restore the build's colours bit-for-bit-ish - i.e. the toggle is reversible, not
+		// a one-way accumulation onto whatever the previous mode left behind.
+		recolorLodTree(tree, tree_scales.data(), tree_colours.data(), GaussianSplatMergeColourMode_Legacy);
+		for(size_t i=0; i<tree.size(); ++i)
+			for(int c=0; c<4; ++c)
+				testAssert(epsEqual(tree_colours[i].x[c], tree[i].colour.x[c], 1.0e-4f));
+	}
+
+	// SESSION071 Test 11: the two failure modes Energy mode exists to fix, as direct numeric checks.
+	{
+		// (a) Heavy overlap: many opaque children packed inside a parent footprint barely larger than one of them. Legacy's
+		// A_raw > 1 branch scales the colour up and clamps it to white; Energy must saturate the ALPHA instead and leave
+		// the colour alone.
+		const int NC = 8;
+		std::vector<Vec4f> cc(NC, Vec4f(0.7f, 0.7f, 0.7f, 0.9f));
+		std::vector<Vec3f> cs(NC, Vec3f(0.1f, 0.1f, 0.02f));
+		const Vec3f parent_scale(0.12f, 0.12f, 0.03f); // Barely bigger than one child, so the children overlap it ~8x.
+
+		const Vec4f energy = computeMergedColourAlphaEnergy(cc.data(), cs.data(), NC, parent_scale);
+		testAssert(energy.x[3] > 0.99f);                    // Saturates towards opaque...
+		testAssert(epsEqual(energy.x[0], 0.7f, 1.0e-3f));   // ...without the colour being driven into the clamp.
+
+		const Vec4f legacy = computeMergedColourAlphaLegacyArrays(cc.data(), cs.data(), NC, parent_scale);
+		testAssert(legacy.x[0] > 0.99f); // Legacy's blowout, asserted so this test fails loudly if that branch is ever changed.
+
+		// (b) Wide VOLUMETRIC spread - small opaque children scattered through a parent inflated in all three axes by the
+		// merge's spread-of-centres term (tree foliage, as opposed to a flat wall). This is where the volume-vs-area choice
+		// actually bites: the parent's volume grows as d^3 while its silhouette grows as d^2, so Legacy's volume ratio
+		// punishes the spread an extra factor of d harder and collapses towards transparent. (Deliberately volumetric: if
+		// the children and parent share a thickness, volume ratio == area ratio identically and the two agree, which is why
+		// a planar test case here would pass for the wrong reason.)
+		const int NS = 8;
+		std::vector<Vec4f> sc(NS, Vec4f(1, 1, 1, 1));
+		std::vector<Vec3f> ss(NS, Vec3f(0.05f, 0.05f, 0.05f));
+		const Vec3f spread_parent(1.f, 1.f, 1.f);
+
+		const Vec4f spread_energy = computeMergedColourAlphaEnergy(sc.data(), ss.data(), NS, spread_parent);
+		const Vec4f spread_legacy = computeMergedColourAlphaLegacyArrays(sc.data(), ss.data(), NS, spread_parent);
+		testAssert(spread_energy.x[3] > spread_legacy.x[3] * 4.f); // ~20x here - the whole point: far less collapse towards transparent.
+
+		// (c) Partial coverage must stay proportional, not saturate: opaque children covering ~10% of the parent's
+		// footprint must give ~0.1 opacity, NOT 1.0. This is the n < 1 branch, and it is the reason the opacity is not a
+		// plain 1 - (1 - a)^n - see the comment there.
+		const Vec4f pc[1] = { Vec4f(1, 1, 1, 1) };
+		const Vec3f ps[1] = { Vec3f(0.05f, 0.05f, 0.01f) };
+		const Vec3f partial_parent(0.5f, 0.05f, 0.01f); // Silhouette (two largest axes) 0.5*0.05 = 10x the child's 0.05*0.05.
+		const Vec4f partial = computeMergedColourAlphaEnergy(pc, ps, 1, partial_parent);
+		testAssert(epsEqual(partial.x[3], 0.1f, 1.0e-3f));
 	}
 
 	conPrint("GaussianSplatLodTreeTests::test() done");

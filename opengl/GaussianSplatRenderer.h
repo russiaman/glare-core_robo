@@ -314,6 +314,12 @@ public:
 	bool getCoarseLayerDebug() const { return coarse_layer_debug; }
 	void setCoarseLayerDebug(bool v) { coarse_layer_debug = v; }
 
+	// SESSION071: which formulation derives a merged LoD node's colour + opacity - see GaussianSplatMergeColourMode. The
+	// setter re-derives every loaded cloud's merged colours in place and re-uploads them, so the two can be compared live
+	// on the same scene without a reload: a colour pass over the tree, no traversal, no re-bake of pose data.
+	GaussianSplatMergeColourMode getMergeColourMode() const { return splat_merge_colour_mode; }
+	void setMergeColourMode(GaussianSplatMergeColourMode v);
+
 
 	// Diagnostic tool, not a LoD parameter: culls any splat whose feature_size (2 * max scale axis, matching
 	// GaussianSplatLodNode::feature_size) falls outside [min, max], directly in the vertex shader, regardless of
@@ -1296,6 +1302,8 @@ private:
 	float filter_min_rot_rate_deg_per_s;
 	float filter_max_rot_rate_deg_per_s; // SESSION071: see getFilterMaxRotRateDegPerS() above.
 	float filter_min_trans_rate_m_per_s;
+
+	GaussianSplatMergeColourMode splat_merge_colour_mode; // SESSION071 - see getMergeColourMode() above.
 
 	// SESSION063 K4: coarse floor knobs - see the getters above.
 	bool split_coarse_floor_enabled;

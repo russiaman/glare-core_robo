@@ -68,6 +68,51 @@ struct GaussianSplatLodNode
 };
 
 
+// SESSION071: which formulation derives a merged node's colour + opacity from its children. Selectable so the two can be
+// A/B'd live on a loaded scene - see recolorLodTree().
+enum GaussianSplatMergeColourMode
+{
+	// The session063 formulation, as built into the tree by buildGaussianSplatLodTree(): weight = opacity * VOLUME,
+	// amplitude A = sum(weight) / parent volume, and where A > 1 the excess is multiplied into the colour before both are
+	// clamped to [0, 1]. Two failure modes, both visible as the LoD coarsens (see session071):
+	//   - A > 1 (children overlapping the parent's footprint more than once) drives the colour hard into the clamp, so a
+	//     bright dense region merges to flat white and loses all its modulation.
+	//   - The parent's volume includes the merge's spread-of-centres term, so a widely-spread group divides by a volume
+	//     far larger than its children's, collapsing A towards 0 and letting the background show through.
+	GaussianSplatMergeColourMode_Legacy = 0,
+
+	// SESSION071: derived from conservation of on-screen premultiplied energy instead. A splat's contribution integrates
+	// to alpha * colour * (silhouette area), so requiring the parent to match the sum of its children gives:
+	//   colour = sum(alpha_i * colour_i * area_i) / sum(alpha_i * area_i)   (weight = opacity * AREA, not volume - a
+	//                                                                        splat contributes in proportion to the area
+	//                                                                        it covers, not to its volume)
+	//   n      = sum(area_i) / area_parent                                  (how many layers deep the children cover the
+	//                                                                        parent's own footprint)
+	//   A      = 1 - pow(1 - mean_alpha, n)                                 (saturating composite of n layers)
+	// A can no longer exceed 1 by construction, so the colour is never scaled up into the clamp; and a spread-out group
+	// saturates towards its children's own opacity rather than collapsing towards transparent.
+	GaussianSplatMergeColourMode_Energy = 1
+};
+
+
+// SESSION071: recomputes every MERGED node's colour + opacity under the given formulation, over colour/scale arrays held
+// OUTSIDE the tree but indexed in lockstep with it (element i describes tree[i]) - which is how the renderer stores its
+// world-baked copy, so an A/B toggle can re-derive colours on a loaded scene without rebuilding any tree or touching the
+// shared, cross-thread-readable GaussianSplatData.
+//
+// Leaves are left exactly as they are: an original splat's colour is ground truth, never re-derived. Merged nodes are
+// visited in one REVERSE pass, which is bottom-up here because buildGaussianSplatLodTree()'s breadth-first linearisation
+// guarantees a node's children sit later in the array than the node itself - so every child has already been recomputed
+// by the time its parent is reached, exactly as during the bottom-up build.
+//
+// Both formulations depend only on ratios of areas/volumes, so passing world-baked scales (leaf scale * uniform world
+// scale) gives the same answer as object-space ones - the uniform factor cancels top and bottom.
+//
+// Re-running this is idempotent per mode and safe to switch back and forth: each merged node is fully rederived from its
+// children, never accumulated onto its previous value.
+void recolorLodTree(const std::vector<GaussianSplatLodNode>& tree, const Vec3f* scales, Vec4f* colours, GaussianSplatMergeColourMode mode);
+
+
 // Builds a leaf node directly from one splat's un-merged attributes (e.g. from GaussianSplatData's parallel arrays). child_count = 0, feature_size computed from scale.
 GaussianSplatLodNode makeGaussianSplatLodLeafNode(const Vec3f& centre_os, const Vec3f& scale, const Vec4f& rotation, const Vec4f& colour);
 

@@ -1002,6 +1002,16 @@ public:
 	float getCurrentLowPassVariance() const { return splat_low_pass_variance_current; }
 	void setResolveLowPassVarianceUniform(float variance) const;
 
+	// SESSION070 - SplatDoFDepthMode_Weighted routed through TAA: the resolve's own gl_FragDepth write is a no-op in
+	// TAA mode (see isTAAActiveForResolve()'s comment) since it draws into a colour-only texture there. This is a
+	// second, depth-only draw of the composite's quad, run with colour masked off by the caller - see the shader's own
+	// comment for why a separate draw (rather than folding this into the composite shader) is what keeps a discard here
+	// from also discarding the colour composite already written. Uniform indices: 0 = splat_dof_depth_texture
+	// (sampler2D), 1 = splat_resolve_dims_px (vec2), 2 = splat_dof_near_clip_dist (float).
+	const Reference<OpenGLProgram>& getTAADepthWritebackProgram() const { return taa_depth_writeback_prog; }
+	int getTAADepthWritebackDepthTexUniformLoc() const;
+	void setTAADepthWritebackUniforms(const Vec2i& resolve_dims, float near_clip_dist) const;
+
 	// SESSION069 - Called by drainSortResults()/drainTraversalResults()/drainFilterResults() when they applied something
 	// this frame.  updateTAAState() reads and clears the counter to decide whether to reset the accumulation - if the
 	// draw list changed at all, the history is stale for the affected pixels and must be started over.
@@ -1221,6 +1231,7 @@ private:
 	// via appendUserUniformInfo() defer-until-linked, same as depth_downsample_prog.
 	Reference<OpenGLProgram> taa_accumulate_prog;
 	Reference<OpenGLProgram> taa_composite_prog;
+	Reference<OpenGLProgram> taa_depth_writeback_prog; // SESSION070 - see getTAADepthWritebackProgram().
 
 	OpenGLEngine* opengl_engine;
 

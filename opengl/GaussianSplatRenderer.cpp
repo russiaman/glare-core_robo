@@ -1281,6 +1281,22 @@ void GaussianSplatRenderer::buildShadersIfNeeded()
 	taa_composite_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int, "history_texture");
 
 
+	// SESSION070 - depth-only draw of the composite's quad, for SplatDoFDepthMode_Weighted under TAA - see
+	// getTAADepthWritebackProgram()'s own comment.
+	taa_depth_writeback_prog = new OpenGLProgram(
+		"gaussian splat taa depth writeback prog",
+		new OpenGLShader(shader_dir + "/gaussian_splat_resolve_vert_shader.glsl", version_directive, key_defs + preprocessor_defines, GL_VERTEX_SHADER),
+		new OpenGLShader(shader_dir + "/gaussian_splat_taa_depth_writeback_frag_shader.glsl", version_directive, key_defs + preprocessor_defines, GL_FRAGMENT_SHADER),
+		opengl_engine->getAndIncrNextProgramIndex(),
+		/*wait_for_build_to_complete=*/!opengl_engine->parallel_shader_compile_support
+	);
+	opengl_engine->addProgram(taa_depth_writeback_prog);
+
+	taa_depth_writeback_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "splat_dof_depth_texture");
+	taa_depth_writeback_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Vec2,  "splat_resolve_dims_px");
+	taa_depth_writeback_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "splat_dof_near_clip_dist");
+
+
 	// Halves the coverage pyramid by mean instead of minimum, once per level - see getCoverageShrinkStrength() and
 	// gaussian_splat_mask_reduce_mean_frag_shader.glsl. Same full-viewport quad vertex shader again.
 	mean_reduce_prog = new OpenGLProgram(
@@ -1544,11 +1560,12 @@ bool GaussianSplatRenderer::isTAAActiveForResolve() const
 	// (Session069) An earlier draft of this method also required !SplatDoFDepthMode_Weighted, on the theory that the
 	// resolve's gl_FragDepth write would need the frame's depth attachment - but that turned out to gate TAA off in
 	// practice, because DoF weighted mode is persisted and the owner had it on.  Since the resolve in TAA mode writes
-	// to a colour-only framebuffer, gl_FragDepth simply has nowhere to land and is dropped by the driver (per the GL
-	// spec: depth writes to a framebuffer without a depth attachment are no-ops, and depth test with no depth buffer
-	// always passes).  The visible cost is that DoF blur no longer receives per-splat depth while TAA is on - a
-	// graceful degradation, not a crash.  If both need to coexist properly, the composite pass (which does write into
-	// the frame's real depth buffer via a target-and-blend switch) is the right place to route the weighted depth.
+	// to a colour-only framebuffer, gl_FragDepth simply has nowhere to land there and is dropped by the driver (per the
+	// GL spec: depth writes to a framebuffer without a depth attachment are no-ops, and depth test with no depth buffer
+	// always passes) - harmless, since it isn't the only place the weighted depth gets written any more.  (Session070)
+	// OpenGLEngine::resolveSplatAccumBuffer() now routes it through a dedicated depth-only draw of the composite's
+	// quad instead - see GaussianSplatRenderer::getTAADepthWritebackProgram()'s comment - so DoF still receives
+	// per-splat depth correctly while TAA is on.
 	if(!splat_taa_enabled) return false;
 	if(!opengl_engine) return false;
 	const Vec2i viewport_dims = opengl_engine->getViewportDims();
@@ -1671,6 +1688,19 @@ void GaussianSplatRenderer::setResolveTAAActiveUniform(int taa_active) const
 void GaussianSplatRenderer::setResolveTAAJitterUniform(const Vec2f& jitter_accum_px) const
 {
 	glUniform2f(resolve_prog->user_uniform_info[17].loc, jitter_accum_px.x, jitter_accum_px.y);
+}
+
+
+int GaussianSplatRenderer::getTAADepthWritebackDepthTexUniformLoc() const
+{
+	return taa_depth_writeback_prog.nonNull() ? taa_depth_writeback_prog->user_uniform_info[0].loc : -1;
+}
+
+
+void GaussianSplatRenderer::setTAADepthWritebackUniforms(const Vec2i& resolve_dims, float near_clip_dist) const
+{
+	glUniform2f(taa_depth_writeback_prog->user_uniform_info[1].loc, (float)resolve_dims.x, (float)resolve_dims.y);
+	glUniform1f(taa_depth_writeback_prog->user_uniform_info[2].loc, near_clip_dist);
 }
 
 

@@ -11789,8 +11789,9 @@ void OpenGLEngine::resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name,
 	// SESSION069 - TAA rewires the composite: the resolve here draws its splat layer into a full-resolution TAA current
 	// texture (blending off) instead of blending directly into the frame; two extra polymorphic passes then run below
 	// (accumulate + composite) to average it with history and blend the result onto the frame the way the resolve used
-	// to do in one shot.  isTAAActiveForResolve() already gates on scale-<1 and !write_weighted_depth, so taa_active
-	// implies both.
+	// to do in one shot.  isTAAActiveForResolve() gates on scale-<1 only - it does NOT exclude write_weighted_depth
+	// (see that method's own comment), so taa_active and write_weighted_depth can both be true at once.  SESSION070
+	// handles that combination with a third pass below (depth writeback) rather than forbidding it.
 	const bool taa_active = splat_renderer->isTAAActiveForResolve();
 	if(taa_active)
 		allocSplatTAABuffersIfNeeded();
@@ -11932,12 +11933,38 @@ void OpenGLEngine::resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name,
 		if(scene_target_framebuffer_name != 0)
 			setSingleDrawBuffer(GL_COLOR_ATTACHMENT0);
 		glViewport(0, 0, (GLsizei)resolve_dims.x, (GLsizei)resolve_dims.y);
+		// SESSION070 fix - this colour-only draw must never touch depth, regardless of write_weighted_depth: the shader
+		// below doesn't write gl_FragDepth, so leaving depthMask at whatever the resolve pass above set it to (TRUE,
+		// GL_ALWAYS, whenever write_weighted_depth is true) would stomp the *entire* viewport's depth to this quad's own
+		// rasterised depth - real geometry included. The actual weighted depth is written by a dedicated, colour-masked
+		// second draw right below, which is the only one allowed to touch the depth buffer here.
+		glDepthMask(GL_FALSE);
 		glEnable(GL_BLEND);
 		glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA); // History is premultiplied, same as the resolve output was; composite exactly as the pre-TAA resolve did.
 		comp_prog->useProgram();
 		bindTextureUnitToSampler(*current_scene->splat_taa_history_texture[write], /*unit=*/0, splat_renderer->getTAACompositeHistoryTexUniformLoc());
 		drawElementsBaseVertex(GL_TRIANGLES, (GLsizei)unit_quad_meshdata->batches[0].num_indices, unit_quad_meshdata->getIndexType(), (void*)unit_quad_meshdata->getBatch0IndicesTotalBufferOffset(), unit_quad_meshdata->vbo_handle.base_vertex);
 		unbindTextureFromTextureUnit(*current_scene->splat_taa_history_texture[write], /*unit=*/0);
+
+		//----- Depth writeback pass (SplatDoFDepthMode_Weighted only) -----
+		// SESSION070 - the resolve's own gl_FragDepth write above landed nowhere (splat_taa_current_framebuffer has no
+		// depth attachment - see isTAAActiveForResolve()'s comment). Route it through here instead: same quad, same
+		// real framebuffer, but colour masked off so this draw cannot disturb the composite colour just written, and
+		// the shader discards at pixels with no splat coverage so depth is left exactly as opaque geometry set it there.
+		if(write_weighted_depth)
+		{
+			const Reference<OpenGLProgram>& depth_wb_prog = splat_renderer->getTAADepthWritebackProgram();
+			assert(depth_wb_prog.nonNull());
+			glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+			glDepthMask(GL_TRUE);
+			glDepthFunc(GL_ALWAYS); // Already set by the resolve pass above, restated here for clarity - nothing in between changes it.
+			depth_wb_prog->useProgram();
+			splat_renderer->setTAADepthWritebackUniforms(resolve_dims, (float)current_scene->near_draw_dist);
+			bindTextureUnitToSampler(*current_scene->splat_dof_depth_copy_texture, /*unit=*/0, splat_renderer->getTAADepthWritebackDepthTexUniformLoc());
+			drawElementsBaseVertex(GL_TRIANGLES, (GLsizei)unit_quad_meshdata->batches[0].num_indices, unit_quad_meshdata->getIndexType(), (void*)unit_quad_meshdata->getBatch0IndicesTotalBufferOffset(), unit_quad_meshdata->vbo_handle.base_vertex);
+			unbindTextureFromTextureUnit(*current_scene->splat_dof_depth_copy_texture, /*unit=*/0);
+			glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+		}
 	}
 
 	//----------------------- Cleanup -----------------------

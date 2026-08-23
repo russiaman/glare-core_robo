@@ -1044,7 +1044,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	filter_dilation_latency(0.06f), filter_min_rot_rate_deg_per_s(45.f), filter_max_rot_rate_deg_per_s(40.f), filter_min_trans_rate_m_per_s(2.0f), // SESSION063 K3 (K4 defaults: coarse floor covers the edge, so the fine dilation can be tight/cheap); SESSION071 max: 40deg/s default, owner-confirmed no visible holes at the canonical test scene
 	split_coarse_floor_enabled(true), split_coarse_pixel_scale(30.f), filter_coarse_dilation_latency(0.9f), coarse_layer_debug(false), // SESSION063 K4
 	splat_point_size_px(1.f),
-	splat_merge_spread_widen(1.7320508f), // SESSION071: sqrt(3) - the analytic value that makes merged nodes' Gaussians meet, see widenedMergedScale().
+	splat_merge_spread_widen(3.0f), // SESSION071: analytic minimum is sqrt(3) (see widenedMergedScale()); owner default set higher for extra margin.
 	// SESSION071: GaussianSplatMergeColourParams defaults to Energy - owner-confirmed better at every pixel scale limit tested; Legacy is kept only as the A/B comparison.
 	have_prev_think_cam_state(false), prev_think_cam_pos_ws(0.f), prev_think_cam_forward_ws(0.f), cam_velocity_ema_ws(0.f), cam_angular_speed_ema(0.f), cam_angular_speed_peak(0.f), cam_inst_angular_speed(0.f),
 	splat_size_clamp_min(0.0f), splat_size_clamp_max(0.0f), splat_size_clamp_invert(false),

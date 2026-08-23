@@ -314,6 +314,19 @@ public:
 	bool getCoarseLayerDebug() const { return coarse_layer_debug; }
 	void setCoarseLayerDebug(bool v) { coarse_layer_debug = v; }
 
+	// SESSION072: live toggles for the three stdout diagnostic traces, previously build-time consts an engineer had to
+	// flip and recompile. Each conPrint() runs on the MAIN thread (kickOffFilters/drainFilterResults/kickOffTraversals
+	// all run there), and console I/O is comparatively slow (flushed per line) - measured to visibly cost frame time
+	// while a trace is firing every frame during motion. Default off for exactly that reason: a session should not
+	// silently pay for logging nobody asked to see. Turning one off costs nothing beyond the bool check already
+	// guarding every conPrint() call - no rebuild needed either way.
+	bool getFilterDebugLog() const { return filter_debug_log; } // [gsr-filter-kick] / [gsr-filter-drain] - kickOffFilters()/drainFilterResults().
+	void setFilterDebugLog(bool v) { filter_debug_log = v; }
+	bool getKickDebugLog() const { return kick_debug_log; }     // [gsr-kick] / [gsr-rot-blocked] - kickOffTraversals().
+	void setKickDebugLog(bool v) { kick_debug_log = v; }
+	bool getCpuProfLog() const { return cpu_prof_log; }         // [gsr-prof] - fillTraversalScratch()/drainTraversalResults() VBO upload.
+	void setCpuProfLog(bool v) { cpu_prof_log = v; }
+
 	// SESSION071: which formulation derives a merged LoD node's colour + opacity - see GaussianSplatMergeColourMode. The
 	// setter re-derives every loaded cloud's merged colours in place and re-uploads them, so the two can be compared live
 	// on the same scene without a reload: a colour pass over the tree, no traversal, no re-bake of pose data.
@@ -1334,6 +1347,7 @@ private:
 	float split_coarse_pixel_scale;         // pixel_scale threshold for the coarse cut (>> pixel_scale_limit).
 	float filter_coarse_dilation_latency;   // s - the coarse tail's (wider) dilation window.
 	bool coarse_layer_debug;                // Draw only the coarse floor - see getCoarseLayerDebug().
+	bool filter_debug_log, kick_debug_log, cpu_prof_log; // SESSION072: live log toggles - see getFilterDebugLog() etc.
 
 	// SESSION055: camera-motion tracker for anisotropic frustum-cull dilation. think() diffs the current cam pose against
 	// the previous one to compute an instantaneous velocity and angular speed, feeds them through an EMA with a
@@ -1349,6 +1363,13 @@ private:
 	float cam_angular_speed_ema;             // Scalar angular speed (rad/s), max(inst, blended).
 	float cam_angular_speed_peak;            // SESSION055: slow-decay peak of angular speed, so a mouse flick keeps rotation dilation elevated for the next ~1s of kicks - covers subsequent bursts that neither EMA nor empirical predict in time.
 	float cam_inst_angular_speed;            // SESSION064: this frame's raw instantaneous angular speed (rad/s), NOT smoothed. Drives the filter's per-frame re-filter trigger (kickOffFilters()): it is 0 the moment the camera stops, whereas the EMA/peak above coast down over ~2s and would keep re-filtering (and boiling) a static camera - see session064 snapshot.
+	// SESSION072: EMA-smoothed unit rotation axis (world space, w=0) - the direction cam_angular_speed_ema/_peak's
+	// magnitude is spinning about. Updated only on frames with a measurable rotation (near-zero deltas would normalise
+	// to a meaningless/noisy axis - see think()); holds its last direction otherwise, same as the magnitude EMA holding
+	// its value while decaying. Paired with the magnitude in kickOffFilters() to make the split filter's rotational
+	// dilation anisotropic - see filterUnculledFrontier()'s per-plane rotation_swept_fine/coarse vectors. Zero until the
+	// first measurable rotation.
+	Vec4f cam_angular_axis_ema_ws;
 
 	// See getSizeClampMin()/getSizeClampMax() above. Defaults (0, 0) disable both bounds, so never exclude a real splat.
 	float splat_size_clamp_min;

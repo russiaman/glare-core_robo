@@ -64,12 +64,10 @@ static const int max_slice_samples = 4096;
 // print site (some of which - e.g. fillTraversalScratch() - are defined earlier in the file than kickOffTraversals()),
 // so every timestamp shares the same zero point and lines from different sites stay chronologically comparable.
 static Timer diag_timer;
-static const bool filter_debug_log = true; // SESSION064 DIAG: [gsr-filter-kick] / [gsr-filter-drain] traces to localise the post-stop boiling. Set false once diagnosed.
-
-// SESSION058: toggle for [gsr-prof] stdout traces around fillTraversalScratch() and the traversal-result VBO upload -
-// see session058 snapshot §3. Measures whether the memcpy-per-kick over the whole cloud (not just the visible subset)
-// is really the 23ms session057 §3 flagged, before committing to the CoW refactor (session058 snapshot §2 plan A).
-static const bool cpu_prof_log = false; // Flip to true to re-enable [gsr-prof] stdout traces from session058 tuning.
+// SESSION072: filter_debug_log/cpu_prof_log/kick_debug_log (below, near kickOffTraversals()) moved from build-time
+// consts to live GaussianSplatRenderer members - see getFilterDebugLog() etc. in the header. [gsr-filter-kick] /
+// [gsr-filter-drain] trace kickOffFilters()/drainFilterResults(); [gsr-prof] traces fillTraversalScratch() and the
+// traversal-result VBO upload (session058 snapshot §3).
 
 
 // SESSION058: immutable, cacheable copy of one cloud's world-space node positions + feature_size, shared (via Reference<>)
@@ -1041,12 +1039,13 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 :	opengl_engine(&opengl_engine_), next_handle(1), next_cloud_id(1), num_sorts_in_flight(0),
 	num_traversals_in_flight(0), num_filters_in_flight(0), lod_pixel_scale_limit(1.0f), lod_max_splats_budget(10000000), lod_resort_move_threshold_ws(0.1f),
 	lod_max_layer_density(0.0f), lod_max_tree_depth(0), lod_frustum_cull_enabled(true), split_filter_enabled(false),
-	filter_dilation_latency(0.06f), filter_min_rot_rate_deg_per_s(45.f), filter_max_rot_rate_deg_per_s(40.f), filter_min_trans_rate_m_per_s(2.0f), // SESSION063 K3 (K4 defaults: coarse floor covers the edge, so the fine dilation can be tight/cheap); SESSION071 max: 40deg/s default, owner-confirmed no visible holes at the canonical test scene
+	filter_dilation_latency(0.17f), filter_min_rot_rate_deg_per_s(45.f), filter_max_rot_rate_deg_per_s(40.f), filter_min_trans_rate_m_per_s(2.0f), // SESSION063 K3 (K4 defaults: coarse floor covers the edge, so the fine dilation can be tight/cheap); SESSION071 max: 40deg/s default, owner-confirmed no visible holes at the canonical test scene; SESSION072: 0.06->0.17 - measured kick-to-drain round trip is 136-166ms during a fast flick (owner's [gsr-filter-kick]/[gsr-filter-drain] log), not the ~13ms the filter task itself takes - the gap is real frame time (millions of survivors to issue/draw), not queueing, and existed under the old isotropic dilation too, just masked by its uniform over-padding on every plane.
 	split_coarse_floor_enabled(true), split_coarse_pixel_scale(30.f), filter_coarse_dilation_latency(0.9f), coarse_layer_debug(false), // SESSION063 K4
+	filter_debug_log(false), kick_debug_log(false), cpu_prof_log(false), // SESSION072: default off - see getFilterDebugLog()'s comment.
 	splat_point_size_px(1.f),
 	splat_merge_spread_widen(3.0f), // SESSION071: analytic minimum is sqrt(3) (see widenedMergedScale()); owner default set higher for extra margin.
 	// SESSION071: GaussianSplatMergeColourParams defaults to Energy - owner-confirmed better at every pixel scale limit tested; Legacy is kept only as the A/B comparison.
-	have_prev_think_cam_state(false), prev_think_cam_pos_ws(0.f), prev_think_cam_forward_ws(0.f), cam_velocity_ema_ws(0.f), cam_angular_speed_ema(0.f), cam_angular_speed_peak(0.f), cam_inst_angular_speed(0.f),
+	have_prev_think_cam_state(false), prev_think_cam_pos_ws(0.f), prev_think_cam_forward_ws(0.f), cam_velocity_ema_ws(0.f), cam_angular_speed_ema(0.f), cam_angular_speed_peak(0.f), cam_inst_angular_speed(0.f), cam_angular_axis_ema_ws(0.f), // SESSION072
 	splat_size_clamp_min(0.0f), splat_size_clamp_max(0.0f), splat_size_clamp_invert(false),
 	splat_dist_clamp_min(0.0f), splat_dist_clamp_max(1000.0f), splat_dist_clamp_invert(false), splat_alpha_cutoff(1.0f / 255.0f),
 	splat_alpha_gain(1.0f), splat_alpha_gamma(1.0f), // Identity: the cloud as captured - see getAlphaGain().
@@ -1788,36 +1787,72 @@ static inline bool pointInFrustum(const Planef* frustum_clip_planes, int num_fru
 // inside every plane once that plane is pushed out by three margins, mirroring the base_margin+translation+rotation
 // dilation the old cull-traversal used (see the cull block in GaussianSplatLodTraversalTask::run()), computed for the
 // filter's own (much shorter) latency in kickOffFilters():
-//   - radius            : the node's own cull_radius (its 3-sigma footprint), always applied.
-//   - trans_dilation[i] : per-plane world-space margin (metres) for camera translation during the latency window.
-//   - rate * dist       : rotational margin - a node at range r shifts r*theta tangentially when the camera turns by
-//                         theta, so the plane is pushed out proportional to the node's distance from the camera.
-// SESSION063 K4: the rate is chosen PER NODE from uf.is_coarse - coarse-floor nodes get rate_coarse (wider) so their big
-// cheap splats catch motion-revealed edges, while the dense fine set stays at the tight, cheap rate_fine. Because fine and
+//   - radius                     : the node's own cull_radius (its 3-sigma footprint), always applied.
+//   - trans_dilation[i]          : per-plane world-space margin (metres) for camera translation during the latency window.
+//   - rotational margin          : SESSION072 - was isotropic (rate*dist, same on all 6 planes); now max() of two
+//                                   per-plane terms - see below.
+// SESSION072: anisotropic rotational dilation (session067 §8/§15 plan A). The isotropic rate*dist margin assumed the
+// worst case (a node exactly perpendicular to the rotation axis) on EVERY plane at once, which is what let a violent
+// flick multiply the whole draw list regardless of which edge it actually threatened. Replaced by max() of:
+//   - rate_*_baseline * dist : isotropic FLOOR only now - covers the static->moving transition, where nothing has
+//                              rotated yet in any direction, so there is no axis to be anisotropic about.
+//   - dot(d, cn[pl]) * mag   : the measured term. The camera's rotation over the latency window is an axis-aligned
+//                              swept-angle vector: direction rotation_axis (unit), magnitude swept_fine/swept_coarse
+//                              (the angle swept during the fine/coarse latency window). The tangential displacement a
+//                              node at offset d = node_pos - cam_pos picks up from that rotation is swept x d; the
+//                              component that threatens plane i is dot(n_i, swept x d). Precomputing cn_i = n_i x axis
+//                              ONCE per plane (below, outside the node loop) turns this per-node-per-plane into a plain
+//                              dot(d, cn_i) scaled by the swept magnitude - the scalar triple product identity
+//                              n.(a x b) == b.(n x a). By Cauchy-Schwarz |dot(d,cn_i)*mag| <= mag*|d| = the old
+//                              isotropic pad, with equality only when d is exactly perpendicular to the rotation axis -
+//                              so this can only shrink the margin relative to the old code, never grow it.
+//
+// SESSION072 measured cost (owner's A/B, [gsr-filter-drain] compute= vs iso=): the first cut of this took ~2.5x the
+// isotropic pass (~150ms vs ~60ms on a 15.5M-node U(P)) because it did TWO dot products per plane per node - one for
+// the fine swept vector, one for the coarse-minus-fine difference. Only one is needed: the fine and coarse swept
+// vectors share the rotation axis and differ only in magnitude (both are axis * w_eff * their own latency), and the
+// cross product is linear in its second argument, so n x swept_coarse is just a scalar multiple of n x swept_fine.
+// Passing the unit axis plus the two magnitudes separately (rather than two pre-scaled vectors) makes that explicit:
+// one cross product per plane, one dot product per plane per node, and the per-node fine/coarse magnitude blend hoists
+// entirely OUT of the plane loop. Also handles a zero fine latency cleanly, which a ratio between the two would not.
+//
+// SESSION063 K4: fine vs coarse is still chosen PER NODE from uf.is_coarse - coarse-floor nodes get the wider _coarse
+// terms so their big cheap splats catch motion-revealed edges, while the dense fine set stays tight. Because fine and
 // coarse are one globally sorted list, survivors come out globally front-to-back (a near coarse node correctly occludes a
 // far fine one - the fix for the green bleed of the old draw-coarse-last approach). coarse_only_debug keeps only coarse
 // nodes, for the isolation view. Writes survivor indices in input order (no re-sort); shrinks out_indices to the count.
 static size_t filterUnculledFrontier(const GaussianSplatUnculledFrontier& uf, const Planef* planes, int num_planes,
-	const Vec4f& cam_pos_ws, float rate_fine, float rate_coarse, const float* trans_dilation, bool coarse_only_debug,
-	js::Vector<uint32, 16>& out_indices)
+	const Vec4f& cam_pos_ws, float rate_fine_baseline, float rate_coarse_baseline,
+	const Vec4f& rotation_axis, float swept_fine, float swept_coarse, // SESSION072: unit rotation axis + the angle swept during each layer's latency window - see above.
+	const float* trans_dilation, bool coarse_only_debug,
+	js::Vector<uint32, 16>& out_indices,
+	size_t* out_num_coarse = NULL) // SESSION072 DIAGNOSTIC: if non-null, receives how many of the survivors were coarse-floor nodes - see [gsr-filter-drain].
 {
+	size_t num_coarse_out = 0;
 	const size_t n = uf.indices.size();
 	out_indices.resizeNoCopy(n); // Worst case every node survives.
 	const int npl = myMin(num_planes, 6);
 
 	__m128 pl_nx[6], pl_ny[6], pl_nz[6], pl_d[6], pl_d_raw[6];
+	__m128 cn_x[6], cn_y[6], cn_z[6]; // SESSION072: SoA broadcasts of cn[pl] below, for the SIMD node loop.
+	Vec4f cn[6];                      // Same values, kept as plain Vec4f for the scalar tail loop.
 	for(int pl=0; pl<npl; ++pl)
 	{
 		const Vec4f& nrm = planes[pl].getNormal();
 		pl_nx[pl] = _mm_set1_ps(nrm.x[0]); pl_ny[pl] = _mm_set1_ps(nrm.x[1]); pl_nz[pl] = _mm_set1_ps(nrm.x[2]);
 		pl_d[pl]     = _mm_set1_ps(planes[pl].getD() + (trans_dilation ? trans_dilation[pl] : 0.f)); // Dilated plane (translation dilation folds into d).
 		pl_d_raw[pl] = _mm_set1_ps(planes[pl].getD()); // SESSION063 K4: the tight (undilated) plane, for confining the coarse floor to the dilation band - see below.
+
+		cn[pl] = crossProduct(nrm, rotation_axis); // Unit axis, so this carries direction only - the swept magnitude is applied per node below.
+		cn_x[pl] = _mm_set1_ps(cn[pl].x[0]); cn_y[pl] = _mm_set1_ps(cn[pl].x[1]); cn_z[pl] = _mm_set1_ps(cn[pl].x[2]);
 	}
+	const __m128 swept_fine_v = _mm_set1_ps(swept_fine);
+	const __m128 swept_diff_v = _mm_set1_ps(swept_coarse - swept_fine); // mag = swept_fine + is_coarse * (swept_coarse - swept_fine).
 	const __m128 cam_x = _mm_set1_ps(cam_pos_ws.x[0]);
 	const __m128 cam_y = _mm_set1_ps(cam_pos_ws.x[1]);
 	const __m128 cam_z = _mm_set1_ps(cam_pos_ws.x[2]);
-	const __m128 rate_fine_v = _mm_set1_ps(rate_fine);
-	const __m128 rate_diff_v = _mm_set1_ps(rate_coarse - rate_fine); // rate = rate_fine + is_coarse * (rate_coarse - rate_fine).
+	const __m128 rate_fine_baseline_v = _mm_set1_ps(rate_fine_baseline);
+	const __m128 rate_baseline_diff_v = _mm_set1_ps(rate_coarse_baseline - rate_fine_baseline); // baseline_rate = rate_fine_baseline + is_coarse * (rate_coarse_baseline - rate_fine_baseline).
 
 	const float* const px = uf.px.data();
 	const float* const py = uf.py.data();
@@ -1836,16 +1871,24 @@ static size_t filterUnculledFrontier(const GaussianSplatUnculledFrontier& uf, co
 		const __m128 Z = _mm_loadu_ps(pz + i);
 		const __m128 R = _mm_loadu_ps(rad + i);
 		const __m128 IC = _mm_loadu_ps(isc + i); // 1.0 for coarse nodes, 0.0 for fine.
-		const __m128 rate = _mm_add_ps(rate_fine_v, _mm_mul_ps(IC, rate_diff_v)); // Per-node dilation rate.
+		const __m128 baseline_rate = _mm_add_ps(rate_fine_baseline_v, _mm_mul_ps(IC, rate_baseline_diff_v));
 		const __m128 dx = _mm_sub_ps(X, cam_x), dy = _mm_sub_ps(Y, cam_y), dz = _mm_sub_ps(Z, cam_z);
 		const __m128 dist = _mm_sqrt_ps(_mm_add_ps(_mm_add_ps(_mm_mul_ps(dx, dx), _mm_mul_ps(dy, dy)), _mm_mul_ps(dz, dz)));
-		const __m128 sub = _mm_add_ps(R, _mm_mul_ps(rate, dist));
+		const __m128 baseline_pad = _mm_mul_ps(baseline_rate, dist); // SESSION072: isotropic floor only now - see the function comment.
+		// SESSION072: the swept magnitude this node's layer uses. Hoisted out of the plane loop - it depends only on
+		// is_coarse, not on which plane, which is exactly what makes the single-cross-product form above worth having.
+		const __m128 swept_mag = _mm_add_ps(swept_fine_v, _mm_mul_ps(IC, swept_diff_v));
 		__m128 outside = _mm_setzero_ps();      // Outside the DILATED frustum (the keep test).
 		__m128 outside_tight = _mm_setzero_ps(); // Outside the TIGHT (undilated, radius-only) frustum - for the coarse band test.
 		for(int pl=0; pl<npl; ++pl)
 		{
 			const __m128 dotv = _mm_add_ps(_mm_add_ps(_mm_mul_ps(X, pl_nx[pl]), _mm_mul_ps(Y, pl_ny[pl])), _mm_mul_ps(Z, pl_nz[pl]));
-			outside       = _mm_or_ps(outside,       _mm_cmpge_ps(_mm_sub_ps(dotv, sub), pl_d[pl]));     // dot - (radius + rate*dist) >= d + trans.
+			// SESSION072: anisotropic rotational pad for this plane - see the function comment. One dot product against
+			// the axis-only cn[pl], scaled by the per-node swept magnitude computed above.
+			const __m128 measured_dir = _mm_add_ps(_mm_add_ps(_mm_mul_ps(dx, cn_x[pl]), _mm_mul_ps(dy, cn_y[pl])), _mm_mul_ps(dz, cn_z[pl]));
+			const __m128 measured = _mm_mul_ps(measured_dir, swept_mag);
+			const __m128 sub = _mm_add_ps(R, _mm_max_ps(baseline_pad, measured)); // max(), not sum - see the function comment.
+			outside       = _mm_or_ps(outside,       _mm_cmpge_ps(_mm_sub_ps(dotv, sub), pl_d[pl]));     // dot - (radius + pad) >= d + trans.
 			outside_tight = _mm_or_ps(outside_tight, _mm_cmpge_ps(_mm_sub_ps(dotv, R),   pl_d_raw[pl])); // dot - radius >= d.
 		}
 		if(coarse_only_debug)
@@ -1857,23 +1900,27 @@ static size_t filterUnculledFrontier(const GaussianSplatUnculledFrontier& uf, co
 			// beyond the tight frustum (off-screen until motion reveals it), which is where it's actually needed.
 			outside = _mm_or_ps(outside, _mm_and_ps(_mm_cmpgt_ps(IC, _mm_setzero_ps()), _mm_cmpeq_ps(outside_tight, _mm_setzero_ps())));
 		const int m = _mm_movemask_ps(outside) & 0xF; // bit j set = point i+j is outside/rejected.
-		if((m & 1) == 0) out[num_out++] = idx[i+0];
-		if((m & 2) == 0) out[num_out++] = idx[i+1];
-		if((m & 4) == 0) out[num_out++] = idx[i+2];
-		if((m & 8) == 0) out[num_out++] = idx[i+3];
+		if((m & 1) == 0) { out[num_out++] = idx[i+0]; if(isc[i+0] != 0.f) ++num_coarse_out; } // SESSION072 DIAGNOSTIC counting - see out_num_coarse.
+		if((m & 2) == 0) { out[num_out++] = idx[i+1]; if(isc[i+1] != 0.f) ++num_coarse_out; }
+		if((m & 4) == 0) { out[num_out++] = idx[i+2]; if(isc[i+2] != 0.f) ++num_coarse_out; }
+		if((m & 8) == 0) { out[num_out++] = idx[i+3]; if(isc[i+3] != 0.f) ++num_coarse_out; }
 	}
 	for(size_t i=n4; i<n; ++i) // Tail (n not a multiple of 4).
 	{
 		const bool is_coarse = isc[i] != 0.f;
 		if(coarse_only_debug && !is_coarse) continue;
-		const float rate = rate_fine + isc[i] * (rate_coarse - rate_fine);
+		const float baseline_rate = rate_fine_baseline + isc[i] * (rate_coarse_baseline - rate_fine_baseline);
 		const float ddx = px[i]-cam_pos_ws.x[0], ddy = py[i]-cam_pos_ws.x[1], ddz = pz[i]-cam_pos_ws.x[2];
-		const float sub = rad[i] + rate * std::sqrt(ddx*ddx + ddy*ddy + ddz*ddz);
+		const float baseline_pad = baseline_rate * std::sqrt(ddx*ddx + ddy*ddy + ddz*ddz);
+		const float swept_mag = swept_fine + isc[i] * (swept_coarse - swept_fine); // SESSION072: as in the SIMD loop - depends only on is_coarse, so it is hoisted out of the plane loop.
 		bool inside = true, inside_tight = true;
 		for(int pl=0; pl<npl; ++pl)
 		{
 			const Vec4f& nrm = planes[pl].getNormal();
 			const float dpn = nrm.x[0]*px[i] + nrm.x[1]*py[i] + nrm.x[2]*pz[i];
+			// SESSION072: same anisotropic pad as the SIMD loop above, scalar form.
+			const float measured = (cn[pl].x[0]*ddx + cn[pl].x[1]*ddy + cn[pl].x[2]*ddz) * swept_mag;
+			const float sub = rad[i] + myMax(baseline_pad, measured);
 			const float d_dil = planes[pl].getD() + (trans_dilation ? trans_dilation[pl] : 0.f);
 			if(dpn - sub    >= d_dil)              inside = false;
 			if(dpn - rad[i] >= planes[pl].getD())  inside_tight = false;
@@ -1882,8 +1929,11 @@ static size_t filterUnculledFrontier(const GaussianSplatUnculledFrontier& uf, co
 		if(!inside) continue;
 		if(!coarse_only_debug && is_coarse && inside_tight) continue; // Band restriction: coarse only survives beyond the tight frustum.
 		out[num_out++] = idx[i];
+		if(is_coarse) ++num_coarse_out; // SESSION072 DIAGNOSTIC counting - see out_num_coarse.
 	}
 	out_indices.resize(num_out); // Shrink to survivor count (keeps prefix, no realloc) so .size() is authoritative.
+	if(out_num_coarse)
+		*out_num_coarse = num_coarse_out;
 	return num_out;
 }
 
@@ -1896,6 +1946,8 @@ public:
 	uint64 cloud_id;
 	Reference<GaussianSplatUnculledFrontier> frontier; // The U(P) this result was filtered from - staleness check on drain.
 	js::Vector<uint32, 16> survivors; // The draw list S(P,R), globally front-to-back (fine + coarse interleaved by depth).
+	size_t num_coarse_survivors; // SESSION072 DIAGNOSTIC - see [gsr-filter-drain].
+	double filter_compute_ms; // SESSION072 DIAGNOSTIC: pure filterUnculledFrontier() time on the worker thread - excludes task scheduling/queueing, unlike the kick-to-drain gap in the logs. See [gsr-filter-drain].
 };
 
 
@@ -1907,10 +1959,13 @@ class GaussianSplatFilterTask : public glare::Task
 {
 public:
 	GaussianSplatFilterTask(uint64 cloud_id_, const Reference<GaussianSplatUnculledFrontier>& frontier_,
-		const Planef* planes_, int num_planes_, const Vec4f& cam_pos_ws_, float rate_fine_, float rate_coarse_, const float* trans_dilation_,
-		bool coarse_only_debug_, ThreadSafeQueue<Reference<ThreadMessage> >* result_queue_)
+		const Planef* planes_, int num_planes_, const Vec4f& cam_pos_ws_, float rate_fine_baseline_, float rate_coarse_baseline_,
+		const Vec4f& rotation_axis_, float swept_fine_, float swept_coarse_, // SESSION072: anisotropic rotational dilation - see kickOffFilters().
+		const float* trans_dilation_, bool coarse_only_debug_, ThreadSafeQueue<Reference<ThreadMessage> >* result_queue_)
 	:	cloud_id(cloud_id_), frontier(frontier_), num_planes(num_planes_), cam_pos_ws(cam_pos_ws_),
-		rate_fine(rate_fine_), rate_coarse(rate_coarse_), coarse_only_debug(coarse_only_debug_), result_queue(result_queue_)
+		rate_fine_baseline(rate_fine_baseline_), rate_coarse_baseline(rate_coarse_baseline_),
+		rotation_axis(rotation_axis_), swept_fine(swept_fine_), swept_coarse(swept_coarse_),
+		coarse_only_debug(coarse_only_debug_), result_queue(result_queue_)
 	{
 		if(num_planes < 0) num_planes = 0;
 		if(num_planes > (int)staticArrayNumElems(planes)) num_planes = (int)staticArrayNumElems(planes);
@@ -1925,7 +1980,10 @@ public:
 		Reference<GaussianSplatFilterResultMsg> msg = new GaussianSplatFilterResultMsg();
 		msg->cloud_id = cloud_id;
 		msg->frontier = frontier;
-		filterUnculledFrontier(*frontier, planes, num_planes, cam_pos_ws, rate_fine, rate_coarse, trans_dilation, coarse_only_debug, msg->survivors);
+		Timer filter_compute_timer; // SESSION072 DIAGNOSTIC: isolates filterUnculledFrontier()'s own cost from task scheduling - see msg->filter_compute_ms.
+		filterUnculledFrontier(*frontier, planes, num_planes, cam_pos_ws, rate_fine_baseline, rate_coarse_baseline,
+			rotation_axis, swept_fine, swept_coarse, trans_dilation, coarse_only_debug, msg->survivors, &msg->num_coarse_survivors);
+		msg->filter_compute_ms = filter_compute_timer.elapsed() * 1.0e3;
 		result_queue->enqueue(msg);
 	}
 
@@ -1934,10 +1992,12 @@ private:
 	Reference<GaussianSplatUnculledFrontier> frontier;
 	Planef planes[6];
 	int num_planes;
-	Vec4f cam_pos_ws;               // SESSION063 K3: for the per-node rotation dilation (rate * dist-to-camera).
-	float rate_fine, rate_coarse;   // SESSION063 K4: rotation dilation rates for fine nodes and (wider) coarse nodes.
-	bool coarse_only_debug;         // SESSION063 K4: keep only coarse nodes (isolation view).
-	float trans_dilation[6];        // per-plane translation margin (metres).
+	Vec4f cam_pos_ws;                                 // SESSION063 K3: for the per-node rotation dilation (rate * dist-to-camera).
+	float rate_fine_baseline, rate_coarse_baseline;   // SESSION063 K4/SESSION072: isotropic floor only now - see rotation_axis/swept_* for the measured (anisotropic) component.
+	Vec4f rotation_axis;                              // SESSION072: unit rotation axis (world space) - anisotropic rotational dilation, see kickOffFilters().
+	float swept_fine, swept_coarse;                   // SESSION072: angle swept about that axis during the fine/coarse dilation latency window. Kept separate from the axis (rather than as two pre-scaled vectors) so the filter needs one cross product per plane instead of two - see filterUnculledFrontier().
+	bool coarse_only_debug;                           // SESSION063 K4: keep only coarse nodes (isolation view).
+	float trans_dilation[6];                          // per-plane translation margin (metres).
 	ThreadSafeQueue<Reference<ThreadMessage> >* result_queue;
 };
 
@@ -2677,6 +2737,7 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 	// World-wide roll-up, accumulated across the clouds below.
 	size_t world_frontier = 0, world_frontier_in_frustum = 0, world_leaves_in_frustum = 0, world_frontier_leaves_in_frustum = 0;
 	double world_quad_area = 0, world_ellipse_area = 0;
+	double world_traversal_ms = 0; // SESSION072: sum of each cloud's own synchronous task.run() time - see below.
 	size_t world_reached_rasteriser = 0, world_in_frustum_before_shader = 0; // Kept on the renderer afterwards, so the diagnostics panel can show what this press measured - see getDiagnostics().
 	size_t world_reason_counts[FrontierStop_NumReasons];
 	for(size_t i=0; i<FrontierStop_NumReasons; ++i)
@@ -2742,7 +2803,16 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 			/*frustum_clip_planes=*/NULL, /*num_frustum_clip_planes=*/0, /*frustum_cull_enabled=*/false,
 			/*translation_dilation=*/NULL, /*rotation_dilation_rate=*/0.f,
 			/*result_queue=*/NULL, &frontier);
+		// SESSION072: isolates the traversal itself from the rest of this function's cost (stats accumulation, string
+		// building below) - "Report took" at the bottom times the whole button press, this times just the thing the
+		// owner actually wants to know the cost of. Same task, same call the per-frame async path makes (run() doesn't
+		// know or care whether its caller is sync or a worker thread), just on the main thread and with frustum-cull
+		// off - see the comment above.
+		Timer cloud_traversal_timer;
 		task.run(0);
+		const double cloud_traversal_ms = cloud_traversal_timer.elapsed() * 1.0e3;
+		world_traversal_ms += cloud_traversal_ms;
+		s += "  Traversal: " + doubleToStringNSigFigs(cloud_traversal_ms, 4) + " ms (main thread, unculled - see report note above)\n";
 
 		// Not returned to the pool yet: the pruning ceiling below walks scratch->selected_indices, which is the frontier in
 		// the front-to-back order the draw actually uses, and which the frontier records deliberately don't preserve.
@@ -3504,7 +3574,8 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 
 	s += mergeColourByDepthReport();
 
-	s += "\nReport took " + doubleToStringNDecimalPlaces(timer.elapsed() * 1.0e3, 1) + " ms (one full traversal per cloud, on the main thread).\n";
+	s += "\nReport took " + doubleToStringNDecimalPlaces(timer.elapsed() * 1.0e3, 1) + " ms total (one full traversal per cloud, on the main thread), of which " +
+		doubleToStringNDecimalPlaces(world_traversal_ms, 1) + " ms was traversal itself (see \"Traversal:\" per cloud above) - the rest is this report's own stats/string-building overhead, which the real per-frame path never pays.\n";
 	// Kept for the diagnostics panel - see the members' comment.  Set from the world-wide roll-up whether or not the
 	// per-world section above was printed, since that one is only printed when there is more than one cloud.
 	last_report_reached_rasteriser = world_reached_rasteriser;
@@ -5148,7 +5219,7 @@ void GaussianSplatRenderer::kickOffFilters()
 
 	// SESSION064: the per-frame re-filter trigger follows THIS frame's raw rotation (cam_inst_angular_speed), which is 0
 	// the moment the camera stops - NOT the smoothed ema/peak, which coast down over ~2s. Using the decaying trackers
-	// here re-filtered a *static* camera every frame with an ever-shrinking dilation band (rate_fine below), so S(P,R)
+	// here re-filtered a *static* camera every frame with an ever-shrinking dilation band (rate_fine_baseline below), so S(P,R)
 	// churned by ~1.4% for ~2s after every stop; invisible without the saturation gate, but the gate amplified the
 	// membership churn into visible "boiling" in dense regions - see session064 snapshot. Now: rotating stops with the
 	// camera, we stop re-filtering, and the last (in-motion-band) selection is simply held.
@@ -5165,7 +5236,6 @@ void GaussianSplatRenderer::kickOffFilters()
 	// re-filter or the settle transition - it only bounds how wide a kick's band gets.
 	const float max_rot_rate_rad_s = filter_max_rot_rate_deg_per_s * (3.14159265f / 180.f);
 	const float w_effective = myMin(myMax(cam_angular_speed_ema, cam_angular_speed_peak), max_rot_rate_rad_s);
-	const float w_floored = myMax(w_effective, min_rot_rate_rad_s);
 	// SESSION066: the camera has come to rest once even the slow-decay peak has fallen back to the floor (~2s after a stop) -
 	// distinct from `rotating` (this frame's raw speed), which goes false instantly. A cloud still carrying an above-floor
 	// band at that point (filter_dilation_elevated) gets exactly one "settle" re-filter, whose width is now ~floor, to swap
@@ -5174,8 +5244,29 @@ void GaussianSplatRenderer::kickOffFilters()
 	// nor holes (the in-motion band stays predictive until this point). This is session059's traversal "settle" ported to
 	// the filter - see SplatCloud::last_traversal_dilation_elevated's comment.
 	const bool motion_calmed = w_effective <= min_rot_rate_rad_s;
-	const float rate_fine   = w_floored * filter_dilation_latency;        // SESSION063 K4: tight dilation for the dense fine set.
-	const float rate_coarse = w_floored * filter_coarse_dilation_latency; // wider dilation for the cheap coarse floor (see filterUnculledFrontier).
+	// SESSION072: anisotropic rotational dilation (session067 §8/§15 plan A). Previously rate_fine/rate_coarse were
+	// isotropic - w_floored (= max(w_effective, min_rot_rate_rad_s)) applied identically to all 6 planes via rate*dist
+	// inside filterUnculledFrontier(), so a violent flick multiplied the whole draw list regardless of which edge it
+	// actually threatened. Split into two additive-by-max components instead:
+	//   - baseline (isotropic): min_rot_rate_rad_s has no direction to be anisotropic about - it exists purely to
+	//     cover the static->moving transition, where nothing has rotated yet in ANY direction (see min_rot_rate_rad_s's
+	//     own history above). Kept as a plain rate*dist floor, same as before, just no longer mixed with the measured
+	//     term before the split.
+	//   - measured (anisotropic): w_effective paired with cam_angular_axis_ema_ws (SESSION072 - see its own comment)
+	//     gives an actual swept-angle VECTOR. filterUnculledFrontier() turns this into a per-plane, per-node pad via
+	//     dot(plane_normal, rotation_swept x (node_pos - cam_pos)) - by Cauchy-Schwarz this is never more than the old
+	//     isotropic rate*dist (equality only when the node sits exactly perpendicular to the rotation axis), so this
+	//     is a strict reduction in padding, never an increase, over every plane and every node.
+	// The two are combined with max(), not sum, at the per-node/per-plane site in filterUnculledFrontier() - mirrors
+	// exactly how translation_dilation[] above already floors its per-plane EMA/empirical shift against
+	// min_trans_dilation_m.
+	const float rate_fine_baseline   = min_rot_rate_rad_s * filter_dilation_latency;        // SESSION063 K4 tight window, SESSION072: baseline-only now.
+	const float rate_coarse_baseline = min_rot_rate_rad_s * filter_coarse_dilation_latency;  // wider coarse window, baseline-only.
+	// SESSION072: axis and swept magnitudes passed separately rather than as two pre-scaled vectors - the two swept
+	// vectors are parallel (same axis, different latency), so the filter can do one cross product per plane instead of
+	// two and hoist the fine/coarse blend out of its plane loop. See filterUnculledFrontier().
+	const float swept_fine   = w_effective * filter_dilation_latency;
+	const float swept_coarse = w_effective * filter_coarse_dilation_latency;
 
 	const char* filter_kick_reason = "?"; // SESSION064 DIAG
 	while(num_filters_in_flight < max_concurrent_filters)
@@ -5213,14 +5304,16 @@ void GaussianSplatRenderer::kickOffFilters()
 		num_filters_in_flight++;
 
 		task_manager->addTask(new GaussianSplatFilterTask(best_cloud->cloud_id, best_cloud->cached_ufrontier,
-			scene->frustum_clip_planes, scene->num_frustum_clip_planes, cam_pos_ws, rate_fine, rate_coarse, trans_dilation,
-			coarse_layer_debug, &filter_result_queue));
+			scene->frustum_clip_planes, scene->num_frustum_clip_planes, cam_pos_ws, rate_fine_baseline, rate_coarse_baseline,
+			cam_angular_axis_ema_ws, swept_fine, swept_coarse, trans_dilation, coarse_layer_debug, &filter_result_queue));
 
 		if(filter_debug_log) // SESSION064 DIAG: how long do filter kicks continue after the camera stops, and with what band?
 			conPrint("[gsr-filter-kick] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms reason=" + std::string(filter_kick_reason) +
 				" ema=" + doubleToStringNDecimalPlaces(cam_angular_speed_ema * (180.0 / 3.14159265), 1) + "deg/s" +
 				" peak=" + doubleToStringNDecimalPlaces(cam_angular_speed_peak * (180.0 / 3.14159265), 1) + "deg/s" +
-				" rate_fine=" + doubleToStringNDecimalPlaces(rate_fine, 3));
+				" w_eff=" + doubleToStringNDecimalPlaces(w_effective * (180.0 / 3.14159265), 1) + "deg/s" + // SESSION072: the capped magnitude actually paired with the axis below.
+				" axis=(" + doubleToStringNDecimalPlaces(cam_angular_axis_ema_ws.x[0], 2) + "," + doubleToStringNDecimalPlaces(cam_angular_axis_ema_ws.x[1], 2) + "," + doubleToStringNDecimalPlaces(cam_angular_axis_ema_ws.x[2], 2) + ")" + // SESSION072
+				" rate_fine_baseline=" + doubleToStringNDecimalPlaces(rate_fine_baseline, 3));
 	}
 }
 
@@ -5268,7 +5361,11 @@ void GaussianSplatRenderer::drainFilterResults()
 		noteDrawOrderForSlicing(*cloud, survivors.data(), survivors.size());
 
 		if(filter_debug_log) // SESSION064 DIAG: does the applied survivor count keep changing after the camera stops? That churn is what the gate turns into boiling.
-			conPrint("[gsr-filter-drain] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms surv=" + uInt64ToStringCommaSeparated(survivors.size()));
+			conPrint("[gsr-filter-drain] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms surv=" + uInt64ToStringCommaSeparated(survivors.size()) +
+				" coarse=" + uInt64ToStringCommaSeparated(msg->num_coarse_survivors) + // SESSION072 DIAGNOSTIC
+				" fine=" + uInt64ToStringCommaSeparated(survivors.size() - msg->num_coarse_survivors) +
+				" pool=" + uInt64ToStringCommaSeparated(msg->frontier->indices.size()) +
+				" compute=" + doubleToStringNDecimalPlaces(msg->filter_compute_ms, 2) + "ms"); // SESSION072 DIAGNOSTIC: pure filterUnculledFrontier() cost, no scheduling.
 	}
 
 	completed_filter_msgs.clear();
@@ -5276,14 +5373,14 @@ void GaussianSplatRenderer::drainFilterResults()
 
 
 // SESSION055 diag: one shared Timer for kickOffTraversals logging; timestamps are ms-since-first-log so
-// pauses and streaks in the traversal pipeline read easily against each other. Toggle kick_debug_log below.
+// pauses and streaks in the traversal pipeline read easily against each other. Toggle: getKickDebugLog()/
+// setKickDebugLog() (SESSION072 - was a build-time const here, see its declaration's comment in the header).
 // Only two events actually print, both signal-only:
 //   [gsr-kick]        each successful traversal kick, with reason (rot / trans / topo / first / settle - SESSION059).
 //   [gsr-rot-blocked] when the camera is rotating fast enough to trigger the 5deg re-kick BUT no kick went out
 //                     (either the target cloud's slot is in flight, or all concurrent slots are full).
 // Both are throttled per-event-type - see rot_blocked_min_gap_ms below - so a held-down rotation logs a heartbeat,
 // not a flood.
-static const bool kick_debug_log = false; // Flip to true to re-enable [gsr-kick] / [gsr-rot-blocked] stdout traces from session055 tuning.
 static double last_rot_blocked_log_ms = -1e9;
 static const double rot_blocked_min_gap_ms = 250.0;
 
@@ -5670,6 +5767,8 @@ void GaussianSplatRenderer::think()
 			const float inst_ang = std::acos(dot_fw) / dt;
 			cam_inst_angular_speed = inst_ang; // SESSION064: raw, un-smoothed - see the member's comment and kickOffFilters().
 			const float alpha = 0.15f;
+			// SESSION072: captured before cam_angular_speed_ema is overwritten below - see the axis snap further down.
+			const bool was_calm = cam_angular_speed_ema <= 1.0e-4f;
 			// SESSION055: plain EMA for velocity vector - the per-axis abs-max used earlier kept the STALE direction on
 			// reversal (e.g. long east motion followed by short west step held ema pointing east, so kickOff dilated
 			// the east plane instead of west and left holes on the west edge). max(EMA, empirical) is applied per
@@ -5686,6 +5785,38 @@ void GaussianSplatRenderer::think()
 			// two kicks and the currently-in-flight traversal (kicked before the flick with low w) can't help, but
 			// the NEXT kick, informed by peak, is over-dilated so a follow-up flick is already covered.
 			cam_angular_speed_peak = myMax(inst_ang, cam_angular_speed_peak * 0.98f);
+
+			// SESSION072: rotation axis for the split filter's anisotropic dilation - see cam_angular_axis_ema_ws's
+			// comment and kickOffFilters(). cross(prev_fwd, cur_fwd)'s length is sin(angle) between the two unit
+			// vectors, so it doubles as the reliability signal for the direction it also gives: near a near-zero
+			// rotation the cross product is noise-dominated, and normalising it would inject a near-random axis into
+			// the EMA - so skip the update entirely on those frames and hold the last good direction, the same way
+			// the magnitude EMA holds its value while decaying rather than resetting to a fresh (here: meaningless)
+			// sample.
+			//
+			// SESSION072: uses its own, much faster blend rate (alpha_axis) than the magnitude EMA's
+			// alpha above. A typical mouse flick is over in 3-6 frames - far under alpha=0.15's ~7-frame (117ms) time
+			// constant - so the axis was still mostly pointing at whatever it held before the flick for MOST of a short
+			// flick's duration, systematically under-dilating the actually-threatened plane (magnitude was never the
+			// problem: cam_angular_speed_ema/_peak already respond instantly via max(inst,blended)/attack-instant peak
+			// above, so a correctly-SIZED dilation vector was being paired with a WRONGLY-DIRECTED one). alpha_axis
+			// converges to ~94% of the true direction within 3 frames instead of ~24%.
+			const float alpha_axis = 0.5f;
+			const Vec4f cross_v = crossProduct(prev_think_cam_forward_ws, cur_cam_forward); // Rotating prev_fwd by inst_ang about this axis (right-hand rule) reaches cur_fwd.
+			float cross_len;
+			const Vec4f inst_axis = normalise(cross_v, cross_len); // NaN if cross_len==0 - fine, never read unless the guard below passes, which it can't from exactly 0.
+			if(cross_len > 1.0e-5f)
+			{
+				// SESSION072: snap rather than blend when starting from a standstill (cam_angular_speed_ema was ~0 the
+				// frame before this one) - the held axis could be from an arbitrarily long-ago rotation in a totally
+				// different direction, and blending it in at all (even at alpha_axis) would dilute the one useful
+				// sample available with irrelevant history. Once a rotation is already under way, blending is right -
+				// it's what rejects frame-to-frame axis jitter from mouse-input noise during a steady turn.
+				const Vec4f blended_axis = was_calm ? inst_axis : (cam_angular_axis_ema_ws * (1.f - alpha_axis) + inst_axis * alpha_axis);
+				float blended_len;
+				const Vec4f blended_axis_n = normalise(blended_axis, blended_len);
+				cam_angular_axis_ema_ws = (blended_len > 1.0e-5f) ? blended_axis_n : inst_axis; // Guards the blend cancelling near-exactly (axis flipped between samples).
+			}
 		}
 		prev_think_cam_pos_ws = cur_cam_pos;
 		prev_think_cam_forward_ws = cur_cam_forward;

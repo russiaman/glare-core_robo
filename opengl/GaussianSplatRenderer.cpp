@@ -6,6 +6,7 @@ Copyright Glare Technologies Limited 2026 -
 #include "GaussianSplatRenderer.h"
 
 
+#include "GaussianSplatSaturationGrid.h" // SESSION074
 #include "IncludeOpenGL.h"
 #include "OpenGLEngine.h"
 #include "RenderBuffer.h" // For the accumulation buffer's dimensions in getDiagnostics().
@@ -85,6 +86,7 @@ public:
 	js::Vector<Vec3f, 16> positions;
 	js::Vector<float, 16> feature_size;
 	js::Vector<float, 16> cull_radius; // SESSION059: world-space enclosing-sphere radius per node - see SplatCloud::cull_radius and GaussianSplatLodNode::bounding_radius_os.
+	js::Vector<float, 16> alpha; // SESSION074: colours[i].w, same pattern as cull_radius above - needed by the traversal task's coarse-floor saturation-grid pass (GaussianSplatSaturationGrid.h) to weight each coarse node's contribution; colours itself is never added here, only this one channel, since nothing else on this path needs colour.
 };
 
 
@@ -113,6 +115,44 @@ public:
 	// tight, cheap dilation without leaving holes on motion. See filterUnculledFrontier() / kickOffFilters().
 	js::Vector<float, 16> is_coarse;
 
+	// SESSION074: per-direction saturation depth map, built once by the traversal task (see gsBuildSaturationGrid())
+	// from this frontier's coarse-floor nodes - orientation-invariant (indexed by direction from anchor_pos_ws, not by
+	// screen position), so it is valid for as long as this whole frontier is, and the per-frame filter only ever reads
+	// it. sat_grid_res == 0 means "not built" (stage disabled, or coarse floor empty) - callers must check before
+	// indexing.
+	//
+	// The coarse node SoA the grid is built FROM is deliberately not kept here: it is consumed once, inside the
+	// traversal task, and at this scene's scale it runs to tens of MB (measured ~3.5M coarse nodes = ~70MB across five
+	// parallel arrays) that would otherwise sit on every live frontier for the rest of its life for no reader. Only
+	// the count survives, for diagnostics.
+	js::Vector<float, 16> sat_depth;
+	int sat_grid_res;
+
+	// SESSION074 REVISION: the saturation verdict is applied HERE, when this frontier is built, not in the per-frame
+	// filter - the arrays above are already pruned of occluded nodes by the time anyone sees them (in Drop mode; Count
+	// mode only tallies). Two reasons, both decisive:
+	//
+	//  - It is orientation-independent by construction. Whether a node sits behind opaque geometry is a fact about the
+	//    camera POSITION, exactly like everything else in U(P). The first cut ran the test inside the filter and
+	//    exempted nodes that were only in the dilation margin, which made the verdict depend on where the frustum
+	//    happened to be that frame - so a node flipped between "exempt, drawn" and "tested, dropped" as the tight
+	//    frustum swept across it during rotation. That is the session064 membership-churn failure mode, and it showed
+	//    up as holes crawling along the screen edge on every turn.
+	//
+	//  - It moves the cost off the per-frame path entirely. The test is ~35ns/node scalar (octahedral map + sqrt);
+	//    running it per filter kick cost 105ms+ EVERY kick during rotation, which tripled the filter's async round trip
+	//    and thereby outran the dilation band that keeps the frustum edge fresh. Done once per traversal it costs
+	//    nothing per frame, AND it shrinks the pool every later filter kick has to stream (~12M -> ~2.5M measured), so
+	//    the cheap frustum test gets faster too.
+	//
+	// Coarse-floor nodes are deliberately never pruned - see the traversal task's use of this.
+	size_t sat_num_coarse;       // DIAGNOSTIC: how many coarse-floor nodes fed the grid - see [gsr-sat]'s coarse=.
+	size_t sat_num_tested;       // DIAGNOSTIC: fine nodes the verdict was computed for.
+	size_t sat_num_dropped;      // DIAGNOSTIC: of those, how many the conservative test found occluded (counted in Count mode too, where nothing is actually removed).
+	size_t sat_num_dropped_aggr; // DIAGNOSTIC: the deliberately-wrong upper bound - see gsSatOccluded()'s out_aggressive.
+	double sat_grid_build_ms;    // DIAGNOSTIC: pure gsBuildSaturationGrid() cost on the worker.
+	double sat_test_ms;          // DIAGNOSTIC: cost of testing (and, in Drop mode, compacting) the frontier.
+
 	// Key this frontier was built for; drainTraversalResults() checks these before reusing it, so a settings change that
 	// alters the selection can't be answered from a stale U(P).  Orientation is deliberately NOT here - that's the point.
 	uint64 topology_generation;
@@ -122,6 +162,10 @@ public:
 	float max_layer_density;
 	int max_tree_depth;
 	float focal_px;
+
+	GaussianSplatUnculledFrontier() // SESSION074: defaults are "stage never ran" - only kickOffTraversals() passing the stage-enabled flag sets sat_grid_res non-zero.
+	:	sat_grid_res(0), sat_num_coarse(0), sat_num_tested(0), sat_num_dropped(0), sat_num_dropped_aggr(0),
+		sat_grid_build_ms(0.0), sat_test_ms(0.0) {}
 };
 
 
@@ -700,7 +744,8 @@ public:
 		js::Vector<FrontierNodeRecord, 16>* frontier_record_ = NULL,
 		bool build_unculled_frontier_ = false, // SESSION063: also emit the SoA U(P) into the result msg, for the split filter path.
 		bool coarse_floor_enabled_ = false, float coarse_pixel_scale_ = 20.f, // SESSION063 K4: also capture a coarse floor into U(P) - see GaussianSplatUnculledFrontier::is_coarse.
-		bool dist_clamp_enabled_ = false, float dist_clamp_min_ = 0.f, float dist_clamp_max_ = 0.f, bool dist_clamp_invert_ = false) // SESSION072: distance-slice early-cull, mirrors the frustum-cull block below - see GaussianSplatRenderer::getDistClampEnabled(). Defaults off, so getFrustumStructureReport()'s call site (which omits these) always sees the whole tree.
+		bool dist_clamp_enabled_ = false, float dist_clamp_min_ = 0.f, float dist_clamp_max_ = 0.f, bool dist_clamp_invert_ = false, // SESSION072: distance-slice early-cull, mirrors the frustum-cull block below - see GaussianSplatRenderer::getDistClampEnabled(). Defaults off, so getFrustumStructureReport()'s call site (which omits these) always sees the whole tree.
+		GaussianSplatSatPrefilterMode sat_prefilter_mode_ = GaussianSplatSatPrefilterMode_Off, float sat_saturation_threshold_ = 0.f) // SESSION074: pre-GPU saturation cull - see GaussianSplatSaturationGrid.h. Defaults off; only meaningful when build_unculled_frontier_ and coarse_floor_enabled_ are also both true (the grid is built from the coarse floor captured into U(P)). Drop mode prunes the frontier here; Count only tallies.
 	:	cloud_id(cloud_id_), topology_generation(topology_generation_), scratch(scratch_), cam_pos_ws(cam_pos_ws_),
 		pixel_scale_limit(pixel_scale_limit_), max_splats_budget(max_splats_budget_), max_layer_density(max_layer_density_), max_tree_depth(max_tree_depth_), focal_px(focal_px_),
 		num_frustum_clip_planes(num_frustum_clip_planes_), frustum_cull_enabled(frustum_cull_enabled_),
@@ -709,7 +754,8 @@ public:
 		frontier_record(frontier_record_),
 		build_unculled_frontier(build_unculled_frontier_),
 		coarse_floor_enabled(coarse_floor_enabled_), coarse_pixel_scale(coarse_pixel_scale_),
-		dist_clamp_enabled(dist_clamp_enabled_), dist_clamp_min(dist_clamp_min_), dist_clamp_max(dist_clamp_max_), dist_clamp_invert(dist_clamp_invert_)
+		dist_clamp_enabled(dist_clamp_enabled_), dist_clamp_min(dist_clamp_min_), dist_clamp_max(dist_clamp_max_), dist_clamp_invert(dist_clamp_invert_),
+		sat_prefilter_mode(sat_prefilter_mode_), sat_saturation_threshold(sat_saturation_threshold_) // SESSION074
 	{
 		if(num_frustum_clip_planes < 0)
 			num_frustum_clip_planes = 0;
@@ -726,6 +772,7 @@ public:
 		const js::Vector<Vec3f, 16>& positions = scratch->geom->positions; // SESSION058: shared cached snapshot, never the live cloud arrays - see GaussianSplatCachedGeom.
 		const js::Vector<float, 16>& feature_sizes = scratch->geom->feature_size; // SESSION054: replaces per-push Vec3f scales[] lookup + 3-way max in makeHeapItem.
 		const js::Vector<float, 16>& cull_radii = scratch->geom->cull_radius; // SESSION059: enclosing-sphere bound for the frustum-cull margin below - NOT the same quantity as feature_size, see GaussianSplatLodNode::bounding_radius_os's comment.
+		const js::Vector<float, 16>& alphas = scratch->geom->alpha; // SESSION074: only read when build_saturation_grid is set - see the coarse-SoA block below.
 
 		js::Vector<uint32, 16>& output = scratch->selected_indices;
 
@@ -998,6 +1045,106 @@ public:
 				uf->max_layer_density = max_layer_density;
 				uf->max_tree_depth = max_tree_depth;
 				uf->focal_px = focal_px;
+
+				// SESSION074: pre-GPU saturation cull, Stage A/B (see GaussianSplatSaturationGrid.h). Compact coarse-only
+				// SoA, built from the SAME loop's output/coarse_flags rather than re-deriving it - a linear filter over
+				// n (already ~800k-11M depending on scene), not a second pass over the tree. Order is preserved (both
+				// output and coarse_flags come from the same globally-sorted 'decorated', so this stays front-to-back -
+				// required by gsBuildSaturationGrid()'s sequential accumulation).
+				if(sat_prefilter_mode != GaussianSplatSatPrefilterMode_Off && coarse_floor_enabled)
+				{
+					// Scratch only - consumed by the grid build below and dropped when this scope exits. Deliberately NOT
+					// stored on the frontier: see GaussianSplatUnculledFrontier::sat_depth's comment for the size involved.
+					js::Vector<float, 16> coarse_px, coarse_py, coarse_pz, coarse_radius, coarse_alpha;
+					for(size_t i=0; i<n; ++i)
+					{
+						if(coarse_flags[i] == 0.f)
+							continue;
+						const uint32 idx = output[i];
+						const Vec3f& p = positions[idx];
+						coarse_px.push_back(p.x); coarse_py.push_back(p.y); coarse_pz.push_back(p.z);
+						// SESSION074: the node's OWN drawn radius, NOT cull_radii[]. cull_radius is the enclosing sphere of
+						// this node's whole SUBTREE (see GaussianSplatLodNode::bounding_radius_os) - correct as a frustum-cull
+						// margin, catastrophically wrong as an occluder footprint: a coarse-floor node sits high in the tree by
+						// construction, so its subtree sphere spans a large part of the scene, and rasterising THAT into the
+						// grid marks tens of degrees as occluded on the strength of a splat that actually paints ~30 pixels.
+						// Measured consequence before this was caught: sat_tiles pinned at 100% of the whole sphere and
+						// would_drop at ~90%. Only the node itself is ever drawn at the frontier (never its subtree), and the
+						// shader cuts it at splat_cutoff_sigmas of max(scale) = half that many feature_sizes - so this is the
+						// radius that can actually occlude anything.
+						coarse_radius.push_back(0.5f * splat_cutoff_sigmas * feature_sizes[idx]);
+						coarse_alpha.push_back(alphas[idx]);
+					}
+					if(!coarse_px.empty())
+					{
+						uf->sat_num_coarse = coarse_px.size();
+						uf->sat_grid_res = gsSatGridResForFocal(focal_px, coarse_pixel_scale);
+						Timer sat_grid_timer; // SESSION074 DIAGNOSTIC - see uf->sat_grid_build_ms / [gsr-sat]'s grid_ms.
+						gsBuildSaturationGrid(coarse_px.data(), coarse_py.data(), coarse_pz.data(), coarse_radius.data(), coarse_alpha.data(), coarse_px.size(),
+							cam_pos_ws, uf->sat_grid_res, sat_saturation_threshold, uf->sat_depth);
+						uf->sat_grid_build_ms = sat_grid_timer.elapsed() * 1.0e3;
+					}
+					// else: no coarse nodes this traversal (tiny scene/empty frustum) - uf->sat_grid_res stays 0 (default), meaning "not built"; the filter must check this before using the grid.
+
+					// SESSION074 REVISION: apply the verdict HERE, to the frontier itself - see
+					// GaussianSplatUnculledFrontier::sat_num_coarse's block comment for why this belongs on the traversal
+					// stage rather than in the per-frame filter (orientation independence, and keeping the ~35ns/node
+					// scalar test off the per-kick path). In Drop mode the arrays are compacted in place; in Count mode
+					// nothing is removed and only the tallies are filled.
+					//
+					// Compaction preserves order (a retained subsequence of a front-to-back list is still front-to-back),
+					// which every later stage depends on - the filter emits in input order and never re-sorts.
+					//
+					// Coarse-floor nodes are never dropped: they are the layer that plugs motion-revealed frustum edges,
+					// they are already confined to the dilation band by the filter, and they are what the grid was built
+					// from in the first place. Testing them would trade the mechanism's own safety margin for a cut on a
+					// set that barely costs anything to draw.
+					if(uf->sat_grid_res > 0)
+					{
+						Timer sat_test_timer;
+						const bool prune = (sat_prefilter_mode == GaussianSplatSatPrefilterMode_Drop);
+						size_t num_tested = 0, num_dropped = 0, num_dropped_aggr = 0, w = 0;
+						for(size_t i=0; i<n; ++i)
+						{
+							bool drop = false;
+							if(uf->is_coarse[i] == 0.f) // Fine nodes only - see above.
+							{
+								const float dx = uf->px[i] - cam_pos_ws.x[0];
+								const float dy = uf->py[i] - cam_pos_ws.x[1];
+								const float dz = uf->pz[i] - cam_pos_ws.x[2];
+								bool aggr = false;
+								drop = gsSatOccluded(Vec4f(dx, dy, dz, 0.f), dx*dx + dy*dy + dz*dz, uf->radius[i],
+									uf->sat_depth, uf->sat_grid_res, &aggr);
+								++num_tested;
+								if(drop) ++num_dropped;
+								if(aggr) ++num_dropped_aggr;
+							}
+
+							if(prune && drop)
+								continue;
+							if(w != i) // Self-copy is a no-op worth skipping while nothing has been dropped yet.
+							{
+								uf->indices[w] = uf->indices[i];
+								uf->px[w] = uf->px[i]; uf->py[w] = uf->py[i]; uf->pz[w] = uf->pz[i];
+								uf->radius[w] = uf->radius[i];
+								uf->is_coarse[w] = uf->is_coarse[i];
+							}
+							++w;
+						}
+						if(w != n)
+						{
+							uf->indices.resize(w);
+							uf->px.resize(w); uf->py.resize(w); uf->pz.resize(w);
+							uf->radius.resize(w);
+							uf->is_coarse.resize(w);
+						}
+						uf->sat_num_tested = num_tested;
+						uf->sat_num_dropped = num_dropped;
+						uf->sat_num_dropped_aggr = num_dropped_aggr;
+						uf->sat_test_ms = sat_test_timer.elapsed() * 1.0e3;
+					}
+				}
+
 				msg->unculled_frontier = uf;
 			}
 
@@ -1072,6 +1219,8 @@ private:
 	bool dist_clamp_enabled;      // SESSION072: distance-slice early-cull toggle - see GaussianSplatRenderer::getDistClampEnabled().
 	float dist_clamp_min, dist_clamp_max;
 	bool dist_clamp_invert;
+	GaussianSplatSatPrefilterMode sat_prefilter_mode; // SESSION074: Off = don't build the grid at all; Count = build + tally; Drop = build, tally and prune the frontier - see GaussianSplatSaturationGrid.h.
+	float sat_saturation_threshold;  // SESSION074: reuses the existing splat_saturation_threshold live knob (GaussianSplatRenderer::getSaturationThreshold()) - no new threshold introduced, see the plan's "no manual per-scene tuning" constraint.
 };
 
 
@@ -1085,6 +1234,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	filter_dilation_latency(0.17f), filter_min_rot_rate_deg_per_s(45.f), filter_max_rot_rate_deg_per_s(40.f), filter_min_trans_rate_m_per_s(2.0f), // SESSION063 K3 (K4 defaults: coarse floor covers the edge, so the fine dilation can be tight/cheap); SESSION071 max: 40deg/s default, owner-confirmed no visible holes at the canonical test scene; SESSION072: 0.06->0.17 - measured kick-to-drain round trip is 136-166ms during a fast flick (owner's [gsr-filter-kick]/[gsr-filter-drain] log), not the ~13ms the filter task itself takes - the gap is real frame time (millions of survivors to issue/draw), not queueing, and existed under the old isotropic dilation too, just masked by its uniform over-padding on every plane.
 	split_coarse_floor_enabled(true), split_coarse_pixel_scale(30.f), filter_coarse_dilation_latency(0.9f), coarse_layer_debug(false), // SESSION063 K4
 	filter_debug_log(false), kick_debug_log(false), cpu_prof_log(false), // SESSION072: default off - see getFilterDebugLog()'s comment.
+	sat_prefilter_mode(GaussianSplatSatPrefilterMode_Off), filter_frustum_planes_enabled(true), // SESSION074: stage off by default, frustum planes on (i.e. unchanged pipeline) - see getSatPrefilterMode()/getFilterFrustumPlanesEnabled().
 	splat_point_size_px(1.f),
 	splat_merge_spread_widen(3.0f), // SESSION071: analytic minimum is sqrt(3) (see widenedMergedScale()); owner default set higher for extra margin.
 	// SESSION071: GaussianSplatMergeColourParams defaults to Energy - owner-confirmed better at every pixel scale limit tested; Legacy is kept only as the A/B comparison.
@@ -1871,6 +2021,9 @@ static size_t filterUnculledFrontier(const GaussianSplatUnculledFrontier& uf, co
 	js::Vector<uint32, 16>& out_indices,
 	size_t* out_num_coarse = NULL) // SESSION072 DIAGNOSTIC: if non-null, receives how many of the survivors were coarse-floor nodes - see [gsr-filter-drain].
 {
+	// SESSION074: no saturation work happens here any more. The verdict is orientation-independent, so it is applied
+	// once when the frontier is built and this function simply streams whatever survived - see
+	// GaussianSplatUnculledFrontier::sat_num_coarse's block comment for why that move mattered.
 	size_t num_coarse_out = 0;
 	const size_t n = uf.indices.size();
 	out_indices.resizeNoCopy(n); // Worst case every node survives.
@@ -2004,7 +2157,8 @@ public:
 	GaussianSplatFilterTask(uint64 cloud_id_, const Reference<GaussianSplatUnculledFrontier>& frontier_,
 		const Planef* planes_, int num_planes_, const Vec4f& cam_pos_ws_, float rate_fine_baseline_, float rate_coarse_baseline_,
 		const Vec4f& rotation_axis_, float swept_fine_, float swept_coarse_, // SESSION072: anisotropic rotational dilation - see kickOffFilters().
-		const float* trans_dilation_, bool coarse_only_debug_, ThreadSafeQueue<Reference<ThreadMessage> >* result_queue_)
+		const float* trans_dilation_, bool coarse_only_debug_,
+		ThreadSafeQueue<Reference<ThreadMessage> >* result_queue_)
 	:	cloud_id(cloud_id_), frontier(frontier_), num_planes(num_planes_), cam_pos_ws(cam_pos_ws_),
 		rate_fine_baseline(rate_fine_baseline_), rate_coarse_baseline(rate_coarse_baseline_),
 		rotation_axis(rotation_axis_), swept_fine(swept_fine_), swept_coarse(swept_coarse_),
@@ -2025,7 +2179,8 @@ public:
 		msg->frontier = frontier;
 		Timer filter_compute_timer; // SESSION072 DIAGNOSTIC: isolates filterUnculledFrontier()'s own cost from task scheduling - see msg->filter_compute_ms.
 		filterUnculledFrontier(*frontier, planes, num_planes, cam_pos_ws, rate_fine_baseline, rate_coarse_baseline,
-			rotation_axis, swept_fine, swept_coarse, trans_dilation, coarse_only_debug, msg->survivors, &msg->num_coarse_survivors);
+			rotation_axis, swept_fine, swept_coarse, trans_dilation, coarse_only_debug,
+			msg->survivors, &msg->num_coarse_survivors);
 		msg->filter_compute_ms = filter_compute_timer.elapsed() * 1.0e3;
 		result_queue->enqueue(msg);
 	}
@@ -2516,6 +2671,13 @@ void GaussianSplatRenderer::fillTraversalScratch(SplatCloud& cloud, GaussianSpla
 		geom->cull_radius.resizeNoCopy(cloud.total_splats);
 		std::memcpy(geom->cull_radius.data(), cloud.cull_radius.data(), cloud.total_splats * sizeof(float));
 
+		// SESSION074: unlike positions/feature_size/cull_radius, there is no pre-maintained flat alpha array on the
+		// cloud to memcpy - colours is Vec4f (rgb+alpha interleaved), so this is a per-node extract, not a raw copy.
+		// Only runs on a cache miss (topology change), same as the blocks above.
+		geom->alpha.resizeNoCopy(cloud.total_splats);
+		for(size_t i=0; i<cloud.total_splats; ++i)
+			geom->alpha[i] = cloud.colours[i][3];
+
 		cloud.cached_traversal_geom = geom;
 		cloud.cached_traversal_geom_generation = cloud.topology_generation;
 	}
@@ -2532,7 +2694,7 @@ void GaussianSplatRenderer::fillTraversalScratch(SplatCloud& cloud, GaussianSpla
 
 	if(cpu_prof_log)
 	{
-		const size_t bytes_copied = cache_hit ? 0 : cloud.total_splats * (sizeof(Vec3f) + sizeof(float) + sizeof(float)); // positions + feature_size + cull_radius (SESSION059).
+		const size_t bytes_copied = cache_hit ? 0 : cloud.total_splats * (sizeof(Vec3f) + sizeof(float) + sizeof(float) + sizeof(float)); // positions + feature_size + cull_radius (SESSION059) + alpha (SESSION074).
 		conPrint("[gsr-prof] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms fillTraversalScratch cloud=" +
 			toString(cloud.cloud_id) + " splats=" + toString(cloud.total_splats) +
 			" " + (cache_hit ? std::string("HIT") : std::string("MISS")) +
@@ -4281,6 +4443,26 @@ static void bakeMember(SplatCloud& cloud, CloudMember& member, const GaussianSpl
 }
 
 
+// SESSION074 - see the declaration's comment for why this can't be an inline assignment.
+void GaussianSplatRenderer::setSatPrefilterMode(GaussianSplatSatPrefilterMode v)
+{
+	if(v == sat_prefilter_mode)
+		return;
+	sat_prefilter_mode = v;
+
+	// Drop every cached frontier so the next kickOffTraversals() rebuilds one under the new setting. Clearing the
+	// Reference is enough: the in-flight traversal (if any) still holds its own, and drainTraversalResults() adopts
+	// whatever lands next regardless. Nothing is drawn from U(P) directly - the live draw list is the last filter's
+	// survivors, which keeps rendering untouched until the fresh frontier's own filter lands, exactly as it does after
+	// any other traversal.
+	for(size_t i=0; i<clouds.size(); ++i)
+	{
+		clouds[i]->cached_ufrontier = NULL;
+		clouds[i]->have_last_traversal_cam_pos = false; // Makes this cloud unconditionally overdue - see kickOffTraversals()'s "first" reason.
+	}
+}
+
+
 void GaussianSplatRenderer::setMergeColourMode(GaussianSplatMergeColourMode v)
 {
 	if(v == splat_merge_colour_params.mode)
@@ -5286,6 +5468,34 @@ void GaussianSplatRenderer::drainTraversalResults()
 			cloud->last_traversal_hit_budget_cap = msg->scratch->hit_budget_cap;
 			cloud->last_traversal_hit_density_cap = msg->scratch->hit_density_cap;
 			cloud->last_traversal_hit_depth_cap = msg->scratch->hit_depth_cap;
+
+			// SESSION074 DIAGNOSTIC: the saturation stage's own numbers. Reported HERE rather than per filter drain
+			// because that is the cadence at which they actually change - the verdict is orientation-independent and
+			// applied once per traversal (see GaussianSplatUnculledFrontier::sat_num_coarse's comment), so printing it
+			// per filter kick would repeat identical values every frame of a rotation. sat_grid_res == 0 means the grid
+			// wasn't built for this frontier (stage off, or the coarse floor was empty) - print nothing rather than a
+			// line of zeros. Shares the filter trace's toggle, as the rest of this stage's logging does.
+			const GaussianSplatUnculledFrontier& uf = *msg->unculled_frontier;
+			if(filter_debug_log && uf.sat_grid_res > 0)
+			{
+				const size_t num_tiles = (size_t)uf.sat_grid_res * (size_t)uf.sat_grid_res;
+				size_t sat_tiles = 0;
+				for(size_t t=0; t<uf.sat_depth.size(); ++t)
+					if(std::isfinite(uf.sat_depth[t]))
+						++sat_tiles;
+				const double tested = (double)uf.sat_num_tested;
+				conPrint("[gsr-sat] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms coarse=" + uInt64ToStringCommaSeparated(uf.sat_num_coarse) +
+					" tiles=" + uInt64ToStringCommaSeparated(num_tiles) +
+					" sat_tiles=" + doubleToStringNDecimalPlaces(num_tiles > 0 ? (100.0 * (double)sat_tiles / (double)num_tiles) : 0.0, 1) + "%" +
+					" grid_ms=" + doubleToStringNDecimalPlaces(uf.sat_grid_build_ms, 2) +
+					" test_ms=" + doubleToStringNDecimalPlaces(uf.sat_test_ms, 2) +
+					" tested=" + uInt64ToStringCommaSeparated(uf.sat_num_tested) +
+					" dropped=" + uInt64ToStringCommaSeparated(uf.sat_num_dropped) +
+					" (" + doubleToStringNDecimalPlaces(tested > 0 ? (100.0 * (double)uf.sat_num_dropped / tested) : 0.0, 1) + "%)" +
+					" aggr=" + uInt64ToStringCommaSeparated(uf.sat_num_dropped_aggr) + // Deliberately-wrong upper bound, not a real verdict - see gsSatOccluded()'s out_aggressive.
+					" (" + doubleToStringNDecimalPlaces(tested > 0 ? (100.0 * (double)uf.sat_num_dropped_aggr / tested) : 0.0, 1) + "%)" +
+					" pool_after=" + uInt64ToStringCommaSeparated(uf.indices.size())); // In Drop mode this is the pruned frontier every later filter kick streams - the whole point of pruning here.
+			}
 			continue;
 		}
 
@@ -5432,8 +5642,16 @@ void GaussianSplatRenderer::kickOffFilters()
 		best_cloud->diag_filter_band_fine_rad = swept_fine;           // SESSION073 DIAGNOSTIC: what this kick's fine layer actually dilated by, to compare against how far the camera turns before the result is replaced.
 		num_filters_in_flight++;
 
+		// SESSION074: frustum-plane culling and the saturation pre-filter are independent mechanisms that happen to share
+		// this one streaming pass over U(P). Passing zero planes disables only the frustum half - the plane loop inside
+		// filterUnculledFrontier() then does nothing, every node is "inside", and the saturation test still runs on each
+		// one - so the two can be measured separately on the same scene. Note the coarse floor drops out entirely in that
+		// mode, which is correct rather than incidental: it exists only to plug frustum-edge gaps revealed by motion, and
+		// with no frustum edge there is nothing for it to plug (the band restriction below rejects it on its own).
+		const int filter_num_planes = filter_frustum_planes_enabled ? scene->num_frustum_clip_planes : 0;
+
 		task_manager->addTask(new GaussianSplatFilterTask(best_cloud->cloud_id, best_cloud->cached_ufrontier,
-			scene->frustum_clip_planes, scene->num_frustum_clip_planes, cam_pos_ws, rate_fine_baseline, rate_coarse_baseline,
+			scene->frustum_clip_planes, filter_num_planes, cam_pos_ws, rate_fine_baseline, rate_coarse_baseline,
 			cam_angular_axis_ema_ws, swept_fine, swept_coarse, trans_dilation, coarse_layer_debug, &filter_result_queue));
 
 		if(filter_debug_log) // SESSION064 DIAG: how long do filter kicks continue after the camera stops, and with what band?
@@ -5523,6 +5741,7 @@ void GaussianSplatRenderer::drainFilterResults()
 				" band=" + doubleToStringNDecimalPlaces(band_deg, 2) + "deg" +
 				" stale=" + doubleToStringNDecimalPlaces(stale_deg, 2) + "deg" +
 				" deficit=" + doubleToStringNDecimalPlaces(stale_deg - band_deg, 2) + "deg");
+
 		}
 	}
 
@@ -5771,7 +5990,8 @@ void GaussianSplatRenderer::kickOffTraversals()
 			&traversal_result_queue,
 			/*frontier_record=*/NULL, /*build_unculled_frontier=*/split_filter_enabled, // SESSION063: cull-off traversal builds U(P) for the split filter.
 			/*coarse_floor_enabled=*/split_filter_enabled && split_coarse_floor_enabled, /*coarse_pixel_scale=*/split_coarse_pixel_scale, // SESSION063 K4.
-			/*dist_clamp_enabled=*/splat_dist_clamp_enabled, splat_dist_clamp_min, splat_dist_clamp_max, splat_dist_clamp_invert)); // SESSION072.
+			/*dist_clamp_enabled=*/splat_dist_clamp_enabled, splat_dist_clamp_min, splat_dist_clamp_max, splat_dist_clamp_invert, // SESSION072.
+			/*sat_prefilter_mode=*/(split_filter_enabled && split_coarse_floor_enabled) ? sat_prefilter_mode : GaussianSplatSatPrefilterMode_Off, splat_saturation_threshold)); // SESSION074.
 	}
 
 	// SESSION055 diag: after the while-loop, detect *unmet* rotation demand - a cloud whose forward has shifted past the

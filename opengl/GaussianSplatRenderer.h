@@ -103,6 +103,18 @@ Not handled:
    maxSplatsPerCloud()).  A merge that would exceed it is refused, leaving the
    clouds separate and their relative order approximate.
 =====================================================================*/
+// SESSION074: pre-GPU saturation cull stage (see snapshots/2026-08-24-session074-cpu-saturation-prefilter-plan.md).
+// Off: stage disabled entirely, no grid built, no cost anywhere (default). Count: grid built and every fine node
+// tested, but nothing is dropped - Stage A, measurement only, see GaussianSplatRenderer::getSatPrefilterMode().
+// Drop: Stage A's tested behaviour, actually applied to the draw list - Stage B.
+enum GaussianSplatSatPrefilterMode
+{
+	GaussianSplatSatPrefilterMode_Off = 0,
+	GaussianSplatSatPrefilterMode_Count = 1,
+	GaussianSplatSatPrefilterMode_Drop = 2
+};
+
+
 class GaussianSplatRenderer
 {
 public:
@@ -330,6 +342,30 @@ public:
 	// isolation - see drainFilterResults(). Off = normal (fine + coarse).
 	bool getCoarseLayerDebug() const { return coarse_layer_debug; }
 	void setCoarseLayerDebug(bool v) { coarse_layer_debug = v; }
+
+	// SESSION074: pre-GPU saturation cull stage - see GaussianSplatSatPrefilterMode's own comment above and the
+	// session074 plan snapshot. Off by default; only takes effect when the coarse floor is also enabled (the grid is
+	// built from it - see kickOffTraversals()'s use of this). Reuses getSaturationThreshold()'s existing threshold -
+	// no separate threshold is exposed here, by design (no manual per-scene tuning).
+	// The verdict is baked into U(P) when the frontier is built, not re-evaluated per frame, so a live change of this
+	// setting cannot take effect until a fresh traversal runs - and during pure rotation no traversal is ever kicked,
+	// which would leave the switch looking broken for as long as the camera stays put. The setter therefore drops every
+	// cached frontier, forcing one. Out-of-line for that reason; nothing else here needs to touch cloud state.
+	GaussianSplatSatPrefilterMode getSatPrefilterMode() const { return sat_prefilter_mode; }
+	void setSatPrefilterMode(GaussianSplatSatPrefilterMode v);
+
+	// SESSION074: whether the per-orientation filter applies the frustum planes at all. On (the default) is the normal
+	// pipeline. Off keeps the whole split-filter machinery running - U(P) is still built and streamed, the saturation
+	// pre-filter above still runs on every node - but no node is ever rejected for being outside the view, so the two
+	// mechanisms can be A/B'd independently on one scene: frustum-only (sat pre-filter off), saturation-only (this
+	// off), both, or neither.
+	//
+	// This is NOT the same switch as getFrustumCullEnabled(): that one, when cleared, also takes the split architecture
+	// down with it and reverts to the pre-session063 whole-traversal path (which is itself a meaningful comparison - see
+	// the session073 snapshot - and is deliberately left working exactly as it was). This one changes only what the
+	// filter does with the planes it is handed.
+	bool getFilterFrustumPlanesEnabled() const { return filter_frustum_planes_enabled; }
+	void setFilterFrustumPlanesEnabled(bool v) { filter_frustum_planes_enabled = v; }
 
 	// SESSION072: live toggles for the three stdout diagnostic traces, previously build-time consts an engineer had to
 	// flip and recompile. Each conPrint() runs on the MAIN thread (kickOffFilters/drainFilterResults/kickOffTraversals
@@ -1370,6 +1406,8 @@ private:
 	float filter_coarse_dilation_latency;   // s - the coarse tail's (wider) dilation window.
 	bool coarse_layer_debug;                // Draw only the coarse floor - see getCoarseLayerDebug().
 	bool filter_debug_log, kick_debug_log, cpu_prof_log; // SESSION072: live log toggles - see getFilterDebugLog() etc.
+	GaussianSplatSatPrefilterMode sat_prefilter_mode; // SESSION074 - see getSatPrefilterMode(). [gsr-sat] trace reuses filter_debug_log above (plan's own choice - one checkbox, not a second toggle) - see drainFilterResults().
+	bool filter_frustum_planes_enabled;              // SESSION074 - see getFilterFrustumPlanesEnabled().
 
 	// SESSION055: camera-motion tracker for anisotropic frustum-cull dilation. think() diffs the current cam pose against
 	// the previous one to compute an instantaneous velocity and angular speed, feeds them through an EMA with a

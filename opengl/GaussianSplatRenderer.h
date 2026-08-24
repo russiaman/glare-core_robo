@@ -167,7 +167,11 @@ public:
 	// counts only the splats that pass the frustum + size/distance slices this frame - i.e. what really reaches the screen;
 	// it is the number that drops when the pixel_scale limit or the distance slice tighten. So the button reports the
 	// geometric-in-frustum ceiling (in_frustum/total), the raw draw count (drawn), and the real on-screen count (visible).
-	struct FrustumCounts { size_t in_frustum; size_t total; size_t drawn; size_t visible; };
+	// SESSION072: 'frontier' is the cached unculled LoD frontier U(P) (sum of cached_ufrontier->indices.size() across
+	// clouds, split_filter_enabled only - 0 for a cloud with none cached yet) - what the traversal stage handed to the
+	// filter stage, before filterUnculledFrontier() cuts it down to 'drawn'. Sits between 'total'/'in_frustum' (a static,
+	// LoD-independent ceiling over the whole tree) and 'drawn' (this frame's post-filter draw list) in the pipeline.
+	struct FrustumCounts { size_t in_frustum; size_t total; size_t frontier; size_t drawn; size_t visible; };
 	FrustumCounts countSplatsInFrustum() const;
 
 	// One-off diagnostic (GaussianSplatSettingsWidget's "Frustum report" button, Qt only): a multi-line breakdown of what

@@ -2013,6 +2013,7 @@ GaussianSplatRenderer::FrustumCounts GaussianSplatRenderer::countSplatsInFrustum
 	FrustumCounts result;
 	result.in_frustum = 0;
 	result.total = 0;
+	result.frontier = 0;
 	result.drawn = 0;
 	result.visible = 0;
 	for(size_t c=0; c<clouds.size(); ++c)
@@ -2050,6 +2051,7 @@ GaussianSplatRenderer::FrustumCounts GaussianSplatRenderer::countSplatsInFrustum
 		};
 
 		result.total += cloud.total_splats; // Leaves + merged internal nodes - matches what the traversal iterates over.
+		result.frontier += cloud.cached_ufrontier.isNull() ? 0 : cloud.cached_ufrontier->indices.size(); // SESSION072: U(P) as last cached by the traversal stage (split_filter_enabled) - 0 if none cached yet.
 		result.drawn += (size_t)myMax(0, cloud.ob->num_instances_to_draw); // SESSION066: the live LoD draw list S(P,R) size - the pre-slice, dilation-band-inclusive selection the pixel_scale limit / camera position pick this frame.
 
 		// in_frustum: over the whole baked tree (the geometric ceiling, LoD-independent).

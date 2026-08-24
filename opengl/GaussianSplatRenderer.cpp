@@ -610,6 +610,7 @@ enum FrontierStopReason
 	FrontierStop_BudgetCap,  // max_splats_budget stopped expansion, and this node was drained from the heap as-is.
 	FrontierStop_NoTree,     // The member has no LoD tree at all, so every one of its splats is always selected.
 	FrontierStop_OutOfFrustum, // SESSION055: the node's centre is outside the frustum (dilated by 1.5*feature_size to keep large nodes whose centre is just past a plane), so it and its subtree were skipped. Only produced when frustum-cull is on (see GaussianSplatRenderer::setFrustumCullEnabled). getFrustumStructureReport() disables cull, so this bucket stays 0 there - it exists so the runtime path can bucket cheaply and so the count matches what the fast path actually did.
+	FrontierStop_OutOfDistRange, // SESSION072: the node's whole bounding sphere is outside the distance-slice shell (or, inverted, entirely inside it) - see GaussianSplatRenderer::getDistClampEnabled(). Only produced when the dist-clamp checkbox is on; getFrustumStructureReport() always leaves it off, same reasoning as FrontierStop_OutOfFrustum above.
 	FrontierStop_NumReasons
 };
 
@@ -686,7 +687,8 @@ public:
 		ThreadSafeQueue<Reference<ThreadMessage> >* result_queue_,
 		js::Vector<FrontierNodeRecord, 16>* frontier_record_ = NULL,
 		bool build_unculled_frontier_ = false, // SESSION063: also emit the SoA U(P) into the result msg, for the split filter path.
-		bool coarse_floor_enabled_ = false, float coarse_pixel_scale_ = 20.f) // SESSION063 K4: also capture a coarse floor into U(P) - see GaussianSplatUnculledFrontier::is_coarse.
+		bool coarse_floor_enabled_ = false, float coarse_pixel_scale_ = 20.f, // SESSION063 K4: also capture a coarse floor into U(P) - see GaussianSplatUnculledFrontier::is_coarse.
+		bool dist_clamp_enabled_ = false, float dist_clamp_min_ = 0.f, float dist_clamp_max_ = 0.f, bool dist_clamp_invert_ = false) // SESSION072: distance-slice early-cull, mirrors the frustum-cull block below - see GaussianSplatRenderer::getDistClampEnabled(). Defaults off, so getFrustumStructureReport()'s call site (which omits these) always sees the whole tree.
 	:	cloud_id(cloud_id_), topology_generation(topology_generation_), scratch(scratch_), cam_pos_ws(cam_pos_ws_),
 		pixel_scale_limit(pixel_scale_limit_), max_splats_budget(max_splats_budget_), max_layer_density(max_layer_density_), max_tree_depth(max_tree_depth_), focal_px(focal_px_),
 		num_frustum_clip_planes(num_frustum_clip_planes_), frustum_cull_enabled(frustum_cull_enabled_),
@@ -694,7 +696,8 @@ public:
 		result_queue(result_queue_),
 		frontier_record(frontier_record_),
 		build_unculled_frontier(build_unculled_frontier_),
-		coarse_floor_enabled(coarse_floor_enabled_), coarse_pixel_scale(coarse_pixel_scale_)
+		coarse_floor_enabled(coarse_floor_enabled_), coarse_pixel_scale(coarse_pixel_scale_),
+		dist_clamp_enabled(dist_clamp_enabled_), dist_clamp_min(dist_clamp_min_), dist_clamp_max(dist_clamp_max_), dist_clamp_invert(dist_clamp_invert_)
 	{
 		if(num_frustum_clip_planes < 0)
 			num_frustum_clip_planes = 0;
@@ -790,11 +793,16 @@ public:
 			// push children nor add the node to decorated. Overrides the "no frustum test here" property called out at the
 			// top of the class; the paired re-kick-on-rotation trigger in kickOffTraversals() puts back the property that
 			// turning on the spot updates the selection.
+			// SESSION072: shared by the frustum-cull block below and the distance-slice block right after it - both need
+			// distance-to-camera, and dist_sq is already sitting in top from makeHeapItem() (session054), so computing the
+			// one sqrt here instead of inside each block avoids paying it twice when both culls are active.
+			const bool need_dist_to_node = frustum_cull_enabled || dist_clamp_enabled;
+			const float dist_to_node = need_dist_to_node ? std::sqrt(top.dist_sq) : 0.f;
+
 			if(frustum_cull_enabled)
 			{
 				const Vec3f& p = positions[cloud_idx_u32];
 				const float base_margin = cull_radii[cloud_idx_u32];
-				const float dist_to_node = std::sqrt(top.dist_sq); // dist_sq is already computed in makeHeapItem (session054); one sqrt per pop.
 				const float rot_pad = rotation_dilation_rate * dist_to_node;
 				const Vec4f pos4(p.x, p.y, p.z, 1.f);
 				bool outside = false;
@@ -807,6 +815,26 @@ public:
 				if(outside)
 				{
 					recordFrontierNode(cloud_idx_u32, top.member_idx, top.tree_local_idx, top.depth, FrontierStop_OutOfFrustum);
+					continue;
+				}
+			}
+
+			// SESSION072: distance-slice early-cull - moves the "isolate a distance shell" debug tool (GaussianSplatSettingsWidget's
+			// distClamp* controls, previously a per-instance vertex-shader discard only - see countSplatsInFrustum()) up to a real
+			// subtree prune here, gated by its own checkbox rather than by "min/max still at the keep-everything default" (that
+			// implicit check stays where it always was, in the shader and the two CPU diagnostics - this is a separate, additive
+			// early-out). A whole subtree is only skippable when EVERY point in it is provably on the excluded side: normal mode
+			// prunes when the node's whole bounding sphere lies entirely outside [min, max]; inverted mode (hiding the shell)
+			// prunes when the whole sphere lies entirely inside it - the mirror image of the same margin test frustum-cull uses.
+			if(dist_clamp_enabled)
+			{
+				const float radius = cull_radii[cloud_idx_u32];
+				const bool outside = dist_clamp_invert
+					? (dist_to_node - radius >= dist_clamp_min && dist_to_node + radius <= dist_clamp_max)
+					: (dist_to_node + radius < dist_clamp_min || dist_to_node - radius > dist_clamp_max);
+				if(outside)
+				{
+					recordFrontierNode(cloud_idx_u32, top.member_idx, top.tree_local_idx, top.depth, FrontierStop_OutOfDistRange);
 					continue;
 				}
 			}
@@ -1029,6 +1057,9 @@ private:
 	bool build_unculled_frontier; // SESSION063: gather the SoA U(P) at the end of run() and hand it back on the result msg.
 	bool coarse_floor_enabled;    // SESSION063 K4: also capture the coarse floor.
 	float coarse_pixel_scale;     // SESSION063 K4: pixel_scale threshold for the coarse floor cut (>> pixel_scale_limit).
+	bool dist_clamp_enabled;      // SESSION072: distance-slice early-cull toggle - see GaussianSplatRenderer::getDistClampEnabled().
+	float dist_clamp_min, dist_clamp_max;
+	bool dist_clamp_invert;
 };
 
 
@@ -1047,7 +1078,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	// SESSION071: GaussianSplatMergeColourParams defaults to Energy - owner-confirmed better at every pixel scale limit tested; Legacy is kept only as the A/B comparison.
 	have_prev_think_cam_state(false), prev_think_cam_pos_ws(0.f), prev_think_cam_forward_ws(0.f), cam_velocity_ema_ws(0.f), cam_angular_speed_ema(0.f), cam_angular_speed_peak(0.f), cam_inst_angular_speed(0.f), cam_angular_axis_ema_ws(0.f), // SESSION072
 	splat_size_clamp_min(0.0f), splat_size_clamp_max(0.0f), splat_size_clamp_invert(false),
-	splat_dist_clamp_min(0.0f), splat_dist_clamp_max(1000.0f), splat_dist_clamp_invert(false), splat_alpha_cutoff(1.0f / 255.0f),
+	splat_dist_clamp_min(0.0f), splat_dist_clamp_max(1000.0f), splat_dist_clamp_invert(false), splat_dist_clamp_enabled(false), splat_alpha_cutoff(1.0f / 255.0f),
 	splat_alpha_gain(1.0f), splat_alpha_gamma(1.0f), // Identity: the cloud as captured - see getAlphaGain().
 	last_report_reached_rasteriser(0), last_report_in_frustum(0),
 	splat_num_draw_slices(1), splat_draw_slice_limit(0), splat_layer_cap(0), splat_layer_cap_opaque(true), splat_coverage_cap(0.f), splat_ablation_stage(0), splat_quad_radius_scale(1.f), cap_fill_mask_tex_uniform_loc(-2), splat_area_scale_gamma(1.f), splat_area_scale_ref_px(20.f), splat_coverage_shrink_strength(0.f), splat_coverage_shrink_mode(0), splat_coverage_reduce_mode(0), splat_show_coverage_map_level(-1), coverage_mask_tex_uniform_loc(-2), splat_ewa_fix_enabled(true), splat_near_fade_width(0.3f), splat_near_epsilon(0.1f), splat_dof_depth_mode(0), splat_dof_depth_prepass_alpha_min(0.3f), splat_hide_test_conservative(true), splat_layer_estimate_requested(false), splat_slice_growth(1.0f), splat_visible_slicing(false), splat_saturation_gate_enabled(false), splat_saturation_threshold(1.0f - 1.0f / 255.0f),
@@ -2041,11 +2072,14 @@ GaussianSplatRenderer::FrustumCounts GaussianSplatRenderer::countSplatsInFrustum
 					return false;
 			}
 
-			const Vec4f pos_vs = scene->last_view_matrix * Vec4f(pos.x, pos.y, pos.z, 1.f);
-			const float dist_to_cam = Vec4f(pos_vs[0], pos_vs[1], pos_vs[2], 0.f).length();
-			const bool inside_dist_range = (dist_to_cam >= splat_dist_clamp_min) && (dist_to_cam <= splat_dist_clamp_max);
-			if(splat_dist_clamp_invert ? inside_dist_range : !inside_dist_range)
-				return false;
+			if(splat_dist_clamp_enabled)
+			{
+				const Vec4f pos_vs = scene->last_view_matrix * Vec4f(pos.x, pos.y, pos.z, 1.f);
+				const float dist_to_cam = Vec4f(pos_vs[0], pos_vs[1], pos_vs[2], 0.f).length();
+				const bool inside_dist_range = (dist_to_cam >= splat_dist_clamp_min) && (dist_to_cam <= splat_dist_clamp_max);
+				if(splat_dist_clamp_invert ? inside_dist_range : !inside_dist_range)
+					return false;
+			}
 
 			return true;
 		};
@@ -2426,7 +2460,8 @@ static const char* const stop_reason_labels[FrontierStop_NumReasons] =
 	"depth cap",
 	"budget cap",
 	"member has no LoD tree",
-	"out of frustum" // SESSION055 - only produced by the fast path with cull enabled; getFrustumStructureReport() disables cull so this stays 0 there.
+	"out of frustum", // SESSION055 - only produced by the fast path with cull enabled; getFrustumStructureReport() disables cull so this stays 0 there.
+	"out of distance slice" // SESSION072 - only produced by the fast path with the dist-clamp checkbox on; getFrustumStructureReport() always leaves it off.
 };
 
 
@@ -2991,13 +3026,16 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 					continue;
 				}
 
-				const Vec4f pos_vs = scene->last_view_matrix * Vec4f(p.x, p.y, p.z, 1.f);
-				const float dist_to_cam = Vec4f(pos_vs[0], pos_vs[1], pos_vs[2], 0.f).length(); // The shader takes length(pos_vs.xyz), so the w the transform leaves must not be in it.
-				const bool inside_dist_range = (dist_to_cam >= splat_dist_clamp_min) && (dist_to_cam <= splat_dist_clamp_max);
-				if(splat_dist_clamp_invert ? inside_dist_range : !inside_dist_range)
+				if(splat_dist_clamp_enabled)
 				{
-					culled_by_dist_slice++;
-					continue;
+					const Vec4f pos_vs = scene->last_view_matrix * Vec4f(p.x, p.y, p.z, 1.f);
+					const float dist_to_cam = Vec4f(pos_vs[0], pos_vs[1], pos_vs[2], 0.f).length(); // The shader takes length(pos_vs.xyz), so the w the transform leaves must not be in it.
+					const bool inside_dist_range = (dist_to_cam >= splat_dist_clamp_min) && (dist_to_cam <= splat_dist_clamp_max);
+					if(splat_dist_clamp_invert ? inside_dist_range : !inside_dist_range)
+					{
+						culled_by_dist_slice++;
+						continue;
+					}
 				}
 
 				const SplatFootprint fp = splatFootprint(p, sc, cloud.rotations[idx], opacity, scene->last_view_matrix,
@@ -3811,7 +3849,7 @@ std::string GaussianSplatRenderer::getDiagnostics() const
 		", alpha_cutoff " + doubleToStringNDecimalPlaces(splat_alpha_cutoff, 4) + "\n";
 	// Printed whether or not it is doing anything, because a forgotten distance slice looks exactly like a broken scene.
 	s += "             dist_clamp [" + doubleToStringNDecimalPlaces(splat_dist_clamp_min, 2) + ", " + doubleToStringNDecimalPlaces(splat_dist_clamp_max, 2) + "] m" +
-		((splat_dist_clamp_min <= 0.f && splat_dist_clamp_max >= 1000.f && !splat_dist_clamp_invert) ? " (keeps everything)" : (splat_dist_clamp_invert ? " INVERTED - this shell is hidden" : " - only this shell is shown")) + "\n";
+		(!splat_dist_clamp_enabled ? " (disabled)" : (splat_dist_clamp_invert ? " INVERTED - this shell is hidden" : " - only this shell is shown")) + "\n"; // SESSION072: enable state now comes from its own checkbox, not from min/max sitting at the keep-everything default.
 	// Says when the request and the reality differ, rather than only what was asked for: the overdraw views force half
 	// float whatever this switch says, and a line reading RGBA8 next to a working overdraw ramp would be a puzzle.
 	s += "             accumulation buffer " + std::string(splat_accum_buffer_8bit ? "RGBA8" : "RGBA16F") +
@@ -5614,7 +5652,8 @@ void GaussianSplatRenderer::kickOffTraversals()
 			translation_dilation, rotation_dilation_rate,
 			&traversal_result_queue,
 			/*frontier_record=*/NULL, /*build_unculled_frontier=*/split_filter_enabled, // SESSION063: cull-off traversal builds U(P) for the split filter.
-			/*coarse_floor_enabled=*/split_filter_enabled && split_coarse_floor_enabled, /*coarse_pixel_scale=*/split_coarse_pixel_scale)); // SESSION063 K4.
+			/*coarse_floor_enabled=*/split_filter_enabled && split_coarse_floor_enabled, /*coarse_pixel_scale=*/split_coarse_pixel_scale, // SESSION063 K4.
+			/*dist_clamp_enabled=*/splat_dist_clamp_enabled, splat_dist_clamp_min, splat_dist_clamp_max, splat_dist_clamp_invert)); // SESSION072.
 	}
 
 	// SESSION055 diag: after the while-loop, detect *unmet* rotation demand - a cloud whose forward has shifted past the
@@ -5717,8 +5756,10 @@ void GaussianSplatRenderer::think()
 		mat.user_uniform_vals[6].intval = splat_show_overdraw_mode;
 		// 7 and 8 (splat_saturation_mask_block / _max_level) belong to the draw path, which decides per frame whether the
 		// gate actually runs - see setSplatMaskBlockSize().
-		mat.user_uniform_vals[9].vec2 = Vec2f(splat_dist_clamp_min, splat_dist_clamp_max);
-		mat.user_uniform_vals[10].intval = splat_dist_clamp_invert ? 1 : 0;
+		// SESSION072: no shader-side enabled flag needed - when the checkbox is off, upload a wide-open range instead
+		// (matches the "min 0 / max 1000 keeps everything" no-op the shader already relied on before the checkbox existed).
+		mat.user_uniform_vals[9].vec2 = splat_dist_clamp_enabled ? Vec2f(splat_dist_clamp_min, splat_dist_clamp_max) : Vec2f(0.f, std::numeric_limits<float>::max());
+		mat.user_uniform_vals[10].intval = (splat_dist_clamp_enabled && splat_dist_clamp_invert) ? 1 : 0;
 		// 11 (splat_mask_centre_test) also belongs to the draw path - see setSplatMaskBlockSize().
 		mat.user_uniform_vals[12].vec2 = Vec2f(splat_alpha_gain, splat_alpha_gamma); // See getAlphaGain().
 		// 13 (splat_frag_mask_block) belongs to the draw path - see setSplatFragMaskBlockSize().

@@ -378,6 +378,11 @@ public:
 	// false (default) = keep what is inside the range; true = keep what is outside it, i.e. cut that shell away.
 	bool getDistClampInvert() const { return splat_dist_clamp_invert; }
 	void setDistClampInvert(bool v) { splat_dist_clamp_invert = v; }
+	// SESSION072: master on/off for the whole distance-slice mechanism, separate from min/max/invert above. False (default)
+	// = fully inert everywhere it is checked (shader uniform upload, the two CPU diagnostics, and the traversal-time
+	// subtree prune in kickOffTraversals()) - min/max sitting at their keep-everything default is no longer what gates it.
+	bool getDistClampEnabled() const { return splat_dist_clamp_enabled; }
+	void setDistClampEnabled(bool v) { splat_dist_clamp_enabled = v; }
 
 	// Per-splat quad radius is cut to exactly where alpha decays to this value (opacity * exp(-0.5*k^2) = alpha_cutoff),
 	// instead of a fixed 3-sigma bound - see the derivation in gaussian_splat_vert_shader.glsl. Default 1/255 matches
@@ -1384,6 +1389,7 @@ private:
 	float splat_dist_clamp_min;
 	float splat_dist_clamp_max;
 	bool splat_dist_clamp_invert;
+	bool splat_dist_clamp_enabled; // See getDistClampEnabled() above. Default false.
 
 	// See getAlphaCutoff() above. Default 1/255 is lossless (matches the fragment shader's fixed discard threshold).
 	float splat_alpha_cutoff;

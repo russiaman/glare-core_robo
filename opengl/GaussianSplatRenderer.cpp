@@ -168,7 +168,8 @@ public:
 		last_traversal_kicked_topology_generation(0), last_traversal_hit_budget_cap(false), last_traversal_hit_density_cap(false), last_traversal_hit_depth_cap(false), last_traversal_dilation_elevated(false),
 		cached_traversal_geom_generation(0), importance_num_views(0),
 		filter_in_flight(false), ufrontier_needs_filter(false), have_last_filter_cam_forward(false), last_filter_cam_forward_ws(0.f), // SESSION063
-		filter_dilation_elevated(false) // SESSION066
+		filter_dilation_elevated(false), // SESSION066
+		diag_filter_kick_time_s(0.0), diag_filter_band_fine_rad(0.f), diag_applied_kick_forward_ws(0.f), diag_have_applied_filter(false) // SESSION073 DIAGNOSTIC
 	{}
 
 	uint64 cloud_id; // Stable, never reused.  Sort results carry it, so a result for a cloud that has since been merged away can be dropped.
@@ -227,6 +228,17 @@ public:
 	bool have_last_filter_cam_forward;
 	Vec4f last_filter_cam_forward_ws;      // Camera forward at the last filter kick, so a rotation past threshold re-filters - see kickOffFilters().
 	bool filter_dilation_elevated;         // SESSION066: true if the last filter kick for this cloud used an above-floor dilation band, so kickOffFilters() knows to fire one tight "settle" re-filter once the slow-decay peak falls back to the floor - the filter analogue of last_traversal_dilation_elevated. Without it a wide band from an in-motion kick would stay applied after the camera stops (the observed stall).
+
+	// SESSION073 DIAGNOSTIC (temporary - remove once the rotational-hole question is settled). Measures the dilation band's
+	// ADEQUACY directly, in degrees, rather than inferring it from compute times: a hole appears exactly when the camera
+	// turns further, while a draw list is on screen, than the band that list was dilated by. All three numbers the
+	// comparison needs are already on the main thread at drain time - only one filter per cloud is ever in flight, and
+	// think() drains before it kicks, so last_filter_cam_forward_ws still holds the forward of the kick that produced the
+	// result being drained. See the [gsr-filter-drain] print in drainFilterResults().
+	double diag_filter_kick_time_s;        // diag_timer.elapsed() at that kick, for the real kick->drain round-trip.
+	float diag_filter_band_fine_rad;       // swept_fine of that kick - the angular half-width the fine layer was dilated by.
+	Vec4f diag_applied_kick_forward_ws;    // Camera forward at the kick of the list CURRENTLY on screen, so the next drain can report the total angle that list went stale by before being replaced (the worst-case deficit, roughly double the kick->drain figure).
+	bool diag_have_applied_filter;         // False until the first result has been applied, so the first drain doesn't report a bogus staleness against a zero vector.
 
 	// SESSION059: true if the traversal just kicked for this cloud used a rotation_dilation_rate above the baseline
 	// floor (i.e. cam_angular_speed_ema/peak was elevated at kick time) - see kickOffTraversals()'s "settle" re-kick.
@@ -4385,6 +4397,9 @@ void GaussianSplatRenderer::noteDrawOrderForSlicing(SplatCloud& cloud, const uin
 	// SESSION066: retain the full draw order so the "Count in frustum" button can report the really-drawn count (draw list
 	// tested against the current frustum + slices). A single memcpy of the same indices just uploaded to the VBO; happens
 	// only on a draw-order write (traversal/filter land), not per frame.
+	// SESSION073: briefly gated behind a live checkbox (draw_order_diag_enabled) to avoid this on rotation once survivors
+	// reached a few million - reverted at the owner's request: the report should always reflect what's on screen without
+	// having to remember to arm a toggle first.
 	cloud.current_draw_indices.resizeNoCopy(count);
 	if(count > 0)
 		std::memcpy(cloud.current_draw_indices.data(), draw_indices, count * sizeof(uint32));
@@ -4776,6 +4791,78 @@ std::string GaussianSplatRenderer::restoreUnmergedSplats()
 
 	return "Restored " + uInt64ToStringCommaSeparated(members_restored) + " splat object(s) to their loaded splats (" +
 		uInt64ToStringCommaSeparated(total_splats) + " splats), in " + doubleToStringNDecimalPlaces(timer.elapsed(), 2) + " s.";
+}
+
+
+// SESSION073: see the header's comment. Builds a fresh GaussianSplatData per distinct source pointer (never mutates one
+// in place - an in-flight traversal/filter task may hold its own Reference to the object being rebuilt, mid-read, on a
+// worker thread; swapping member.splat_data to a new object is what keeps that read safe, same as applyCoplanarMerge()
+// above), then hands rebuildCloud() the swapped-in members exactly as applyCoplanarMerge() does.
+std::string GaussianSplatRenderer::rebuildAllLodTrees(float lod_base)
+{
+	Timer timer;
+
+	std::map<const GaussianSplatData*, GaussianSplatDataRef> rebuilt_for_source;
+
+	size_t members_rebuilt = 0, total_splats = 0, total_nodes = 0;
+
+	for(size_t c=0; c<clouds.size(); ++c)
+	{
+		SplatCloud& cloud = *clouds[c];
+
+		size_t rebuilt_here = 0;
+		for(size_t m=0; m<cloud.members.size(); ++m)
+		{
+			CloudMember& member = cloud.members[m];
+			const GaussianSplatDataRef& src = member.splat_data;
+			if(src.isNull() || src->numSplats() < 2)
+				continue;
+
+			std::map<const GaussianSplatData*, GaussianSplatDataRef>::iterator res = rebuilt_for_source.find(src.ptr());
+			if(res == rebuilt_for_source.end())
+			{
+				Reference<GaussianSplatData> rebuilt = new GaussianSplatData();
+				rebuilt->positions = src->positions;
+				rebuilt->scales    = src->scales;
+				rebuilt->rotations = src->rotations;
+				rebuilt->colours   = src->colours;
+				rebuilt->aabb_os   = src->aabb_os;
+
+				try
+				{
+					rebuilt->lod_tree = buildGaussianSplatLodTree(rebuilt->positions.data(), rebuilt->scales.data(), rebuilt->rotations.data(), rebuilt->colours.data(),
+						rebuilt->numSplats(), lod_base);
+				}
+				catch(std::exception&)
+				{
+					// As at load time: the tree is a nice-to-have, and an empty one means "no LoD, draw every splat" rather
+					// than a broken cloud - see mergedSplatData()'s own catch and GaussianSplatData::lod_tree's comment.
+					rebuilt->lod_tree.clear();
+				}
+
+				res = rebuilt_for_source.insert(std::make_pair(src.ptr(), rebuilt)).first;
+			}
+
+			member.splat_data = res->second;
+			member.count = res->second->numNodes();
+			total_splats += res->second->numSplats();
+			total_nodes += res->second->numNodes();
+			rebuilt_here++;
+		}
+
+		if(rebuilt_here > 0)
+		{
+			rebuildCloud(cloud);
+			members_rebuilt += rebuilt_here;
+		}
+	}
+
+	if(members_rebuilt == 0)
+		return "Rebuild LoDs: no splat cloud registered, nothing done.";
+
+	return "Rebuilt " + uInt64ToStringCommaSeparated(members_rebuilt) + " splat object(s) at lod_base " + doubleToStringNDecimalPlaces(lod_base, 3) + " (" +
+		uInt64ToStringCommaSeparated(total_splats) + " splats, " + uInt64ToStringCommaSeparated(total_nodes) + " tree nodes total), in " +
+		doubleToStringNDecimalPlaces(timer.elapsed(), 2) + " s.";
 }
 
 
@@ -5341,6 +5428,8 @@ void GaussianSplatRenderer::kickOffFilters()
 		best_cloud->filter_dilation_elevated = (w_effective > min_rot_rate_rad_s); // SESSION066: remember if this kick used an above-floor band, so the settle above can later tighten it once peak decays (and the settle kick itself, at ~floor width, clears it).
 		best_cloud->have_last_filter_cam_forward = true;
 		best_cloud->last_filter_cam_forward_ws = cam_forward_ws;
+		best_cloud->diag_filter_kick_time_s = diag_timer.elapsed();   // SESSION073 DIAGNOSTIC - see the member's comment.
+		best_cloud->diag_filter_band_fine_rad = swept_fine;           // SESSION073 DIAGNOSTIC: what this kick's fine layer actually dilated by, to compare against how far the camera turns before the result is replaced.
 		num_filters_in_flight++;
 
 		task_manager->addTask(new GaussianSplatFilterTask(best_cloud->cloud_id, best_cloud->cached_ufrontier,
@@ -5400,12 +5489,41 @@ void GaussianSplatRenderer::drainFilterResults()
 		cloud->ob->num_instances_to_draw = (int)survivors.size();
 		noteDrawOrderForSlicing(*cloud, survivors.data(), survivors.size());
 
+		// SESSION073 DIAGNOSTIC: band adequacy in degrees - see SplatCloud::diag_filter_kick_time_s's comment.
+		//   age    : real kick->drain round-trip (what the fixed filter_dilation_latency knob is supposed to stand in for).
+		//   swept  : how far the camera actually turned over that window.
+		//   band   : the angular margin this result was dilated by (swept_fine, from its own kick).
+		//   stale  : total angle the PREVIOUS list went stale by before this one replaced it - the worst case, since a list
+		//            stays on screen from its own kick until the next drain, not just until its own.
+		// A hole is expected exactly when stale > band; the excess is its angular size at the frustum edge.
+		// The two state writes are unconditional (a couple of assignments) so that toggling the log on mid-flight doesn't
+		// report its first line against a stale reference pose; only the trigonometry below is gated - session072 measured
+		// that diagnostic work in this path costs real frame time.
+		const Vec4f prev_applied_forward = cloud->diag_applied_kick_forward_ws;
+		const bool had_applied = cloud->diag_have_applied_filter;
+		cloud->diag_applied_kick_forward_ws = cloud->last_filter_cam_forward_ws; // This result is now the list on screen; the next drain reports how stale it got.
+		cloud->diag_have_applied_filter = true;
+
 		if(filter_debug_log) // SESSION064 DIAG: does the applied survivor count keep changing after the camera stops? That churn is what the gate turns into boiling.
-			conPrint("[gsr-filter-drain] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms surv=" + uInt64ToStringCommaSeparated(survivors.size()) +
+		{
+			const double now_s_diag = diag_timer.elapsed();
+			const Vec4f cur_forward_diag = normalise(opengl_engine->getCurrentScene()->cam_to_world.getColumn(1)); // Column 1 is forward; normalise because acos(dot()) silently under-reads small angles otherwise.
+			const float swept_deg = std::acos(myClamp(dot(cur_forward_diag, cloud->last_filter_cam_forward_ws), -1.f, 1.f)) * (180.f / 3.14159265f);
+			const float stale_deg = had_applied ?
+				(std::acos(myClamp(dot(cur_forward_diag, prev_applied_forward), -1.f, 1.f)) * (180.f / 3.14159265f)) : 0.f;
+			const float band_deg = cloud->diag_filter_band_fine_rad * (180.f / 3.14159265f);
+			conPrint("[gsr-filter-drain] t" + doubleToStringNDecimalPlaces(now_s_diag * 1000.0, 0) + "ms surv=" + uInt64ToStringCommaSeparated(survivors.size()) +
 				" coarse=" + uInt64ToStringCommaSeparated(msg->num_coarse_survivors) + // SESSION072 DIAGNOSTIC
 				" fine=" + uInt64ToStringCommaSeparated(survivors.size() - msg->num_coarse_survivors) +
 				" pool=" + uInt64ToStringCommaSeparated(msg->frontier->indices.size()) +
-				" compute=" + doubleToStringNDecimalPlaces(msg->filter_compute_ms, 2) + "ms"); // SESSION072 DIAGNOSTIC: pure filterUnculledFrontier() cost, no scheduling.
+				" compute=" + doubleToStringNDecimalPlaces(msg->filter_compute_ms, 2) + "ms" + // SESSION072 DIAGNOSTIC: pure filterUnculledFrontier() cost, no scheduling.
+				// SESSION073 DIAGNOSTIC - see the block above.
+				" age=" + doubleToStringNDecimalPlaces((now_s_diag - cloud->diag_filter_kick_time_s) * 1000.0, 1) + "ms" +
+				" swept=" + doubleToStringNDecimalPlaces(swept_deg, 2) + "deg" +
+				" band=" + doubleToStringNDecimalPlaces(band_deg, 2) + "deg" +
+				" stale=" + doubleToStringNDecimalPlaces(stale_deg, 2) + "deg" +
+				" deficit=" + doubleToStringNDecimalPlaces(stale_deg - band_deg, 2) + "deg");
+		}
 	}
 
 	completed_filter_msgs.clear();

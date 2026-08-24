@@ -225,6 +225,19 @@ public:
 	// eyes-on A/B at a fixed camera: a merge that changes the picture is only visible against the picture it changed.
 	std::string restoreUnmergedSplats();
 
+	// SESSION073: rebuilds every registered member's LoD tree in place, from its own current splats (whatever merge state
+	// they are already in - this does not re-run or undo a coplanar merge, only the tree), at the given lod_base. Exists
+	// because lod_base is otherwise a load-time-only knob (see GUIClient::gaussian_splat_lod_base's comment) - a tree
+	// already built keeps the lod_base it was built with even after the panel's spinbox changes, so trying a new value
+	// meant restarting the client. "Rebuild" beside the spinbox calls this instead.
+	//
+	// Synchronous, on the main thread, same cost class as applyCoplanarMerge() above (seconds on a multi-million-splat
+	// capture) - meant for an occasional button press, not a live-tunable.
+	//
+	// Dedups by source GaussianSplatData pointer (not the (source, scale) pair applyCoplanarMerge() uses): the tree
+	// doesn't depend on world scale, so two members sharing one decoded/merged source only pay the build once.
+	std::string rebuildAllLodTrees(float lod_base);
+
 	// Forces every cloud's LoD frontier to be recomputed on the next think()/kickOffTraversals(), bypassing the normal
 	// camera-movement threshold - for GaussianSplatSettingsWidget's live traversal parameters (pixel_scale_limit,
 	// max_splats_budget, max_layer_density, max_tree_depth), so a value change is visible immediately rather than

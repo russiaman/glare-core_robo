@@ -11,15 +11,6 @@ Copyright Glare Technologies Limited 2026 -
 #include <limits>
 
 
-// SESSION074: headroom between a coarse node's angular size and a grid tile's.
-//
-// 1 means "a tile is about as big as the node meant to fill it", which is what the rasterising build pass below wants:
-// a node then covers 1-4 tiles, so its footprint is captured almost exactly, with neither the ~16x write amplification
-// a finer grid would cost nor the coverage loss a coarser one would force. The first cut used 4 (tile a quarter of a
-// node per axis) while writing only the node's centre tile - the worst of both, and it also pinned res at
-// gsSatGridMaxTiles in every measured view, so the derivation never actually chose anything. See the plan snapshot.
-static const float gs_sat_grid_tile_headroom_K = 1.f;
-
 // SESSION074: fixed margin for the octahedral mapping's area distortion (not equal-area; the literature bounds the
 // stretch under 2x, worst near the square's corners). Applied to the tile's nominal angular size wherever a footprint
 // is compared against it, so every such comparison errs towards "this node covers fewer tiles than the ideal geometry
@@ -59,13 +50,14 @@ float gsSatGridTileAngle(int res)
 }
 
 
-int gsSatGridResForFocal(float focal_px, float coarse_pixel_scale)
+int gsSatGridResForFocal(float focal_px, float coarse_pixel_scale, float tile_subdiv)
 {
 	// SESSION074: derive tile angular size from the existing coarse_pixel_scale/focal_px knobs rather than exposing a
 	// new UI parameter - project rule, no manual per-scene tuning. A coarse node subtends about
-	// coarse_pixel_scale/focal_px radians; K sizes the tile against that (see the constant's comment).
+	// coarse_pixel_scale/focal_px radians; the subdivision sizes the tile against that.
+	// SESSION076 CALIBRATION: tile_subdiv replaces the fixed K - see the header.
 	const float safe_focal = myMax(focal_px, 1.f);
-	const float tile_ang = myMax(coarse_pixel_scale, 1.0e-3f) / (safe_focal * gs_sat_grid_tile_headroom_K);
+	const float tile_ang = myMax(coarse_pixel_scale, 1.0e-3f) / (safe_focal * myMax(tile_subdiv, 0.01f));
 
 	// Inverse of gsSatGridTileAngle(), including its distortion margin, so that the res chosen here and the tile size
 	// reported there are consistent with each other rather than two independent approximations.
@@ -156,7 +148,7 @@ static inline float gsSatExpNeg(float x) // x >= 0; caller has already rejected 
 
 
 void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, const float* radius, const float* alpha, size_t n,
-	const Vec4f& anchor_pos_ws, int res, float saturation_threshold,
+	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float coverage_sigmas,
 	js::Vector<float, 16>& sat_depth_out, size_t* out_writers, size_t* out_tile_writes)
 {
 	const size_t num_tiles = (size_t)res * (size_t)res;
@@ -239,15 +231,30 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 		// of, or interleaved with, the very geometry that saturated the tile.
 		const float far_edge = (1.f / inv_dist) + r;
 
-		// Touch span, not coverage span: with a falloff weight there is no longer any reason to demand full coverage,
-		// and a tile the footprint merely clips now correctly receives a small contribution instead of none.
-		const float span = radius_tiles + gs_sat_tile_half_diag;
+		// SESSION076: coverage span - only tiles lying FULLY inside the node's coverage disc may be claimed.
+		//
+		// The weight above says how much of the node is over a tile; this says whether the node is entitled to speak for
+		// that tile at all. Both are needed, and the first cut of the Gaussian model shipped without the second: every
+		// node wrote into all ~34 tiles it touched, the average tile received 586 contributions, transmittance collapsed
+		// at any threshold below 1.0, and geometry that merely SHARED a tile with something nearer was cut - a chair back
+		// protruding a tile's width above a table, with nothing in front of it, disappeared. Requiring full coverage makes
+		// "this tile's whole cone is blocked" a claim the node has established rather than a cone-average.
+		//
+		// Measured in the node's own sigmas, not in its 3-sigma extent, so the entitlement follows the dense core rather
+		// than the transparent tail - the 3-sigma tail claiming tiles is exactly what made shadows 3x too wide.
+		const float coverage_tiles = sigma_tiles * coverage_sigmas;
+		const float span = coverage_tiles - gs_sat_tile_half_diag;
+		if(span <= 0.f)
+			continue; // Too small to blanket any tile: it may occlude something, but not a whole tile's worth of directions.
+
 		const int u0 = myClamp((int)std::ceil (cu - span - 0.5f), 0, res - 1);
 		const int u1 = myClamp((int)std::floor(cu + span - 0.5f), 0, res - 1);
 		const int v0 = myClamp((int)std::ceil (cv - span - 0.5f), 0, res - 1);
 		const int v1 = myClamp((int)std::floor(cv + span - 0.5f), 0, res - 1);
 		if(u1 < u0 || v1 < v0)
 			continue;
+
+		const float span_sq = span * span;
 
 		if(out_writers) ++(*out_writers); // SESSION076 DIAGNOSTIC: this node contributes something.
 
@@ -261,8 +268,14 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 			const float dv_sq = dv * dv;
 			for(int u=u0; u<=u1; ++u)
 			{
+				// The [u0,u1]x[v0,v1] box bounds the covered set; its corners can still fall outside the disc, so test
+				// each tile centre exactly. Over-claiming here is precisely the unsafe direction.
 				const float du = ((float)u + 0.5f) - cu;
-				const float x = (du * du + dv_sq) * inv_2var;
+				const float d_sq = du * du + dv_sq;
+				if(d_sq > span_sq)
+					continue;
+
+				const float x = d_sq * inv_2var;
 				if(x >= gs_sat_exp_lut_max)
 					continue; // Contribution below the lookup's tail - see gs_sat_exp_lut_max.
 

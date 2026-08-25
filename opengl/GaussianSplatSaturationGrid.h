@@ -64,7 +64,11 @@ already-opaque coverage, never something that might still be visible in front of
 // the ceiling was silently the only thing setting resolution. With K=1 (see gsSatGridResForFocal()) the natural res
 // is ~4x smaller per axis, so this ceiling is back to being what it was meant to be: an unreachable backstop for
 // extreme zoom, not the operating point.
-static const int gsSatGridMaxTiles = 300000;
+// SESSION076 CALIBRATION: raised from 300000. The subdivision factor is now a live knob (see gsSatGridResForFocal())
+// while the working point is being found, and at the values under test the old ceiling bound in every view - which is
+// precisely the failure mode this constant's own comment warns about, the ceiling silently becoming the only thing
+// setting resolution. Revisit downwards once the subdivision is frozen back into a constant.
+static const int gsSatGridMaxTiles = 2500000;
 
 // SESSION074: floor on grid resolution, guarding degenerate inputs (focal_px near zero, etc.) from producing a
 // grid too coarse to be useful at all. 8x8 = 64 tiles is a deliberately generous floor - never expected to bind in
@@ -117,7 +121,13 @@ Vec2f gsDirToOct(const Vec4f& dir);
 
 // Grid resolution (grid is res x res, covering the WHOLE sphere in one octahedral square - see gsDirToOct()) derived
 // from the existing coarse_pixel_scale/focal_px knobs, no new UI parameter - see the .cpp for the derivation.
-int gsSatGridResForFocal(float focal_px, float coarse_pixel_scale);
+//
+// SESSION076 CALIBRATION: tile_subdiv divides the tile's angular size, i.e. res scales with it. It exists because the
+// grid's angular resolution turned out to be the binding constraint on silhouette accuracy: a tile spans
+// coarse_pixel_scale (30 px at the owner's settings), so a 30-50 px feature - a chair back protruding above a table -
+// lands inside a single tile together with the near geometry beside it, and one scalar barrier per tile cannot keep one
+// and drop the other. Live knob while the working point is found; to be frozen as a constant afterwards.
+int gsSatGridResForFocal(float focal_px, float coarse_pixel_scale, float tile_subdiv);
 
 // Tile index (row-major, [0, res*res)) for a direction (any positive length - see gsDirToOct()).
 int gsSatGridTileForDir(const Vec4f& dir, int res);
@@ -172,8 +182,16 @@ float gsSatGridTileAngle(int res);
 // their zeroing) with the number of nodes that cleared the full-coverage test and the total number of per-tile writes
 // those nodes made. Both are gated by the "sat diag" checkbox at the call site and left null otherwise, so the hot
 // loop pays only a null test per node in normal operation.
+//
+// SESSION076 CALIBRATION: coverage_sigmas is how far out, in the node's own sigmas, it is allowed to CLAIM a tile - as
+// opposed to gs_sat_occluder_sigmas, which is how far its weighting extends. A tile is written only if it lies fully
+// inside that coverage disc, so the claim "this whole tile's cone is behind opaque coverage" is one the node has
+// actually established rather than an average over a cone it only partly fills. Dropping that requirement (the first
+// cut of the Gaussian model) let every node write into all 34 tiles it touched, which put 586 contributions into the
+// average tile, collapsed transmittance at any threshold below 1.0, and cut visible geometry that happened to share a
+// tile with something nearer. Live knob while the working point is found; to be frozen as a constant afterwards.
 void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, const float* radius, const float* alpha, size_t n,
-	const Vec4f& anchor_pos_ws, int res, float saturation_threshold,
+	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float coverage_sigmas,
 	js::Vector<float, 16>& sat_depth_out, size_t* out_writers = NULL, size_t* out_tile_writes = NULL);
 
 

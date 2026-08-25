@@ -787,7 +787,8 @@ public:
 		bool dist_clamp_enabled_ = false, float dist_clamp_min_ = 0.f, float dist_clamp_max_ = 0.f, bool dist_clamp_invert_ = false, // SESSION072: distance-slice early-cull, mirrors the frustum-cull block below - see GaussianSplatRenderer::getDistClampEnabled(). Defaults off, so getFrustumStructureReport()'s call site (which omits these) always sees the whole tree.
 		GaussianSplatSatPrefilterMode sat_prefilter_mode_ = GaussianSplatSatPrefilterMode_Off, float sat_saturation_threshold_ = 0.f, // SESSION074: pre-GPU saturation cull - see GaussianSplatSaturationGrid.h. Defaults off; only meaningful when build_unculled_frontier_ and coarse_floor_enabled_ are also both true (the grid is built from the coarse floor captured into U(P)). Drop mode prunes the frontier here; Count only tallies.
 		bool sat_diag_log_ = false, // SESSION076 DIAGNOSTIC: gated by its own "sat diag" checkbox - fills GaussianSplatUnculledFrontier's sat_diag_* counters. Off means the extra counting is not done at all.
-		bool coarse_layer_drawn_ = true) // SESSION076: whether anything will actually DRAW the captured coarse layer (the "coarse" checkbox). False means it was captured solely to feed the saturation grid, which lets this task both skip capturing nodes the grid cannot use and evict the rest once the grid is built - see the capture block and the compaction loop in run(). Defaults true, i.e. the pre-session076 behaviour, so callers that don't care are unaffected.
+		bool coarse_layer_drawn_ = true, // SESSION076: whether anything will actually DRAW the captured coarse layer (the "coarse" checkbox). False means it was captured solely to feed the saturation grid, which lets this task both skip capturing nodes the grid cannot use and evict the rest once the grid is built - see the capture block and the compaction loop in run(). Defaults true, i.e. the pre-session076 behaviour, so callers that don't care are unaffected.
+		float sat_grid_subdiv_ = 1.f, float sat_coverage_sigmas_ = 1.f) // SESSION076 CALIBRATION - see GaussianSplatRenderer::getSatGridSubdiv().
 	:	cloud_id(cloud_id_), topology_generation(topology_generation_), scratch(scratch_), cam_pos_ws(cam_pos_ws_),
 		pixel_scale_limit(pixel_scale_limit_), max_splats_budget(max_splats_budget_), max_layer_density(max_layer_density_), max_tree_depth(max_tree_depth_), focal_px(focal_px_),
 		num_frustum_clip_planes(num_frustum_clip_planes_), frustum_cull_enabled(frustum_cull_enabled_),
@@ -798,7 +799,8 @@ public:
 		coarse_floor_enabled(coarse_floor_enabled_), coarse_pixel_scale(coarse_pixel_scale_),
 		dist_clamp_enabled(dist_clamp_enabled_), dist_clamp_min(dist_clamp_min_), dist_clamp_max(dist_clamp_max_), dist_clamp_invert(dist_clamp_invert_),
 		sat_prefilter_mode(sat_prefilter_mode_), sat_saturation_threshold(sat_saturation_threshold_), // SESSION074
-		sat_diag_log(sat_diag_log_), coarse_layer_drawn(coarse_layer_drawn_) // SESSION076
+		sat_diag_log(sat_diag_log_), coarse_layer_drawn(coarse_layer_drawn_),
+		sat_grid_subdiv(sat_grid_subdiv_), sat_coverage_sigmas(sat_coverage_sigmas_) // SESSION076
 	{
 		if(num_frustum_clip_planes < 0)
 			num_frustum_clip_planes = 0;
@@ -1184,10 +1186,10 @@ public:
 					uf2->focal_px = uf->focal_px;
 
 					uf2->sat_num_coarse = coarse_px.size();
-					uf2->sat_grid_res = gsSatGridResForFocal(focal_px, coarse_pixel_scale);
+					uf2->sat_grid_res = gsSatGridResForFocal(focal_px, coarse_pixel_scale, sat_grid_subdiv); // SESSION076 CALIBRATION
 					Timer sat_grid_timer; // SESSION074 DIAGNOSTIC - see sat_grid_build_ms / [gsr-sat]'s grid_ms.
 					gsBuildSaturationGrid(coarse_px.data(), coarse_py.data(), coarse_pz.data(), coarse_radius.data(), coarse_alpha.data(), coarse_px.size(),
-						cam_pos_ws, uf2->sat_grid_res, sat_saturation_threshold, uf2->sat_depth,
+						cam_pos_ws, uf2->sat_grid_res, sat_saturation_threshold, sat_coverage_sigmas, uf2->sat_depth,
 						sat_diag_log ? &uf2->sat_diag_writers : NULL, sat_diag_log ? &uf2->sat_diag_tile_writes : NULL); // SESSION076 DIAGNOSTIC - null (no counting) unless the sat diag checkbox is on.
 					uf2->sat_grid_build_ms = sat_grid_timer.elapsed() * 1.0e3;
 
@@ -1333,6 +1335,7 @@ private:
 	float sat_saturation_threshold;  // SESSION074: reuses the existing splat_saturation_threshold live knob (GaussianSplatRenderer::getSaturationThreshold()) - no new threshold introduced, see the plan's "no manual per-scene tuning" constraint.
 	bool sat_diag_log;               // SESSION076 DIAGNOSTIC: see the ctor param.
 	bool coarse_layer_drawn;         // SESSION076: see the ctor param.
+	float sat_grid_subdiv, sat_coverage_sigmas; // SESSION076 CALIBRATION: see the ctor param.
 };
 
 
@@ -1347,7 +1350,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	split_coarse_floor_enabled(true), split_coarse_pixel_scale(30.f), filter_coarse_dilation_latency(0.9f), coarse_layer_debug(false), // SESSION063 K4
 	filter_debug_log(false), kick_debug_log(false), cpu_prof_log(false), // SESSION072: default off - see getFilterDebugLog()'s comment.
 	sat_prefilter_mode(GaussianSplatSatPrefilterMode_Off), filter_frustum_planes_enabled(true), // SESSION074: stage off by default, frustum planes on (i.e. unchanged pipeline) - see getSatPrefilterMode()/getFilterFrustumPlanesEnabled().
-	sat_diag_log(false), // SESSION076: diagnostic off by default - see getSatDiagLog().
+	sat_diag_log(false), sat_grid_subdiv(3.f), sat_coverage_sigmas(1.f), // SESSION076: diagnostic off by default - see getSatDiagLog(). Calibration defaults are the values reasoned to on paper, not yet confirmed on a scene.
 	splat_point_size_px(1.f),
 	splat_merge_spread_widen(3.0f), // SESSION071: analytic minimum is sqrt(3) (see widenedMergedScale()); owner default set higher for extra margin.
 	// SESSION071: GaussianSplatMergeColourParams defaults to Energy - owner-confirmed better at every pixel scale limit tested; Legacy is kept only as the A/B comparison.
@@ -4619,6 +4622,37 @@ void GaussianSplatRenderer::setSatDiagLog(bool v)
 }
 
 
+// SESSION076 CALIBRATION: both rebuild the saturation grid from scratch, so like setSatPrefilterMode() they must force
+// a fresh traversal - otherwise a live change sits invisible until the camera happens to move, which during pure
+// rotation is never. See getSatGridSubdiv().
+void GaussianSplatRenderer::setSatGridSubdiv(float v)
+{
+	if(v == sat_grid_subdiv)
+		return;
+	sat_grid_subdiv = v;
+
+	for(size_t i=0; i<clouds.size(); ++i)
+	{
+		clouds[i]->cached_ufrontier = NULL;
+		clouds[i]->have_last_traversal_cam_pos = false;
+	}
+}
+
+
+void GaussianSplatRenderer::setSatCoverageSigmas(float v)
+{
+	if(v == sat_coverage_sigmas)
+		return;
+	sat_coverage_sigmas = v;
+
+	for(size_t i=0; i<clouds.size(); ++i)
+	{
+		clouds[i]->cached_ufrontier = NULL;
+		clouds[i]->have_last_traversal_cam_pos = false;
+	}
+}
+
+
 void GaussianSplatRenderer::setMergeColourMode(GaussianSplatMergeColourMode v)
 {
 	if(v == splat_merge_colour_params.mode)
@@ -6199,7 +6233,8 @@ void GaussianSplatRenderer::kickOffTraversals()
 			/*dist_clamp_enabled=*/splat_dist_clamp_enabled, splat_dist_clamp_min, splat_dist_clamp_max, splat_dist_clamp_invert, // SESSION072.
 			/*sat_prefilter_mode=*/split_filter_enabled ? sat_prefilter_mode : GaussianSplatSatPrefilterMode_Off, splat_saturation_threshold, // SESSION074, SESSION075: no longer needs coarse_capture_needed here - it's already folded into coarse_floor_enabled_ above, which capture is gated on.
 			/*sat_diag_log=*/sat_diag_log, // SESSION076 DIAGNOSTIC.
-			/*coarse_layer_drawn=*/split_coarse_floor_enabled)); // SESSION076: lets the task skip/evict coarse nodes when the layer is captured only to feed the saturation grid - see its ctor param.
+			/*coarse_layer_drawn=*/split_coarse_floor_enabled, // SESSION076: lets the task skip/evict coarse nodes when the layer is captured only to feed the saturation grid - see its ctor param.
+			/*sat_grid_subdiv=*/sat_grid_subdiv, /*sat_coverage_sigmas=*/sat_coverage_sigmas));
 	}
 
 	// SESSION055 diag: after the while-loop, detect *unmet* rotation demand - a cloud whose forward has shifted past the

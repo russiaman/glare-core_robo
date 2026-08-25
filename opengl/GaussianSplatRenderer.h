@@ -370,6 +370,23 @@ public:
 	bool getSatDiagLog() const { return sat_diag_log; }
 	void setSatDiagLog(bool v);
 
+	// SESSION076 CALIBRATION, both temporary: the saturation grid's angular resolution and how far a node may claim.
+	// Exposed as live knobs only to find the working point on a real scene - once found, both are to be frozen back
+	// into code constants and the UI removed (project rule: no manual per-scene tuning; a knob used to MEASURE is
+	// fine, a knob the scene depends on is not).
+	//
+	//  - subdiv divides the tile's angular size, so grid res scales with it. Silhouette accuracy is bounded by tile
+	//    size: at subdiv 1 a tile spans coarse_pixel_scale (30 px at the owner's settings), which cannot separate a
+	//    30-50 px feature from the geometry beside it.
+	//  - coverage sigmas is how far out, in the node's own sigmas, it may claim a tile as fully behind it. Independent
+	//    of the weighting extent (gs_sat_occluder_sigmas) - see gsBuildSaturationGrid().
+	//
+	// Both change what a traversal PRODUCES, so both setters drop cached frontiers, as setSatPrefilterMode() does.
+	float getSatGridSubdiv() const { return sat_grid_subdiv; }
+	void setSatGridSubdiv(float v);
+	float getSatCoverageSigmas() const { return sat_coverage_sigmas; }
+	void setSatCoverageSigmas(float v);
+
 	// SESSION074: whether the per-orientation filter applies the frustum planes at all. On (the default) is the normal
 	// pipeline. Off keeps the whole split-filter machinery running - U(P) is still built and streamed, the saturation
 	// pre-filter above still runs on every node - but no node is ever rejected for being outside the view, so the two
@@ -1425,6 +1442,7 @@ private:
 	GaussianSplatSatPrefilterMode sat_prefilter_mode; // SESSION074 - see getSatPrefilterMode(). [gsr-sat] trace reuses filter_debug_log above (plan's own choice - one checkbox, not a second toggle) - see drainFilterResults().
 	bool filter_frustum_planes_enabled;              // SESSION074 - see getFilterFrustumPlanesEnabled().
 	bool sat_diag_log;                               // SESSION076 - see getSatDiagLog(). Own toggle, not folded into filter_debug_log, because the counting itself perturbs what is being measured.
+	float sat_grid_subdiv, sat_coverage_sigmas;      // SESSION076 CALIBRATION - see getSatGridSubdiv()/getSatCoverageSigmas().
 
 	// SESSION055: camera-motion tracker for anisotropic frustum-cull dilation. think() diffs the current cam pose against
 	// the previous one to compute an instantaneous velocity and angular speed, feeds them through an EMA with a

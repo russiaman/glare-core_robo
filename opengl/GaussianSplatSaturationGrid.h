@@ -196,9 +196,31 @@ float gsSatGridTileAngle(int res);
 // grid round blobs. With the FINE frontier as input, a node's footprint IS the geometry's footprint, and every node
 // contributes in proportion to how much of a tile it actually covers - which is the whole model, with nothing left to
 // arbitrate. See the .cpp's write loop.
+// SESSION077 DIAGNOSTIC: out_accum_t, when non-null, receives the pass's final per-tile TRANSMITTANCE (res*res, 1 =
+// nothing occludes this direction, 0 = fully blocked) - the running quantity the barrier decision is made from, which
+// otherwise dies with this function's local scratch. Only the debug overlay reads it, and only while the "diag"
+// checkbox is on: the binary "is this tile saturated?" that sat_depth_out records is a single threshold test away from
+// it (t <= 1 - saturation_threshold), so the overlay can show either view from this one array.
+//
+// Requesting this ALSO changes what gets computed, not just what gets kept: with out_accum_t null (the production
+// path - prune, or diag off), a tile stops being written to the instant it first crosses the threshold, so its
+// transmittance is whatever value first tripped it, not the true product of every occluder that touched it - cheap,
+// and irrelevant to sat_depth_out, which only ever asks "occluded or not". With out_accum_t non-null, every touching
+// occluder keeps multiplying in regardless, so the overlay reads the UNCLAMPED value - see the .cpp write loop's
+// already_saturated guard. sat_depth_out's own barrier is bit-identical either way: it is still latched on the FIRST
+// crossing only, so nothing about the prune's behaviour changes by asking for this.
+// SESSION077 DIAGNOSTIC: out_amp_sum, when non-null, receives the pass's per-tile SUM of every touching occluder's
+// weighted contribution (amp * gaussian falloff to the tile) - unlike out_accum_t's transmittance, which is a PRODUCT
+// of (1 - contribution) terms and is therefore bounded to [0, 1] and visually saturates towards 1 however much
+// occluding mass actually piled up, this sum has no ceiling: a tile ten occluders deep reads roughly 10x a tile with
+// one. Owner-requested (session077) specifically to see the RANGE of how much is contributing, not just whether the
+// threshold was crossed - out_accum_t alone cannot distinguish "barely occluded" from "extremely occluded" once both
+// are near 1. Computed under the same condition as out_accum_t (both are requested together by the one diag call
+// site) - see the .cpp write loop.
 void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, const float* radius, const float* alpha, size_t n,
 	const Vec4f& anchor_pos_ws, int res, float saturation_threshold,
-	js::Vector<float, 16>& sat_depth_out, size_t* out_writers = NULL, size_t* out_tile_writes = NULL);
+	js::Vector<float, 16>& sat_depth_out, size_t* out_writers = NULL, size_t* out_tile_writes = NULL,
+	js::Vector<float, 16>* out_accum_t = NULL, js::Vector<float, 16>* out_amp_sum = NULL);
 
 
 // SESSION074: pass 2's per-node read - true if this fine node is unambiguously behind saturated coarse geometry, so

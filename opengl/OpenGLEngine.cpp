@@ -206,7 +206,9 @@ enum TextureUnitIndices
 
 	SPLAT_SATURATION_MASK_TEXTURE_UNIT_INDEX, // The splat program's second texture, after the packed splat data - see drawSplatClouds().
 	SPLAT_COVERAGE_MASK_TEXTURE_UNIT_INDEX, // The splat program's third texture - see GaussianSplatRenderer::getCoverageShrinkStrength().
-	SPLAT_HIDE_COUNT_TEXTURE_UNIT_INDEX // SESSION066 - the "Clip" diagnostic's own overdraw-count texture - see drawSplatClouds().
+	SPLAT_HIDE_COUNT_TEXTURE_UNIT_INDEX, // SESSION066 - the "Clip" diagnostic's own overdraw-count texture - see drawSplatClouds().
+	SAT_GRID_DEBUG_TEXTURE_UNIT_INDEX, // SESSION076 §9 - see drawSatGridDebugSphere().
+	SAT_GRID_DEBUG_RAMP_TEXTURE_UNIT_INDEX // SESSION077 - the ramp view's own unbounded-sum texture, same function.
 };
 
 
@@ -2828,6 +2830,11 @@ void OpenGLEngine::buildPrograms()
 
 		clearProbeIrradianceAtlas(); // Also sets global_sky_probe_needs_bake.
 	}
+
+	//------------------------------------------- Build saturation-grid debug prog -------------------------------------------
+	// SESSION076 §9: unconditional (unlike the probe progs above) - splat_renderer always exists (see line ~596), and
+	// this overlay's own gate is the "diag" checkbox at the drawSatGridDebugSphere() call site, not a build-time setting.
+	sat_grid_debug_prog = buildSatGridDebugProg();
 
 
 	if(settings.render_to_offscreen_renderbuffers)
@@ -7024,6 +7031,99 @@ void OpenGLEngine::drawProbeDebugSpheres(const Matrix4f& view_matrix, const Matr
 }
 
 
+OpenGLProgramRef OpenGLEngine::buildSatGridDebugProg()
+{
+	const std::string key_defs = preprocessorDefsForKey(ProgramKey(ProgramKey::ProgramName_blur_ssao, ProgramKeyArgs())); // Needed to define MATERIALISE_EFFECT to 0 etc. for frag_utils_glsl.
+
+	OpenGLProgramRef prog = new OpenGLProgram(
+		"sat_grid_debug",
+		new OpenGLShader(shaders_dir + "/sat_grid_debug_vert_shader.glsl", version_directive, key_defs + preprocessor_defines, GL_VERTEX_SHADER),
+		new OpenGLShader(shaders_dir + "/sat_grid_debug_frag_shader.glsl", version_directive, key_defs + preprocessor_defines + frag_utils_glsl, GL_FRAGMENT_SHADER),
+		getAndIncrNextProgramIndex(),
+		/*wait for build to complete=*/true
+	);
+	getUniformLocations(prog);
+	addProgram(prog);
+
+	sat_grid_debug_sphere_pos_radius_location   = prog->getUniformLocation("sat_grid_sphere_pos_radius");
+	sat_grid_debug_tex_location                 = prog->getUniformLocation("sat_grid_tex");
+	sat_grid_debug_ramp_tex_location            = prog->getUniformLocation("sat_grid_ramp_tex");
+	sat_grid_debug_remaining_threshold_location = prog->getUniformLocation("sat_grid_remaining_threshold");
+	sat_grid_debug_mode_location                = prog->getUniformLocation("sat_grid_debug_mode");
+	sat_grid_debug_ramp_range_min_location      = prog->getUniformLocation("sat_grid_ramp_range_min");
+	sat_grid_debug_ramp_range_max_location      = prog->getUniformLocation("sat_grid_ramp_range_max");
+
+	return prog;
+}
+
+
+// SESSION076 §9: overlay the saturation grid's sat_depth over the current view, as a giant sphere centred on the
+// frontier's anchor position with the camera inside it - see GaussianSplatSaturationGrid.h and the session077
+// snapshot for what is being shown and why this is the chosen visualisation method.
+// Called from draw() right after drawSplatClouds(), gated on GaussianSplatRenderer::getSatDiagLog() ("diag" checkbox)
+// at the call site - see there for why that's the gate.
+void OpenGLEngine::drawSatGridDebugSphere(const Matrix4f& view_matrix, const Matrix4f& proj_matrix)
+{
+	DebugGroup debug_group("drawSatGridDebugSphere");
+
+	std::vector<GaussianSplatRenderer::SatGridDebugInfo> spheres;
+	splat_renderer->getSatGridDebugInfo(spheres);
+	if(spheres.empty())
+		return;
+
+	if(current_scene->render_to_main_render_framebuffer)
+	{
+		current_scene->main_render_framebuffer->bindForDrawing();
+		current_scene->main_render_framebuffer->setSingleDrawBuffer(GL_COLOR_ATTACHMENT0); // Colour only - see sat_grid_debug_frag_shader.glsl.
+	}
+	else if(this->target_frame_buffer)
+	{
+		this->target_frame_buffer->bindForDrawing();
+		this->target_frame_buffer->setSingleDrawBuffer(GL_COLOR_ATTACHMENT0);
+	}
+
+	sat_grid_debug_prog->useProgram();
+	setSharedUniformsForProg(*sat_grid_debug_prog, view_matrix, proj_matrix);
+
+	// SESSION077: the same threshold test the grid build makes, so the binary view is the prune's own verdict rather
+	// than a re-derivation of it - see gsBuildSaturationGrid()'s remaining_threshold.
+	glUniform1f(sat_grid_debug_remaining_threshold_location, myClamp(1.f - splat_renderer->getSaturationThreshold(), 0.f, 1.f));
+	glUniform1i(sat_grid_debug_mode_location, splat_renderer->getSatGridDebugRamp() ? 1 : 0);
+	glUniform1f(sat_grid_debug_ramp_range_min_location, splat_renderer->getOverdrawRangeMin()); // SESSION077: shared with the overdraw view's own range controls - see the shader's comment.
+	glUniform1f(sat_grid_debug_ramp_range_max_location, splat_renderer->getOverdrawRangeMax());
+
+	glDisable(GL_DEPTH_TEST); // Draw over everything, including splats - see the shader header comment.
+	glDepthMask(GL_FALSE);
+	glEnable(GL_BLEND);
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+	// No face culling: camera is inside the sphere, so the visible surface is its geometric back face under
+	// makeSphereMesh()'s winding - same situation as drawProbeDebugSpheres(), see its comment.
+	glDisable(GL_CULL_FACE);
+
+	bindMeshData(*sphere_meshdata);
+
+	const float radius = current_scene->max_draw_dist * 0.95f; // Just inside far-clip, so perspective doesn't cut the sphere.
+
+	for(size_t i=0; i<spheres.size(); ++i)
+	{
+		bindTextureUnitToSampler(*spheres[i].tex,      SAT_GRID_DEBUG_TEXTURE_UNIT_INDEX,      sat_grid_debug_tex_location);
+		bindTextureUnitToSampler(*spheres[i].ramp_tex, SAT_GRID_DEBUG_RAMP_TEXTURE_UNIT_INDEX, sat_grid_debug_ramp_tex_location);
+
+		glUniform4f(sat_grid_debug_sphere_pos_radius_location, spheres[i].anchor_ws[0], spheres[i].anchor_ws[1], spheres[i].anchor_ws[2], radius);
+
+		drawElementsBaseVertex(GL_TRIANGLES, (GLsizei)sphere_meshdata->batches[0].num_indices, sphere_meshdata->getIndexType(),
+			(void*)sphere_meshdata->getBatch0IndicesTotalBufferOffset(), sphere_meshdata->vbo_handle.base_vertex);
+	}
+
+	flushDrawCommandsAndUnbindPrograms();
+
+	glDepthMask(GL_TRUE); // Restore.
+	glDisable(GL_BLEND);
+	glEnable(GL_DEPTH_TEST);
+}
+
+
 // The probe members of MaterialCommonUniforms are present whether or not probes are enabled, so that the block
 // layout does not depend on the setting.  They are just left zeroed when there are no probes.
 void OpenGLEngine::setProbeGridUniforms(MaterialCommonUniforms& common_uniforms)
@@ -7715,6 +7815,15 @@ void OpenGLEngine::draw()
 		catch(glare::Exception& e)
 		{
 			conPrint("Error while reloading downsize and blur progs: " + e.what());
+		}
+
+		try
+		{
+			sat_grid_debug_prog = buildSatGridDebugProg();
+		}
+		catch(glare::Exception& e)
+		{
+			conPrint("Error while reloading sat grid debug prog: " + e.what());
 		}
 
 		// Try and reload draw-aurora shader
@@ -8474,6 +8583,10 @@ void OpenGLEngine::draw()
 	//================= Draw Gaussian splat clouds =================
 	// Before the alpha-blended objects, so that transparent props composite over splat captures, which are environment content.
 	drawSplatClouds(view_matrix, proj_matrix);
+
+	//================= Draw saturation-grid debug overlay (SESSION076 §9) =================
+	if(splat_renderer->getSatDiagLog())
+		drawSatGridDebugSphere(view_matrix, proj_matrix);
 
 	//================= Draw triangle batches with that use alpha-blending (e.g. participating media materials / particles, text objects) =================
 	drawAlphaBlendedObjects(view_matrix, proj_matrix);

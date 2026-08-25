@@ -149,12 +149,18 @@ static inline float gsSatExpNeg(float x) // x >= 0; caller has already rejected 
 
 void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, const float* radius, const float* alpha, size_t n,
 	const Vec4f& anchor_pos_ws, int res, float saturation_threshold,
-	js::Vector<float, 16>& sat_depth_out, size_t* out_writers, size_t* out_tile_writes)
+	js::Vector<float, 16>& sat_depth_out, size_t* out_writers, size_t* out_tile_writes,
+	js::Vector<float, 16>* out_accum_t, js::Vector<float, 16>* out_amp_sum)
 {
 	const size_t num_tiles = (size_t)res * (size_t)res;
 	sat_depth_out.resizeNoCopy(num_tiles);
 	for(size_t i=0; i<num_tiles; ++i)
 		sat_depth_out[i] = std::numeric_limits<float>::infinity();
+
+	// SESSION077 DIAGNOSTIC: unbounded companion to accum_t below - see out_amp_sum's header comment.
+	js::Vector<float, 16> amp_sum;
+	if(out_amp_sum)
+		amp_sum.resize(num_tiles, 0.f);
 
 	// SESSION074: running per-tile transmittance, local scratch only (not stored on the frontier - sat_depth_out is
 	// the only thing callers need). Reset to 1 (fully transparent) before the sequential pass below.
@@ -258,6 +264,7 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 		{
 			float* const accum_row = &accum_t[(size_t)v * (size_t)res];
 			float* const depth_row = &sat_depth_out[(size_t)v * (size_t)res];
+			float* const sum_row = out_amp_sum ? &amp_sum[(size_t)v * (size_t)res] : NULL;
 			const float dv = ((float)v + 0.5f) - cv;
 			const float dv_sq = dv * dv;
 			for(int u=u0; u<=u1; ++u)
@@ -267,17 +274,41 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 				if(x >= gs_sat_exp_lut_max)
 					continue; // Contribution below the lookup's tail - see gs_sat_exp_lut_max.
 
-				if(depth_row[u] != std::numeric_limits<float>::infinity())
-					continue; // Already saturated by something nearer (front-to-back order) - nothing more to do for this tile.
+				const float w = gsSatExpNeg(x); // Gaussian falloff to this tile - shared by both accumulators below.
+				const bool already_saturated = depth_row[u] != std::numeric_limits<float>::infinity();
+
+				// SESSION077: the fast path (skip a tile once its barrier is set) is unchanged when nobody wants the
+				// diagnostic accumulators - sat_depth_out's semantics (barrier = FIRST crossing's far edge) do not need
+				// any writes past that point, so production runs (prune, or diag off) keep paying for exactly what they
+				// use.
+				//
+				// With out_accum_t/out_amp_sum requested, keep accumulating past saturation too: sat_depth_out's reader
+				// only ever asks "occluded or not", so nothing beyond the crossing point was ever computed anywhere
+				// before - accum_t alone showed whatever value first tripped the threshold, near-identical for every
+				// saturated tile regardless of how much more geometry piled up behind it (read by the owner, correctly,
+				// as "clamped"); amp_sum below is the actual fix for that - an unbounded running total, not a [0, 1]
+				// product, so a tile with ten occluders reads roughly 10x one with a single occluder. depth_row[u]
+				// itself is still only ever set on the FIRST crossing (the `!already_saturated` guard below), so the
+				// barrier this grid actually prunes by is bit-identical either way.
+				if(already_saturated && !out_accum_t && !out_amp_sum)
+					continue;
 
 				if(out_tile_writes) ++(*out_tile_writes); // SESSION076 DIAGNOSTIC: write amplification.
 
-				accum_row[u] *= (1.f - amp * gsSatExpNeg(x));
-				if(accum_row[u] <= remaining_threshold)
+				accum_row[u] *= (1.f - amp * w);
+				if(!already_saturated && accum_row[u] <= remaining_threshold)
 					depth_row[u] = far_edge;
+
+				if(sum_row) sum_row[u] += amp * w;
 			}
 		}
 	}
+
+	// SESSION077 DIAGNOSTIC: hand the accumulator fields out for the debug overlay - see the header.
+	if(out_accum_t)
+		*out_accum_t = accum_t;
+	if(out_amp_sum)
+		*out_amp_sum = amp_sum;
 }
 
 

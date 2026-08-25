@@ -27,12 +27,14 @@ Copyright Glare Technologies Limited 2026 -
 
 class OpenGLEngine;
 class OpenGLProgram;
+class OpenGLTexture; // SESSION076 §9: for SatGridDebugInfo::tex - see GaussianSplatRenderer::getSatGridDebugInfo().
 struct GLObject; // Only ever passed through by pointer here - see visibleFractionToDrawIndex().  Declared the same way MeshPrimitiveBuilding.h and TransformGizmo.h do it.
 namespace glare { class TaskManager; }
 class SplatCloud; // Defined in GaussianSplatRenderer.cpp - one drawable cloud, holding one or more splat objects.
 struct CloudMember; // Defined in GaussianSplatRenderer.cpp - one registered splat object within a cloud.
 class GaussianSplatSortScratch; // Defined in GaussianSplatRenderer.cpp - the reusable working buffers a background depth-sort uses.
 class GaussianSplatLodTraversalScratch; // Defined in GaussianSplatRenderer.cpp - the reusable working buffers a background LoD traversal uses.
+class GaussianSplatUnculledFrontier; // Defined in GaussianSplatRenderer.cpp - the split-filter architecture's U(P), see drainTraversalResults().
 
 
 /*=====================================================================
@@ -369,6 +371,32 @@ public:
 	// drops the cached frontiers to force one.
 	bool getSatDiagLog() const { return sat_diag_log; }
 	void setSatDiagLog(bool v);
+
+	// SESSION076 §9 / SESSION077: one entry per cloud currently holding saturation-grid debug textures (built by
+	// drainTraversalResults() only while getSatDiagLog() is on - see there). Both are R32F, res x res, sampled by
+	// sat_grid_debug_frag_shader.glsl via the octahedral direction mapping - see the struct fields for what each
+	// holds. anchor_ws is the world position the grid's directions are anchored to
+	// (GaussianSplatUnculledFrontier::anchor_pos_ws as of the traversal the textures were built from). Empty when the
+	// diag checkbox is off or no cloud has a grid yet.
+	struct SatGridDebugInfo
+	{
+		Reference<OpenGLTexture> tex;      // Binary view source: transmittance.
+		Reference<OpenGLTexture> ramp_tex; // Ramp view source: unbounded contribution sum - see sat_amp_sum.
+		Vec4f anchor_ws;
+	};
+	void getSatGridDebugInfo(std::vector<SatGridDebugInfo>& out) const;
+
+	// SESSION077: which of the two views the overlay above draws. Off = the binary one (only tiles the prune actually
+	// treats as saturated, in one flat colour) - the verdict itself. On = a blue->green->red ramp over each tile's
+	// accumulated saturation, i.e. the CONTINUOUS field that verdict is thresholded out of.
+	//
+	// Added because the binary view cannot distinguish "this tile is correctly saturated" from "the accumulation is
+	// wrong here": a flat ceiling coming out half tinted and half clear looks identical either way. The ramp shows how
+	// far each tile got, so the accumulation can be checked against what the scene plainly looks like before anything
+	// downstream of it is tuned. Pure presentation - changes nothing the traversal or the prune computes, so unlike the
+	// diag checkbox it does not need to drop any cached frontier.
+	bool getSatGridDebugRamp() const { return sat_grid_debug_ramp; }
+	void setSatGridDebugRamp(bool v) { sat_grid_debug_ramp = v; }
 
 	// SESSION076 CALIBRATION, temporary: the saturation grid's angular resolution. Divides the tile's angular size, so
 	// grid res scales with it. Silhouette accuracy is bounded by tile size - at subdiv 1 a tile spans coarse_pixel_scale
@@ -1338,6 +1366,7 @@ private:
 
 	void writePlaceholderSelection(SplatCloud& cloud); // Synchronous stand-in frontier (root-only per member with a tree, everything for a member without one), written after any structural change, until the next background traversal's result supersedes it.
 	void drainTraversalResults();
+	void updateSatGridDebugTexture(SplatCloud& cloud, const GaussianSplatUnculledFrontier& uf); // SESSION076 §9 - see drainTraversalResults()'s use of this.
 	void kickOffTraversals();
 	void kickOffFilters();      // SESSION063: split architecture - see the .cpp.
 	void drainFilterResults();  // SESSION063
@@ -1439,6 +1468,7 @@ private:
 	GaussianSplatSatPrefilterMode sat_prefilter_mode; // SESSION074 - see getSatPrefilterMode(). [gsr-sat] trace reuses filter_debug_log above (plan's own choice - one checkbox, not a second toggle) - see drainFilterResults().
 	bool filter_frustum_planes_enabled;              // SESSION074 - see getFilterFrustumPlanesEnabled().
 	bool sat_diag_log;                               // SESSION076 - see getSatDiagLog(). Own toggle, not folded into filter_debug_log, because the counting itself perturbs what is being measured.
+	bool sat_grid_debug_ramp;                        // SESSION077 - see getSatGridDebugRamp(). Presentation only, no effect on what is computed.
 	float sat_grid_subdiv;                           // SESSION076 CALIBRATION - see getSatGridSubdiv().
 
 	// SESSION055: camera-motion tracker for anisotropic frustum-cull dilation. think() diffs the current cam pose against

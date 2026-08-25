@@ -128,6 +128,18 @@ public:
 	js::Vector<float, 16> sat_depth;
 	int sat_grid_res;
 
+	// SESSION077 DIAGNOSTIC, gated by the "diag" checkbox: the grid build's final per-tile TRANSMITTANCE, kept only so
+	// the debug overlay's binary view can show exactly what the prune's threshold test acts on - see
+	// gsBuildSaturationGrid()'s out_accum_t and updateSatGridDebugTexture(). Empty (size 0) whenever diag is off, so a
+	// normal session pays neither the copy nor the res*res floats.
+	js::Vector<float, 16> sat_accum_t;
+
+	// SESSION077 DIAGNOSTIC, same gate: the UNBOUNDED companion to sat_accum_t above, for the overlay's ramp view - see
+	// gsBuildSaturationGrid()'s out_amp_sum. Transmittance is a product and saturates towards 1 regardless of how much
+	// occluding mass actually piled up, which reads as "everything clamps to the same colour"; this is a running sum
+	// with no ceiling, so a heavily-occluded tile visibly reads higher than a barely-occluded one.
+	js::Vector<float, 16> sat_amp_sum;
+
 	// SESSION074 REVISION: the saturation verdict is applied HERE, when this frontier is built, not in the per-frame
 	// filter - the arrays above are already pruned of occluded nodes by the time anyone sees them (in Drop mode; Count
 	// mode only tallies). Two reasons, both decisive:
@@ -237,6 +249,7 @@ public:
 		topology_generation(0), traversal_in_flight(false), have_last_traversal_cam_pos(false), last_traversal_cam_pos_ws(0.f), last_traversal_cam_forward_ws(0.f), last_traversal_kick_time_s(0.0),
 		last_traversal_kicked_topology_generation(0), last_traversal_hit_budget_cap(false), last_traversal_hit_density_cap(false), last_traversal_hit_depth_cap(false), last_traversal_dilation_elevated(false),
 		cached_traversal_geom_generation(0), importance_num_views(0),
+		sat_grid_debug_anchor_ws(0.f), // SESSION076 §9
 		filter_in_flight(false), ufrontier_needs_filter(false), have_last_filter_cam_forward(false), last_filter_cam_forward_ws(0.f), // SESSION063
 		filter_dilation_elevated(false), // SESSION066
 		diag_filter_kick_time_s(0.0), diag_filter_band_fine_rad(0.f), diag_applied_kick_forward_ws(0.f), diag_have_applied_filter(false) // SESSION073 DIAGNOSTIC
@@ -293,6 +306,16 @@ public:
 	// drainTraversalResults() from a cull-off traversal; a rotation re-filters this instead of re-traversing. Null until
 	// the first split-mode traversal for this cloud lands. See GaussianSplatUnculledFrontier.
 	Reference<GaussianSplatUnculledFrontier> cached_ufrontier;
+
+	// SESSION076 §9 / SESSION077: debug-only visualisation of cached_ufrontier's saturation grid, rebuilt by
+	// drainTraversalResults() alongside cached_ufrontier whenever getSatDiagLog() is on. Null whenever the diag
+	// checkbox is off, the frontier has no grid (sat_grid_res == 0), or none has landed yet - see
+	// getSatGridDebugInfo(), which skips a cloud with a null binary tex. Two textures, one per overlay mode - see
+	// GaussianSplatUnculledFrontier::sat_accum_t / sat_amp_sum for why one field can't serve both.
+	Reference<OpenGLTexture> sat_grid_debug_tex;      // Binary view source: transmittance.
+	Reference<OpenGLTexture> sat_grid_debug_ramp_tex; // Ramp view source: unbounded contribution sum.
+	Vec4f sat_grid_debug_anchor_ws;
+
 	bool filter_in_flight;                 // True from a filter kick until its result is applied/dropped - see kickOffFilters().
 	bool ufrontier_needs_filter;           // Set when a fresh U(P) lands, so kickOffFilters() produces the first S(P,R) for it even with no rotation.
 	bool have_last_filter_cam_forward;
@@ -1141,7 +1164,13 @@ public:
 			// The prune is written into a NEW frontier rather than compacted into `uf` in place: `uf` is live from the
 			// moment it was enqueued, a filter task may be streaming it on another thread right now, and the class is
 			// documented immutable-once-built. The extra allocation is on the async path, not the one the picture waits on.
-			if(uf.nonNull() && sat_prefilter_mode != GaussianSplatSatPrefilterMode_Off)
+			// SESSION077: also runs with the "Saturation filter" itself Off, as long as the "diag" checkbox is on - the
+			// owner wants the sat_depth overlay (session076 §9) viewable over the UNPRUNED frontier, to compare the mask
+			// against the true selection rather than one it has already edited. Harmless when sat_prefilter_mode is Off:
+			// prune below stays false either way (it's keyed on GaussianSplatSatPrefilterMode_Drop specifically), so uf2
+			// ends up a full, unpruned copy of uf with sat_depth attached - exactly the overlay-only, no-side-effect mode
+			// this is meant to be.
+			if(uf.nonNull() && (sat_prefilter_mode != GaussianSplatSatPrefilterMode_Off || sat_diag_log))
 			{
 				// SESSION076: the grid is accumulated from the FINE frontier, not from the coarse floor it was originally
 				// written against. The coarse source was measured to a dead end - at the only setting that preserved
@@ -1194,7 +1223,8 @@ public:
 					Timer sat_grid_timer; // SESSION074 DIAGNOSTIC - see sat_grid_build_ms / [gsr-sat]'s grid_ms.
 					gsBuildSaturationGrid(occl_px.data(), occl_py.data(), occl_pz.data(), occl_radius.data(), occl_alpha.data(), occl_px.size(),
 						cam_pos_ws, uf2->sat_grid_res, sat_saturation_threshold, uf2->sat_depth,
-						sat_diag_log ? &uf2->sat_diag_writers : NULL, sat_diag_log ? &uf2->sat_diag_tile_writes : NULL); // SESSION076 DIAGNOSTIC - null (no counting) unless the sat diag checkbox is on.
+						sat_diag_log ? &uf2->sat_diag_writers : NULL, sat_diag_log ? &uf2->sat_diag_tile_writes : NULL, // SESSION076 DIAGNOSTIC - null (no counting) unless the sat diag checkbox is on.
+					sat_diag_log ? &uf2->sat_accum_t : NULL, sat_diag_log ? &uf2->sat_amp_sum : NULL); // SESSION077 DIAGNOSTIC - the two overlay fields, same gate.
 					uf2->sat_grid_build_ms = sat_grid_timer.elapsed() * 1.0e3;
 
 					// SESSION076 DIAGNOSTIC: carry the DFS-side breakdown across to where [gsr-sat-diag] prints it.
@@ -1348,7 +1378,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	split_coarse_floor_enabled(true), split_coarse_pixel_scale(30.f), filter_coarse_dilation_latency(0.9f), coarse_layer_debug(false), // SESSION063 K4
 	filter_debug_log(false), kick_debug_log(false), cpu_prof_log(false), // SESSION072: default off - see getFilterDebugLog()'s comment.
 	sat_prefilter_mode(GaussianSplatSatPrefilterMode_Off), filter_frustum_planes_enabled(true), // SESSION074: stage off by default, frustum planes on (i.e. unchanged pipeline) - see getSatPrefilterMode()/getFilterFrustumPlanesEnabled().
-	sat_diag_log(false), sat_grid_subdiv(3.f), // SESSION076: diagnostic off by default - see getSatDiagLog(). Calibration defaults are the values reasoned to on paper, not yet confirmed on a scene.
+	sat_diag_log(false), sat_grid_debug_ramp(false), sat_grid_subdiv(3.f), // SESSION076/077: diagnostics off by default - see getSatDiagLog()/getSatGridDebugRamp(). Calibration defaults are the values reasoned to on paper, not yet confirmed on a scene.
 	splat_point_size_px(1.f),
 	splat_merge_spread_widen(3.0f), // SESSION071: analytic minimum is sqrt(3) (see widenedMergedScale()); owner default set higher for extra margin.
 	// SESSION071: GaussianSplatMergeColourParams defaults to Energy - owner-confirmed better at every pixel scale limit tested; Legacy is kept only as the A/B comparison.
@@ -4616,6 +4646,8 @@ void GaussianSplatRenderer::setSatDiagLog(bool v)
 	{
 		clouds[i]->cached_ufrontier = NULL;
 		clouds[i]->have_last_traversal_cam_pos = false;
+		clouds[i]->sat_grid_debug_tex = NULL; // SESSION076 §9: stale overlay texture from before the toggle - not drawn either way (gated at the call site), but no reason to keep the GPU memory.
+		clouds[i]->sat_grid_debug_ramp_tex = NULL; // SESSION077: its ramp-view companion.
 	}
 }
 
@@ -5590,6 +5622,57 @@ void GaussianSplatRenderer::kickOffSorts()
 }
 
 
+// SESSION076 §9 / SESSION077: (re)build cloud's two overlay textures from uf's two diagnostic accumulators - see
+// drainTraversalResults()'s call site and GaussianSplatRenderer::getSatGridDebugInfo(). Always allocates fresh
+// textures rather than updating in place: this only runs once per traversal while the "diag" checkbox is on, so the
+// extra allocation cost is not worth avoiding, and fresh textures mean a resolution change (sat_grid_subdiv) can
+// never be applied to a texture sized for the old resolution.
+void GaussianSplatRenderer::updateSatGridDebugTexture(SplatCloud& cloud, const GaussianSplatUnculledFrontier& uf)
+{
+	const size_t res = (size_t)uf.sat_grid_res;
+
+	// The frontier may predate the diag checkbox being switched on (setSatDiagLog() drops cached frontiers to force a
+	// fresh traversal, but a result already in flight is not covered by that), in which case there is nothing to show.
+	if(uf.sat_accum_t.size() != res * res || uf.sat_amp_sum.size() != res * res)
+	{
+		cloud.sat_grid_debug_tex = NULL;
+		cloud.sat_grid_debug_ramp_tex = NULL;
+		return;
+	}
+
+	cloud.sat_grid_debug_tex = new OpenGLTexture(res, res, opengl_engine,
+		ArrayRef<uint8>((const uint8*)uf.sat_accum_t.data(), uf.sat_accum_t.size() * sizeof(float)),
+		OpenGLTextureFormat::Format_Greyscale_Float,
+		OpenGLTexture::Filtering_Nearest, // Nearest: tiles are discrete decisions, not a field to interpolate.
+		OpenGLTexture::Wrapping_Clamp,
+		/*has_mipmaps=*/false);
+
+	cloud.sat_grid_debug_ramp_tex = new OpenGLTexture(res, res, opengl_engine,
+		ArrayRef<uint8>((const uint8*)uf.sat_amp_sum.data(), uf.sat_amp_sum.size() * sizeof(float)),
+		OpenGLTextureFormat::Format_Greyscale_Float,
+		OpenGLTexture::Filtering_Nearest,
+		OpenGLTexture::Wrapping_Clamp,
+		/*has_mipmaps=*/false);
+
+	cloud.sat_grid_debug_anchor_ws = uf.anchor_pos_ws;
+}
+
+
+void GaussianSplatRenderer::getSatGridDebugInfo(std::vector<SatGridDebugInfo>& out) const
+{
+	out.clear();
+	for(size_t i=0; i<clouds.size(); ++i)
+		if(clouds[i]->sat_grid_debug_tex.nonNull() && clouds[i]->sat_grid_debug_ramp_tex.nonNull())
+		{
+			SatGridDebugInfo info;
+			info.tex = clouds[i]->sat_grid_debug_tex;
+			info.ramp_tex = clouds[i]->sat_grid_debug_ramp_tex;
+			info.anchor_ws = clouds[i]->sat_grid_debug_anchor_ws;
+			out.push_back(info);
+		}
+}
+
+
 void GaussianSplatRenderer::drainTraversalResults()
 {
 	traversal_result_queue.dequeueAnyQueuedItems(completed_traversal_msgs);
@@ -5629,6 +5712,19 @@ void GaussianSplatRenderer::drainTraversalResults()
 			{
 				cloud->cached_ufrontier = msg->unculled_frontier;
 				cloud->ufrontier_needs_filter = true; // Re-filter against the pruned frontier; until that lands the previous S(P,R) keeps drawing.
+
+				// SESSION076 §9: rebuild the sat_depth debug texture alongside cached_ufrontier, gated purely on the "diag"
+				// checkbox (sat_diag_log) per the owner's request - independent of filter_debug_log, which only gates
+				// stdout tracing. Rebuilt rather than updated in place (simpler, and this is a diagnostic path, not a hot
+				// one) - see updateSatGridDebugTexture(). Runs on the main thread with a valid GL context, same as the
+				// VBO updates elsewhere in this function.
+				if(sat_diag_log && msg->unculled_frontier->sat_grid_res > 0)
+					updateSatGridDebugTexture(*cloud, *msg->unculled_frontier);
+				else
+				{
+					cloud->sat_grid_debug_tex = NULL; // Diag off, or this frontier has no grid: nothing to show.
+					cloud->sat_grid_debug_ramp_tex = NULL;
+				}
 
 				// SESSION074/076 DIAGNOSTIC: the saturation stage's own numbers, printed at the cadence they change - once
 				// per traversal, not per filter kick (the verdict is orientation-independent, so per-kick printing would

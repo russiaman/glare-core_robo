@@ -1515,6 +1515,10 @@ private:
 	void setProbeGridUniforms(MaterialCommonUniforms& common_uniforms);
 	OpenGLProgramRef buildProbeDebugProg();
 	void drawProbeDebugSpheres(const Matrix4f& view_matrix, const Matrix4f& proj_matrix);
+
+	// SESSION076 §9: saturation-grid debug overlay - see sat_grid_debug_vert/frag_shader.glsl and the session077 snapshot.
+	OpenGLProgramRef buildSatGridDebugProg();
+	void drawSatGridDebugSphere(const Matrix4f& view_matrix, const Matrix4f& proj_matrix);
 public:
 	// Render the 6 cube faces around probe_pos into the capture texture.  capture_radius bounds how far out
 	// geometry is gathered.
@@ -1699,6 +1703,14 @@ private:
 	Reference<OpenGLProgram> probe_debug_prog;
 	int probe_debug_sphere_pos_radius_location;
 	int probe_debug_probe_index_location;
+	Reference<OpenGLProgram> sat_grid_debug_prog; // SESSION076 §9.
+	int sat_grid_debug_sphere_pos_radius_location;
+	int sat_grid_debug_tex_location;
+	int sat_grid_debug_ramp_tex_location; // SESSION077
+	int sat_grid_debug_remaining_threshold_location; // SESSION077
+	int sat_grid_debug_mode_location;                // SESSION077
+	int sat_grid_debug_ramp_range_min_location;      // SESSION077
+	int sat_grid_debug_ramp_range_max_location;      // SESSION077
 	int probe_bake_source_cube_tex_location;
 	int probe_bake_tile_origin_location;
 	int probe_bake_env_phi_location;

@@ -864,7 +864,7 @@ public:
 		// deliberate choice - it can never discard a node that would have contributed, so the grid it produces is
 		// bit-identical to the unfiltered one. Tightening it towards the sufficient bound (~0.94x) would cut more nodes
 		// but would start silently weakening the cull.
-		const float min_writing_pixel_scale = gsSatGridMinWritingPixelScaleFactor(splat_cutoff_sigmas) * coarse_pixel_scale;
+		const float min_writing_pixel_scale = gsSatGridMinWritingPixelScaleFactor(gs_sat_occluder_sigmas) * coarse_pixel_scale; // SESSION076: the OCCLUDER sigmas, matching the radius handed to the grid above - the two must agree or this skips nodes the grid would have accepted.
 
 		for(size_t mi=0; mi<scratch->members_snapshot.size(); ++mi)
 		{
@@ -1180,9 +1180,11 @@ public:
 					// grid marks tens of degrees as occluded on the strength of a splat that actually paints ~30 pixels.
 					// Measured consequence before this was caught: sat_tiles pinned at 100% of the whole sphere and
 					// would_drop at ~90%. Only the node itself is ever drawn at the frontier (never its subtree), and the
-					// shader cuts it at splat_cutoff_sigmas of max(scale) = half that many feature_sizes - so this is the
-					// radius that can actually occlude anything.
-					coarse_radius.push_back(0.5f * splat_cutoff_sigmas * feature_sizes[idx]);
+					// shader cuts it at splat_cutoff_sigmas of max(scale) = half that many feature_sizes.
+					//
+					// SESSION076: and NOT the shader's cutoff radius either - gs_sat_occluder_sigmas, the radius out to which
+					// the node is still near-opaque. See that constant for why the difference removed visible geometry.
+					coarse_radius.push_back(0.5f * gs_sat_occluder_sigmas * feature_sizes[idx]);
 					coarse_alpha.push_back(alphas[idx]);
 				}
 

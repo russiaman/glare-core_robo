@@ -120,9 +120,18 @@ static inline float gsSatGridFootprint(const Vec4f& offset, float ang_radius, in
 static const float gs_sat_tile_half_diag = 0.70710678f;
 
 
+float gsSatGridMinWritingPixelScaleFactor(float splat_cutoff_sigmas)
+{
+	// SESSION076: see the header for the derivation. Guarded against a zero/negative cutoff (which would mean nodes
+	// have no footprint at all) by reporting "nothing can ever write", the honest answer for that input.
+	const float half_sigmas = 0.5f * splat_cutoff_sigmas;
+	return half_sigmas > 0.f ? (gs_sat_tile_half_diag / half_sigmas) : std::numeric_limits<float>::infinity();
+}
+
+
 void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, const float* radius, const float* alpha, size_t n,
 	const Vec4f& anchor_pos_ws, int res, float saturation_threshold,
-	js::Vector<float, 16>& sat_depth_out)
+	js::Vector<float, 16>& sat_depth_out, size_t* out_writers, size_t* out_tile_writes)
 {
 	const size_t num_tiles = (size_t)res * (size_t)res;
 	sat_depth_out.resizeNoCopy(num_tiles);
@@ -189,6 +198,8 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 		const float t_factor = 1.f - a;
 		const float cover_radius_sq = cover_radius * cover_radius;
 
+		if(out_writers) ++(*out_writers); // SESSION076 DIAGNOSTIC: this node cleared the full-coverage test, i.e. it contributes.
+
 		for(int v=v0; v<=v1; ++v)
 		{
 			float* const accum_row = &accum_t[(size_t)v * (size_t)res];
@@ -203,6 +214,8 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 				const float du = ((float)u + 0.5f) - cu;
 				if(du * du + dv_sq > cover_radius_sq)
 					continue;
+
+				if(out_tile_writes) ++(*out_tile_writes); // SESSION076 DIAGNOSTIC: write amplification - tiles touched per node, summed.
 
 				if(depth_row[u] != std::numeric_limits<float>::infinity())
 					continue; // Already saturated by something nearer (front-to-back order) - nothing more to do for this tile.

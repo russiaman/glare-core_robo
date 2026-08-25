@@ -354,6 +354,22 @@ public:
 	GaussianSplatSatPrefilterMode getSatPrefilterMode() const { return sat_prefilter_mode; }
 	void setSatPrefilterMode(GaussianSplatSatPrefilterMode v);
 
+	// SESSION076: extra [gsr-sat] fields answering "what is the coarse capture actually buying the saturation grid?" -
+	// the group A/B split of the capture and how many of those nodes the grid accepted. See
+	// GaussianSplatUnculledFrontier::sat_diag_coarse_a for what the numbers mean.
+	//
+	// Deliberately its own toggle rather than more fields on the existing [gsr-sat] line: the counting costs a branch
+	// per captured node in the DFS and per tile write in the grid build - both hot loops whose cost is exactly what
+	// this stage is being measured on, so it must be possible to read the timings with the instrumentation absent.
+	// Only meaningful while the saturation filter itself is on; harmless (nothing is printed) otherwise. Like the
+	// saturation filter, this is a measurement mode and is deliberately not persisted across sessions.
+	//
+	// Same live-change problem as setSatPrefilterMode() above: the counters are filled when a frontier is built, so
+	// turning this on cannot show anything until a fresh traversal runs. Out-of-line for the same reason - the setter
+	// drops the cached frontiers to force one.
+	bool getSatDiagLog() const { return sat_diag_log; }
+	void setSatDiagLog(bool v);
+
 	// SESSION074: whether the per-orientation filter applies the frustum planes at all. On (the default) is the normal
 	// pipeline. Off keeps the whole split-filter machinery running - U(P) is still built and streamed, the saturation
 	// pre-filter above still runs on every node - but no node is ever rejected for being outside the view, so the two
@@ -1408,6 +1424,7 @@ private:
 	bool filter_debug_log, kick_debug_log, cpu_prof_log; // SESSION072: live log toggles - see getFilterDebugLog() etc.
 	GaussianSplatSatPrefilterMode sat_prefilter_mode; // SESSION074 - see getSatPrefilterMode(). [gsr-sat] trace reuses filter_debug_log above (plan's own choice - one checkbox, not a second toggle) - see drainFilterResults().
 	bool filter_frustum_planes_enabled;              // SESSION074 - see getFilterFrustumPlanesEnabled().
+	bool sat_diag_log;                               // SESSION076 - see getSatDiagLog(). Own toggle, not folded into filter_debug_log, because the counting itself perturbs what is being measured.
 
 	// SESSION055: camera-motion tracker for anisotropic frustum-cull dilation. think() diffs the current cam pose against
 	// the previous one to compute an instantaneous velocity and angular speed, feeds them through an EMA with a

@@ -90,6 +90,24 @@ int gsSatGridResForFocal(float focal_px, float coarse_pixel_scale);
 // Tile index (row-major, [0, res*res)) for a direction (any positive length - see gsDirToOct()).
 int gsSatGridTileForDir(const Vec4f& dir, int res);
 
+// SESSION076 DIAGNOSTIC: the smallest pixel_scale a node can have and still write to the grid, as a MULTIPLE of
+// coarse_pixel_scale.
+//
+// The build pass only accepts a node that fully covers at least one tile (see gsBuildSaturationGrid()'s cover_radius
+// test), which makes "can this node contribute at all?" a pure function of pixel_scale. Collecting the algebra in one
+// place so the traversal's diagnostic can predict the build pass's own verdict without duplicating its constants:
+//
+//   a tile subtends           coarse_pixel_scale / focal_px  radians   (by construction, gsSatGridResForFocal())
+//   a node's angular radius   0.5*cutoff_sigmas*feature_size / dist    (the radius the renderer feeds this grid)
+//                           = 0.5*cutoff_sigmas * pixel_scale / focal_px
+//   so radius_tiles         = 0.5*cutoff_sigmas * pixel_scale / coarse_pixel_scale
+//   and cover_radius > 0    <=>  pixel_scale > (tile half-diagonal / (0.5*cutoff_sigmas)) * coarse_pixel_scale
+//
+// At the renderer's cutoff_sigmas of 3 the factor is ~0.47 - note this sits BELOW 1, i.e. below the capture rule's own
+// threshold, so a node captured for being at or just under coarse_pixel_scale is right on the boundary of being
+// useless to the grid: whether it contributes at all depends on how far past the threshold its level jumped.
+float gsSatGridMinWritingPixelScaleFactor(float splat_cutoff_sigmas);
+
 // Angular size of one grid tile at the given resolution - the SAME quantity gsSatGridResForFocal() solves for (a tile
 // of solid angle ~= tile_ang^2 covering, together with res*res of its neighbours, the whole sphere's 4*pi steradians),
 // returned here so every caller shares one consistent notion of "how big is a tile" rather than re-deriving its own
@@ -129,9 +147,14 @@ float gsSatGridTileAngle(int res);
 // source frontier. saturation_threshold is the existing splat_saturation_threshold knob (no new threshold is
 // introduced - see the plan's "no manual per-scene tuning" constraint). sat_depth_out is resized to res*res and
 // filled; a tile with no saturating coverage is left at +inf.
+//
+// SESSION076 DIAGNOSTIC: out_writers / out_tile_writes, when non-null, are INCREMENTED (not reset - the caller owns
+// their zeroing) with the number of nodes that cleared the full-coverage test and the total number of per-tile writes
+// those nodes made. Both are gated by the "sat diag" checkbox at the call site and left null otherwise, so the hot
+// loop pays only a null test per node in normal operation.
 void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, const float* radius, const float* alpha, size_t n,
 	const Vec4f& anchor_pos_ws, int res, float saturation_threshold,
-	js::Vector<float, 16>& sat_depth_out);
+	js::Vector<float, 16>& sat_depth_out, size_t* out_writers = NULL, size_t* out_tile_writes = NULL);
 
 
 // SESSION074: pass 2's per-node read - true if this fine node is unambiguously behind saturated coarse geometry, so

@@ -148,7 +148,7 @@ static inline float gsSatExpNeg(float x) // x >= 0; caller has already rejected 
 
 
 void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, const float* radius, const float* alpha, size_t n,
-	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float coverage_sigmas,
+	const Vec4f& anchor_pos_ws, int res, float saturation_threshold,
 	js::Vector<float, 16>& sat_depth_out, size_t* out_writers, size_t* out_tile_writes)
 {
 	const size_t num_tiles = (size_t)res * (size_t)res;
@@ -231,30 +231,24 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 		// of, or interleaved with, the very geometry that saturated the tile.
 		const float far_edge = (1.f / inv_dist) + r;
 
-		// SESSION076: coverage span - only tiles lying FULLY inside the node's coverage disc may be claimed.
+		// SESSION076: every tile the footprint reaches, weighted - no entitlement test.
 		//
-		// The weight above says how much of the node is over a tile; this says whether the node is entitled to speak for
-		// that tile at all. Both are needed, and the first cut of the Gaussian model shipped without the second: every
-		// node wrote into all ~34 tiles it touched, the average tile received 586 contributions, transmittance collapsed
-		// at any threshold below 1.0, and geometry that merely SHARED a tile with something nearer was cut - a chair back
-		// protruding a tile's width above a table, with nothing in front of it, disappeared. Requiring full coverage makes
-		// "this tile's whole cone is blocked" a claim the node has established rather than a cone-average.
+		// Entitlement ("this node may only claim tiles it fully blankets") existed to stop a coarse blob from asserting
+		// occlusion across directions its silhouette never covered. Feeding the grid the fine frontier removes the
+		// premise: a fine node's footprint IS the geometry's footprint, so a node that half-covers a tile makes exactly
+		// a half-covered tile's worth of claim, and a tile straddling a silhouette accumulates the mixture it actually
+		// contains rather than being arbitrated one way or the other by a rule.
 		//
-		// Measured in the node's own sigmas, not in its 3-sigma extent, so the entitlement follows the dense core rather
-		// than the transparent tail - the 3-sigma tail claiming tiles is exactly what made shadows 3x too wide.
-		const float coverage_tiles = sigma_tiles * coverage_sigmas;
-		const float span = coverage_tiles - gs_sat_tile_half_diag;
-		if(span <= 0.f)
-			continue; // Too small to blanket any tile: it may occlude something, but not a whole tile's worth of directions.
-
+		// This is what makes the ambiguous cell behave correctly on its own: a tile that is half opaque table and half
+		// open space accumulates towards half-opacity and does not reach the threshold, so nothing behind it is dropped.
+		// Under the coarse source that same cell was claimed outright by whichever blob's disc happened to reach it.
+		const float span = radius_tiles + gs_sat_tile_half_diag;
 		const int u0 = myClamp((int)std::ceil (cu - span - 0.5f), 0, res - 1);
 		const int u1 = myClamp((int)std::floor(cu + span - 0.5f), 0, res - 1);
 		const int v0 = myClamp((int)std::ceil (cv - span - 0.5f), 0, res - 1);
 		const int v1 = myClamp((int)std::floor(cv + span - 0.5f), 0, res - 1);
 		if(u1 < u0 || v1 < v0)
 			continue;
-
-		const float span_sq = span * span;
 
 		if(out_writers) ++(*out_writers); // SESSION076 DIAGNOSTIC: this node contributes something.
 
@@ -268,14 +262,8 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 			const float dv_sq = dv * dv;
 			for(int u=u0; u<=u1; ++u)
 			{
-				// The [u0,u1]x[v0,v1] box bounds the covered set; its corners can still fall outside the disc, so test
-				// each tile centre exactly. Over-claiming here is precisely the unsafe direction.
 				const float du = ((float)u + 0.5f) - cu;
-				const float d_sq = du * du + dv_sq;
-				if(d_sq > span_sq)
-					continue;
-
-				const float x = d_sq * inv_2var;
+				const float x = (du * du + dv_sq) * inv_2var;
 				if(x >= gs_sat_exp_lut_max)
 					continue; // Contribution below the lookup's tail - see gs_sat_exp_lut_max.
 

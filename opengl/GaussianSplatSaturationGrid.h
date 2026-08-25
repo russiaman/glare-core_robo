@@ -25,11 +25,19 @@ same ray already made the pixel opaque. The existing saturation gate (vertex sha
 on the CPU, before a node is even considered for the draw list, whether it is behind already-saturated geometry -
 cutting both K and the blend cost, not just the blend cost.
 
-The approach, in one sentence: walk the LoD tree's existing coarse floor (K4, session063 - a cheap, already-sorted,
-already-complete low-detail cut of the whole scene, ~800k nodes vs ~11-16M in the fine frontier) front-to-back once,
-accumulating a per-direction "depth beyond which this direction is saturated" map (sat_depth), then let the
-per-frame fine-node filter reject any fine node whose near edge lies beyond its direction's sat_depth - a single
-read + compare per node, no cross-node dependency, so the filter keeps its existing SIMD-friendly shape.
+The approach, in one sentence: walk the frontier front-to-back once, accumulating a per-direction "depth beyond which
+this direction is saturated" map (sat_depth), then reject any node whose near edge lies beyond its direction's
+sat_depth - a single read + compare per node, no cross-node dependency, so the filter keeps its SIMD-friendly shape.
+
+SESSION076: the accumulation walks the FINE frontier, not the coarse floor it was originally written against. The
+coarse version was measured to a dead end: at the only setting that preserved visible geometry it dropped 1.0% with a
+ceiling of 10.8%, and no tuning moved that. The reason is structural - a coarse node is a round blob, while occlusion
+boundaries follow silhouettes, which are not round. Any disc-shaped claim either under-covers (useless) or reaches
+past the geometry it stands for and removes things that are plainly visible; there is no working point between. The
+fine frontier is the actual geometry at the actual selected scale, so opacity accumulates where geometry IS, and the
+boundary between a table and a chair back behind it falls out of the data instead of being arbitrated by a rule. This
+is, in effect, a very low resolution software rasterisation of the same alpha the GPU accumulates every frame - see
+the session076 snapshot for why we compute it rather than read it back.
 
 Why a DIRECTION map, not a screen-space tile grid: a screen-space grid depends on orientation and would have to be
 rebuilt every frame (the cost the plan's §2.3 estimate worried about). A grid anchored on unit directions from the
@@ -183,15 +191,13 @@ float gsSatGridTileAngle(int res);
 // those nodes made. Both are gated by the "sat diag" checkbox at the call site and left null otherwise, so the hot
 // loop pays only a null test per node in normal operation.
 //
-// SESSION076 CALIBRATION: coverage_sigmas is how far out, in the node's own sigmas, it is allowed to CLAIM a tile - as
-// opposed to gs_sat_occluder_sigmas, which is how far its weighting extends. A tile is written only if it lies fully
-// inside that coverage disc, so the claim "this whole tile's cone is behind opaque coverage" is one the node has
-// actually established rather than an average over a cone it only partly fills. Dropping that requirement (the first
-// cut of the Gaussian model) let every node write into all 34 tiles it touched, which put 586 contributions into the
-// average tile, collapsed transmittance at any threshold below 1.0, and cut visible geometry that happened to share a
-// tile with something nearer. Live knob while the working point is found; to be frozen as a constant afterwards.
+// SESSION076: the coverage-entitlement parameter is gone with the coarse source it was invented for. Entitlement was an
+// attempt to stop a round blob from claiming directions its silhouette never covered; the fix was to stop feeding the
+// grid round blobs. With the FINE frontier as input, a node's footprint IS the geometry's footprint, and every node
+// contributes in proportion to how much of a tile it actually covers - which is the whole model, with nothing left to
+// arbitrate. See the .cpp's write loop.
 void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, const float* radius, const float* alpha, size_t n,
-	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float coverage_sigmas,
+	const Vec4f& anchor_pos_ws, int res, float saturation_threshold,
 	js::Vector<float, 16>& sat_depth_out, size_t* out_writers = NULL, size_t* out_tile_writes = NULL);
 
 

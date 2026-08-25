@@ -146,7 +146,7 @@ public:
 	//    the cheap frustum test gets faster too.
 	//
 	// Coarse-floor nodes are deliberately never pruned - see the traversal task's use of this.
-	size_t sat_num_coarse;       // DIAGNOSTIC: how many coarse-floor nodes fed the grid - see [gsr-sat]'s coarse=.
+	size_t sat_num_occluders;    // DIAGNOSTIC: how many frontier nodes fed the grid - see [gsr-sat]'s occl=.
 	size_t sat_num_tested;       // DIAGNOSTIC: fine nodes the verdict was computed for.
 	size_t sat_num_dropped;      // DIAGNOSTIC: of those, how many the conservative test found occluded (counted in Count mode too, where nothing is actually removed).
 	size_t sat_num_dropped_aggr; // DIAGNOSTIC: the deliberately-wrong upper bound - see gsSatOccluded()'s out_aggressive.
@@ -189,7 +189,7 @@ public:
 	float focal_px;
 
 	GaussianSplatUnculledFrontier() // SESSION074: defaults are "stage never ran" - only kickOffTraversals() passing the stage-enabled flag sets sat_grid_res non-zero.
-	:	sat_grid_res(0), sat_num_coarse(0), sat_num_tested(0), sat_num_dropped(0), sat_num_dropped_aggr(0),
+	:	sat_grid_res(0), sat_num_occluders(0), sat_num_tested(0), sat_num_dropped(0), sat_num_dropped_aggr(0),
 		sat_grid_build_ms(0.0), sat_test_ms(0.0),
 		sat_diag_coarse_a(0), sat_diag_coarse_b(0), sat_diag_writers(0), sat_diag_tile_writes(0) {} // SESSION076
 };
@@ -788,7 +788,7 @@ public:
 		GaussianSplatSatPrefilterMode sat_prefilter_mode_ = GaussianSplatSatPrefilterMode_Off, float sat_saturation_threshold_ = 0.f, // SESSION074: pre-GPU saturation cull - see GaussianSplatSaturationGrid.h. Defaults off; only meaningful when build_unculled_frontier_ and coarse_floor_enabled_ are also both true (the grid is built from the coarse floor captured into U(P)). Drop mode prunes the frontier here; Count only tallies.
 		bool sat_diag_log_ = false, // SESSION076 DIAGNOSTIC: gated by its own "sat diag" checkbox - fills GaussianSplatUnculledFrontier's sat_diag_* counters. Off means the extra counting is not done at all.
 		bool coarse_layer_drawn_ = true, // SESSION076: whether anything will actually DRAW the captured coarse layer (the "coarse" checkbox). False means it was captured solely to feed the saturation grid, which lets this task both skip capturing nodes the grid cannot use and evict the rest once the grid is built - see the capture block and the compaction loop in run(). Defaults true, i.e. the pre-session076 behaviour, so callers that don't care are unaffected.
-		float sat_grid_subdiv_ = 1.f, float sat_coverage_sigmas_ = 1.f) // SESSION076 CALIBRATION - see GaussianSplatRenderer::getSatGridSubdiv().
+		float sat_grid_subdiv_ = 1.f) // SESSION076 CALIBRATION - see GaussianSplatRenderer::getSatGridSubdiv().
 	:	cloud_id(cloud_id_), topology_generation(topology_generation_), scratch(scratch_), cam_pos_ws(cam_pos_ws_),
 		pixel_scale_limit(pixel_scale_limit_), max_splats_budget(max_splats_budget_), max_layer_density(max_layer_density_), max_tree_depth(max_tree_depth_), focal_px(focal_px_),
 		num_frustum_clip_planes(num_frustum_clip_planes_), frustum_cull_enabled(frustum_cull_enabled_),
@@ -800,7 +800,7 @@ public:
 		dist_clamp_enabled(dist_clamp_enabled_), dist_clamp_min(dist_clamp_min_), dist_clamp_max(dist_clamp_max_), dist_clamp_invert(dist_clamp_invert_),
 		sat_prefilter_mode(sat_prefilter_mode_), sat_saturation_threshold(sat_saturation_threshold_), // SESSION074
 		sat_diag_log(sat_diag_log_), coarse_layer_drawn(coarse_layer_drawn_),
-		sat_grid_subdiv(sat_grid_subdiv_), sat_coverage_sigmas(sat_coverage_sigmas_) // SESSION076
+		sat_grid_subdiv(sat_grid_subdiv_) // SESSION076
 	{
 		if(num_frustum_clip_planes < 0)
 			num_frustum_clip_planes = 0;
@@ -1141,37 +1141,41 @@ public:
 			// The prune is written into a NEW frontier rather than compacted into `uf` in place: `uf` is live from the
 			// moment it was enqueued, a filter task may be streaming it on another thread right now, and the class is
 			// documented immutable-once-built. The extra allocation is on the async path, not the one the picture waits on.
-			if(uf.nonNull() && sat_prefilter_mode != GaussianSplatSatPrefilterMode_Off && coarse_floor_enabled)
+			if(uf.nonNull() && sat_prefilter_mode != GaussianSplatSatPrefilterMode_Off)
 			{
+				// SESSION076: the grid is accumulated from the FINE frontier, not from the coarse floor it was originally
+				// written against. The coarse source was measured to a dead end - at the only setting that preserved
+				// visible geometry it dropped 1.0% against a 10.8% ceiling, and no tuning moved that - because a coarse
+				// node is a round blob while occlusion boundaries follow silhouettes. See GaussianSplatSaturationGrid.h.
+				//
+				// Coarse nodes are skipped rather than merged in: where they exist at all (the "coarse" checkbox on) they
+				// are a second, redundant representation of the same geometry the fine nodes already describe, so
+				// accumulating both would double-count the same surfaces into the same directions.
+				//
 				// Scratch only - consumed by the grid build below and dropped when this scope exits. Deliberately NOT
 				// stored on the frontier: see GaussianSplatUnculledFrontier::sat_depth's comment for the size involved.
-				// Read off the published frontier (indices/is_coarse), not the traversal's own output/coarse_flags arrays,
-				// which alias the recyclable scratch. Order is preserved either way - a filtered subsequence of a
-				// front-to-back list is still front-to-back, as gsBuildSaturationGrid()'s sequential accumulation requires.
+				// Read off the published frontier, not the traversal's own output/coarse_flags arrays, which alias the
+				// recyclable scratch. Order is preserved either way - a filtered subsequence of a front-to-back list is
+				// still front-to-back, as gsBuildSaturationGrid()'s sequential accumulation requires.
 				const size_t n = uf->indices.size();
-				js::Vector<float, 16> coarse_px, coarse_py, coarse_pz, coarse_radius, coarse_alpha;
+				js::Vector<float, 16> occl_px, occl_py, occl_pz, occl_radius, occl_alpha;
 				for(size_t i=0; i<n; ++i)
 				{
-					if(uf->is_coarse[i] == 0.f)
+					if(uf->is_coarse[i] != 0.f)
 						continue;
 					const uint32 idx = uf->indices[i];
-					coarse_px.push_back(uf->px[i]); coarse_py.push_back(uf->py[i]); coarse_pz.push_back(uf->pz[i]);
+					occl_px.push_back(uf->px[i]); occl_py.push_back(uf->py[i]); occl_pz.push_back(uf->pz[i]);
 					// SESSION074: the node's OWN drawn radius, NOT cull_radii[]. cull_radius is the enclosing sphere of
 					// this node's whole SUBTREE (see GaussianSplatLodNode::bounding_radius_os) - correct as a frustum-cull
-					// margin, catastrophically wrong as an occluder footprint: a coarse-floor node sits high in the tree by
-					// construction, so its subtree sphere spans a large part of the scene, and rasterising THAT into the
-					// grid marks tens of degrees as occluded on the strength of a splat that actually paints ~30 pixels.
-					// Measured consequence before this was caught: sat_tiles pinned at 100% of the whole sphere and
-					// would_drop at ~90%. Only the node itself is ever drawn at the frontier (never its subtree), and the
-					// shader cuts it at splat_cutoff_sigmas of max(scale) = half that many feature_sizes.
-					//
-					// SESSION076: and NOT the shader's cutoff radius either - gs_sat_occluder_sigmas, the radius out to which
-					// the node is still near-opaque. See that constant for why the difference removed visible geometry.
-					coarse_radius.push_back(0.5f * gs_sat_occluder_sigmas * feature_sizes[idx]);
-					coarse_alpha.push_back(alphas[idx]);
+					// margin, catastrophically wrong as an occluder footprint: it spans a large part of the scene on the
+					// strength of a splat that paints a few pixels. Only the node itself is ever drawn at the frontier,
+					// never its subtree, and the shader cuts it at splat_cutoff_sigmas of max(scale) = half that many
+					// feature_sizes - so this is the radius that can actually occlude anything.
+					occl_radius.push_back(0.5f * gs_sat_occluder_sigmas * feature_sizes[idx]);
+					occl_alpha.push_back(alphas[idx]);
 				}
 
-				if(!coarse_px.empty())
+				if(!occl_px.empty())
 				{
 					// The pruned replacement. Key fields are copied verbatim: it describes the same camera position and the
 					// same selection parameters as `uf`, only with occluded nodes removed, so drainTraversalResults()'s
@@ -1185,11 +1189,11 @@ public:
 					uf2->max_tree_depth = uf->max_tree_depth;
 					uf2->focal_px = uf->focal_px;
 
-					uf2->sat_num_coarse = coarse_px.size();
+					uf2->sat_num_occluders = occl_px.size();
 					uf2->sat_grid_res = gsSatGridResForFocal(focal_px, coarse_pixel_scale, sat_grid_subdiv); // SESSION076 CALIBRATION
 					Timer sat_grid_timer; // SESSION074 DIAGNOSTIC - see sat_grid_build_ms / [gsr-sat]'s grid_ms.
-					gsBuildSaturationGrid(coarse_px.data(), coarse_py.data(), coarse_pz.data(), coarse_radius.data(), coarse_alpha.data(), coarse_px.size(),
-						cam_pos_ws, uf2->sat_grid_res, sat_saturation_threshold, sat_coverage_sigmas, uf2->sat_depth,
+					gsBuildSaturationGrid(occl_px.data(), occl_py.data(), occl_pz.data(), occl_radius.data(), occl_alpha.data(), occl_px.size(),
+						cam_pos_ws, uf2->sat_grid_res, sat_saturation_threshold, uf2->sat_depth,
 						sat_diag_log ? &uf2->sat_diag_writers : NULL, sat_diag_log ? &uf2->sat_diag_tile_writes : NULL); // SESSION076 DIAGNOSTIC - null (no counting) unless the sat diag checkbox is on.
 					uf2->sat_grid_build_ms = sat_grid_timer.elapsed() * 1.0e3;
 
@@ -1212,7 +1216,6 @@ public:
 					{
 						Timer sat_test_timer;
 						const bool prune = (sat_prefilter_mode == GaussianSplatSatPrefilterMode_Drop);
-						const bool evict_coarse = !coarse_layer_drawn; // Independent of prune: this is "no consumer", not a saturation verdict, so it applies in Count mode too.
 						uf2->indices.reserve(n);
 						uf2->px.reserve(n); uf2->py.reserve(n); uf2->pz.reserve(n); uf2->radius.reserve(n);
 						uf2->is_coarse.reserve(n);
@@ -1220,12 +1223,7 @@ public:
 						for(size_t i=0; i<n; ++i)
 						{
 							bool drop = false;
-							if(uf->is_coarse[i] != 0.f)
-							{
-								if(evict_coarse)
-									continue;
-							}
-							else
+							if(uf->is_coarse[i] == 0.f) // Coarse nodes are never saturation-tested - see above.
 							{
 								const float dx = uf->px[i] - cam_pos_ws.x[0];
 								const float dy = uf->py[i] - cam_pos_ws.x[1];
@@ -1258,7 +1256,7 @@ public:
 						result_queue->enqueue(sat_msg);
 					}
 				}
-				// else: no coarse nodes this traversal (tiny scene/empty frustum) - no grid, no follow-up; the unpruned
+				// else: no occluders this traversal (tiny scene/empty frontier) - no grid, no follow-up; the unpruned
 				// frontier already published above simply stays live, which is the correct fallback.
 			}
 		}
@@ -1335,7 +1333,7 @@ private:
 	float sat_saturation_threshold;  // SESSION074: reuses the existing splat_saturation_threshold live knob (GaussianSplatRenderer::getSaturationThreshold()) - no new threshold introduced, see the plan's "no manual per-scene tuning" constraint.
 	bool sat_diag_log;               // SESSION076 DIAGNOSTIC: see the ctor param.
 	bool coarse_layer_drawn;         // SESSION076: see the ctor param.
-	float sat_grid_subdiv, sat_coverage_sigmas; // SESSION076 CALIBRATION: see the ctor param.
+	float sat_grid_subdiv; // SESSION076 CALIBRATION: see the ctor param.
 };
 
 
@@ -1350,7 +1348,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	split_coarse_floor_enabled(true), split_coarse_pixel_scale(30.f), filter_coarse_dilation_latency(0.9f), coarse_layer_debug(false), // SESSION063 K4
 	filter_debug_log(false), kick_debug_log(false), cpu_prof_log(false), // SESSION072: default off - see getFilterDebugLog()'s comment.
 	sat_prefilter_mode(GaussianSplatSatPrefilterMode_Off), filter_frustum_planes_enabled(true), // SESSION074: stage off by default, frustum planes on (i.e. unchanged pipeline) - see getSatPrefilterMode()/getFilterFrustumPlanesEnabled().
-	sat_diag_log(false), sat_grid_subdiv(3.f), sat_coverage_sigmas(1.f), // SESSION076: diagnostic off by default - see getSatDiagLog(). Calibration defaults are the values reasoned to on paper, not yet confirmed on a scene.
+	sat_diag_log(false), sat_grid_subdiv(3.f), // SESSION076: diagnostic off by default - see getSatDiagLog(). Calibration defaults are the values reasoned to on paper, not yet confirmed on a scene.
 	splat_point_size_px(1.f),
 	splat_merge_spread_widen(3.0f), // SESSION071: analytic minimum is sqrt(3) (see widenedMergedScale()); owner default set higher for extra margin.
 	// SESSION071: GaussianSplatMergeColourParams defaults to Energy - owner-confirmed better at every pixel scale limit tested; Legacy is kept only as the A/B comparison.
@@ -2140,7 +2138,7 @@ static size_t filterUnculledFrontier(const GaussianSplatUnculledFrontier& uf, co
 {
 	// SESSION074: no saturation work happens here any more. The verdict is orientation-independent, so it is applied
 	// once when the frontier is built and this function simply streams whatever survived - see
-	// GaussianSplatUnculledFrontier::sat_num_coarse's block comment for why that move mattered.
+	// GaussianSplatUnculledFrontier::sat_num_occluders's block comment for why that move mattered.
 	size_t num_coarse_out = 0;
 	const size_t n = uf.indices.size();
 	out_indices.resizeNoCopy(n); // Worst case every node survives.
@@ -4622,28 +4620,14 @@ void GaussianSplatRenderer::setSatDiagLog(bool v)
 }
 
 
-// SESSION076 CALIBRATION: both rebuild the saturation grid from scratch, so like setSatPrefilterMode() they must force
-// a fresh traversal - otherwise a live change sits invisible until the camera happens to move, which during pure
-// rotation is never. See getSatGridSubdiv().
+// SESSION076 CALIBRATION: rebuilds the saturation grid from scratch, so like setSatPrefilterMode() it must force a
+// fresh traversal - otherwise a live change sits invisible until the camera happens to move, which during pure rotation
+// is never. See getSatGridSubdiv().
 void GaussianSplatRenderer::setSatGridSubdiv(float v)
 {
 	if(v == sat_grid_subdiv)
 		return;
 	sat_grid_subdiv = v;
-
-	for(size_t i=0; i<clouds.size(); ++i)
-	{
-		clouds[i]->cached_ufrontier = NULL;
-		clouds[i]->have_last_traversal_cam_pos = false;
-	}
-}
-
-
-void GaussianSplatRenderer::setSatCoverageSigmas(float v)
-{
-	if(v == sat_coverage_sigmas)
-		return;
-	sat_coverage_sigmas = v;
 
 	for(size_t i=0; i<clouds.size(); ++i)
 	{
@@ -5658,7 +5642,7 @@ void GaussianSplatRenderer::drainTraversalResults()
 						if(std::isfinite(uf.sat_depth[t]))
 							++sat_tiles;
 					const double tested = (double)uf.sat_num_tested;
-					conPrint("[gsr-sat] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms coarse=" + uInt64ToStringCommaSeparated(uf.sat_num_coarse) +
+					conPrint("[gsr-sat] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms occl=" + uInt64ToStringCommaSeparated(uf.sat_num_occluders) +
 						" tiles=" + uInt64ToStringCommaSeparated(num_tiles) +
 						" sat_tiles=" + doubleToStringNDecimalPlaces(num_tiles > 0 ? (100.0 * (double)sat_tiles / (double)num_tiles) : 0.0, 1) + "%" +
 						" grid_ms=" + doubleToStringNDecimalPlaces(uf.sat_grid_build_ms, 2) +
@@ -5676,14 +5660,14 @@ void GaussianSplatRenderer::drainTraversalResults()
 					// grid actually accepted, with pred= the value derived analytically from pixel_scale alone.
 					if(sat_diag_log)
 					{
-						const double coarse = (double)uf.sat_num_coarse;
-						conPrint("[gsr-sat-diag] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms coarse=" + uInt64ToStringCommaSeparated(uf.sat_num_coarse) +
+						const double occl = (double)uf.sat_num_occluders;
+						conPrint("[gsr-sat-diag] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms occl=" + uInt64ToStringCommaSeparated(uf.sat_num_occluders) +
 							" cA=" + uInt64ToStringCommaSeparated(uf.sat_diag_coarse_a) +
-							" (" + doubleToStringNDecimalPlaces(coarse > 0 ? (100.0 * (double)uf.sat_diag_coarse_a / coarse) : 0.0, 1) + "%)" +
+							" (" + doubleToStringNDecimalPlaces(occl > 0 ? (100.0 * (double)uf.sat_diag_coarse_a / occl) : 0.0, 1) + "%)" +
 							" cB=" + uInt64ToStringCommaSeparated(uf.sat_diag_coarse_b) +
-							" (" + doubleToStringNDecimalPlaces(coarse > 0 ? (100.0 * (double)uf.sat_diag_coarse_b / coarse) : 0.0, 1) + "%)" +
+							" (" + doubleToStringNDecimalPlaces(occl > 0 ? (100.0 * (double)uf.sat_diag_coarse_b / occl) : 0.0, 1) + "%)" +
 							" writers=" + uInt64ToStringCommaSeparated(uf.sat_diag_writers) +
-							" (" + doubleToStringNDecimalPlaces(coarse > 0 ? (100.0 * (double)uf.sat_diag_writers / coarse) : 0.0, 1) + "%)" +
+							" (" + doubleToStringNDecimalPlaces(occl > 0 ? (100.0 * (double)uf.sat_diag_writers / occl) : 0.0, 1) + "%)" +
 								" tile_writes=" + uInt64ToStringCommaSeparated(uf.sat_diag_tile_writes) +
 							" per_writer=" + doubleToStringNDecimalPlaces(uf.sat_diag_writers > 0 ? ((double)uf.sat_diag_tile_writes / (double)uf.sat_diag_writers) : 0.0, 1) +
 							" fine=" + uInt64ToStringCommaSeparated(uf.sat_num_tested));
@@ -6222,7 +6206,12 @@ void GaussianSplatRenderer::kickOffTraversals()
 		// "draw it as edge-filling", so turning "coarse" off (wanted only to skip the draw) also starved the saturation
 		// grid of its only data source. The "coarse" checkbox (split_coarse_floor_enabled) now controls solely whether
 		// the captured layer is later allowed to survive the filter - see kickOffFilters()'s draw_coarse_layer.
-		const bool coarse_capture_needed = split_coarse_floor_enabled || (sat_prefilter_mode != GaussianSplatSatPrefilterMode_Off);
+		// SESSION076: the saturation grid no longer needs the coarse floor - it accumulates the fine frontier instead
+		// (see the traversal task's saturation phase). So capture is back to being requested by its one real consumer,
+		// the drawn edge-filling patch. With the "coarse" checkbox off, the ~1.7M coarse nodes that session075 started
+		// capturing for the grid's sake are simply never produced: no push_backs in the DFS, no ~56% growth of the radix
+		// sort's array, no SoA gather, no inflated pool for the filter to stream.
+		const bool coarse_capture_needed = split_coarse_floor_enabled;
 		task_manager->addTask(new GaussianSplatLodTraversalTask(best_cloud->cloud_id, best_cloud->topology_generation, scratch, cam_pos_ws,
 			lod_pixel_scale_limit, lod_max_splats_budget, lod_max_layer_density, lod_max_tree_depth, focal_px,
 			scene->frustum_clip_planes, scene->num_frustum_clip_planes, cull_active,
@@ -6234,7 +6223,7 @@ void GaussianSplatRenderer::kickOffTraversals()
 			/*sat_prefilter_mode=*/split_filter_enabled ? sat_prefilter_mode : GaussianSplatSatPrefilterMode_Off, splat_saturation_threshold, // SESSION074, SESSION075: no longer needs coarse_capture_needed here - it's already folded into coarse_floor_enabled_ above, which capture is gated on.
 			/*sat_diag_log=*/sat_diag_log, // SESSION076 DIAGNOSTIC.
 			/*coarse_layer_drawn=*/split_coarse_floor_enabled, // SESSION076: lets the task skip/evict coarse nodes when the layer is captured only to feed the saturation grid - see its ctor param.
-			/*sat_grid_subdiv=*/sat_grid_subdiv, /*sat_coverage_sigmas=*/sat_coverage_sigmas));
+			/*sat_grid_subdiv=*/sat_grid_subdiv));
 	}
 
 	// SESSION055 diag: after the while-loop, detect *unmet* rotation demand - a cloud whose forward has shifted past the

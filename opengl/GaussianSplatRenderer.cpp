@@ -166,15 +166,16 @@ public:
 	//    patch, NOT of this grid). Those nodes are near-field and are already present in the fine frontier under
 	//    their own index - i.e. duplicates, paid for a third time here.
 	//
-	// Cross-checked against what the grid actually did with them: a node only writes if its footprint fully covers at
-	// least one tile (gsBuildSaturationGrid()'s cover_radius test), which works out analytically to
-	// pixel_scale > 0.47*coarse_pixel_scale. pred_writers counts that prediction at capture time; writers counts the
-	// real thing inside the build pass. The two are printed side by side deliberately - if they disagree, the
-	// derivation above is wrong and every conclusion drawn from it has to be re-examined before it is acted on.
+	// Alongside the split: what the grid actually did with them. A predicted-writers count used to be printed next to
+	// writers as a check on the binary write rule's analytic threshold; that rule is gone (see the removal note in
+	// GaussianSplatSaturationGrid.h), and under the Gaussian model a node is skipped only when its integrated occlusion
+	// is negligible, which is a property of the contribution rather than of pixel_scale. writers/tile_writes therefore
+	// stand on their own now: writers is how many nodes contributed at all, tile_writes the build pass's write
+	// amplification (tiles touched, summed) - together they say whether the grid is being fed by a few large occluders
+	// or by a haze of small ones.
 	size_t sat_diag_coarse_a;     // Captured because pixel_scale <= coarse_pixel_scale.
 	size_t sat_diag_coarse_b;     // Captured only because the branch was terminal, while still coarser than the threshold.
-	size_t sat_diag_pred_writers; // Predicted grid contributors, from the analytic threshold above.
-	size_t sat_diag_writers;      // Actual grid contributors (nodes that fully covered >= 1 tile).
+	size_t sat_diag_writers;      // Grid contributors: nodes whose contribution cleared the negligible-amplitude cutoff.
 	size_t sat_diag_tile_writes;  // Total per-tile writes - the build pass's write amplification.
 
 	// Key this frontier was built for; drainTraversalResults() checks these before reusing it, so a settings change that
@@ -190,7 +191,7 @@ public:
 	GaussianSplatUnculledFrontier() // SESSION074: defaults are "stage never ran" - only kickOffTraversals() passing the stage-enabled flag sets sat_grid_res non-zero.
 	:	sat_grid_res(0), sat_num_coarse(0), sat_num_tested(0), sat_num_dropped(0), sat_num_dropped_aggr(0),
 		sat_grid_build_ms(0.0), sat_test_ms(0.0),
-		sat_diag_coarse_a(0), sat_diag_coarse_b(0), sat_diag_pred_writers(0), sat_diag_writers(0), sat_diag_tile_writes(0) {} // SESSION076
+		sat_diag_coarse_a(0), sat_diag_coarse_b(0), sat_diag_writers(0), sat_diag_tile_writes(0) {} // SESSION076
 };
 
 
@@ -852,19 +853,8 @@ public:
 		// SESSION076 DIAGNOSTIC: coarse-capture breakdown, counted inline in the DFS below (the only place that still
 		// knows WHY each node was captured - the flag array downstream records only that it was). All three stay zero
 		// unless the "sat diag" checkbox is on. See GaussianSplatUnculledFrontier::sat_diag_coarse_a.
-		size_t diag_coarse_a = 0, diag_coarse_b = 0, diag_pred_writers = 0;
+		size_t diag_coarse_a = 0, diag_coarse_b = 0;
 
-		// SESSION076: smallest pixel_scale that can possibly contribute to the saturation grid - see
-		// gsSatGridMinWritingPixelScaleFactor(). Used for two things below: the diagnostic's prediction, and (when the
-		// coarse layer is captured only to feed the grid) skipping the capture of nodes that provably cannot write.
-		//
-		// This is the NECESSARY condition, not the sufficient one: a node must also cover a tile's CENTRE to write, which
-		// depends on where in the grid it lands and so cannot be expressed as a pixel_scale threshold at all. Measured
-		// (session076): of the nodes passing this test, only ~65-75% go on to write. Using the necessary condition is the
-		// deliberate choice - it can never discard a node that would have contributed, so the grid it produces is
-		// bit-identical to the unfiltered one. Tightening it towards the sufficient bound (~0.94x) would cut more nodes
-		// but would start silently weakening the cull.
-		const float min_writing_pixel_scale = gsSatGridMinWritingPixelScaleFactor(gs_sat_occluder_sigmas) * coarse_pixel_scale; // SESSION076: the OCCLUDER sigmas, matching the radius handed to the grid above - the two must agree or this skips nodes the grid would have accepted.
 
 		for(size_t mi=0; mi<scratch->members_snapshot.size(); ++mi)
 		{
@@ -981,18 +971,11 @@ public:
 					(decorated.size() + stack.size() + node.child_count > max_splats_budget);
 				const bool by_threshold = top.pixel_scale <= coarse_pixel_scale;
 
-				// SESSION076: when nothing draws this layer, its only consumer is the saturation grid - so a node the grid
-				// provably cannot use is captured for no one. Skipping it saves its push_back here, its slot in the radix
-				// sort below (coarse ran 25-45% of the whole sorted array), its entry in the coarse SoA, and its pass
-				// through the grid build's input scan.
-				//
-				// Not applied when the layer IS drawn: the drawn patch's whole job is to plug motion-revealed frustum
-				// edges, which needs the "every branch contributes exactly one node" completeness the rule below gives it.
-				// Leaving the branch uncaptured (rather than marking it captured-and-skipped) is deliberate - a descendant
-				// may still qualify, and the flag means "this branch has its representative", which it does not.
-				const bool useless_to_grid = !coarse_layer_drawn && (top.pixel_scale <= min_writing_pixel_scale);
-
-				if((by_threshold || terminal) && !useless_to_grid)
+				// SESSION076: the capture-time skip that used to sit here is gone with the binary write rule it depended
+				// on - see gsSatGridMinWritingPixelScaleFactor's removal note in GaussianSplatSaturationGrid.h. Under the
+				// Gaussian model every node contributes in proportion to its integrated occlusion, so there is no
+				// pixel_scale below which a node is provably useless to the grid.
+				if(by_threshold || terminal)
 				{
 					DistIdx cd; cd.dist_sq = top.dist_sq; cd.idx = cloud_idx_u32 | 0x80000000u; // Bit 31 marks a coarse-floor node.
 					decorated.push_back(cd);
@@ -1004,8 +987,6 @@ public:
 					if(sat_diag_log)
 					{
 						if(by_threshold) ++diag_coarse_a; else ++diag_coarse_b;
-						if(top.pixel_scale > min_writing_pixel_scale)
-							++diag_pred_writers; // Equals the capture count whenever the skip above is active - the residual writers/pred gap is then the centre-coverage effect alone.
 					}
 				}
 			}
@@ -1213,7 +1194,6 @@ public:
 					// SESSION076 DIAGNOSTIC: carry the DFS-side breakdown across to where [gsr-sat-diag] prints it.
 					uf2->sat_diag_coarse_a = diag_coarse_a;
 					uf2->sat_diag_coarse_b = diag_coarse_b;
-					uf2->sat_diag_pred_writers = diag_pred_writers;
 
 					// Apply the verdict, building the survivor set into uf2. Coarse-floor nodes are never saturation-TESTED:
 					// they are the layer that plugs motion-revealed frustum edges, they are already confined to the dilation
@@ -5670,8 +5650,7 @@ void GaussianSplatRenderer::drainTraversalResults()
 							" (" + doubleToStringNDecimalPlaces(coarse > 0 ? (100.0 * (double)uf.sat_diag_coarse_b / coarse) : 0.0, 1) + "%)" +
 							" writers=" + uInt64ToStringCommaSeparated(uf.sat_diag_writers) +
 							" (" + doubleToStringNDecimalPlaces(coarse > 0 ? (100.0 * (double)uf.sat_diag_writers / coarse) : 0.0, 1) + "%)" +
-							" pred=" + uInt64ToStringCommaSeparated(uf.sat_diag_pred_writers) + // Must track writers closely; a large gap means the analytic threshold is wrong - see gsSatGridMinWritingPixelScaleFactor().
-							" tile_writes=" + uInt64ToStringCommaSeparated(uf.sat_diag_tile_writes) +
+								" tile_writes=" + uInt64ToStringCommaSeparated(uf.sat_diag_tile_writes) +
 							" per_writer=" + doubleToStringNDecimalPlaces(uf.sat_diag_writers > 0 ? ((double)uf.sat_diag_tile_writes / (double)uf.sat_diag_writers) : 0.0, 1) +
 							" fine=" + uInt64ToStringCommaSeparated(uf.sat_num_tested));
 					}

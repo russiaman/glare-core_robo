@@ -72,28 +72,36 @@ static const int gsSatGridMaxTiles = 300000;
 static const int gsSatGridMinRes = 8;
 
 
-// SESSION076: how far out, in sigmas of the node's own Gaussian, this stage treats a node as an OCCLUDER.
+// SESSION076: how far out, in sigmas of the node's own Gaussian, this stage lets a node occlude - and the sigma the
+// falloff within that extent is measured against. Equal to the shader's own draw cutoff, deliberately: the build pass
+// now WEIGHTS each tile's contribution by the Gaussian instead of stamping it uniformly, so a tile at 3 sigma receives
+// ~1% of the node's alpha, which is what it should receive. There is no reason to truncate the extent early once the
+// weighting is right.
 //
-// This is NOT splat_cutoff_sigmas (3), which is where the shader stops drawing the splat because it has become
-// invisible. The build pass stamps "this tile is behind opaque coverage" uniformly across every tile the node's disc
-// covers, so the radius it is given must be the radius out to which the node is actually near-opaque - and a Gaussian
-// at 3 sigma is exp(-4.5) ~= 0.011 of its peak, i.e. transparent. Using the cutoff radius made every occluder cast a
-// shadow 3x too wide in angle and ~9x too large in area.
+// Two earlier cuts got this wrong in opposite directions, and both failures are worth keeping because they are what
+// established that the error was never in the radius:
 //
-// Measured consequence, and how this was found (session076): the owner reported glasses and cups standing on a table -
-// 100x200 px objects, plainly visible - vanishing when the stage was switched on, with which object vanished changing
-// under a 10-20cm camera step, "as if the mask were attached to the camera rather than to the objects". That is the
-// signature of shadows far wider than the geometry casting them. The same run showed the saturation threshold to be
-// nearly inert between 0.96 and 0.9999 (only exactly 1.0, which disables the mechanism, changed anything), meaning
-// per-tile transmittance was collapsing to ~0 regardless - the second half of the same problem, since a merged node's
-// alpha is a saturating composite (1 - (1-mean_alpha)^n, see GaussianSplatMergeColourMode_Energy) that goes to 1 for
-// any node standing in for more than a handful of splats. An over-wide disc of near-opaque alpha is exactly what
-// drives every tile to zero.
+//  - At 3 sigma with a UNIFORM stamp, every occluder asserted near-opaque coverage out to where it is ~1% of peak, so
+//    each shadow was 3x too wide in angle and ~9x too large in area. Owner-visible as 100x200 px objects standing on a
+//    table vanishing outright, and as WHICH object vanished changing under a 10-20cm camera step - "as if the mask were
+//    attached to the camera rather than to the objects", the exact signature of shadows far wider than the geometry
+//    casting them. The same run found the saturation threshold nearly inert between 0.96 and 0.9999 (only exactly 1.0,
+//    which disables the stage, changed anything): per-tile transmittance was collapsing to ~0 regardless. A merged
+//    node's alpha is a saturating composite, 1 - (1-mean_alpha)^n (GaussianSplatMergeColourMode_Energy), which goes to
+//    1 for any node standing in for more than a handful of splats - so an over-wide disc of near-opaque alpha drove
+//    every tile straight to zero.
 //
-// 1 sigma (exp(-0.5) ~= 0.61 of peak) is the value under test. It also makes the grid self-consistent for the first
-// time: gsSatGridResForFocal() sizes a tile to coarse_pixel_scale/focal_px, which is one node DIAMETER at 1 sigma, so
-// a node covers about one tile - the "1-4 tiles" that constant's own comment claims and never actually got.
-static const float gs_sat_occluder_sigmas = 1.f;
+//  - Shrunk to 1 sigma to fix that, the disc became exactly one tile ACROSS at the coarse scale (gsSatGridResForFocal()
+//    sizes a tile to coarse_pixel_scale/focal_px), so the full-coverage write rule could not be satisfied by a
+//    coarse-scale node at all. Measured: cA went to exactly 0 - every node captured for being at or below the coarse
+//    pixel scale became unable to write - leaving only near-field terminal leaves as occluders. A chair three metres
+//    away then had no representative in the grid and stopped occluding anything behind it, while thin near geometry
+//    (a floor underfoot) still did.
+//
+// The threshold did become responsive at 1 sigma (dropped 1.2% at 0.96 against 25.6% at 0.06, where before it had been
+// flat), which confirmed the transmittance-collapse half of the diagnosis even as the coverage half broke. Hence the
+// current model: the node is a Gaussian, not a disc of any radius, and is treated as one. See the write loop.
+static const float gs_sat_occluder_sigmas = 3.f;
 
 
 // Octahedral direction -> unit-square coordinate, in [-1, 1]^2.
@@ -114,25 +122,11 @@ int gsSatGridResForFocal(float focal_px, float coarse_pixel_scale);
 // Tile index (row-major, [0, res*res)) for a direction (any positive length - see gsDirToOct()).
 int gsSatGridTileForDir(const Vec4f& dir, int res);
 
-// SESSION076 DIAGNOSTIC: the smallest pixel_scale a node can have and still write to the grid, as a MULTIPLE of
-// coarse_pixel_scale.
-//
-// The build pass only accepts a node that fully covers at least one tile (see gsBuildSaturationGrid()'s cover_radius
-// test), which makes "can this node contribute at all?" a pure function of pixel_scale. Collecting the algebra in one
-// place so the traversal's diagnostic can predict the build pass's own verdict without duplicating its constants:
-//
-//   a tile subtends           coarse_pixel_scale / focal_px  radians   (by construction, gsSatGridResForFocal())
-//   a node's angular radius   0.5*cutoff_sigmas*feature_size / dist    (the radius the renderer feeds this grid)
-//                           = 0.5*cutoff_sigmas * pixel_scale / focal_px
-//   so radius_tiles         = 0.5*cutoff_sigmas * pixel_scale / coarse_pixel_scale
-//   and cover_radius > 0    <=>  pixel_scale > (tile half-diagonal / (0.5*cutoff_sigmas)) * coarse_pixel_scale
-//
-// Pass the OCCLUDER sigmas (gs_sat_occluder_sigmas), the same value the radius fed to the build pass is derived from -
-// not the shader's cutoff sigmas. At 3 the factor was ~0.47, below the capture rule's own threshold; at 1 it is ~1.41,
-// above it, which means no node captured merely for being at or under coarse_pixel_scale can write at all and only the
-// larger terminal captures reach the grid. That is a real narrowing of what feeds the grid, and it is the point: those
-// were the nodes whose over-wide shadows were removing visible geometry.
-float gsSatGridMinWritingPixelScaleFactor(float splat_cutoff_sigmas);
+// SESSION076: the pixel_scale write threshold that used to live here is gone. It existed because the write rule was
+// binary (a node either fully covered a tile or contributed nothing), which made "can this node write at all?" a pure
+// function of pixel_scale. With the Gaussian falloff there is no such cliff - every node contributes in proportion to
+// its integrated occlusion - so no pixel_scale threshold can exclude a node without discarding real signal. The
+// negligible-amplitude cutoff in the .cpp replaces it, applied to the contribution itself rather than to a proxy.
 
 // Angular size of one grid tile at the given resolution - the SAME quantity gsSatGridResForFocal() solves for (a tile
 // of solid angle ~= tile_ang^2 covering, together with res*res of its neighbours, the whole sphere's 4*pi steradians),

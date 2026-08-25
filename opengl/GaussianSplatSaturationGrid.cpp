@@ -99,12 +99,11 @@ int gsSatGridTileForDir(const Vec4f& dir, int res)
 // handled), it is bounded in oct space by scaling the angular radius into tile units via gsSatGridTileAngle() - the
 // same quantity the resolution was solved for, already carrying the distortion margin.
 //
-// The two sides deliberately do NOT share a span beyond this point, because they need opposite roundings and getting
-// that wrong is not symmetric: the write side must use only tiles the disc FULLY covers (over-marking a tile asserts
-// occlusion that was never established), while the read side must use every tile the disc TOUCHES (missing one lets a
-// node through that some tile disagreed about). An earlier cut of this file used the touch span for both - the
-// comment claimed a separate full-coverage test on the write side that was never actually written - which marked each
-// node into a ~3x3 block instead of ~1 tile and saturated essentially the whole sphere. See the plan snapshot.
+// SESSION076: both sides now use the TOUCH span. They used to differ - the write side demanded full coverage of a
+// tile, on the reasoning that "this tile is behind opaque coverage" is a claim a partly-covering node has not
+// established. That reasoning was sound only while the contribution was binary. Now a partly-covering node contributes
+// a correspondingly small alpha instead of a full one, so the claim it makes is already proportionate to what it
+// covers, and demanding full coverage would simply discard it. See the write loop for the model.
 static inline float gsSatGridFootprint(const Vec4f& offset, float ang_radius, int res, float& cu, float& cv)
 {
 	const Vec2f oct = gsDirToOct(offset);
@@ -120,12 +119,39 @@ static inline float gsSatGridFootprint(const Vec4f& offset, float ang_radius, in
 static const float gs_sat_tile_half_diag = 0.70710678f;
 
 
-float gsSatGridMinWritingPixelScaleFactor(float splat_cutoff_sigmas)
+// SESSION076: an occluder whose peak contribution to any tile is below this is skipped outright. It is a
+// negligible-contribution cutoff, not a tuning knob: 0.2% of a tile's transmittance is an order of magnitude below the
+// resolution of any saturation threshold the panel can express, so nothing that clears it can change a verdict. Its
+// only job is to keep the millions of ~2px fine-scale nodes - whose integrated occlusion is genuinely nil - out of the
+// write loop.
+static const float gs_sat_min_occluder_amp = 0.002f;
+
+
+// SESSION076: exp(-x) over x in [0, gs_sat_exp_lut_max), sampled at bin centres. The write loop below evaluates one
+// Gaussian per tile touched - tens of millions per grid build - and expf() at ~10-20ns each would put that cost back on
+// the same order as the tree walk we just moved it off. Nearest-bin lookup is ~1.5% relative error, which is far below
+// this stage's own resolution (see gs_sat_min_occluder_amp) and biases nothing systematically.
+//
+// Built at static-init time by the constructor rather than lazily, so the worker threads that read it never race to
+// initialise it.
+static const int gs_sat_exp_lut_n = 256;
+static const float gs_sat_exp_lut_max = 8.f; // exp(-8) = 3.4e-4: past here the contribution is below the cutoff above.
+
+struct GsSatExpLut
 {
-	// SESSION076: see the header for the derivation. Guarded against a zero/negative cutoff (which would mean nodes
-	// have no footprint at all) by reporting "nothing can ever write", the honest answer for that input.
-	const float half_sigmas = 0.5f * splat_cutoff_sigmas;
-	return half_sigmas > 0.f ? (gs_sat_tile_half_diag / half_sigmas) : std::numeric_limits<float>::infinity();
+	GsSatExpLut()
+	{
+		for(int i=0; i<gs_sat_exp_lut_n; ++i)
+			v[i] = std::exp(-(((float)i + 0.5f) * (gs_sat_exp_lut_max / (float)gs_sat_exp_lut_n)));
+	}
+	float v[gs_sat_exp_lut_n];
+};
+static const GsSatExpLut gs_sat_exp_lut;
+
+static inline float gsSatExpNeg(float x) // x >= 0; caller has already rejected x >= gs_sat_exp_lut_max.
+{
+	const int bin = (int)(x * ((float)gs_sat_exp_lut_n / gs_sat_exp_lut_max));
+	return gs_sat_exp_lut.v[myClamp(bin, 0, gs_sat_exp_lut_n - 1)];
 }
 
 
@@ -171,22 +197,40 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 		float cu, cv;
 		const float radius_tiles = gsSatGridFootprint(Vec4f(dx, dy, dz, 0.f), ang_radius, res, cu, cv);
 
-		// SESSION074: only tiles this node FULLY covers may be written - see gsSatGridFootprint()'s comment for why the
-		// write and read sides must round in opposite directions. A tile is fully inside the footprint disc iff its
-		// centre lies within (radius_tiles - tile half-diagonal) of the disc centre; if that shrunken radius is
-		// negative the node cannot fully cover any tile and contributes nothing at all. That is deliberate, not a
-		// missed opportunity: this pass's claim is "this whole tile is behind opaque coverage", which a node too small
-		// to fill the tile has not established.
-		const float cover_radius = radius_tiles - gs_sat_tile_half_diag;
-		if(cover_radius <= 0.f)
-			continue;
-
-		const int u0 = myClamp((int)std::ceil (cu - cover_radius - 0.5f), 0, res - 1);
-		const int u1 = myClamp((int)std::floor(cu + cover_radius - 0.5f), 0, res - 1);
-		const int v0 = myClamp((int)std::ceil (cv - cover_radius - 0.5f), 0, res - 1);
-		const int v1 = myClamp((int)std::floor(cv + cover_radius - 0.5f), 0, res - 1);
-		if(u1 < u0 || v1 < v0)
-			continue;
+		// SESSION076: an occluder is a GAUSSIAN, not a uniformly opaque disc, and the whole of this pass's accuracy
+		// turns on that distinction. Both earlier cuts modelled it as a disc and failed in opposite directions:
+		//
+		//  - at the shader's 3-sigma draw cutoff, the disc stamped near-opaque coverage out to where the node is
+		//    actually ~1% of peak, so every occluder cast a shadow 3x too wide in angle. Owner-visible as plainly
+		//    unoccluded objects on a table disappearing, and as which object disappeared changing under a 10-20cm
+		//    camera step.
+		//  - shrunk to 1 sigma to fix that, the disc became exactly one tile across at the coarse scale, so the
+		//    full-coverage write rule could never be satisfied by a coarse-scale node at all - the mid-field lost its
+		//    occluders entirely and a chair three metres away stopped occluding anything behind it.
+		//
+		// There is no radius that is right, because the error is in the disc, not its size. So: contribute to every
+		// tile the footprint TOUCHES, weighted by the node's own Gaussian falloff to that tile.
+		//
+		// The weight is not the Gaussian sampled at the tile centre, which would be a point sample of a continuous
+		// quantity and would make a sub-tile node either count fully (centre hit) or not at all (centre missed). It is
+		// the Gaussian CONVOLVED WITH THE TILE - the tile's own box approximated by its variance, 1/12 per axis. That
+		// makes the contribution conserve the node's integrated occlusion in both regimes, which is the same energy
+		// argument session071 used for merged colours (GaussianSplatMergeColourMode_Energy):
+		//
+		//   var  = sigma^2 + 1/12                     (Gaussian variance widened by the tile's own)
+		//   amp  = alpha * sigma^2 / var              (peak scaled so the integral is unchanged)
+		//   a_eff(d) = amp * exp(-d^2 / (2*var))
+		//
+		// Large node (sigma >> 1 tile): amp -> alpha, a_eff -> the alpha at that tile. Small node (sigma << 1 tile):
+		// amp -> alpha * 12 * sigma^2, and the total spread over the neighbourhood comes to alpha * 2*pi*sigma^2 - the
+		// true integral of the node's occlusion. Neither regime is special-cased.
+		const float sigma_tiles = radius_tiles * (1.f / gs_sat_occluder_sigmas);
+		const float sigma_sq = sigma_tiles * sigma_tiles;
+		const float var = sigma_sq + (1.f / 12.f);
+		const float a = myClamp(alpha[i], 0.f, 1.f);
+		const float amp = a * (sigma_sq / var);
+		if(amp < gs_sat_min_occluder_amp)
+			continue; // Integrated occlusion is nil - see gs_sat_min_occluder_amp. Skips the fine-scale bulk cheaply.
 
 		// SESSION074: recorded at the node's FAR edge (dist + radius), not its centre or near edge - deliberately
 		// conservative. The true saturation point lies somewhere within this node's footprint (we don't know exactly
@@ -194,11 +238,20 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 		// unambiguously behind the coarse mass that caused saturation - never something that might still be in front
 		// of, or interleaved with, the very geometry that saturated the tile.
 		const float far_edge = (1.f / inv_dist) + r;
-		const float a = myClamp(alpha[i], 0.f, 1.f);
-		const float t_factor = 1.f - a;
-		const float cover_radius_sq = cover_radius * cover_radius;
 
-		if(out_writers) ++(*out_writers); // SESSION076 DIAGNOSTIC: this node cleared the full-coverage test, i.e. it contributes.
+		// Touch span, not coverage span: with a falloff weight there is no longer any reason to demand full coverage,
+		// and a tile the footprint merely clips now correctly receives a small contribution instead of none.
+		const float span = radius_tiles + gs_sat_tile_half_diag;
+		const int u0 = myClamp((int)std::ceil (cu - span - 0.5f), 0, res - 1);
+		const int u1 = myClamp((int)std::floor(cu + span - 0.5f), 0, res - 1);
+		const int v0 = myClamp((int)std::ceil (cv - span - 0.5f), 0, res - 1);
+		const int v1 = myClamp((int)std::floor(cv + span - 0.5f), 0, res - 1);
+		if(u1 < u0 || v1 < v0)
+			continue;
+
+		if(out_writers) ++(*out_writers); // SESSION076 DIAGNOSTIC: this node contributes something.
+
+		const float inv_2var = 0.5f / var;
 
 		for(int v=v0; v<=v1; ++v)
 		{
@@ -208,18 +261,17 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 			const float dv_sq = dv * dv;
 			for(int u=u0; u<=u1; ++u)
 			{
-				// The [u0,u1]x[v0,v1] box above bounds the covered set; its corners can still fall outside the disc, so
-				// test each tile centre exactly. Cheap - the box is 1-3 tiles per axis at the resolution this grid runs
-				// at - and over-marking here is precisely the unsafe direction.
 				const float du = ((float)u + 0.5f) - cu;
-				if(du * du + dv_sq > cover_radius_sq)
-					continue;
-
-				if(out_tile_writes) ++(*out_tile_writes); // SESSION076 DIAGNOSTIC: write amplification - tiles touched per node, summed.
+				const float x = (du * du + dv_sq) * inv_2var;
+				if(x >= gs_sat_exp_lut_max)
+					continue; // Contribution below the lookup's tail - see gs_sat_exp_lut_max.
 
 				if(depth_row[u] != std::numeric_limits<float>::infinity())
 					continue; // Already saturated by something nearer (front-to-back order) - nothing more to do for this tile.
-				accum_row[u] *= t_factor;
+
+				if(out_tile_writes) ++(*out_tile_writes); // SESSION076 DIAGNOSTIC: write amplification.
+
+				accum_row[u] *= (1.f - amp * gsSatExpNeg(x));
 				if(accum_row[u] <= remaining_threshold)
 					depth_row[u] = far_edge;
 			}

@@ -2018,6 +2018,7 @@ static size_t filterUnculledFrontier(const GaussianSplatUnculledFrontier& uf, co
 	const Vec4f& cam_pos_ws, float rate_fine_baseline, float rate_coarse_baseline,
 	const Vec4f& rotation_axis, float swept_fine, float swept_coarse, // SESSION072: unit rotation axis + the angle swept during each layer's latency window - see above.
 	const float* trans_dilation, bool coarse_only_debug,
+	bool draw_coarse_layer, // SESSION075: whether coarse-floor nodes may survive at all - see kickOffFilters()'s call site. Independent of whether U(P) captured them (see kickOffTraversals()'s coarse_capture_needed): captured-but-not-drawn is now a valid state, for saturation-only measurement.
 	js::Vector<uint32, 16>& out_indices,
 	size_t* out_num_coarse = NULL) // SESSION072 DIAGNOSTIC: if non-null, receives how many of the survivors were coarse-floor nodes - see [gsr-filter-drain].
 {
@@ -2089,6 +2090,10 @@ static size_t filterUnculledFrontier(const GaussianSplatUnculledFrontier& uf, co
 		}
 		if(coarse_only_debug)
 			outside = _mm_or_ps(outside, _mm_cmpeq_ps(IC, _mm_setzero_ps())); // Debug: keep only coarse nodes (show full coarse coverage, band restriction off).
+		else if(!draw_coarse_layer)
+			// SESSION075: coarse layer captured (for saturation) but not meant to draw - reject every coarse node
+			// outright, regardless of the band test below. See this function's draw_coarse_layer parameter comment.
+			outside = _mm_or_ps(outside, _mm_cmpgt_ps(IC, _mm_setzero_ps()));
 		else
 			// SESSION063 K4: confine the coarse floor to the dilation band. A coarse node INSIDE the tight frustum is
 			// rejected - there the fine set already covers, and letting the coarse layer draw over the whole visible frame
@@ -2123,6 +2128,7 @@ static size_t filterUnculledFrontier(const GaussianSplatUnculledFrontier& uf, co
 			if(!inside) break;
 		}
 		if(!inside) continue;
+		if(!coarse_only_debug && is_coarse && !draw_coarse_layer) continue; // SESSION075: captured-but-not-drawn coarse - see draw_coarse_layer's comment.
 		if(!coarse_only_debug && is_coarse && inside_tight) continue; // Band restriction: coarse only survives beyond the tight frustum.
 		out[num_out++] = idx[i];
 		if(is_coarse) ++num_coarse_out; // SESSION072 DIAGNOSTIC counting - see out_num_coarse.
@@ -2157,12 +2163,12 @@ public:
 	GaussianSplatFilterTask(uint64 cloud_id_, const Reference<GaussianSplatUnculledFrontier>& frontier_,
 		const Planef* planes_, int num_planes_, const Vec4f& cam_pos_ws_, float rate_fine_baseline_, float rate_coarse_baseline_,
 		const Vec4f& rotation_axis_, float swept_fine_, float swept_coarse_, // SESSION072: anisotropic rotational dilation - see kickOffFilters().
-		const float* trans_dilation_, bool coarse_only_debug_,
+		const float* trans_dilation_, bool coarse_only_debug_, bool draw_coarse_layer_, // SESSION075
 		ThreadSafeQueue<Reference<ThreadMessage> >* result_queue_)
 	:	cloud_id(cloud_id_), frontier(frontier_), num_planes(num_planes_), cam_pos_ws(cam_pos_ws_),
 		rate_fine_baseline(rate_fine_baseline_), rate_coarse_baseline(rate_coarse_baseline_),
 		rotation_axis(rotation_axis_), swept_fine(swept_fine_), swept_coarse(swept_coarse_),
-		coarse_only_debug(coarse_only_debug_), result_queue(result_queue_)
+		coarse_only_debug(coarse_only_debug_), draw_coarse_layer(draw_coarse_layer_), result_queue(result_queue_)
 	{
 		if(num_planes < 0) num_planes = 0;
 		if(num_planes > (int)staticArrayNumElems(planes)) num_planes = (int)staticArrayNumElems(planes);
@@ -2179,7 +2185,7 @@ public:
 		msg->frontier = frontier;
 		Timer filter_compute_timer; // SESSION072 DIAGNOSTIC: isolates filterUnculledFrontier()'s own cost from task scheduling - see msg->filter_compute_ms.
 		filterUnculledFrontier(*frontier, planes, num_planes, cam_pos_ws, rate_fine_baseline, rate_coarse_baseline,
-			rotation_axis, swept_fine, swept_coarse, trans_dilation, coarse_only_debug,
+			rotation_axis, swept_fine, swept_coarse, trans_dilation, coarse_only_debug, draw_coarse_layer,
 			msg->survivors, &msg->num_coarse_survivors);
 		msg->filter_compute_ms = filter_compute_timer.elapsed() * 1.0e3;
 		result_queue->enqueue(msg);
@@ -2195,6 +2201,7 @@ private:
 	Vec4f rotation_axis;                              // SESSION072: unit rotation axis (world space) - anisotropic rotational dilation, see kickOffFilters().
 	float swept_fine, swept_coarse;                   // SESSION072: angle swept about that axis during the fine/coarse dilation latency window. Kept separate from the axis (rather than as two pre-scaled vectors) so the filter needs one cross product per plane instead of two - see filterUnculledFrontier().
 	bool coarse_only_debug;                           // SESSION063 K4: keep only coarse nodes (isolation view).
+	bool draw_coarse_layer;                           // SESSION075: whether captured coarse nodes may survive at all - see filterUnculledFrontier()'s parameter comment.
 	float trans_dilation[6];                          // per-plane translation margin (metres).
 	ThreadSafeQueue<Reference<ThreadMessage> >* result_queue;
 };
@@ -5652,7 +5659,8 @@ void GaussianSplatRenderer::kickOffFilters()
 
 		task_manager->addTask(new GaussianSplatFilterTask(best_cloud->cloud_id, best_cloud->cached_ufrontier,
 			scene->frustum_clip_planes, filter_num_planes, cam_pos_ws, rate_fine_baseline, rate_coarse_baseline,
-			cam_angular_axis_ema_ws, swept_fine, swept_coarse, trans_dilation, coarse_layer_debug, &filter_result_queue));
+			cam_angular_axis_ema_ws, swept_fine, swept_coarse, trans_dilation, coarse_layer_debug,
+			split_coarse_floor_enabled, &filter_result_queue)); // SESSION075: "coarse" checkbox now controls only whether the (possibly sat-only-captured) coarse layer is allowed to draw - see filterUnculledFrontier()'s draw_coarse_layer.
 
 		if(filter_debug_log) // SESSION064 DIAG: how long do filter kicks continue after the camera stops, and with what band?
 			conPrint("[gsr-filter-kick] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms reason=" + std::string(filter_kick_reason) +
@@ -5983,15 +5991,21 @@ void GaussianSplatRenderer::kickOffTraversals()
 
 		// SESSION055: pass frustum planes (copied into task, see its ctor) and the anisotropic dilation numbers computed
 		// once above per kickOffTraversals() call.
+		// SESSION075: coarse-floor DATA capture (feeds both the edge-filling draw layer AND the saturation grid) is now
+		// requested by EITHER consumer wanting it - previously a single flag conflated "capture the coarse floor" with
+		// "draw it as edge-filling", so turning "coarse" off (wanted only to skip the draw) also starved the saturation
+		// grid of its only data source. The "coarse" checkbox (split_coarse_floor_enabled) now controls solely whether
+		// the captured layer is later allowed to survive the filter - see kickOffFilters()'s draw_coarse_layer.
+		const bool coarse_capture_needed = split_coarse_floor_enabled || (sat_prefilter_mode != GaussianSplatSatPrefilterMode_Off);
 		task_manager->addTask(new GaussianSplatLodTraversalTask(best_cloud->cloud_id, best_cloud->topology_generation, scratch, cam_pos_ws,
 			lod_pixel_scale_limit, lod_max_splats_budget, lod_max_layer_density, lod_max_tree_depth, focal_px,
 			scene->frustum_clip_planes, scene->num_frustum_clip_planes, cull_active,
 			translation_dilation, rotation_dilation_rate,
 			&traversal_result_queue,
 			/*frontier_record=*/NULL, /*build_unculled_frontier=*/split_filter_enabled, // SESSION063: cull-off traversal builds U(P) for the split filter.
-			/*coarse_floor_enabled=*/split_filter_enabled && split_coarse_floor_enabled, /*coarse_pixel_scale=*/split_coarse_pixel_scale, // SESSION063 K4.
+			/*coarse_floor_enabled=*/split_filter_enabled && coarse_capture_needed, /*coarse_pixel_scale=*/split_coarse_pixel_scale, // SESSION063 K4, SESSION075.
 			/*dist_clamp_enabled=*/splat_dist_clamp_enabled, splat_dist_clamp_min, splat_dist_clamp_max, splat_dist_clamp_invert, // SESSION072.
-			/*sat_prefilter_mode=*/(split_filter_enabled && split_coarse_floor_enabled) ? sat_prefilter_mode : GaussianSplatSatPrefilterMode_Off, splat_saturation_threshold)); // SESSION074.
+			/*sat_prefilter_mode=*/split_filter_enabled ? sat_prefilter_mode : GaussianSplatSatPrefilterMode_Off, splat_saturation_threshold)); // SESSION074, SESSION075: no longer needs coarse_capture_needed here - it's already folded into coarse_floor_enabled_ above, which capture is gated on.
 	}
 
 	// SESSION055 diag: after the while-loop, detect *unmet* rotation demand - a cloud whose forward has shifted past the

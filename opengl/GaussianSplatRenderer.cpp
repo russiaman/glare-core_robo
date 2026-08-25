@@ -771,7 +771,8 @@ public:
 		bool coarse_floor_enabled_ = false, float coarse_pixel_scale_ = 20.f, // SESSION063 K4: also capture a coarse floor into U(P) - see GaussianSplatUnculledFrontier::is_coarse.
 		bool dist_clamp_enabled_ = false, float dist_clamp_min_ = 0.f, float dist_clamp_max_ = 0.f, bool dist_clamp_invert_ = false, // SESSION072: distance-slice early-cull, mirrors the frustum-cull block below - see GaussianSplatRenderer::getDistClampEnabled(). Defaults off, so getFrustumStructureReport()'s call site (which omits these) always sees the whole tree.
 		GaussianSplatSatPrefilterMode sat_prefilter_mode_ = GaussianSplatSatPrefilterMode_Off, float sat_saturation_threshold_ = 0.f, // SESSION074: pre-GPU saturation cull - see GaussianSplatSaturationGrid.h. Defaults off; only meaningful when build_unculled_frontier_ and coarse_floor_enabled_ are also both true (the grid is built from the coarse floor captured into U(P)). Drop mode prunes the frontier here; Count only tallies.
-		bool sat_diag_log_ = false) // SESSION076 DIAGNOSTIC: gated by its own "sat diag" checkbox - fills GaussianSplatUnculledFrontier's sat_diag_* counters. Off means the extra counting is not done at all.
+		bool sat_diag_log_ = false, // SESSION076 DIAGNOSTIC: gated by its own "sat diag" checkbox - fills GaussianSplatUnculledFrontier's sat_diag_* counters. Off means the extra counting is not done at all.
+		bool coarse_layer_drawn_ = true) // SESSION076: whether anything will actually DRAW the captured coarse layer (the "coarse" checkbox). False means it was captured solely to feed the saturation grid, which lets this task both skip capturing nodes the grid cannot use and evict the rest once the grid is built - see the capture block and the compaction loop in run(). Defaults true, i.e. the pre-session076 behaviour, so callers that don't care are unaffected.
 	:	cloud_id(cloud_id_), topology_generation(topology_generation_), scratch(scratch_), cam_pos_ws(cam_pos_ws_),
 		pixel_scale_limit(pixel_scale_limit_), max_splats_budget(max_splats_budget_), max_layer_density(max_layer_density_), max_tree_depth(max_tree_depth_), focal_px(focal_px_),
 		num_frustum_clip_planes(num_frustum_clip_planes_), frustum_cull_enabled(frustum_cull_enabled_),
@@ -782,7 +783,7 @@ public:
 		coarse_floor_enabled(coarse_floor_enabled_), coarse_pixel_scale(coarse_pixel_scale_),
 		dist_clamp_enabled(dist_clamp_enabled_), dist_clamp_min(dist_clamp_min_), dist_clamp_max(dist_clamp_max_), dist_clamp_invert(dist_clamp_invert_),
 		sat_prefilter_mode(sat_prefilter_mode_), sat_saturation_threshold(sat_saturation_threshold_), // SESSION074
-		sat_diag_log(sat_diag_log_) // SESSION076
+		sat_diag_log(sat_diag_log_), coarse_layer_drawn(coarse_layer_drawn_) // SESSION076
 	{
 		if(num_frustum_clip_planes < 0)
 			num_frustum_clip_planes = 0;
@@ -832,7 +833,18 @@ public:
 		// knows WHY each node was captured - the flag array downstream records only that it was). All three stay zero
 		// unless the "sat diag" checkbox is on. See GaussianSplatUnculledFrontier::sat_diag_coarse_a.
 		size_t diag_coarse_a = 0, diag_coarse_b = 0, diag_pred_writers = 0;
-		const float diag_min_writing_pixel_scale = sat_diag_log ? (gsSatGridMinWritingPixelScaleFactor(splat_cutoff_sigmas) * coarse_pixel_scale) : 0.f;
+
+		// SESSION076: smallest pixel_scale that can possibly contribute to the saturation grid - see
+		// gsSatGridMinWritingPixelScaleFactor(). Used for two things below: the diagnostic's prediction, and (when the
+		// coarse layer is captured only to feed the grid) skipping the capture of nodes that provably cannot write.
+		//
+		// This is the NECESSARY condition, not the sufficient one: a node must also cover a tile's CENTRE to write, which
+		// depends on where in the grid it lands and so cannot be expressed as a pixel_scale threshold at all. Measured
+		// (session076): of the nodes passing this test, only ~65-75% go on to write. Using the necessary condition is the
+		// deliberate choice - it can never discard a node that would have contributed, so the grid it produces is
+		// bit-identical to the unfiltered one. Tightening it towards the sufficient bound (~0.94x) would cut more nodes
+		// but would start silently weakening the cull.
+		const float min_writing_pixel_scale = gsSatGridMinWritingPixelScaleFactor(splat_cutoff_sigmas) * coarse_pixel_scale;
 
 		for(size_t mi=0; mi<scratch->members_snapshot.size(); ++mi)
 		{
@@ -948,7 +960,19 @@ public:
 					(max_tree_depth > 0 && top.depth >= (uint32)max_tree_depth) ||
 					(decorated.size() + stack.size() + node.child_count > max_splats_budget);
 				const bool by_threshold = top.pixel_scale <= coarse_pixel_scale;
-				if(by_threshold || terminal)
+
+				// SESSION076: when nothing draws this layer, its only consumer is the saturation grid - so a node the grid
+				// provably cannot use is captured for no one. Skipping it saves its push_back here, its slot in the radix
+				// sort below (coarse ran 25-45% of the whole sorted array), its entry in the coarse SoA, and its pass
+				// through the grid build's input scan.
+				//
+				// Not applied when the layer IS drawn: the drawn patch's whole job is to plug motion-revealed frustum
+				// edges, which needs the "every branch contributes exactly one node" completeness the rule below gives it.
+				// Leaving the branch uncaptured (rather than marking it captured-and-skipped) is deliberate - a descendant
+				// may still qualify, and the flag means "this branch has its representative", which it does not.
+				const bool useless_to_grid = !coarse_layer_drawn && (top.pixel_scale <= min_writing_pixel_scale);
+
+				if((by_threshold || terminal) && !useless_to_grid)
 				{
 					DistIdx cd; cd.dist_sq = top.dist_sq; cd.idx = cloud_idx_u32 | 0x80000000u; // Bit 31 marks a coarse-floor node.
 					decorated.push_back(cd);
@@ -960,8 +984,8 @@ public:
 					if(sat_diag_log)
 					{
 						if(by_threshold) ++diag_coarse_a; else ++diag_coarse_b;
-						if(top.pixel_scale > diag_min_writing_pixel_scale)
-							++diag_pred_writers;
+						if(top.pixel_scale > min_writing_pixel_scale)
+							++diag_pred_writers; // Equals the capture count whenever the skip above is active - the residual writers/pred gap is then the centre-coverage effect alone.
 					}
 				}
 			}
@@ -1145,19 +1169,34 @@ public:
 					// Compaction preserves order (a retained subsequence of a front-to-back list is still front-to-back),
 					// which every later stage depends on - the filter emits in input order and never re-sorts.
 					//
-					// Coarse-floor nodes are never dropped: they are the layer that plugs motion-revealed frustum edges,
-					// they are already confined to the dilation band by the filter, and they are what the grid was built
-					// from in the first place. Testing them would trade the mechanism's own safety margin for a cut on a
-					// set that barely costs anything to draw.
+					// Coarse-floor nodes are never saturation-TESTED: they are the layer that plugs motion-revealed frustum
+					// edges, they are already confined to the dilation band by the filter, and they are what the grid was
+					// built from in the first place. Testing them would trade the mechanism's own safety margin for a cut
+					// on a set that barely costs anything to draw.
+					//
+					// SESSION076: they are, however, EVICTED here when nothing draws them. The grid is finished with them
+					// by this point (it was built above, and holds only the resulting sat_depth), so with the "coarse"
+					// checkbox off they have no remaining consumer at all - yet they stayed in U(P) for its whole life,
+					// and U(P) is what every later filter kick streams and frustum-tests. Measured on the owner's interior
+					// at pixel scale limit 2: 1.72M of the 3.57M-node pool were coarse nodes the filter tested and then
+					// unconditionally rejected on every single kick (visible as coarse=0 in [gsr-filter-drain] while
+					// [gsr-sat]'s pool_after counted them) - 48% of the pool, and with it ~48% of the filter's per-kick
+					// compute, spent on nodes nothing could ever draw.
 					if(uf->sat_grid_res > 0)
 					{
 						Timer sat_test_timer;
 						const bool prune = (sat_prefilter_mode == GaussianSplatSatPrefilterMode_Drop);
+						const bool evict_coarse = !coarse_layer_drawn; // SESSION076 - see above. Independent of prune: this is "no consumer", not a saturation verdict, so it applies in Count mode too.
 						size_t num_tested = 0, num_dropped = 0, num_dropped_aggr = 0, w = 0;
 						for(size_t i=0; i<n; ++i)
 						{
 							bool drop = false;
-							if(uf->is_coarse[i] == 0.f) // Fine nodes only - see above.
+							if(uf->is_coarse[i] != 0.f)
+							{
+								if(evict_coarse)
+									continue;
+							}
+							else // Fine nodes only - see above.
 							{
 								const float dx = uf->px[i] - cam_pos_ws.x[0];
 								const float dy = uf->py[i] - cam_pos_ws.x[1];
@@ -1272,6 +1311,7 @@ private:
 	GaussianSplatSatPrefilterMode sat_prefilter_mode; // SESSION074: Off = don't build the grid at all; Count = build + tally; Drop = build, tally and prune the frontier - see GaussianSplatSaturationGrid.h.
 	float sat_saturation_threshold;  // SESSION074: reuses the existing splat_saturation_threshold live knob (GaussianSplatRenderer::getSaturationThreshold()) - no new threshold introduced, see the plan's "no manual per-scene tuning" constraint.
 	bool sat_diag_log;               // SESSION076 DIAGNOSTIC: see the ctor param.
+	bool coarse_layer_drawn;         // SESSION076: see the ctor param.
 };
 
 
@@ -4522,6 +4562,25 @@ void GaussianSplatRenderer::setSatPrefilterMode(GaussianSplatSatPrefilterMode v)
 }
 
 
+// SESSION076: the "coarse" checkbox now changes what a traversal PRODUCES, not just what the filter is allowed to draw
+// from it - with the layer undrawn, the traversal skips capturing grid-useless coarse nodes and evicts the rest once the
+// grid is built. So a cached U(P) built while this was off physically has no coarse layer left in it, and turning the
+// checkbox back on could not restore the edge-filling patch until something else happened to force a fresh traversal -
+// during pure rotation, nothing does. Dropping the cached frontiers here forces one, exactly as setSatPrefilterMode() does.
+void GaussianSplatRenderer::setCoarseFloorEnabled(bool v)
+{
+	if(v == split_coarse_floor_enabled)
+		return;
+	split_coarse_floor_enabled = v;
+
+	for(size_t i=0; i<clouds.size(); ++i)
+	{
+		clouds[i]->cached_ufrontier = NULL;
+		clouds[i]->have_last_traversal_cam_pos = false;
+	}
+}
+
+
 // SESSION076: same cached-frontier drop as setSatPrefilterMode() above, for the same reason - the sat_diag_* counters
 // are filled when a frontier is BUILT, so without forcing a fresh traversal the checkbox would appear to do nothing
 // until the camera happened to move.
@@ -6096,7 +6155,8 @@ void GaussianSplatRenderer::kickOffTraversals()
 			/*coarse_floor_enabled=*/split_filter_enabled && coarse_capture_needed, /*coarse_pixel_scale=*/split_coarse_pixel_scale, // SESSION063 K4, SESSION075.
 			/*dist_clamp_enabled=*/splat_dist_clamp_enabled, splat_dist_clamp_min, splat_dist_clamp_max, splat_dist_clamp_invert, // SESSION072.
 			/*sat_prefilter_mode=*/split_filter_enabled ? sat_prefilter_mode : GaussianSplatSatPrefilterMode_Off, splat_saturation_threshold, // SESSION074, SESSION075: no longer needs coarse_capture_needed here - it's already folded into coarse_floor_enabled_ above, which capture is gated on.
-			/*sat_diag_log=*/sat_diag_log)); // SESSION076 DIAGNOSTIC.
+			/*sat_diag_log=*/sat_diag_log, // SESSION076 DIAGNOSTIC.
+			/*coarse_layer_drawn=*/split_coarse_floor_enabled)); // SESSION076: lets the task skip/evict coarse nodes when the layer is captured only to feed the saturation grid - see its ctor param.
 	}
 
 	// SESSION055 diag: after the while-loop, detect *unmet* rotation demand - a cloud whose forward has shifted past the

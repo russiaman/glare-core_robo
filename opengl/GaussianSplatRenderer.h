@@ -332,7 +332,7 @@ public:
 	// coarse_pixel_scale), drawn after the fine set; the filter dilates this cut with its own (wider) latency so cheap big
 	// splats plug motion-revealed edges/holes without the fine set paying for a wide dilation. See GaussianSplatUnculledFrontier.
 	bool getCoarseFloorEnabled() const { return split_coarse_floor_enabled; }
-	void setCoarseFloorEnabled(bool v) { split_coarse_floor_enabled = v; }
+	void setCoarseFloorEnabled(bool v); // SESSION076: out-of-line - toggling this now has to drop cached frontiers, see the .cpp.
 	float getCoarsePixelScale() const { return split_coarse_pixel_scale; }
 	void setCoarsePixelScale(float v) { split_coarse_pixel_scale = v; }
 	float getFilterCoarseDilationLatency() const { return filter_coarse_dilation_latency; }

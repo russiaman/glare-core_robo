@@ -117,6 +117,16 @@ enum GaussianSplatSatPrefilterMode
 };
 
 
+// SESSION078: which view of the saturation-grid debug overlay (session076 §9) is drawn, if any - see
+// GaussianSplatRenderer::getSatDebugOverlayMode().
+enum GaussianSplatSatDebugOverlayMode
+{
+	GaussianSplatSatDebugOverlayMode_Off = 0,
+	GaussianSplatSatDebugOverlayMode_Mask = 1,
+	GaussianSplatSatDebugOverlayMode_Ramp = 2
+};
+
+
 class GaussianSplatRenderer
 {
 public:
@@ -369,15 +379,19 @@ public:
 	// Same live-change problem as setSatPrefilterMode() above: the counters are filled when a frontier is built, so
 	// turning this on cannot show anything until a fresh traversal runs. Out-of-line for the same reason - the setter
 	// drops the cached frontiers to force one.
+	// SESSION078: pure console counting - the [gsr-sat-diag] cA/cB/writers/pred= line. No longer has any bearing on
+	// the sat_depth overlay (see GaussianSplatSatDebugOverlayMode below) - that used to piggy-back on this checkbox,
+	// but is now driven independently by "Show debug" + its mode dropdown, so the overlay can be looked at without
+	// paying for this counting and vice versa.
 	bool getSatDiagLog() const { return sat_diag_log; }
 	void setSatDiagLog(bool v);
 
-	// SESSION076 §9 / SESSION077: one entry per cloud currently holding saturation-grid debug textures (built by
-	// drainTraversalResults() only while getSatDiagLog() is on - see there). Both are R32F, res x res, sampled by
-	// sat_grid_debug_frag_shader.glsl via the octahedral direction mapping - see the struct fields for what each
-	// holds. anchor_ws is the world position the grid's directions are anchored to
+	// SESSION076 §9 / SESSION077 / SESSION078: one entry per cloud currently holding saturation-grid debug textures
+	// (built by drainTraversalResults() only while getSatDebugOverlayMode() is not Off - see there). Both are R32F,
+	// res x res, sampled by sat_grid_debug_frag_shader.glsl via the octahedral direction mapping - see the struct
+	// fields for what each holds. anchor_ws is the world position the grid's directions are anchored to
 	// (GaussianSplatUnculledFrontier::anchor_pos_ws as of the traversal the textures were built from). Empty when the
-	// diag checkbox is off or no cloud has a grid yet.
+	// overlay is off or no cloud has a grid yet.
 	struct SatGridDebugInfo
 	{
 		Reference<OpenGLTexture> tex;      // Binary view source: transmittance.
@@ -386,17 +400,24 @@ public:
 	};
 	void getSatGridDebugInfo(std::vector<SatGridDebugInfo>& out) const;
 
-	// SESSION077: which of the two views the overlay above draws. Off = the binary one (only tiles the prune actually
-	// treats as saturated, in one flat colour) - the verdict itself. On = a blue->green->red ramp over each tile's
-	// accumulated saturation, i.e. the CONTINUOUS field that verdict is thresholded out of.
+	// SESSION078: whether the sat_depth debug overlay (session076 §9) is drawn, and which of its two views. Driven by
+	// "Show debug" + the "Saturation mask" / "Saturation ramp" entries in its mode dropdown (GaussianSplatSettingsWidget),
+	// replacing the old standalone "diag"/"ramp" checkboxes - the overlay is now just two more entries in the same
+	// dropdown the Overdraw/Alpha/Coverage views already live in, gated the same way they are.
 	//
-	// Added because the binary view cannot distinguish "this tile is correctly saturated" from "the accumulation is
-	// wrong here": a flat ceiling coming out half tinted and half clear looks identical either way. The ramp shows how
-	// far each tile got, so the accumulation can be checked against what the scene plainly looks like before anything
-	// downstream of it is tuned. Pure presentation - changes nothing the traversal or the prune computes, so unlike the
-	// diag checkbox it does not need to drop any cached frontier.
-	bool getSatGridDebugRamp() const { return sat_grid_debug_ramp; }
-	void setSatGridDebugRamp(bool v) { sat_grid_debug_ramp = v; }
+	// Off = no overlay. Mask = the binary view (only tiles the prune actually treats as saturated, in one flat colour)
+	// - the verdict itself. Ramp = a blue->green->red ramp over each tile's accumulated saturation, i.e. the CONTINUOUS
+	// field that verdict is thresholded out of - added because the binary view cannot distinguish "this tile is
+	// correctly saturated" from "the accumulation is wrong here" (a flat ceiling coming out half tinted and half clear
+	// looks identical either way). Ramp shares the "Show overdraw" row's min/max range boxes.
+	//
+	// Off vs. non-Off changes what a traversal COMPUTES (whether sat_accum_t/sat_amp_sum get built at all, and whether
+	// the grid is force-built even with the saturation filter itself off, to see the mask over the unpruned frontier -
+	// see gsBuildSaturationGrid()'s call site), so the setter drops cached frontiers like setSatDiagLog() does.
+	// Switching between Mask and Ramp is pure presentation and does not strictly need to, but is treated the same way
+	// for simplicity - it is a diagnostic path, not one anything times.
+	GaussianSplatSatDebugOverlayMode getSatDebugOverlayMode() const { return sat_debug_overlay_mode; }
+	void setSatDebugOverlayMode(GaussianSplatSatDebugOverlayMode v);
 
 	// SESSION076 CALIBRATION, temporary: the saturation grid's angular resolution. Divides the tile's angular size, so
 	// grid res scales with it. Silhouette accuracy is bounded by tile size - at subdiv 1 a tile spans coarse_pixel_scale
@@ -410,6 +431,25 @@ public:
 	// Changes what a traversal PRODUCES, so the setter drops cached frontiers, as setSatPrefilterMode() does.
 	float getSatGridSubdiv() const { return sat_grid_subdiv; }
 	void setSatGridSubdiv(float v);
+
+
+	// SESSION078: REGION PRUNING. Radius of the ball of camera positions the saturation grid's barrier is made valid
+	// for, in world units. 0 reproduces exactly the old point-anchored behaviour.
+	//
+	// sat_depth is otherwise an assertion about the single camera position it was built from, which is the root of the
+	// staleness this stage has always had: the moment the camera moves the barrier describes somewhere the camera no
+	// longer is, and the ~300ms before a fresh unpruned frontier lands showed as shadow-shaped holes. Asserting over a
+	// whole neighbourhood up front means the barrier does not go stale inside it at all - nothing to switch between and
+	// nothing to re-latch. See gsBuildSaturationGrid()'s header for the geometry (why a ball and not a cube, and what
+	// each side pays for it).
+	//
+	// Strictly weakens the cull - both the build and read sides widen their conservatism - so the useful question is
+	// what it costs in drop rate, which is what [gsr-sat]'s dropped= is for. A live knob to find that, to be frozen
+	// once found (project rule: no manual per-scene tuning).
+	//
+	// Changes what a traversal PRODUCES, so the setter drops cached frontiers, as setSatGridSubdiv() does.
+	float getSatRegionRadius() const { return sat_region_radius; }
+	void setSatRegionRadius(float v);
 
 
 	// SESSION074: whether the per-orientation filter applies the frustum planes at all. On (the default) is the normal
@@ -1468,8 +1508,9 @@ private:
 	GaussianSplatSatPrefilterMode sat_prefilter_mode; // SESSION074 - see getSatPrefilterMode(). [gsr-sat] trace reuses filter_debug_log above (plan's own choice - one checkbox, not a second toggle) - see drainFilterResults().
 	bool filter_frustum_planes_enabled;              // SESSION074 - see getFilterFrustumPlanesEnabled().
 	bool sat_diag_log;                               // SESSION076 - see getSatDiagLog(). Own toggle, not folded into filter_debug_log, because the counting itself perturbs what is being measured.
-	bool sat_grid_debug_ramp;                        // SESSION077 - see getSatGridDebugRamp(). Presentation only, no effect on what is computed.
+	GaussianSplatSatDebugOverlayMode sat_debug_overlay_mode; // SESSION078 - see getSatDebugOverlayMode().
 	float sat_grid_subdiv;                           // SESSION076 CALIBRATION - see getSatGridSubdiv().
+	float sat_region_radius;                         // SESSION078 - see getSatRegionRadius().
 
 	// SESSION055: camera-motion tracker for anisotropic frustum-cull dilation. think() diffs the current cam pose against
 	// the previous one to compute an instantaneous velocity and angular speed, feeds them through an EMA with a

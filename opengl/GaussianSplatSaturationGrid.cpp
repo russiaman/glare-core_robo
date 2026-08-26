@@ -210,7 +210,7 @@ static inline float gsSatExpNeg(float x) // x >= 0; caller has already rejected 
 
 
 void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, const float* radius, const float* alpha, size_t n,
-	const Vec4f& anchor_pos_ws, int res, float saturation_threshold,
+	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius,
 	js::Vector<float, 16>& sat_depth_out, size_t* out_writers, size_t* out_tile_writes,
 	js::Vector<float, 16>* out_accum_t, js::Vector<float, 16>* out_amp_sum)
 {
@@ -245,6 +245,15 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 
 		const float r = radius[i];
 
+		// SESSION078: region pruning - this barrier must hold for EVERY camera position in a ball of region_radius
+		// around the anchor, not just the anchor itself. An occluder only counts in a direction it covers from all of
+		// them, and moving the viewpoint by R shifts a point at distance d by R/d in angle, so the directions common
+		// to every viewpoint are the occluder's own angular disc ERODED by R/d - i.e. an angular radius of (r - R)/d.
+		// An occluder smaller than the region can be stepped around entirely and claims nothing. See the header.
+		const float eroded_r = r - region_radius;
+		if(eroded_r <= 0.f)
+			continue;
+
 		// SESSION074: angular radius without trigonometry. The exact value is asin(r/dist); for the small angles this
 		// pass deals with, r/dist is within a fraction of a percent of it, and it is only ever compared against tile
 		// sizes that already carry a 1.5x safety margin. Kept as the ratio to avoid a per-node asin AND the sqrt that
@@ -252,7 +261,7 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 		// close enough for the approximation to drift (r comparable to dist), it drifts towards a LARGER angle, i.e.
 		// towards covering more tiles - so the comparison below is bounded by the exact one, not looser than it.
 		const float inv_dist = 1.f / std::sqrt(dist_sq); // One sqrt per node here is unavoidable: sat_depth is stored as a real distance, and the span needs a real angle.
-		const float ang_radius = r * inv_dist;
+		const float ang_radius = eroded_r * inv_dist; // SESSION078: eroded by the region radius - see above.
 
 		float cu, cv;
 		const float radius_tiles = gsSatGridFootprint(Vec4f(dx, dy, dz, 0.f), ang_radius, res, cu, cv);
@@ -320,7 +329,9 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 		// where), and placing the cut past its entire extent guarantees this stage only ever drops fine geometry
 		// unambiguously behind the coarse mass that caused saturation - never something that might still be in front
 		// of, or interleaved with, the very geometry that saturated the tile.
-		const float far_edge = (1.f / inv_dist) + r;
+		// SESSION078: + region_radius for the same reason the footprint is eroded above - from the ball point furthest
+		// from this occluder its far edge sits a further R away, and the barrier has to be past it from every one.
+		const float far_edge = (1.f / inv_dist) + r + region_radius;
 
 		// SESSION076: every tile the footprint reaches, weighted - no entitlement test.
 		//
@@ -398,7 +409,7 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 
 
 bool gsSatOccluded(const Vec4f& offset, float dist_sq, float node_radius,
-	const js::Vector<float, 16>& sat_depth, int res, bool* out_aggressive)
+	const js::Vector<float, 16>& sat_depth, int res, float region_radius, bool* out_aggressive)
 {
 	if(out_aggressive)
 		*out_aggressive = false;
@@ -414,7 +425,12 @@ bool gsSatOccluded(const Vec4f& offset, float dist_sq, float node_radius,
 	// node_radius^2 / dist_sq is the squared ratio; comparing spans in tile units needs the ratio itself, so one
 	// reciprocal-sqrt's worth of work is the whole trigonometric cost of this function.
 	const float inv_dist = 1.f / std::sqrt(dist_sq);
-	const float ang_radius = node_radius * inv_dist;
+	// SESSION078: region pruning - the node may only be dropped if it is occluded from EVERY camera position in a ball
+	// of region_radius around the anchor. Moving the viewpoint by R sweeps this node's apparent direction over an extra
+	// R/d, so the set of tiles that must all agree is its footprint DILATED by that - the exact mirror of the build
+	// side's erosion (see gsBuildSaturationGrid()). Both sides widen the conservatism; neither can drop more than the
+	// R = 0 case. See the header.
+	const float ang_radius = (node_radius + region_radius) * inv_dist;
 
 	float cu, cv;
 	const float radius_tiles = gsSatGridFootprint(offset, ang_radius, res, cu, cv);
@@ -455,10 +471,12 @@ bool gsSatOccluded(const Vec4f& offset, float dist_sq, float node_radius,
 			if(sat_d == std::numeric_limits<float>::infinity())
 				return false; // This direction never saturates - node may be visible.
 
-			// Squared form of (dist - node_radius) > sat_d, i.e. dist > sat_d + node_radius. Both sides are
-			// non-negative (sat_d is a distance, node_radius a radius), so squaring preserves the comparison and
-			// the sqrt of dist_sq is never needed.
-			const float threshold = sat_d + node_radius;
+			// Squared form of (dist - node_radius - region_radius) > sat_d, i.e. dist > sat_d + node_radius +
+			// region_radius. All terms are non-negative (sat_d is a distance, the other two radii), so squaring
+			// preserves the comparison and the sqrt of dist_sq is never needed.
+			// SESSION078: + region_radius because the nearest ball point to this node stands R closer to it than the
+			// anchor does - the node has to clear the barrier from there too, not just from the anchor.
+			const float threshold = sat_d + node_radius + region_radius;
 			if(dist_sq <= threshold * threshold)
 				return false; // Not behind the saturation depth in this tile.
 		}

@@ -243,8 +243,34 @@ float gsSatGridTileAngle(int res);
 // threshold was crossed - out_accum_t alone cannot distinguish "barely occluded" from "extremely occluded" once both
 // are near 1. Computed under the same condition as out_accum_t (both are requested together by the one diag call
 // site) - see the .cpp write loop.
+// SESSION078 - REGION PRUNING: region_radius (R) makes the whole grid an assertion about a BALL of camera positions of
+// that radius around anchor_pos_ws, not about the single point it is built from. R = 0 is exactly the old behaviour.
+//
+// Why: sat_depth was a statement about one camera position, so it went stale the moment the camera moved, and the
+// ~300ms between "camera started moving" and "a fresh unpruned frontier arrived" showed as shadow-shaped holes (see the
+// session076 snapshot's 5.1). Making the barrier valid for a whole neighbourhood up front means it does not go stale
+// inside that neighbourhood at all - there is nothing to switch between and nothing to re-latch.
+//
+// A ball, not a box, deliberately: the radius enters as one scalar in every direction. A cube's support function is
+// R*(|ux|+|uy|+|uz|), which swings from R along the world axes to R*sqrt(3) along the diagonals, so it would either cost
+// a flat sqrt(3) of extra dilation (bounding it by the circumscribed sphere) or need per-direction handling whose
+// angular half is a hexagonal cross-section rather than a disc. A ball is also rotation-invariant, which matches the
+// orientation-invariance sat_depth already has by construction. If a voxel CACHE is layered on later, the cube is the
+// right shape for the addressing (floor(pos/S) as a key) and the ball is still the right shape for the math - a cell of
+// side S is covered by R = S*sqrt(3)/2.
+//
+// Both sides pay for it, and both move in the safe direction (neither can ever drop more than R = 0 would):
+//  - build: an occluder claims only the directions it covers from EVERY ball point, so its angular footprint is ERODED
+//    by R/d, and an occluder with r <= R (steppable-around) claims nothing at all. Its barrier is pushed out to
+//    dist + r + R, the furthest its far edge sits from any ball point.
+//  - read: a node is dropped only if occluded from EVERY ball point, so its footprint is DILATED by R/d (every tile in
+//    the widened span must agree) and it must clear the barrier by an extra R in depth.
+//
+// The cost is concentrated near the camera and negligible far away, which is the useful shape: R/d is the angular
+// penalty, so at the owner's settings (tile ~= 4.8 deg) an R of 0.6m costs 0.35 tiles at 20m but 2.4 tiles at 3m - and
+// what this stage drops is distant geometry, while what does the occluding is near.
 void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, const float* radius, const float* alpha, size_t n,
-	const Vec4f& anchor_pos_ws, int res, float saturation_threshold,
+	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius,
 	js::Vector<float, 16>& sat_depth_out, size_t* out_writers = NULL, size_t* out_tile_writes = NULL,
 	js::Vector<float, 16>* out_accum_t = NULL, js::Vector<float, 16>* out_amp_sum = NULL);
 
@@ -268,4 +294,4 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 // centre tile only, node treated as a point. Purely Stage A's "how much could this ever cut" ceiling - see
 // [gsr-sat]'s would_drop_aggr. Nothing in the real drop path reads it.
 bool gsSatOccluded(const Vec4f& offset, float dist_sq, float node_radius,
-	const js::Vector<float, 16>& sat_depth, int res, bool* out_aggressive = NULL);
+	const js::Vector<float, 16>& sat_depth, int res, float region_radius, bool* out_aggressive = NULL);

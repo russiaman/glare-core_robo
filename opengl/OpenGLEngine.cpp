@@ -2833,7 +2833,8 @@ void OpenGLEngine::buildPrograms()
 
 	//------------------------------------------- Build saturation-grid debug prog -------------------------------------------
 	// SESSION076 §9: unconditional (unlike the probe progs above) - splat_renderer always exists (see line ~596), and
-	// this overlay's own gate is the "diag" checkbox at the drawSatGridDebugSphere() call site, not a build-time setting.
+	// this overlay's own gate is "Show debug" + its mode dropdown at the drawSatGridDebugSphere() call site (SESSION078
+	// - see GaussianSplatRenderer::getSatDebugOverlayMode()), not a build-time setting.
 	sat_grid_debug_prog = buildSatGridDebugProg();
 
 
@@ -7060,8 +7061,8 @@ OpenGLProgramRef OpenGLEngine::buildSatGridDebugProg()
 // SESSION076 §9: overlay the saturation grid's sat_depth over the current view, as a giant sphere centred on the
 // frontier's anchor position with the camera inside it - see GaussianSplatSaturationGrid.h and the session077
 // snapshot for what is being shown and why this is the chosen visualisation method.
-// Called from draw() right after drawSplatClouds(), gated on GaussianSplatRenderer::getSatDiagLog() ("diag" checkbox)
-// at the call site - see there for why that's the gate.
+// Called from draw() right after drawSplatClouds(), gated on GaussianSplatRenderer::getSatDebugOverlayMode() != Off
+// ("Show debug" + "Saturation mask"/"Saturation ramp" in its mode dropdown - SESSION078) at the call site.
 void OpenGLEngine::drawSatGridDebugSphere(const Matrix4f& view_matrix, const Matrix4f& proj_matrix)
 {
 	DebugGroup debug_group("drawSatGridDebugSphere");
@@ -7088,7 +7089,7 @@ void OpenGLEngine::drawSatGridDebugSphere(const Matrix4f& view_matrix, const Mat
 	// SESSION077: the same threshold test the grid build makes, so the binary view is the prune's own verdict rather
 	// than a re-derivation of it - see gsBuildSaturationGrid()'s remaining_threshold.
 	glUniform1f(sat_grid_debug_remaining_threshold_location, myClamp(1.f - splat_renderer->getSaturationThreshold(), 0.f, 1.f));
-	glUniform1i(sat_grid_debug_mode_location, splat_renderer->getSatGridDebugRamp() ? 1 : 0);
+	glUniform1i(sat_grid_debug_mode_location, splat_renderer->getSatDebugOverlayMode() == GaussianSplatSatDebugOverlayMode_Ramp ? 1 : 0); // SESSION078
 	glUniform1f(sat_grid_debug_ramp_range_min_location, splat_renderer->getOverdrawRangeMin()); // SESSION077: shared with the overdraw view's own range controls - see the shader's comment.
 	glUniform1f(sat_grid_debug_ramp_range_max_location, splat_renderer->getOverdrawRangeMax());
 
@@ -8585,7 +8586,7 @@ void OpenGLEngine::draw()
 	drawSplatClouds(view_matrix, proj_matrix);
 
 	//================= Draw saturation-grid debug overlay (SESSION076 §9) =================
-	if(splat_renderer->getSatDiagLog())
+	if(splat_renderer->getSatDebugOverlayMode() != GaussianSplatSatDebugOverlayMode_Off) // SESSION078: was gated on "diag" - see that getter's comment.
 		drawSatGridDebugSphere(view_matrix, proj_matrix);
 
 	//================= Draw triangle batches with that use alpha-blending (e.g. participating media materials / particles, text objects) =================

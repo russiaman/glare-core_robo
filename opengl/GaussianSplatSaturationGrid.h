@@ -201,11 +201,12 @@ float gsSatGridTileAngle(int res);
 // second-guess that value; it is the caller's job (and this stage's Gate A, see the plan snapshot) to confirm it
 // actually saturates before trusting drop decisions built on it.
 //
-// KNOWN GAP, deliberately left: alpha is the STORED opacity, not what the renderer actually draws - the live
-// gain/gamma adjustment (adjustSplatAlpha() in GaussianSplatData.h) is applied at draw time and is not accounted for
-// here. Inert while the panel's "ignore" alpha-adjust switch is on, which is its default; if that is ever turned off
-// with a gain far from 1, this grid's opacities are the wrong ones. Fix belongs with whoever wires the adjustment in,
-// not here.
+// SESSION078: alpha here is expected to already be the DRAWN opacity (gain/gamma applied - see adjustSplatAlpha() in
+// GaussianSplatData.h), not the stored one - the caller (GaussianSplatLodTraversalTask::run()) applies the same
+// transform the vertex shader does before building the occluder arrays this feeds. Closes what used to be a KNOWN GAP
+// here: with the "ignore" alpha-adjust switch off, raising alpha in translucent regions (gain > 1, or gamma < 1) now
+// genuinely raises what this stage can prune there, exactly as it raises what the renderer draws - the two agree by
+// construction rather than one silently lagging the other.
 //
 // n arrays (px/py/pz/radius/alpha) must all be the same length and given in the SAME front-to-back order as the
 // source frontier. saturation_threshold is the existing splat_saturation_threshold knob (no new threshold is

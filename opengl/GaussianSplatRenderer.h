@@ -546,12 +546,19 @@ public:
 	// therefore of the adjusted cloud: the saturation gate's coverage, the overdraw views, and the cost predictions in
 	// getFrustumStructureReport(), which apply the same transform on the CPU.
 	//
+	// SESSION078: also reaches the CPU pre-GPU saturation prefilter (GaussianSplatSaturationGrid.h) now - its occluder
+	// alphas are adjusted the same way before the grid is built, closing what used to be a documented gap there (see
+	// gsBuildSaturationGrid()'s header). The intended use: raising alpha in a translucent region (gain > 1 or
+	// gamma < 1) genuinely raises how much that region can prune, since the prefilter now sees the same opacity the
+	// renderer draws rather than the raw stored one. Because of this the setters drop cached frontiers, same as
+	// setSatGridSubdiv() - a value change here is no longer purely a draw-time knob.
+	//
 	// What it does not reach is the LoD tree, whose merged splats were built from the stored alpha when the cloud was
 	// loaded - a tree rebuild is what folds a setting in permanently. 1 and 1 is the cloud as captured.
 	float getAlphaGain() const { return splat_alpha_gain; }
-	void setAlphaGain(float v) { splat_alpha_gain = v; }
+	void setAlphaGain(float v);
 	float getAlphaGamma() const { return splat_alpha_gamma; }
-	void setAlphaGamma(float v) { splat_alpha_gamma = v; }
+	void setAlphaGamma(float v);
 
 	// How many consecutive sub-ranges each cloud's depth-sorted splats are drawn in, nearest range first. 1 (default) is
 	// one draw per cloud, exactly as before this existed. Higher values change nothing on their own - the ranges are

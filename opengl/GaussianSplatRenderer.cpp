@@ -842,7 +842,8 @@ public:
 		bool coarse_layer_drawn_ = true, // SESSION076: whether anything will actually DRAW the captured coarse layer (the "coarse" checkbox). False means it was captured solely to feed the saturation grid, which lets this task both skip capturing nodes the grid cannot use and evict the rest once the grid is built - see the capture block and the compaction loop in run(). Defaults true, i.e. the pre-session076 behaviour, so callers that don't care are unaffected.
 		float sat_grid_subdiv_ = 1.f, // SESSION076 CALIBRATION - see GaussianSplatRenderer::getSatGridSubdiv().
 		float sat_region_radius_ = 0.f, // SESSION078: region pruning - see GaussianSplatRenderer::getSatRegionRadius(). 0 = the point-anchored behaviour.
-		bool sat_overlay_requested_ = false) // SESSION078: driven by "Show debug" + its mode dropdown (getSatDebugOverlayMode() != Off), NOT sat_diag_log_ - see that getter's comment. Forces the grid to build even with the saturation filter off, and fills sat_accum_t/sat_amp_sum, exactly what sat_diag_log_ used to gate before the overlay was split out of it.
+		bool sat_overlay_requested_ = false, // SESSION078: driven by "Show debug" + its mode dropdown (getSatDebugOverlayMode() != Off), NOT sat_diag_log_ - see that getter's comment. Forces the grid to build even with the saturation filter off, and fills sat_accum_t/sat_amp_sum, exactly what sat_diag_log_ used to gate before the overlay was split out of it.
+		float alpha_gain_ = 1.f, float alpha_gamma_ = 1.f) // SESSION078: see GaussianSplatRenderer::getAlphaGain(). Applied to occluder alphas before they feed the saturation grid, matching what the draw path applies - 1/1 (the defaults here) is the identity, i.e. the pre-session078 behaviour.
 	:	cloud_id(cloud_id_), topology_generation(topology_generation_), scratch(scratch_), cam_pos_ws(cam_pos_ws_),
 		pixel_scale_limit(pixel_scale_limit_), max_splats_budget(max_splats_budget_), max_layer_density(max_layer_density_), max_tree_depth(max_tree_depth_), focal_px(focal_px_),
 		num_frustum_clip_planes(num_frustum_clip_planes_), frustum_cull_enabled(frustum_cull_enabled_),
@@ -856,7 +857,8 @@ public:
 		sat_diag_log(sat_diag_log_), coarse_layer_drawn(coarse_layer_drawn_),
 		sat_grid_subdiv(sat_grid_subdiv_), // SESSION076
 		sat_region_radius(sat_region_radius_), // SESSION078
-		sat_overlay_requested(sat_overlay_requested_) // SESSION078
+		sat_overlay_requested(sat_overlay_requested_), // SESSION078
+		alpha_gain(alpha_gain_), alpha_gamma(alpha_gamma_) // SESSION078
 	{
 		if(num_frustum_clip_planes < 0)
 			num_frustum_clip_planes = 0;
@@ -1260,7 +1262,7 @@ public:
 					const Vec4f unit_dir(ddx * inv_d, ddy * inv_d, ddz * inv_d, 0.f);
 
 					occl_radius.push_back(gs_sat_occluder_sigmas * gsSatProjectedRadius(geom_ref->scales[idx], geom_ref->rotations[idx], unit_dir));
-					occl_alpha.push_back(alphas[idx]);
+					occl_alpha.push_back(adjustSplatAlpha(alphas[idx], alpha_gain, alpha_gamma)); // SESSION078: the DRAWN opacity, not the stored one - see GaussianSplatRenderer::getAlphaGain()'s comment and gsBuildSaturationGrid()'s header.
 
 					if(sat_diag_log)
 					{
@@ -1445,6 +1447,7 @@ private:
 	float sat_grid_subdiv; // SESSION076 CALIBRATION: see the ctor param.
 	float sat_region_radius; // SESSION078: see the ctor param.
 	bool sat_overlay_requested; // SESSION078: see the ctor param.
+	float alpha_gain, alpha_gamma; // SESSION078: see the ctor param.
 };
 
 
@@ -4774,6 +4777,38 @@ void GaussianSplatRenderer::setSatGridSubdiv(float v)
 }
 
 
+// SESSION078: alpha gain/gamma now feed the CPU saturation prefilter as well as the draw path - see getAlphaGain()'s
+// comment - so a change here has to drop cached frontiers, same reasoning as setSatGridSubdiv() just above. Cheap while
+// the "ignore" alpha-adjust switch is on, its default: MainWindow.cpp always passes 1/1 in that case, so these are
+// no-ops (the early-out below fires) unless the owner has deliberately turned adjustment on.
+void GaussianSplatRenderer::setAlphaGain(float v)
+{
+	if(v == splat_alpha_gain)
+		return;
+	splat_alpha_gain = v;
+
+	for(size_t i=0; i<clouds.size(); ++i)
+	{
+		clouds[i]->cached_ufrontier = NULL;
+		clouds[i]->have_last_traversal_cam_pos = false;
+	}
+}
+
+
+void GaussianSplatRenderer::setAlphaGamma(float v)
+{
+	if(v == splat_alpha_gamma)
+		return;
+	splat_alpha_gamma = v;
+
+	for(size_t i=0; i<clouds.size(); ++i)
+	{
+		clouds[i]->cached_ufrontier = NULL;
+		clouds[i]->have_last_traversal_cam_pos = false;
+	}
+}
+
+
 // SESSION078: same reasoning as setSatGridSubdiv() just above - this changes what the grid ASSERTS (a ball of camera
 // positions rather than the single one it was built from), so an existing frontier's sat_depth was derived under the old
 // value and cannot be reinterpreted under the new one. Drop the caches and force a fresh traversal. See
@@ -6458,7 +6493,8 @@ void GaussianSplatRenderer::kickOffTraversals()
 			/*coarse_layer_drawn=*/split_coarse_floor_enabled, // SESSION076: lets the task skip/evict coarse nodes when the layer is captured only to feed the saturation grid - see its ctor param.
 			/*sat_grid_subdiv=*/sat_grid_subdiv,
 			/*sat_region_radius=*/sat_region_radius, // SESSION078
-			/*sat_overlay_requested=*/sat_debug_overlay_mode != GaussianSplatSatDebugOverlayMode_Off)); // SESSION078
+			/*sat_overlay_requested=*/sat_debug_overlay_mode != GaussianSplatSatDebugOverlayMode_Off, // SESSION078
+			/*alpha_gain=*/splat_alpha_gain, /*alpha_gamma=*/splat_alpha_gamma)); // SESSION078
 	}
 
 	// SESSION055 diag: after the while-loop, detect *unmet* rotation demand - a cloud whose forward has shifted past the

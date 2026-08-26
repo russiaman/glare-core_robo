@@ -260,11 +260,13 @@ float gsSatGridTileAngle(int res);
 // side S is covered by R = S*sqrt(3)/2.
 //
 // Both sides pay for it, and both move in the safe direction (neither can ever drop more than R = 0 would):
-//  - build: an occluder claims only the directions it covers from EVERY ball point, so its angular footprint is ERODED
-//    by R/d, and an occluder with r <= R (steppable-around) claims nothing at all. Its barrier is pushed out to
-//    dist + r + R, the furthest its far edge sits from any ball point.
+//  - build: the occluder's barrier is pushed out to dist + r + R, the furthest its far edge sits from any ball point.
+//    Its angular footprint is deliberately NOT eroded - see the write loop, which records why the first cut did erode
+//    it and why that was wrong (per-atom erosion shrinks a dense surface's interior coverage, not just its silhouette,
+//    and at R = 0.02 deleted most of a near wall's occluders outright).
 //  - read: a node is dropped only if occluded from EVERY ball point, so its footprint is DILATED by R/d (every tile in
-//    the widened span must agree) and it must clear the barrier by an extra R in depth.
+//    the widened span must agree) and it must clear the barrier by an extra R in depth. This is where the angular half
+//    of the conservatism lives, acting on the finished aggregate mask rather than on individual occluders.
 //
 // The cost is concentrated near the camera and negligible far away, which is the useful shape: R/d is the angular
 // penalty, so at the owner's settings (tile ~= 4.8 deg) an R of 0.6m costs 0.35 tiles at 20m but 2.4 tiles at 3m - and

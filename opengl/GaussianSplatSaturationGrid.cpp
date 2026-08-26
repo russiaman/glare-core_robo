@@ -245,14 +245,6 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 
 		const float r = radius[i];
 
-		// SESSION078: region pruning - this barrier must hold for EVERY camera position in a ball of region_radius
-		// around the anchor, not just the anchor itself. An occluder only counts in a direction it covers from all of
-		// them, and moving the viewpoint by R shifts a point at distance d by R/d in angle, so the directions common
-		// to every viewpoint are the occluder's own angular disc ERODED by R/d - i.e. an angular radius of (r - R)/d.
-		// An occluder smaller than the region can be stepped around entirely and claims nothing. See the header.
-		const float eroded_r = r - region_radius;
-		if(eroded_r <= 0.f)
-			continue;
 
 		// SESSION074: angular radius without trigonometry. The exact value is asin(r/dist); for the small angles this
 		// pass deals with, r/dist is within a fraction of a percent of it, and it is only ever compared against tile
@@ -261,7 +253,25 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 		// close enough for the approximation to drift (r comparable to dist), it drifts towards a LARGER angle, i.e.
 		// towards covering more tiles - so the comparison below is bounded by the exact one, not looser than it.
 		const float inv_dist = 1.f / std::sqrt(dist_sq); // One sqrt per node here is unavoidable: sat_depth is stored as a real distance, and the span needs a real angle.
-		const float ang_radius = eroded_r * inv_dist; // SESSION078: eroded by the region radius - see above.
+		// SESSION078 CORRECTION: this is deliberately NOT eroded by region_radius, though the first cut of region pruning
+		// did erode it (angular radius (r - R)/d, dropping any occluder with r <= R outright, on the argument that an
+		// occluder smaller than the region can be stepped around). That argument holds for an ISOLATED occluder and is
+		// wrong for the thing this grid is actually made of. A wall is a dense sheet of thousands of small overlapping
+		// splats; you cannot step around the WALL by moving 2cm, only around any one of its atoms. Eroding every atom
+		// shrinks the aggregate's interior coverage, not just its silhouette, which is not what the parallax does.
+		//
+		// It failed loudly in practice. The LoD holds nodes near a fixed screen size, so near-field occluders - exactly
+		// the ones doing the occluding when you stand near a wall - have 3-sigma world radii of order 1-2cm. R = 0.02
+		// therefore deleted most of a near wall's occluder population outright, its tiles stopped saturating, and large
+		// islands of geometry behind it (owner's report: a far wall and a sofa, plainly behind a double thickness of
+		// opaque wall) came back into the draw list. R = 0 was correct and R = 0.02 was not, for a 2cm region.
+		//
+		// The ball conservatism belongs on the READ side instead, where it acts on the finished AGGREGATE mask rather
+		// than on each atom: a candidate node's footprint is dilated by R/d and every tile it then touches must agree it
+		// is occluded (see gsSatOccluded()). That is the same silhouette-edge guard, applied to the surface as a whole -
+		// a candidate near the edge of a saturated region reaches an unsaturated tile and is kept, while one deep inside
+		// a genuinely opaque wall is still dropped. The build side keeps only the depth half of the conservatism below.
+		const float ang_radius = r * inv_dist;
 
 		float cu, cv;
 		const float radius_tiles = gsSatGridFootprint(Vec4f(dx, dy, dz, 0.f), ang_radius, res, cu, cv);
@@ -329,8 +339,9 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 		// where), and placing the cut past its entire extent guarantees this stage only ever drops fine geometry
 		// unambiguously behind the coarse mass that caused saturation - never something that might still be in front
 		// of, or interleaved with, the very geometry that saturated the tile.
-		// SESSION078: + region_radius for the same reason the footprint is eroded above - from the ball point furthest
-		// from this occluder its far edge sits a further R away, and the barrier has to be past it from every one.
+		// SESSION078: + region_radius because from the ball point furthest from this occluder its far edge sits a further
+		// R away, and the barrier has to be past it from every position in the ball. This is the build side's whole share
+		// of the region conservatism - see the footprint comment above for why the angular half is not applied here.
 		const float far_edge = (1.f / inv_dist) + r + region_radius;
 
 		// SESSION076: every tile the footprint reaches, weighted - no entitlement test.

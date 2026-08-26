@@ -87,6 +87,20 @@ public:
 	js::Vector<float, 16> feature_size;
 	js::Vector<float, 16> cull_radius; // SESSION059: world-space enclosing-sphere radius per node - see SplatCloud::cull_radius and GaussianSplatLodNode::bounding_radius_os.
 	js::Vector<float, 16> alpha; // SESSION074: colours[i].w, same pattern as cull_radius above - needed by the traversal task's coarse-floor saturation-grid pass (GaussianSplatSaturationGrid.h) to weight each coarse node's contribution; colours itself is never added here, only this one channel, since nothing else on this path needs colour.
+
+	// SESSION077: cloud.scales / cloud.rotations verbatim (world-space), for the saturation grid's occluder footprint -
+	// see the gather loop's gsSatProjectedRadius() call.
+	//
+	// The grid used to treat every occluder as an ISOTROPIC disc of radius max(scale.xyz). That is the right bound for
+	// CULLING (the splat cannot reach further than that in any direction) but the wrong quantity for OCCLUSION, which
+	// needs the splat's cross-section as seen from the anchor. Measured on the owner's interior: mean
+	// max(scale)/min(scale) = 101, 67% of occluders past 10:1, worst 63000:1 - so the isotropic disc overstated most
+	// splats' footprints by orders of magnitude, and by a factor that varies with viewing angle (a flat splat seen
+	// face-on vs edge-on), which is what made an opaque wall's mask break up by distance-from-normal instead of being
+	// uniform. Both arrays are needed because the cross-section depends on the splat's orientation relative to the view
+	// direction, not just on its extents.
+	js::Vector<Vec3f, 16> scales;
+	js::Vector<Vec4f, 16> rotations; // (x, y, z, w), same convention as SplatCloud::rotations.
 };
 
 
@@ -190,6 +204,19 @@ public:
 	size_t sat_diag_writers;      // Grid contributors: nodes whose contribution cleared the negligible-amplitude cutoff.
 	size_t sat_diag_tile_writes;  // Total per-tile writes - the build pass's write amplification.
 
+	// SESSION077 DIAGNOSTIC: anisotropy of the occluder set that fed the grid - max(scale.xyz)/min(scale.xyz) per node,
+	// over the SAME nodes occl_radius/occl_alpha were built from. Answers whether the isotropic-disc occluder model
+	// (occl_radius = max(scale.xyz), same in every direction - see the gather loop's comment) is a reasonable stand-in
+	// for the owner's session077 over-occlusion complaint, or whether the scene's splats are thin/flat enough that
+	// treating them as spheres inflates their claimed footprint by a large factor. sat_diag_aniso_n is the sample count
+	// (== sat_num_occluders when this ran); the rest are that ratio's mean, max, and the fraction of the sample past two
+	// round thresholds (5x, 10x) as a cheap stand-in for a histogram.
+	size_t sat_diag_aniso_n;
+	double sat_diag_aniso_mean;
+	float sat_diag_aniso_max;
+	size_t sat_diag_aniso_gt5;
+	size_t sat_diag_aniso_gt10;
+
 	// Key this frontier was built for; drainTraversalResults() checks these before reusing it, so a settings change that
 	// alters the selection can't be answered from a stale U(P).  Orientation is deliberately NOT here - that's the point.
 	uint64 topology_generation;
@@ -203,7 +230,8 @@ public:
 	GaussianSplatUnculledFrontier() // SESSION074: defaults are "stage never ran" - only kickOffTraversals() passing the stage-enabled flag sets sat_grid_res non-zero.
 	:	sat_grid_res(0), sat_num_occluders(0), sat_num_tested(0), sat_num_dropped(0), sat_num_dropped_aggr(0),
 		sat_grid_build_ms(0.0), sat_test_ms(0.0),
-		sat_diag_coarse_a(0), sat_diag_coarse_b(0), sat_diag_writers(0), sat_diag_tile_writes(0) {} // SESSION076
+		sat_diag_coarse_a(0), sat_diag_coarse_b(0), sat_diag_writers(0), sat_diag_tile_writes(0), // SESSION076
+		sat_diag_aniso_n(0), sat_diag_aniso_mean(0.0), sat_diag_aniso_max(0.f), sat_diag_aniso_gt5(0), sat_diag_aniso_gt10(0) {} // SESSION077
 };
 
 
@@ -1188,6 +1216,14 @@ public:
 				// still front-to-back, as gsBuildSaturationGrid()'s sequential accumulation requires.
 				const size_t n = uf->indices.size();
 				js::Vector<float, 16> occl_px, occl_py, occl_pz, occl_radius, occl_alpha;
+
+				// SESSION077 DIAGNOSTIC: see GaussianSplatUnculledFrontier::sat_diag_aniso_n's comment. Only accumulated
+				// while sat_diag_log is on - geom_ref->scales is always populated (see GaussianSplatCachedGeom::scales),
+				// but the per-node max/min and the branch it costs are skipped entirely otherwise.
+				double aniso_sum = 0.0;
+				float aniso_max = 0.f;
+				size_t aniso_gt5 = 0, aniso_gt10 = 0, aniso_n = 0;
+
 				for(size_t i=0; i<n; ++i)
 				{
 					if(uf->is_coarse[i] != 0.f)
@@ -1200,8 +1236,38 @@ public:
 					// strength of a splat that paints a few pixels. Only the node itself is ever drawn at the frontier,
 					// never its subtree, and the shader cuts it at splat_cutoff_sigmas of max(scale) = half that many
 					// feature_sizes - so this is the radius that can actually occlude anything.
-					occl_radius.push_back(0.5f * gs_sat_occluder_sigmas * feature_sizes[idx]);
+					//
+					// SESSION077: ...and it is now the ANISOTROPIC one. 0.5*feature_size is max(scale.xyz), the splat's
+					// bounding radius - the same in every direction, so a thin wall-aligned splat claimed a sphere of its
+					// longest axis even along its own thin axis. Measured here: mean max/min extent ratio 101, 67% past
+					// 10:1 (see sat_diag_aniso_* below), so that was overstating most occluders' footprints by orders of
+					// magnitude, and by an angle-dependent factor - which is what made an opaque wall's mask break up by
+					// distance-from-normal instead of covering it uniformly. gsSatProjectedRadius() returns the
+					// equal-area radius of the splat's actual cross-section from the anchor; the sigma multiple it is
+					// scaled by is unchanged, so this only corrects the shape, not how far out a node is allowed to
+					// occlude.
+					const float ddx = uf->px[i] - cam_pos_ws.x[0];
+					const float ddy = uf->py[i] - cam_pos_ws.x[1];
+					const float ddz = uf->pz[i] - cam_pos_ws.x[2];
+					const float d_len = std::sqrt(ddx*ddx + ddy*ddy + ddz*ddz);
+					const float inv_d = d_len > 1.0e-6f ? (1.f / d_len) : 0.f; // Degenerate (node at the anchor) - direction is meaningless; the grid build skips such nodes anyway.
+					const Vec4f unit_dir(ddx * inv_d, ddy * inv_d, ddz * inv_d, 0.f);
+
+					occl_radius.push_back(gs_sat_occluder_sigmas * gsSatProjectedRadius(geom_ref->scales[idx], geom_ref->rotations[idx], unit_dir));
 					occl_alpha.push_back(alphas[idx]);
+
+					if(sat_diag_log)
+					{
+						const Vec3f& sc = geom_ref->scales[idx];
+						const float max_s = myMax(sc.x, myMax(sc.y, sc.z));
+						const float min_s = myMax(myMin(sc.x, myMin(sc.y, sc.z)), 1.0e-6f); // Floor avoids a divide-by-zero on a degenerate/near-planar splat.
+						const float ratio = max_s / min_s;
+						aniso_sum += ratio;
+						aniso_max = myMax(aniso_max, ratio);
+						if(ratio > 5.f) ++aniso_gt5;
+						if(ratio > 10.f) ++aniso_gt10;
+						++aniso_n;
+					}
 				}
 
 				if(!occl_px.empty())
@@ -1230,6 +1296,13 @@ public:
 					// SESSION076 DIAGNOSTIC: carry the DFS-side breakdown across to where [gsr-sat-diag] prints it.
 					uf2->sat_diag_coarse_a = diag_coarse_a;
 					uf2->sat_diag_coarse_b = diag_coarse_b;
+
+					// SESSION077 DIAGNOSTIC: the occluder anisotropy sample gathered above.
+					uf2->sat_diag_aniso_n = aniso_n;
+					uf2->sat_diag_aniso_mean = aniso_n > 0 ? (aniso_sum / (double)aniso_n) : 0.0;
+					uf2->sat_diag_aniso_max = aniso_max;
+					uf2->sat_diag_aniso_gt5 = aniso_gt5;
+					uf2->sat_diag_aniso_gt10 = aniso_gt10;
 
 					// Apply the verdict, building the survivor set into uf2. Coarse-floor nodes are never saturation-TESTED:
 					// they are the layer that plugs motion-revealed frustum edges, they are already confined to the dilation
@@ -2829,6 +2902,12 @@ void GaussianSplatRenderer::fillTraversalScratch(SplatCloud& cloud, GaussianSpla
 		for(size_t i=0; i<cloud.total_splats; ++i)
 			geom->alpha[i] = cloud.colours[i][3];
 
+		// SESSION077: see GaussianSplatCachedGeom::scales. Raw memcpys, same pattern as feature_size/cull_radius.
+		geom->scales.resizeNoCopy(cloud.total_splats);
+		std::memcpy(geom->scales.data(), cloud.scales.data(), cloud.total_splats * sizeof(Vec3f));
+		geom->rotations.resizeNoCopy(cloud.total_splats);
+		std::memcpy(geom->rotations.data(), cloud.rotations.data(), cloud.total_splats * sizeof(Vec4f));
+
 		cloud.cached_traversal_geom = geom;
 		cloud.cached_traversal_geom_generation = cloud.topology_generation;
 	}
@@ -2845,7 +2924,7 @@ void GaussianSplatRenderer::fillTraversalScratch(SplatCloud& cloud, GaussianSpla
 
 	if(cpu_prof_log)
 	{
-		const size_t bytes_copied = cache_hit ? 0 : cloud.total_splats * (sizeof(Vec3f) + sizeof(float) + sizeof(float) + sizeof(float)); // positions + feature_size + cull_radius (SESSION059) + alpha (SESSION074).
+		const size_t bytes_copied = cache_hit ? 0 : cloud.total_splats * (sizeof(Vec3f) + sizeof(float) + sizeof(float) + sizeof(float) + sizeof(Vec3f) + sizeof(Vec4f)); // positions + feature_size + cull_radius (SESSION059) + alpha (SESSION074) + scales/rotations (SESSION077).
 		conPrint("[gsr-prof] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms fillTraversalScratch cloud=" +
 			toString(cloud.cloud_id) + " splats=" + toString(cloud.total_splats) +
 			" " + (cache_hit ? std::string("HIT") : std::string("MISS")) +
@@ -5767,6 +5846,19 @@ void GaussianSplatRenderer::drainTraversalResults()
 								" tile_writes=" + uInt64ToStringCommaSeparated(uf.sat_diag_tile_writes) +
 							" per_writer=" + doubleToStringNDecimalPlaces(uf.sat_diag_writers > 0 ? ((double)uf.sat_diag_tile_writes / (double)uf.sat_diag_writers) : 0.0, 1) +
 							" fine=" + uInt64ToStringCommaSeparated(uf.sat_num_tested));
+
+						// SESSION077 DIAGNOSTIC: separate line again, same reasoning as the split above - see
+						// GaussianSplatUnculledFrontier::sat_diag_aniso_n. aniso=max(scale.xyz)/min(scale.xyz) per occluder,
+						// the isotropic-disc model's blind spot: a ratio far above 1 means the splat is thin/flat and the
+						// occl_radius fed to the grid (== its LARGEST axis, applied in every direction) overstates its true
+						// footprint from most viewing angles.
+						conPrint("[gsr-sat-aniso] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms n=" + uInt64ToStringCommaSeparated(uf.sat_diag_aniso_n) +
+							" mean=" + doubleToStringNDecimalPlaces(uf.sat_diag_aniso_mean, 2) +
+							" max=" + doubleToStringNDecimalPlaces(uf.sat_diag_aniso_max, 1) +
+							" >5x=" + uInt64ToStringCommaSeparated(uf.sat_diag_aniso_gt5) +
+							" (" + doubleToStringNDecimalPlaces(uf.sat_diag_aniso_n > 0 ? (100.0 * (double)uf.sat_diag_aniso_gt5 / (double)uf.sat_diag_aniso_n) : 0.0, 1) + "%)" +
+							" >10x=" + uInt64ToStringCommaSeparated(uf.sat_diag_aniso_gt10) +
+							" (" + doubleToStringNDecimalPlaces(uf.sat_diag_aniso_n > 0 ? (100.0 * (double)uf.sat_diag_aniso_gt10 / (double)uf.sat_diag_aniso_n) : 0.0, 1) + "%)");
 					}
 				}
 			}

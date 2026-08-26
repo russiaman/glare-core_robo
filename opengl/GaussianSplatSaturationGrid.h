@@ -7,6 +7,7 @@ Copyright Glare Technologies Limited 2026 -
 
 
 #include "../maths/vec2.h"
+#include "../maths/vec3.h" // SESSION077: per-axis splat scales - see gsSatProjectedRadius().
 #include "../maths/Vec4f.h"
 #include "../utils/Vector.h"
 
@@ -139,6 +140,31 @@ int gsSatGridResForFocal(float focal_px, float coarse_pixel_scale, float tile_su
 
 // Tile index (row-major, [0, res*res)) for a direction (any positive length - see gsDirToOct()).
 int gsSatGridTileForDir(const Vec4f& dir, int res);
+
+
+// SESSION077: the world-space radius of the disc with the SAME AREA as this splat's cross-section as seen from
+// 'unit_dir' - i.e. the footprint it can actually occlude with, in that one direction.
+//
+// Replaces max(scale.xyz), which the grid used before. That was the splat's bounding radius: correct for culling (it
+// cannot reach further in ANY direction) and badly wrong for occlusion, because a 3DGS splat is typically a thin disc.
+// Measured on the owner's interior: mean max/min scale ratio 101, 67% of occluders past 10:1, worst 63000:1 - so most
+// splats were claiming a footprint orders of magnitude larger than they occlude with. Worse, the error is not a
+// constant factor: it depends on the angle between the splat's thin axis and the view, so an opaque wall's mask broke
+// up by how far each part sat from the surface normal instead of being uniform (owner-visible as a clear patch that
+// stayed in the middle of a wall and painted everywhere else - session077).
+//
+// Derivation: for an ellipsoid with covariance C = R diag(s^2) R^T, the silhouette along unit d has area
+// pi * sqrt(det C) * sqrt(d^T C^-1 d). Equal-area radius is the square root of (area/pi), giving
+//
+//   r_eff = sqrt( s0*s1*s2 * sqrt( sum_k (d . axis_k)^2 / s_k^2 ) )
+//
+// which needs only three dot products against the rotation's own axes - no matrix build, no 2D projection. Sanity
+// checks: isotropic (s,s,s) gives exactly s from every direction; a disc (a,a,b) gives a seen down its thin axis and
+// sqrt(a*b) seen edge-on, both the correct equal-area radii.
+//
+// Returned in the same units as 'scales', i.e. one sigma - the caller applies whatever sigma multiple it draws/occludes
+// out to (see gs_sat_occluder_sigmas). rot is (x, y, z, w).
+float gsSatProjectedRadius(const Vec3f& scales, const Vec4f& rot, const Vec4f& unit_dir);
 
 // SESSION076: the pixel_scale write threshold that used to live here is gone. It existed because the write rule was
 // binary (a node either fully covered a tile or contributed nothing), which made "can this node write at all?" a pure

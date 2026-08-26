@@ -71,6 +71,33 @@ int gsSatGridResForFocal(float focal_px, float coarse_pixel_scale, float tile_su
 }
 
 
+float gsSatProjectedRadius(const Vec3f& scales, const Vec4f& rot, const Vec4f& unit_dir)
+{
+	// SESSION077: see the header for the derivation and the sanity checks. Guarded against a degenerate axis: a splat
+	// with a zero (or denormal) extent would otherwise divide by zero below, and 3DGS captures do contain
+	// effectively-planar splats - the owner's interior measured extents down to 1/63000 of the splat's longest axis.
+	const float s0 = myMax(scales.x, 1.0e-8f);
+	const float s1 = myMax(scales.y, 1.0e-8f);
+	const float s2 = myMax(scales.z, 1.0e-8f);
+
+	// Rotation matrix columns = the splat's own principal axes. Written out rather than built as a Matrix3f: only the
+	// three dot products below are wanted, and this runs once per occluder over millions of them.
+	const float x = rot[0], y = rot[1], z = rot[2], w = rot[3];
+	const float xx = x*x, yy = y*y, zz = z*z;
+	const float xy = x*y, xz = x*z, yz = y*z, wx = w*x, wy = w*y, wz = w*z;
+
+	const float dx = unit_dir[0], dy = unit_dir[1], dz = unit_dir[2];
+
+	const float d0 = dx * (1.f - 2.f*(yy + zz)) + dy * (2.f*(xy + wz))        + dz * (2.f*(xz - wy));
+	const float d1 = dx * (2.f*(xy - wz))       + dy * (1.f - 2.f*(xx + zz))  + dz * (2.f*(yz + wx));
+	const float d2 = dx * (2.f*(xz + wy))       + dy * (2.f*(yz - wx))        + dz * (1.f - 2.f*(xx + yy));
+
+	const float q = (d0*d0) / (s0*s0) + (d1*d1) / (s1*s1) + (d2*d2) / (s2*s2); // d^T C^-1 d.
+
+	return std::sqrt(s0 * s1 * s2 * std::sqrt(q));
+}
+
+
 int gsSatGridTileForDir(const Vec4f& dir, int res)
 {
 	const Vec2f oct = gsDirToOct(dir);
@@ -88,20 +115,55 @@ int gsSatGridTileForDir(const Vec4f& dir, int res)
 //
 // The footprint is a disc of angular radius ang_radius around the node's direction. Rather than projecting that disc
 // through the octahedral mapping exactly (which is neither linear nor equal-area, and would need the fold topology
-// handled), it is bounded in oct space by scaling the angular radius into tile units via gsSatGridTileAngle() - the
-// same quantity the resolution was solved for, already carrying the distortion margin.
+// handled), it is bounded in oct space by scaling the angular radius into tile units.
 //
 // SESSION076: both sides now use the TOUCH span. They used to differ - the write side demanded full coverage of a
 // tile, on the reasoning that "this tile is behind opaque coverage" is a claim a partly-covering node has not
 // established. That reasoning was sound only while the contribution was binary. Now a partly-covering node contributes
 // a correspondingly small alpha instead of a full one, so the claim it makes is already proportionate to what it
 // covers, and demanding full coverage would simply discard it. See the write loop for the model.
+//
+// SESSION078 FIX: the scale used to be the GLOBAL mean tile angle, sqrt(4*pi)/res, times a flat 1.5 fudge standing in
+// for "the octahedral mapping's area distortion". That distortion is not a constant, and treating it as one is what put
+// a camera-anchored clear patch on plainly opaque surfaces.
+//
+// The oct map is a radial projection sphere <-> octahedron. For a unit direction d write s = |dx| + |dy| + |dz| (its L1
+// norm, which is 1/r_oct for the octahedron point it lands on). A surface element dA there subtends dA*cos(phi)/r_oct^2
+// with cos(phi) = 1/(sqrt(3)*r_oct), and dA is itself sqrt(3) times its own footprint in the oct plane, so the two
+// sqrt(3)s cancel and
+//
+//   d(solid angle) / d(oct area) = s^3
+//
+// exactly. s runs from 1 along the world axes to sqrt(3) along the body diagonals, so the solid angle behind a tile of
+// fixed oct area varies by 3*sqrt(3) = 5.2x across the sphere. A tile is (2/res)^2 in oct area, hence a local angular
+// size of (2/res) * s^1.5.
+//
+// The old constant, 1.5*sqrt(4*pi)/res = 5.32/res, overstated that by 2.7x along the axes and 1.17x along the
+// diagonals. Overstating the tile angle understates sigma_tiles, and the write loop's deposit goes as sigma^2, so every
+// occluder laid down between 7.1x (axes) and 1.36x (diagonals) too little occlusion. The shortfall is worst along
+// exactly +-x, +-y, +-z - which is where a surface's nearest point sits when you stand square-on to it - so an opaque
+// wall or ceiling came out clear in a patch around its perpendicular foot and painted away from it, the patch riding
+// along with the anchor while staying welded to the geometry under pure rotation. Both are what the owner reported.
+//
+// It is also why sweeping the threshold never helped: the error is a 5x GRADIENT across the sphere, not a gain, so a
+// threshold can only slide the contour along it, never flatten it.
+static inline float gsSatGridLocalTileAngle(const Vec4f& offset, int res)
+{
+	// s = L1/L2 of the offset, i.e. the L1 norm of the unit direction it points along. Scale-invariant, so callers pass
+	// raw offsets here exactly as they already do to gsDirToOct().
+	const float l1 = std::fabs(offset.x[0]) + std::fabs(offset.x[1]) + std::fabs(offset.x[2]);
+	const float l2_sq = offset.x[0]*offset.x[0] + offset.x[1]*offset.x[1] + offset.x[2]*offset.x[2];
+	const float s = (l2_sq > 1.0e-24f) ? (l1 / std::sqrt(l2_sq)) : 1.f;
+	return (2.f / myMax((float)res, 1.f)) * s * std::sqrt(myMax(s, 1.f)); // (2/res) * s^1.5.
+}
+
+
 static inline float gsSatGridFootprint(const Vec4f& offset, float ang_radius, int res, float& cu, float& cv)
 {
 	const Vec2f oct = gsDirToOct(offset);
 	cu = (oct.x * 0.5f + 0.5f) * (float)res;
 	cv = (oct.y * 0.5f + 0.5f) * (float)res;
-	return ang_radius / gsSatGridTileAngle(res);
+	return ang_radius / gsSatGridLocalTileAngle(offset, res);
 }
 
 
@@ -216,17 +278,40 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 		// argument session071 used for merged colours (GaussianSplatMergeColourMode_Energy):
 		//
 		//   var  = sigma^2 + 1/12                     (Gaussian variance widened by the tile's own)
-		//   amp  = alpha * sigma^2 / var              (peak scaled so the integral is unchanged)
 		//   a_eff(d) = amp * exp(-d^2 / (2*var))
 		//
-		// Large node (sigma >> 1 tile): amp -> alpha, a_eff -> the alpha at that tile. Small node (sigma << 1 tile):
-		// amp -> alpha * 12 * sigma^2, and the total spread over the neighbourhood comes to alpha * 2*pi*sigma^2 - the
-		// true integral of the node's occlusion. Neither regime is special-cased.
+		// with amp set so that the node's whole contribution comes to its true integrated occlusion, alpha*2*pi*sigma^2
+		// (the integral of a 2D Gaussian of peak alpha), in tile-area units.
+		//
+		// SESSION077 FIX: amp used to be alpha * sigma^2 / var, which normalises against the kernel's INTEGRAL,
+		// 2*pi*var. The write loop below does not integrate: it sums a_eff over the DISCRETE lattice of tile centres,
+		// and the two only agree while the kernel is wide compared to a tile. At the small end they diverge badly - with
+		// sigma << 1, var -> 1/12, the kernel's width is sqrt(1/12) = 0.29 tiles, so the discrete sum collapses to ~1.0
+		// (essentially the centre tile alone) against an integral of 2*pi/12 = 0.52. Every such node therefore deposited
+		// 12/(2*pi) = 1.9x its own occlusion.
+		//
+		// The error is confined to small sigma, which makes it a DISTANCE-dependent bias rather than a constant one: the
+		// LoD holds nodes at a roughly fixed screen size, so sigma_tiles is small everywhere EXCEPT near the camera,
+		// where the tree runs out of depth and hands back leaf splats larger than the pixel limit. Far field
+		// over-saturated by ~1.9x while the near field was exact, so an opaque surface came out painted beyond a
+		// camera-relative radius and clear inside it - the moving patch the owner tracked across a wall and a ceiling in
+		// session077.
+		//
+		// Normalising against the discrete sum instead removes it. That sum is separable, and its 1D factor
+		// (a theta function) is within a few percent of max(1, sqrt(2*pi*var)) across the whole range - 1 when the
+		// kernel fits inside one tile, sqrt(2*pi*var) once it spans several - so S = max(1, 2*pi*var) in 2D:
+		//
+		//   amp = alpha * 2*pi*sigma^2 / max(1, 2*pi*var)
+		//
+		// Both limits come out right, and neither is special-cased: sigma >> 1 gives amp -> alpha (the node blankets the
+		// tile with its own opacity), sigma << 1 gives amp -> alpha*2*pi*sigma^2 deposited into essentially one tile,
+		// which is exactly that node's integrated occlusion.
 		const float sigma_tiles = radius_tiles * (1.f / gs_sat_occluder_sigmas);
 		const float sigma_sq = sigma_tiles * sigma_tiles;
 		const float var = sigma_sq + (1.f / 12.f);
 		const float a = myClamp(alpha[i], 0.f, 1.f);
-		const float amp = a * (sigma_sq / var);
+		const float two_pi = 6.28318531f;
+		const float amp = a * (two_pi * sigma_sq) / myMax(1.f, two_pi * var);
 		if(amp < gs_sat_min_occluder_amp)
 			continue; // Integrated occlusion is nil - see gs_sat_min_occluder_amp. Skips the fine-scale bulk cheaply.
 

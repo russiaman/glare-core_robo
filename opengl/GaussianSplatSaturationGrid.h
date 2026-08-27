@@ -290,16 +290,15 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius,
 	js::Vector<float, 16>& sat_depth_out, size_t* out_writers = NULL, size_t* out_tile_writes = NULL,
 	js::Vector<float, 16>* out_accum_t = NULL, js::Vector<float, 16>* out_amp_sum = NULL,
-	size_t* out_tile_stats = NULL, // SESSION079 DIAGNOSTIC: 3-element array - [0] total per-tile loop iterations, [1] of those, rejected off the Gaussian's tail, [2] skipped because the tile's barrier was already set. Against out_tile_writes, which counts only the iterations that reached the accumulator.
-	int ablate_stage = 0); // SESSION079 DIAGNOSTIC, THROWAWAY: cut the build loop short to decompose its cost - 0 = full, 1/2/3 = progressively later cut points. See the definition.
+	size_t* out_tile_stats = NULL); // SESSION079 DIAGNOSTIC: 3-element array - [0] total per-tile loop iterations, [1] of those, rejected off the Gaussian's tail, [2] skipped because the tile's barrier was already set. Against out_tile_writes, which counts only the iterations that reached the accumulator.
 
 
 // SESSION079: the same build, split across the task manager by horizontal strips of grid rows. Bit-identical to
 // gsBuildSaturationGrid() - strips own disjoint tiles and each tile still sees its occluders front-to-back - so this is
 // a pure parallelisation, not the approximate stage-7 reformulation the plan originally proposed.
 //
-// Two things it does not do, both because nothing needs them: the debug overlays (out_accum_t / out_amp_sum) and the
-// ablation cut points. Ask for either and the serial entry point above is the one to call.
+// One thing it does not do, because nothing needs it: the debug overlays (out_accum_t / out_amp_sum). Ask for
+// those and the serial entry point above is the one to call.
 //
 // Safe to call from inside a task already running on the same TaskManager - see the runTaskGroup() note in the .cpp.
 //
@@ -309,8 +308,6 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius,
 	js::Vector<float, 16>& sat_depth_out, glare::TaskManager& task_manager,
 	size_t* out_writers = NULL, size_t* out_tile_writes = NULL, size_t* out_tile_stats = NULL,
-	int* out_num_strips = NULL, // SESSION079 DIAGNOSTIC: how many strips it actually split into.
-	int force_num_strips = 0, // SESSION079 DIAGNOSTIC, THROWAWAY: override the strip count, to sweep it. 0 = the derived count.
 	js::Vector<GsSatOccluderRec, 16>* scratch_recs = NULL); // Optional caller-owned scratch for the phase-1 records, to keep the allocation out of the per-build cost.
 
 

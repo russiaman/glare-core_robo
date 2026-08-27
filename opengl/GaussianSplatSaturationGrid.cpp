@@ -252,10 +252,6 @@ static inline float gsSatExpNeg(float x) // x >= 0; caller has already rejected 
 }
 
 
-// SESSION079 DIAGNOSTIC, THROWAWAY: see ablate_sink inside gsBuildSaturationGrid().
-volatile float gs_sat_ablate_sink = 0.f;
-
-
 // SESSION079 PERF: floor/ceil without a library call.
 //
 // This project builds MSVC x64 with no /arch: flag (cmake/shared_cxx_settings.cmake defines -D__SSE4_1__ as a
@@ -398,7 +394,7 @@ static inline void gsSatDepositRec(const GsSatOccluderRec& rec, int res, float r
 static void gsSatBuildStrip(const float* px, const float* py, const float* pz, const float* radius, const float* alpha, size_t n,
 	const Vec4f& anchor_pos_ws, int res, float remaining_threshold, float region_radius,
 	float* const sat_depth, float* const accum, float* const amp_sum, bool keep_accumulating_past_saturation,
-	int v_lo, int v_hi, GsSatStripStats* stats, int ablate_stage)
+	int v_lo, int v_hi, GsSatStripStats* stats)
 {
 	// When the strip is the whole grid there is nothing to reject, so the test below is compiled out of the way and the
 	// serial path costs exactly what it did before this split.
@@ -419,18 +415,6 @@ static void gsSatBuildStrip(const float* px, const float* py, const float* pz, c
 	// whole sphere), so a node whose bound already clears gs_sat_min_occluder_amp would have its true amp clear it too -
 	// see the reject test itself for what that buys.
 	const float amp_reject_k = 3.14159265f * (float)res * (float)res / 18.f;
-
-	// SESSION079 DIAGNOSTIC, THROWAWAY: cost decomposition. Three of this plan's stages predicted their effect and two
-	// missed badly (stage 2 by 3x, stage 3 entirely), which says the cost model of this loop is guesswork. Rather than
-	// keep guessing, ablate_stage cuts the loop short at a known point and lets the caller time each cut. The timings
-	// are exact and assume nothing about clock rate or IPC; the results of the cut runs are garbage and are discarded.
-	//
-	// ablate_stage: 0 = full loop (production). 1 = stop after the early reject. 2 = stop after radius_tiles.
-	// 3 = stop before the tile loop. Each cut adds its own last computed value into ablate_sink, which is stored to a
-	// volatile at the end - without that the optimiser deletes the very work we are trying to time.
-	//
-	// Remove this and the ablate_stage parameter once the plan's priorities are settled.
-	float ablate_sink = 0.f;
 
 	// SESSION074: nodes are assumed already front-to-back (a filtered subsequence of the traversal's globally sorted
 	// output - see GaussianSplatUnculledFrontier / GaussianSplatLodTraversalTask::run()). This is the ONLY sequential,
@@ -463,8 +447,6 @@ static void gsSatBuildStrip(const float* px, const float* py, const float* pz, c
 		const float a = myClamp(alpha[i], 0.f, 1.f); // Hoisted from the amplitude block below, which used to declare it - same value, needed here first.
 		if(a * r * r * amp_reject_k < gs_sat_min_occluder_amp * dist_sq)
 			continue;
-
-		if(ablate_stage == 1) { ablate_sink += dist_sq; continue; } // SESSION079 DIAGNOSTIC cut A - see ablate_sink.
 
 
 		// SESSION074: angular radius without trigonometry. The exact value is asin(r/dist); for the small angles this
@@ -512,15 +494,7 @@ static void gsSatBuildStrip(const float* px, const float* py, const float* pz, c
 				continue;
 		}
 
-		// SESSION079 DIAGNOSTIC cut D: everything above this line is what EVERY strip pays, whether or not the node is its
-		// own - the walk, the early reject, the sqrt, the oct unwrap and the strip test. That is the part the strip split
-		// cannot divide, so it is the floor on what parallelising this way can ever reach. Measuring it settles whether the
-		// next step is to pre-bin the occluders by strip.
-		if(ablate_stage == 4) { ablate_sink += cu + cv; continue; }
-
 		const float radius_tiles = ang_radius * gsSatGridInvLocalTileAngle(l1, inv_dist, res);
-
-		if(ablate_stage == 2) { ablate_sink += radius_tiles + cu + cv; continue; } // SESSION079 DIAGNOSTIC cut B - see ablate_sink.
 
 		// SESSION076: an occluder is a GAUSSIAN, not a uniformly opaque disc, and the whole of this pass's accuracy
 		// turns on that distinction. Both earlier cuts modelled it as a disc and failed in opposite directions:
@@ -608,19 +582,15 @@ static void gsSatBuildStrip(const float* px, const float* py, const float* pz, c
 		rec.far_edge = far_edge;
 		rec.inv_2var = 0.5f / var;
 
-		if(ablate_stage == 3) { ablate_sink += amp + far_edge + rec.span; continue; } // SESSION079 DIAGNOSTIC cut C - see ablate_sink.
-
 		gsSatDepositRec(rec, res, remaining_threshold, sat_depth, accum, amp_sum, keep_accumulating_past_saturation, v_lo, v_hi, stats);
 	}
-
-	gs_sat_ablate_sink = ablate_sink; // SESSION079 DIAGNOSTIC: keeps the ablated work alive against dead-code elimination.
 }
 
 
 void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, const float* radius, const float* alpha, size_t n,
 	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius,
 	js::Vector<float, 16>& sat_depth_out, size_t* out_writers, size_t* out_tile_writes,
-	js::Vector<float, 16>* out_accum_t, js::Vector<float, 16>* out_amp_sum, size_t* out_tile_stats, int ablate_stage)
+	js::Vector<float, 16>* out_accum_t, js::Vector<float, 16>* out_amp_sum, size_t* out_tile_stats)
 {
 	const size_t num_tiles = (size_t)res * (size_t)res;
 	sat_depth_out.resizeNoCopy(num_tiles);
@@ -641,7 +611,7 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 		myClamp(1.f - saturation_threshold, 0.f, 1.f), region_radius,
 		sat_depth_out.data(), accum_t.data(), out_amp_sum ? amp_sum.data() : NULL,
 		(out_accum_t != NULL) || (out_amp_sum != NULL),
-		0, res, (out_writers || out_tile_writes || out_tile_stats) ? &stats : NULL, ablate_stage);
+		0, res, (out_writers || out_tile_writes || out_tile_stats) ? &stats : NULL);
 
 	if(out_writers)     *out_writers     = stats.writers;
 	if(out_tile_writes) *out_tile_writes = stats.tile_writes;
@@ -752,7 +722,7 @@ public:
 void gsBuildSaturationGridParallel(const float* px, const float* py, const float* pz, const float* radius, const float* alpha, size_t n,
 	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius,
 	js::Vector<float, 16>& sat_depth_out, glare::TaskManager& task_manager,
-	size_t* out_writers, size_t* out_tile_writes, size_t* out_tile_stats, int* out_num_strips, int force_num_strips,
+	size_t* out_writers, size_t* out_tile_writes, size_t* out_tile_stats,
 	js::Vector<GsSatOccluderRec, 16>* scratch_recs)
 {
 	const size_t num_tiles = (size_t)res * (size_t)res;
@@ -763,8 +733,7 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 	const int concurrency = myMax(1, (int)task_manager.getConcurrency());
 	const float remaining_threshold = myClamp(1.f - saturation_threshold, 0.f, 1.f);
 
-	const int num_strips = (force_num_strips > 0) ? myClamp(force_num_strips, 1, res) : myClamp(res / gs_sat_min_strip_rows, 1, concurrency);
-	if(out_num_strips) *out_num_strips = num_strips;
+	const int num_strips = myClamp(res / gs_sat_min_strip_rows, 1, concurrency);
 
 	// The occluders are processed in BLOCKS rather than all at once, to bound the record scratch - see
 	// gs_sat_rec_scratch_bytes for the trade-off and the numbers behind the budget.

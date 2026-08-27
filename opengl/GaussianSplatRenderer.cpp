@@ -115,18 +115,6 @@ public:
 // finally-selected node needs only its own 3-sigma footprint, not its whole subtree's bounding sphere), and a
 // subsequence of a distance-sorted list stays sorted, so no re-sort is needed. Immutable once built; validity is keyed
 // by the fields below (see drainTraversalResults()/GaussianSplatFilterTask).
-// SESSION079 DIAGNOSTIC, THROWAWAY: repeats per ablation timing - see the build-side ablation for why the minimum of
-// several runs rather than one. 3 repeats x 4 build cuts x ~100ms plus 2 read variants is roughly 1.8s of extra work,
-// paid once per traversal and only while the "sat diag" checkbox is on.
-static const int gs_sat_ablate_repeats = 3;
-
-
-// SESSION079 DIAGNOSTIC, THROWAWAY: strip counts to sweep. 0 means "whatever the function derives", i.e. the real
-// setting. See the sweep's own comment for what the sweep answers.
-static const int gs_sat_strip_sweep[] = { 0, 2, 3, 4, 6, 8 };
-static const int gs_sat_strip_sweep_n = (int)(sizeof(gs_sat_strip_sweep) / sizeof(gs_sat_strip_sweep[0]));
-
-
 class GaussianSplatUnculledFrontier : public ThreadSafeRefCounted
 {
 public:
@@ -217,17 +205,6 @@ public:
 	size_t sat_diag_writers;      // Grid contributors: nodes whose contribution cleared the negligible-amplitude cutoff.
 	size_t sat_diag_tile_writes;  // Total per-tile writes - the build pass's write amplification.
 	size_t sat_diag_tile_stats[3]; // SESSION079: per-tile loop iterations in the build pass - [0] total, [1] rejected off the Gaussian's tail, [2] skipped as already saturated. Against sat_diag_tile_writes, which counts only those reaching the accumulator.
-	double sat_diag_ablate_ms[4]; // SESSION079 DIAGNOSTIC, THROWAWAY: build-loop cost decomposition - cuts A, B, C then a second full run. See the call site.
-	double sat_diag_test_occl_ms; // SESSION079 DIAGNOSTIC, THROWAWAY: the read pass with gsSatOccluded() only, no compaction.
-	double sat_diag_test_full_ms; // SESSION079 DIAGNOSTIC, THROWAWAY: the same walk WITH compaction. The difference from sat_diag_test_occl_ms is what compaction costs.
-	double sat_diag_par_ms;       // SESSION079: the strip-parallel build - gsBuildSaturationGridParallel(). Correct, unlike the probe below.
-	size_t sat_diag_par_writes;   // SESSION079: that run's tile_writes, which must match the serial build's exactly.
-	int sat_diag_par_strips;      // SESSION079: how many strips the parallel build split into.
-	double sat_diag_par_floor_ms[2]; // SESSION079 DIAGNOSTIC, THROWAWAY: parallel run cut short - [0] after the early reject, [1] after the strip test. The floor the strip split cannot go below.
-	double sat_diag_sweep_ms[8];  // SESSION079 DIAGNOSTIC, THROWAWAY: the strip-count sweep - see gs_sat_strip_sweep.
-	int sat_diag_sweep_strips[8];
-	double sat_diag_sorted_ms;    // SESSION079 DIAGNOSTIC, THROWAWAY: the build loop over occluders reordered by tile - the locality probe. Result is wrong; only the timing counts.
-	size_t sat_diag_sorted_iters; // SESSION079 DIAGNOSTIC, THROWAWAY: that run's tile-loop iteration count, so the comparison can be made per iteration.
 
 	// SESSION077 DIAGNOSTIC: anisotropy of the occluder set that fed the grid - max(scale.xyz)/min(scale.xyz) per node,
 	// over the SAME nodes occl_radius/occl_alpha were built from. Answers whether the isotropic-disc occluder model
@@ -255,13 +232,10 @@ public:
 	GaussianSplatUnculledFrontier() // SESSION074: defaults are "stage never ran" - only kickOffTraversals() passing the stage-enabled flag sets sat_grid_res non-zero.
 	:	sat_grid_res(0), sat_num_occluders(0), sat_num_tested(0), sat_num_dropped(0), sat_num_dropped_aggr(0),
 		sat_grid_build_ms(0.0), sat_test_ms(0.0),
-		sat_diag_coarse_a(0), sat_diag_coarse_b(0), sat_diag_writers(0), sat_diag_tile_writes(0), sat_diag_test_occl_ms(0.0), sat_diag_test_full_ms(0.0), sat_diag_par_ms(0.0), sat_diag_par_writes(0), sat_diag_par_strips(0), sat_diag_sorted_ms(0.0), sat_diag_sorted_iters(0), // SESSION076, SESSION079
+		sat_diag_coarse_a(0), sat_diag_coarse_b(0), sat_diag_writers(0), sat_diag_tile_writes(0), // SESSION076
 		sat_diag_aniso_n(0), sat_diag_aniso_mean(0.0), sat_diag_aniso_max(0.f), sat_diag_aniso_gt5(0), sat_diag_aniso_gt10(0) // SESSION077
 	{
-		for(int i=0; i<4; ++i) sat_diag_ablate_ms[i] = 0.0; // SESSION079 DIAGNOSTIC
 		for(int i=0; i<3; ++i) sat_diag_tile_stats[i] = 0;
-		for(int i=0; i<8; ++i) { sat_diag_sweep_ms[i] = 0.0; sat_diag_sweep_strips[i] = 0; } // SESSION079 DIAGNOSTIC
-		sat_diag_par_floor_ms[0] = sat_diag_par_floor_ms[1] = 0.0;
 	}
 };
 
@@ -513,6 +487,10 @@ public:
 	// scratch, rather than inside the build: at ~2.98M occluders it is a 71MB buffer, and paying its allocation and
 	// first-touch page faults on every build would be a large fraction of the build's own 35ms.
 	js::Vector<GsSatOccluderRec, 16> sat_occluder_recs;
+
+	// SESSION079: scratch for the parallel read pass's keep mask - one byte per frontier node. Kept here for the same
+	// reason as the records above, though it is small by comparison (~3.5MB where they are 32).
+	js::Vector<uint8, 16> sat_keep_mask;
 };
 
 
@@ -857,6 +835,93 @@ struct FrontierNodeRecord
 // coarse enough that a frame-late answer does not show as a hole - so the problem this comment describes disappears as
 // a side effect of that change rather than needing its own mechanism.  That rewrite renumbers everything this task
 // walks, which is the other half of why a per-node frustum test added now would be work thrown away.
+
+
+// SESSION079: one slice of the saturation read pass. Both phases below are cut the same way and share these, so a
+// chunk's verdict pass and its copy pass agree on the range by construction rather than by two matching divisions.
+struct GsSatTestChunk
+{
+	size_t i_begin, i_end;   // Input range, into the source frontier.
+	size_t out_begin;        // Where this chunk's survivors start in the output. Filled by the prefix sum between the phases.
+	size_t kept, tested, dropped, dropped_aggr;
+};
+
+
+// SESSION079: phase 1 of the read pass - the per-node occlusion verdict, which is what the pass actually costs. It is a
+// pure map: each node's answer depends only on that node and on the (finished, read-only) grid, so unlike the build
+// there is nothing to order and nothing to make exact. The result is a byte per node rather than a compacted list,
+// because the survivors' POSITIONS in the output are not knowable until every chunk has counted its own.
+class GsSatTestTask : public glare::Task
+{
+public:
+	virtual void run(size_t /*thread_index*/)
+	{
+		size_t tested = 0, dropped = 0, dropped_aggr = 0, kept = 0;
+		for(size_t i=chunk->i_begin; i<chunk->i_end; ++i)
+		{
+			bool drop = false;
+			if(is_coarse[i] == 0.f) // Coarse nodes are never saturation-tested - see the call site.
+			{
+				const float dx = px[i] - cam_pos_ws.x[0];
+				const float dy = py[i] - cam_pos_ws.x[1];
+				const float dz = pz[i] - cam_pos_ws.x[2];
+				bool aggr = false;
+				drop = gsSatOccluded(Vec4f(dx, dy, dz, 0.f), dx*dx + dy*dy + dz*dz, radius[i],
+					*sat_depth, res, region_radius, &aggr); // SESSION078
+				++tested;
+				if(drop) ++dropped;
+				if(aggr) ++dropped_aggr;
+			}
+
+			const uint8 keep = (prune && drop) ? 0 : 1;
+			keep_mask[i] = keep;
+			kept += keep;
+		}
+		chunk->kept = kept;
+		chunk->tested = tested;
+		chunk->dropped = dropped;
+		chunk->dropped_aggr = dropped_aggr;
+	}
+
+	const float* px; const float* py; const float* pz; const float* radius; const float* is_coarse;
+	const js::Vector<float, 16>* sat_depth;
+	Vec4f cam_pos_ws;
+	int res;
+	float region_radius;
+	bool prune;
+	uint8* keep_mask;
+	GsSatTestChunk* chunk;
+};
+
+
+// SESSION079: phase 2 - the gather. Each chunk copies its own survivors to the exact offsets the prefix sum handed it,
+// so the output keeps the input's front-to-back order (which everything downstream depends on) with no coordination
+// between the chunks at all. Pure bandwidth; it exists as a separate pass only because phase 1 has to finish counting
+// before any chunk knows where to write.
+class GsSatCompactTask : public glare::Task
+{
+public:
+	virtual void run(size_t /*thread_index*/)
+	{
+		size_t d = chunk->out_begin;
+		for(size_t i=chunk->i_begin; i<chunk->i_end; ++i)
+			if(keep_mask[i])
+			{
+				out_indices[d] = in_indices[i];
+				out_px[d] = in_px[i]; out_py[d] = in_py[i]; out_pz[d] = in_pz[i];
+				out_radius[d] = in_radius[i];
+				out_is_coarse[d] = in_is_coarse[i];
+				++d;
+			}
+	}
+
+	const uint32* in_indices; const float* in_px; const float* in_py; const float* in_pz; const float* in_radius; const float* in_is_coarse;
+	uint32* out_indices; float* out_px; float* out_py; float* out_pz; float* out_radius; float* out_is_coarse;
+	const uint8* keep_mask;
+	GsSatTestChunk* chunk;
+};
+
+
 class GaussianSplatLodTraversalTask : public glare::Task
 {
 public:
@@ -1343,140 +1408,15 @@ public:
 						gsBuildSaturationGridParallel(occl_px.data(), occl_py.data(), occl_pz.data(), occl_radius.data(), occl_alpha.data(), occl_px.size(),
 							cam_pos_ws, uf2->sat_grid_res, sat_saturation_threshold, sat_region_radius, uf2->sat_depth, *task_manager,
 							sat_diag_log ? &uf2->sat_diag_writers : NULL, sat_diag_log ? &uf2->sat_diag_tile_writes : NULL,
-							sat_diag_log ? uf2->sat_diag_tile_stats : NULL, NULL, 0, &scratch->sat_occluder_recs);
+							sat_diag_log ? uf2->sat_diag_tile_stats : NULL, &scratch->sat_occluder_recs);
 					}
 					else
 					gsBuildSaturationGrid(occl_px.data(), occl_py.data(), occl_pz.data(), occl_radius.data(), occl_alpha.data(), occl_px.size(),
 						cam_pos_ws, uf2->sat_grid_res, sat_saturation_threshold, sat_region_radius, uf2->sat_depth, // SESSION078: sat_region_radius = 0 reproduces the point-anchored behaviour exactly.
 						sat_diag_log ? &uf2->sat_diag_writers : NULL, sat_diag_log ? &uf2->sat_diag_tile_writes : NULL, // SESSION076 DIAGNOSTIC - null (no counting) unless the sat diag checkbox is on.
 					sat_overlay_requested ? &uf2->sat_accum_t : NULL, sat_overlay_requested ? &uf2->sat_amp_sum : NULL, // SESSION077/078 - the two overlay fields, gated on the overlay request, not the sat diag checkbox.
-						sat_diag_log ? uf2->sat_diag_tile_stats : NULL); // SESSION079 DIAGNOSTIC
+						sat_diag_log ? uf2->sat_diag_tile_stats : NULL); // SESSION079
 					uf2->sat_grid_build_ms = sat_grid_timer.elapsed() * 1.0e3;
-
-					// SESSION079 DIAGNOSTIC, THROWAWAY: cost decomposition of the build loop. Re-runs it with the loop cut
-					// short at three known points, timing each; the results go into a scratch grid and are thrown away, only
-					// the timings matter. Differences between consecutive cuts attribute the cost exactly, with no
-					// assumption about clock rate or IPC - which is what the plan's stage-3 post mortem asked for.
-					//
-					// D2 is a second full run. It exists to check the instrument: the arrays are ~60MB, larger than L3, so
-					// if D2 comes back much faster than the production run above, these numbers are being read warm and the
-					// whole decomposition has to be discounted. Remove all of this once the plan's priorities are settled.
-					if(sat_diag_log)
-					{
-						js::Vector<float, 16> ablate_depth;
-						for(int cut=1; cut<=4; ++cut)
-						{
-							const int ablate_stage = (cut == 4) ? 0 : cut; // 1, 2, 3, then full again.
-
-							// SESSION079: MINIMUM of several repeats, not the mean. Measured run-to-run spread on a quantity
-							// that provably had not changed was +-10%, which put every remaining micro-optimisation below the
-							// noise floor. The minimum is the least-disturbed run - the one that suffered fewest interrupts,
-							// least thermal throttling and least contention - and it is far more stable than the mean, which
-							// every outlier drags. Repeats also cancel the ordering bias the single-pass version had, where
-							// the last cut measured was always the most throttled.
-							double best_ms = -1.0;
-							for(int rep=0; rep<gs_sat_ablate_repeats; ++rep)
-							{
-								Timer ablate_timer;
-								gsBuildSaturationGrid(occl_px.data(), occl_py.data(), occl_pz.data(), occl_radius.data(), occl_alpha.data(), occl_px.size(),
-									cam_pos_ws, uf2->sat_grid_res, sat_saturation_threshold, sat_region_radius, ablate_depth,
-									NULL, NULL, NULL, NULL, NULL, ablate_stage);
-								const double ms = ablate_timer.elapsed() * 1.0e3;
-								if(best_ms < 0.0 || ms < best_ms) best_ms = ms;
-							}
-							uf2->sat_diag_ablate_ms[cut - 1] = best_ms;
-						}
-					}
-
-					// SESSION079: the strip-parallel build, timed alongside the serial one so the two are compared inside a
-					// single traversal rather than across runs (between-traversal spread was measured at +-11%). Its
-					// tile_writes is printed too and must match the serial build's exactly - that is the correctness check,
-					// since strips own disjoint tiles and preserve front-to-back order within each.
-					if(sat_diag_log && task_manager != NULL)
-					{
-						// SESSION079 DIAGNOSTIC, THROWAWAY: sweep the strip count. Every strip re-walks the whole occluder
-						// array, so more strips buy parallelism on the tile work while multiplying the memory traffic -
-						// 12 strips is 12 x 60MB per build. If the walk is what binds, fewer strips will be FASTER, and
-						// that is a direct test of the hypothesis rather than an argument about it.
-						js::Vector<float, 16> par_depth;
-						js::Vector<GsSatOccluderRec, 16> par_recs; // Reused across the sweep so the allocation is not timed.
-						for(int si=0; si<gs_sat_strip_sweep_n; ++si)
-						{
-							double best_ms = -1.0;
-							size_t best_writes = 0;
-							int got_strips = 0;
-							for(int rep=0; rep<gs_sat_ablate_repeats; ++rep)
-							{
-								size_t par_writes = 0;
-								Timer par_timer;
-								gsBuildSaturationGridParallel(occl_px.data(), occl_py.data(), occl_pz.data(), occl_radius.data(), occl_alpha.data(), occl_px.size(),
-									cam_pos_ws, uf2->sat_grid_res, sat_saturation_threshold, sat_region_radius, par_depth, *task_manager,
-									NULL, &par_writes, NULL, &got_strips, gs_sat_strip_sweep[si], &par_recs);
-								const double ms = par_timer.elapsed() * 1.0e3;
-								if(best_ms < 0.0 || ms < best_ms) { best_ms = ms; best_writes = par_writes; }
-							}
-							uf2->sat_diag_sweep_ms[si] = best_ms;
-							uf2->sat_diag_sweep_strips[si] = got_strips;
-							uf2->sat_diag_par_writes = best_writes; // Must be identical for every strip count - that is the correctness check.
-							if(gs_sat_strip_sweep[si] == 0) { uf2->sat_diag_par_ms = best_ms; uf2->sat_diag_par_strips = got_strips; }
-						}
-
-					}
-
-					// SESSION079 DIAGNOSTIC, THROWAWAY: locality probe. The tile loop measured ~29 cycles per iteration for
-					// a few cycles' worth of arithmetic, and the suspect is locality: every iteration does a
-					// read-modify-write on accum_t and a read of sat_depth, two arrays of tiles*4 bytes each, while the
-					// occluders arrive sorted by DEPTH, not by direction. Consecutive nodes therefore land on unrelated rows
-					// of both arrays.
-					//
-					// This reorders the occluders by tile index and runs the same loop over them. The result is GARBAGE -
-					// front-to-back order is what makes the sequential accumulation mean anything - but the timing is exact.
-					// The counting sort is outside the timer, and the reordered arrays are materialised so the occluder
-					// reads stay sequential too, leaving locality of the two grid arrays as the only difference.
-					//
-					// Comparison must be per ITERATION, not per run: a wrong order saturates tiles at different times, so
-					// the iteration count moves. Hence tile_stats is collected for this run too.
-					if(sat_diag_log)
-					{
-						const size_t nn = occl_px.size();
-						const int gres = uf2->sat_grid_res;
-						const size_t nbins = (size_t)gres * (size_t)gres;
-
-						js::Vector<int, 16> bin_of(nn);
-						js::Vector<int, 16> bin_start(nbins + 1, 0);
-						for(size_t i=0; i<nn; ++i)
-						{
-							const Vec4f off(occl_px[i] - cam_pos_ws.x[0], occl_py[i] - cam_pos_ws.x[1], occl_pz[i] - cam_pos_ws.x[2], 0.f);
-							const int b = gsSatGridTileForDir(off, gres);
-							bin_of[i] = b;
-							++bin_start[(size_t)b + 1];
-						}
-						for(size_t b=0; b<nbins; ++b)
-							bin_start[b + 1] += bin_start[b];
-
-						js::Vector<float, 16> so_px(nn), so_py(nn), so_pz(nn), so_radius(nn), so_alpha(nn);
-						js::Vector<int, 16> cursor = bin_start;
-						for(size_t i=0; i<nn; ++i)
-						{
-							const size_t d = (size_t)cursor[(size_t)bin_of[i]]++;
-							so_px[d] = occl_px[i]; so_py[d] = occl_py[i]; so_pz[d] = occl_pz[i];
-							so_radius[d] = occl_radius[i]; so_alpha[d] = occl_alpha[i];
-						}
-
-						js::Vector<float, 16> sorted_depth;
-						double best_ms = -1.0;
-						for(int rep=0; rep<gs_sat_ablate_repeats; ++rep)
-						{
-							size_t stats[3] = { 0, 0, 0 };
-							Timer sorted_timer;
-							gsBuildSaturationGrid(so_px.data(), so_py.data(), so_pz.data(), so_radius.data(), so_alpha.data(), nn,
-								cam_pos_ws, gres, sat_saturation_threshold, sat_region_radius, sorted_depth,
-								NULL, NULL, NULL, NULL, stats, 0);
-							const double ms = sorted_timer.elapsed() * 1.0e3;
-							if(best_ms < 0.0 || ms < best_ms) { best_ms = ms; uf2->sat_diag_sorted_iters = stats[0]; }
-						}
-						uf2->sat_diag_sorted_ms = best_ms;
-					}
 
 					// SESSION076 DIAGNOSTIC: carry the DFS-side breakdown across to where [gsr-sat-diag] prints it.
 					uf2->sat_diag_coarse_a = diag_coarse_a;
@@ -1504,90 +1444,90 @@ public:
 					{
 						Timer sat_test_timer;
 						const bool prune = (sat_prefilter_mode == GaussianSplatSatPrefilterMode_Drop);
-						uf2->indices.reserve(n);
-						uf2->px.reserve(n); uf2->py.reserve(n); uf2->pz.reserve(n); uf2->radius.reserve(n);
-						uf2->is_coarse.reserve(n);
-						size_t num_tested = 0, num_dropped = 0, num_dropped_aggr = 0;
-						for(size_t i=0; i<n; ++i)
-						{
-							bool drop = false;
-							if(uf->is_coarse[i] == 0.f) // Coarse nodes are never saturation-tested - see above.
-							{
-								const float dx = uf->px[i] - cam_pos_ws.x[0];
-								const float dy = uf->py[i] - cam_pos_ws.x[1];
-								const float dz = uf->pz[i] - cam_pos_ws.x[2];
-								bool aggr = false;
-								drop = gsSatOccluded(Vec4f(dx, dy, dz, 0.f), dx*dx + dy*dy + dz*dz, uf->radius[i],
-									uf2->sat_depth, uf2->sat_grid_res, sat_region_radius, &aggr); // SESSION078
-								++num_tested;
-								if(drop) ++num_dropped;
-								if(aggr) ++num_dropped_aggr;
-							}
 
-							if(prune && drop)
-								continue;
-							uf2->indices.push_back(uf->indices[i]);
-							uf2->px.push_back(uf->px[i]); uf2->py.push_back(uf->py[i]); uf2->pz.push_back(uf->pz[i]);
-							uf2->radius.push_back(uf->radius[i]);
-							uf2->is_coarse.push_back(uf->is_coarse[i]);
+						// SESSION079: split across the pool, in two phases - verdicts, then the gather. Once the build was
+						// parallelised this pass became the stage's dominant cost by a factor of three (~111-125ms against
+						// the build's 35), and it is the easier of the two by some distance: no ordering constraint, no
+						// shared accumulator, nothing approximate. The only thing that is not embarrassingly parallel is
+						// where each survivor LANDS, and a prefix sum over the chunk counts settles that exactly.
+						//
+						// The chunks are cut finer than the thread count on purpose. The per-node cost is not uniform -
+						// coarse nodes skip the test entirely, and a tested node's cost depends on how many tiles its
+						// footprint spans - and coarse and fine are interleaved by the distance sort, so an even split of
+						// the INDEX range is not an even split of the work. Smaller chunks let the pool even that out.
+						const int concurrency = (task_manager != NULL) ? myMax(1, (int)task_manager->getConcurrency()) : 1;
+						const size_t min_chunk_nodes = 16384; // Below this the per-task overhead starts to matter against the work.
+						const size_t num_chunks = myMax<size_t>(1, myMin((size_t)concurrency * 4, n / min_chunk_nodes));
+
+						js::Vector<GsSatTestChunk, 16> chunks(num_chunks);
+						for(size_t c=0; c<num_chunks; ++c)
+						{
+							chunks[c].i_begin = (n * c)       / num_chunks;
+							chunks[c].i_end   = (n * (c + 1)) / num_chunks;
+							chunks[c].out_begin = 0;
+							chunks[c].kept = chunks[c].tested = chunks[c].dropped = chunks[c].dropped_aggr = 0;
 						}
+
+						js::Vector<uint8, 16>& keep_mask = scratch->sat_keep_mask;
+						keep_mask.resizeNoCopy(n);
+
+						// ---- Phase 1: the verdict, per node. ----
+						{
+							glare::TaskGroupRef group = new glare::TaskGroup();
+							for(size_t c=0; c<num_chunks; ++c)
+							{
+								Reference<GsSatTestTask> t = new GsSatTestTask();
+								t->px = uf->px.data(); t->py = uf->py.data(); t->pz = uf->pz.data();
+								t->radius = uf->radius.data(); t->is_coarse = uf->is_coarse.data();
+								t->sat_depth = &uf2->sat_depth;
+								t->cam_pos_ws = cam_pos_ws;
+								t->res = uf2->sat_grid_res;
+								t->region_radius = sat_region_radius;
+								t->prune = prune;
+								t->keep_mask = keep_mask.data();
+								t->chunk = &chunks[c];
+								if(task_manager != NULL) group->tasks.push_back(t); else t->run(0); // No pool: same code, run here.
+							}
+							if(task_manager != NULL) task_manager->runTaskGroup(group);
+						}
+
+						size_t num_tested = 0, num_dropped = 0, num_dropped_aggr = 0, num_kept = 0;
+						for(size_t c=0; c<num_chunks; ++c)
+						{
+							chunks[c].out_begin = num_kept;
+							num_kept        += chunks[c].kept;
+							num_tested      += chunks[c].tested;
+							num_dropped     += chunks[c].dropped;
+							num_dropped_aggr+= chunks[c].dropped_aggr;
+						}
+
+						uf2->indices.resizeNoCopy(num_kept);
+						uf2->px.resizeNoCopy(num_kept); uf2->py.resizeNoCopy(num_kept); uf2->pz.resizeNoCopy(num_kept);
+						uf2->radius.resizeNoCopy(num_kept);
+						uf2->is_coarse.resizeNoCopy(num_kept);
+
+						// ---- Phase 2: the gather, into the offsets the prefix sum just fixed. ----
+						if(num_kept > 0)
+						{
+							glare::TaskGroupRef group = new glare::TaskGroup();
+							for(size_t c=0; c<num_chunks; ++c)
+							{
+								Reference<GsSatCompactTask> t = new GsSatCompactTask();
+								t->in_indices = uf->indices.data(); t->in_px = uf->px.data(); t->in_py = uf->py.data();
+								t->in_pz = uf->pz.data(); t->in_radius = uf->radius.data(); t->in_is_coarse = uf->is_coarse.data();
+								t->out_indices = uf2->indices.data(); t->out_px = uf2->px.data(); t->out_py = uf2->py.data();
+								t->out_pz = uf2->pz.data(); t->out_radius = uf2->radius.data(); t->out_is_coarse = uf2->is_coarse.data();
+								t->keep_mask = keep_mask.data();
+								t->chunk = &chunks[c];
+								if(task_manager != NULL) group->tasks.push_back(t); else t->run(0);
+							}
+							if(task_manager != NULL) task_manager->runTaskGroup(group);
+						}
+
 						uf2->sat_num_tested = num_tested;
 						uf2->sat_num_dropped = num_dropped;
 						uf2->sat_num_dropped_aggr = num_dropped_aggr;
 						uf2->sat_test_ms = sat_test_timer.elapsed() * 1.0e3;
-
-						// SESSION079 DIAGNOSTIC, THROWAWAY: the same walk with gsSatOccluded() alone and no compaction.
-						// test_ms measures ~50ns per node, MORE than the build pass despite doing less arithmetic per node
-						// and having no tile loop to speak of; the loop above also does six push_back()s into six separate
-						// vectors for every surviving node, ~15M of them, and nothing has ever measured which half that is.
-						// Remove once the plan's priorities are settled.
-						if(sat_diag_log)
-						{
-							// Two variants, each the MINIMUM of several repeats - see the build-side ablation for why the
-							// minimum. occl-only walks and tests but discards; full also does the six push_back()s the real
-							// loop does. Their difference is the compaction's cost, measured rather than assumed: the plan's
-							// stage 6 takes for granted that compaction is cheap.
-							js::Vector<float, 16> sc_px, sc_py, sc_pz, sc_radius, sc_is_coarse;
-							js::Vector<int, 16> sc_indices;
-							size_t occl_sink = 0;
-							for(int variant=0; variant<2; ++variant)
-							{
-								const bool with_compaction = (variant == 1);
-								double best_ms = -1.0;
-								for(int rep=0; rep<gs_sat_ablate_repeats; ++rep)
-								{
-									sc_indices.resize(0); sc_px.resize(0); sc_py.resize(0); sc_pz.resize(0); sc_radius.resize(0); sc_is_coarse.resize(0);
-									sc_indices.reserve(n); sc_px.reserve(n); sc_py.reserve(n); sc_pz.reserve(n); sc_radius.reserve(n); sc_is_coarse.reserve(n);
-									Timer variant_timer;
-									for(size_t i=0; i<n; ++i)
-									{
-										bool drop = false;
-										if(uf->is_coarse[i] == 0.f)
-										{
-											const float dx = uf->px[i] - cam_pos_ws.x[0];
-											const float dy = uf->py[i] - cam_pos_ws.x[1];
-											const float dz = uf->pz[i] - cam_pos_ws.x[2];
-											drop = gsSatOccluded(Vec4f(dx, dy, dz, 0.f), dx*dx + dy*dy + dz*dz, uf->radius[i],
-												uf2->sat_depth, uf2->sat_grid_res, sat_region_radius, NULL);
-											if(drop) ++occl_sink;
-										}
-										if(with_compaction)
-										{
-											if(prune && drop)
-												continue;
-											sc_indices.push_back(uf->indices[i]);
-											sc_px.push_back(uf->px[i]); sc_py.push_back(uf->py[i]); sc_pz.push_back(uf->pz[i]);
-											sc_radius.push_back(uf->radius[i]);
-											sc_is_coarse.push_back(uf->is_coarse[i]);
-										}
-									}
-									const double ms = variant_timer.elapsed() * 1.0e3;
-									if(best_ms < 0.0 || ms < best_ms) best_ms = ms;
-								}
-								if(with_compaction) uf2->sat_diag_test_full_ms = best_ms; else uf2->sat_diag_test_occl_ms = best_ms;
-							}
-							uf2->sat_num_dropped_aggr += (occl_sink == (size_t)-1) ? 1 : 0; // Keeps occl_sink live; the condition is never true.
-						}
 
 						Reference<GaussianSplatLodTraversalResultMsg> sat_msg = new GaussianSplatLodTraversalResultMsg();
 						sat_msg->cloud_id = cloud_id;
@@ -6178,36 +6118,6 @@ void GaussianSplatRenderer::drainTraversalResults()
 							" tail_rej=" + uInt64ToStringCommaSeparated(uf.sat_diag_tile_stats[1]) +
 							" sat_skip=" + uInt64ToStringCommaSeparated(uf.sat_diag_tile_stats[2]) +
 							" per_writer_iters=" + doubleToStringNDecimalPlaces(uf.sat_diag_writers > 0 ? ((double)uf.sat_diag_tile_stats[0] / (double)uf.sat_diag_writers) : 0.0, 1));
-
-						// SESSION079 DIAGNOSTIC, THROWAWAY: the cost decomposition - see the ablation call sites. A = walk +
-						// early reject only, B = + footprint geometry, C = + amplitude and span, D2 = full again (instrument
-						// check against grid_ms). test_occl = the read pass without its compaction.
-						conPrint("[gsr-sat-cost] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms" +
-							" A=" + doubleToStringNDecimalPlaces(uf.sat_diag_ablate_ms[0], 2) +
-							" B=" + doubleToStringNDecimalPlaces(uf.sat_diag_ablate_ms[1], 2) +
-							" C=" + doubleToStringNDecimalPlaces(uf.sat_diag_ablate_ms[2], 2) +
-							" D2=" + doubleToStringNDecimalPlaces(uf.sat_diag_ablate_ms[3], 2) +
-							" (grid_ms=" + doubleToStringNDecimalPlaces(uf.sat_grid_build_ms, 2) + ")" +
-							" test_occl=" + doubleToStringNDecimalPlaces(uf.sat_diag_test_occl_ms, 2) +
-							" test_full=" + doubleToStringNDecimalPlaces(uf.sat_diag_test_full_ms, 2) +
-							" compact=" + doubleToStringNDecimalPlaces(uf.sat_diag_test_full_ms - uf.sat_diag_test_occl_ms, 2) +
-							" (test_ms=" + doubleToStringNDecimalPlaces(uf.sat_test_ms, 2) + ")" +
-							" | par=" + doubleToStringNDecimalPlaces(uf.sat_diag_par_ms, 2) +
-							" par_writes=" + uInt64ToStringCommaSeparated(uf.sat_diag_par_writes) +
-							" strips=" + toString(uf.sat_diag_par_strips) +
-							" | sorted=" + doubleToStringNDecimalPlaces(uf.sat_diag_sorted_ms, 2) +
-							" sorted_iters=" + uInt64ToStringCommaSeparated(uf.sat_diag_sorted_iters) +
-							" sorted_ns_per_iter=" + doubleToStringNDecimalPlaces(uf.sat_diag_sorted_iters > 0 ? (uf.sat_diag_sorted_ms * 1.0e6 / (double)uf.sat_diag_sorted_iters) : 0.0, 2));
-
-						// SESSION079 DIAGNOSTIC, THROWAWAY: the strip-count sweep, own line to keep [gsr-sat-cost] readable.
-						{
-							std::string sweep_str;
-							for(int si=0; si<gs_sat_strip_sweep_n; ++si)
-								sweep_str += " n" + toString(uf.sat_diag_sweep_strips[si]) + "=" + doubleToStringNDecimalPlaces(uf.sat_diag_sweep_ms[si], 2);
-							conPrint("[gsr-sat-strips] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms" + sweep_str +
-								" | par_writes=" + uInt64ToStringCommaSeparated(uf.sat_diag_par_writes) +
-								" (serial tile_writes=" + uInt64ToStringCommaSeparated(uf.sat_diag_tile_writes) + ")");
-						}
 
 						// SESSION077 DIAGNOSTIC: separate line again, same reasoning as the split above - see
 						// GaussianSplatUnculledFrontier::sat_diag_aniso_n. aniso=max(scale.xyz)/min(scale.xyz) per occluder,

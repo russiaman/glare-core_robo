@@ -1441,7 +1441,7 @@ private:
 	float dist_clamp_min, dist_clamp_max;
 	bool dist_clamp_invert;
 	GaussianSplatSatPrefilterMode sat_prefilter_mode; // SESSION074: Off = don't build the grid at all; Count = build + tally; Drop = build, tally and prune the frontier - see GaussianSplatSaturationGrid.h.
-	float sat_saturation_threshold;  // SESSION074: reuses the existing splat_saturation_threshold live knob (GaussianSplatRenderer::getSaturationThreshold()) - no new threshold introduced, see the plan's "no manual per-scene tuning" constraint.
+	float sat_saturation_threshold;  // SESSION074: this stage's own threshold - see GaussianSplatRenderer::getSatPrefilterThreshold(). SESSION079: split out from splat_saturation_threshold (the GPU gate's), which it used to reuse - see that getter's comment.
 	bool sat_diag_log;               // SESSION076 DIAGNOSTIC: see the ctor param.
 	bool coarse_layer_drawn;         // SESSION076: see the ctor param.
 	float sat_grid_subdiv; // SESSION076 CALIBRATION: see the ctor param.
@@ -1462,6 +1462,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	split_coarse_floor_enabled(true), split_coarse_pixel_scale(30.f), filter_coarse_dilation_latency(0.9f), coarse_layer_debug(false), // SESSION063 K4
 	filter_debug_log(false), kick_debug_log(false), cpu_prof_log(false), // SESSION072: default off - see getFilterDebugLog()'s comment.
 	sat_prefilter_mode(GaussianSplatSatPrefilterMode_Off), filter_frustum_planes_enabled(true), // SESSION074: stage off by default, frustum planes on (i.e. unchanged pipeline) - see getSatPrefilterMode()/getFilterFrustumPlanesEnabled().
+	sat_prefilter_threshold(0.98f), // SESSION079 - see getSatPrefilterThreshold().
 	sat_diag_log(false), sat_debug_overlay_mode(GaussianSplatSatDebugOverlayMode_Off), sat_grid_subdiv(0.3f), sat_region_radius(0.f), // SESSION076/078: diagnostics off by default - see getSatDiagLog()/getSatDebugOverlayMode(). Calibration defaults are the values reasoned to on paper, not yet confirmed on a scene.
 	splat_point_size_px(1.f),
 	splat_merge_spread_widen(3.0f), // SESSION071: analytic minimum is sqrt(3) (see widenedMergedScale()); owner default set higher for extra margin.
@@ -4704,6 +4705,22 @@ void GaussianSplatRenderer::setSatPrefilterMode(GaussianSplatSatPrefilterMode v)
 }
 
 
+// SESSION079: same reasoning as setSatPrefilterMode() just above - the verdict is baked into U(P) at traversal time,
+// so a live change needs a fresh traversal forced. See getSatPrefilterThreshold().
+void GaussianSplatRenderer::setSatPrefilterThreshold(float v)
+{
+	if(v == sat_prefilter_threshold)
+		return;
+	sat_prefilter_threshold = v;
+
+	for(size_t i=0; i<clouds.size(); ++i)
+	{
+		clouds[i]->cached_ufrontier = NULL;
+		clouds[i]->have_last_traversal_cam_pos = false;
+	}
+}
+
+
 // SESSION076: the "coarse" checkbox now changes what a traversal PRODUCES, not just what the filter is allowed to draw
 // from it - with the layer undrawn, the traversal skips capturing grid-useless coarse nodes and evicts the rest once the
 // grid is built. So a cached U(P) built while this was off physically has no coarse layer left in it, and turning the
@@ -6488,7 +6505,7 @@ void GaussianSplatRenderer::kickOffTraversals()
 			/*frontier_record=*/NULL, /*build_unculled_frontier=*/split_filter_enabled, // SESSION063: cull-off traversal builds U(P) for the split filter.
 			/*coarse_floor_enabled=*/split_filter_enabled && coarse_capture_needed, /*coarse_pixel_scale=*/split_coarse_pixel_scale, // SESSION063 K4, SESSION075.
 			/*dist_clamp_enabled=*/splat_dist_clamp_enabled, splat_dist_clamp_min, splat_dist_clamp_max, splat_dist_clamp_invert, // SESSION072.
-			/*sat_prefilter_mode=*/split_filter_enabled ? sat_prefilter_mode : GaussianSplatSatPrefilterMode_Off, splat_saturation_threshold, // SESSION074, SESSION075: no longer needs coarse_capture_needed here - it's already folded into coarse_floor_enabled_ above, which capture is gated on.
+			/*sat_prefilter_mode=*/split_filter_enabled ? sat_prefilter_mode : GaussianSplatSatPrefilterMode_Off, sat_prefilter_threshold, // SESSION074, SESSION075: no longer needs coarse_capture_needed here - it's already folded into coarse_floor_enabled_ above, which capture is gated on. SESSION079: own threshold, no longer splat_saturation_threshold (the GPU gate's).
 			/*sat_diag_log=*/sat_diag_log, // SESSION076 DIAGNOSTIC.
 			/*coarse_layer_drawn=*/split_coarse_floor_enabled, // SESSION076: lets the task skip/evict coarse nodes when the layer is captured only to feed the saturation grid - see its ctor param.
 			/*sat_grid_subdiv=*/sat_grid_subdiv,

@@ -357,14 +357,24 @@ public:
 
 	// SESSION074: pre-GPU saturation cull stage - see GaussianSplatSatPrefilterMode's own comment above and the
 	// session074 plan snapshot. Off by default; only takes effect when the coarse floor is also enabled (the grid is
-	// built from it - see kickOffTraversals()'s use of this). Reuses getSaturationThreshold()'s existing threshold -
-	// no separate threshold is exposed here, by design (no manual per-scene tuning).
+	// built from it - see kickOffTraversals()'s use of this).
 	// The verdict is baked into U(P) when the frontier is built, not re-evaluated per frame, so a live change of this
 	// setting cannot take effect until a fresh traversal runs - and during pure rotation no traversal is ever kicked,
 	// which would leave the switch looking broken for as long as the camera stays put. The setter therefore drops every
 	// cached frontier, forcing one. Out-of-line for that reason; nothing else here needs to touch cloud state.
 	GaussianSplatSatPrefilterMode getSatPrefilterMode() const { return sat_prefilter_mode; }
 	void setSatPrefilterMode(GaussianSplatSatPrefilterMode v);
+
+	// SESSION079: this stage's OWN saturation threshold - "thr" in the "Saturation filter" row. Used to share
+	// getSaturationThreshold()/splat_saturation_threshold with the GPU-side "Saturation gate" (session072), on the
+	// reasoning that one number should mean one thing. Split out independent: the owner expects the GPU gate may be
+	// dropped eventually, and this CPU stage is a genuinely separate mechanism (a pre-GPU cull decided once per
+	// traversal from the coarse floor, not a per-frame GPU test) that should not go down with it, or have its working
+	// point disturbed by tuning the gate for an unrelated reason. Default 0.98 - independent of, and not tied to, the
+	// gate's own 0.99 default.
+	// Same reload-on-change requirement as setSatPrefilterMode() - out-of-line for the same reason.
+	float getSatPrefilterThreshold() const { return sat_prefilter_threshold; }
+	void setSatPrefilterThreshold(float v);
 
 	// SESSION076: extra [gsr-sat] fields answering "what is the coarse capture actually buying the saturation grid?" -
 	// the group A/B split of the capture and how many of those nodes the grid accepted. See
@@ -1513,6 +1523,7 @@ private:
 	bool coarse_layer_debug;                // Draw only the coarse floor - see getCoarseLayerDebug().
 	bool filter_debug_log, kick_debug_log, cpu_prof_log; // SESSION072: live log toggles - see getFilterDebugLog() etc.
 	GaussianSplatSatPrefilterMode sat_prefilter_mode; // SESSION074 - see getSatPrefilterMode(). [gsr-sat] trace reuses filter_debug_log above (plan's own choice - one checkbox, not a second toggle) - see drainFilterResults().
+	float sat_prefilter_threshold;                    // SESSION079 - see getSatPrefilterThreshold(). This stage's own threshold, independent of splat_saturation_threshold (the GPU gate's).
 	bool filter_frustum_planes_enabled;              // SESSION074 - see getFilterFrustumPlanesEnabled().
 	bool sat_diag_log;                               // SESSION076 - see getSatDiagLog(). Own toggle, not folded into filter_debug_log, because the counting itself perturbs what is being measured.
 	GaussianSplatSatDebugOverlayMode sat_debug_overlay_mode; // SESSION078 - see getSatDebugOverlayMode().

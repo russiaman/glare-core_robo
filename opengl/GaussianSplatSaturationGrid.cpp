@@ -209,6 +209,21 @@ static const float gs_sat_min_occluder_amp = 0.002f;
 static const int gs_sat_min_strip_rows = 8;
 
 
+// SESSION079: memory ceiling on the parallel build's record scratch. The block size is derived from this rather than
+// fixed in nodes, because both things this trades off are sizes in bytes, not counts.
+//
+// Without any ceiling the scratch is one record per occluder - ~71MB on the owner's reference scene, on top of the ~60MB
+// of occluder arrays already live, which more than doubles this stage's peak footprint. The web client runs on phones,
+// so that is not acceptable as an unbounded quantity.
+//
+// But blocking is not free either: each block is a synchronisation barrier where every strip waits for the slowest, and
+// at 262144 nodes per block (12 blocks, 23 task-group launches) that measured 33.5 -> 39.6ms, an 18% loss. A byte budget
+// gets both: on a large desktop scene it yields two or three blocks, where the barrier cost is negligible, and on a
+// smaller scene - a phone's, where the LoD budget produces far fewer occluders in the first place - it yields one block,
+// i.e. no blocking at all.
+static const size_t gs_sat_rec_scratch_bytes = 32 * 1024 * 1024;
+
+
 // SESSION076: exp(-x) over x in [0, gs_sat_exp_lut_max), sampled at bin centres. The write loop below evaluates one
 // Gaussian per tile touched - tens of millions per grid build - and expf() at ~10-20ns each would put that cost back on
 // the same order as the tree walk we just moved it off. Nearest-bin lookup is ~1.5% relative error, which is far below
@@ -746,55 +761,68 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 		sat_depth_out[i] = std::numeric_limits<float>::infinity();
 
 	const int concurrency = myMax(1, (int)task_manager.getConcurrency());
+	const float remaining_threshold = myClamp(1.f - saturation_threshold, 0.f, 1.f);
 
-	// ---- Phase 1: geometry, once, in parallel over node ranges. ----
-	js::Vector<GsSatOccluderRec, 16> local_recs;
-	js::Vector<GsSatOccluderRec, 16>& recs = scratch_recs ? *scratch_recs : local_recs;
-	recs.resizeNoCopy(n); // Worst case, every node a writer. Compacted below.
-
-	const int num_chunks = (n == 0) ? 1 : (int)myMin((size_t)concurrency, n);
-	js::Vector<Reference<GsSatRecordTask>, 16> rec_tasks(num_chunks);
-	{
-		glare::TaskGroupRef group = new glare::TaskGroup();
-		for(int c=0; c<num_chunks; ++c)
-		{
-			Reference<GsSatRecordTask> t = new GsSatRecordTask();
-			t->px = px; t->py = py; t->pz = pz; t->radius = radius; t->alpha = alpha;
-			t->i_begin = (n * (size_t)c)       / (size_t)num_chunks;
-			t->i_end   = (n * (size_t)(c + 1)) / (size_t)num_chunks;
-			t->count = 0;
-			t->anchor_pos_ws = anchor_pos_ws;
-			t->res = res;
-			t->region_radius = region_radius;
-			t->out = recs.data() + t->i_begin; // Own slice, sized to the input range - see GsSatRecordTask.
-			rec_tasks[c] = t;
-			group->tasks.push_back(t);
-		}
-		if(n > 0)
-			task_manager.runTaskGroup(group);
-	}
-
-	// Close the gaps the chunks left, in ascending chunk order so the records stay globally front-to-back. Each chunk's
-	// block only ever moves to a LOWER offset, so the copies never overlap forwards.
-	size_t num_recs = 0;
-	for(int c=0; c<num_chunks; ++c)
-	{
-		const GsSatRecordTask& t = *rec_tasks[c];
-		if(t.count > 0 && num_recs != t.i_begin)
-			std::memmove(recs.data() + num_recs, recs.data() + t.i_begin, t.count * sizeof(GsSatOccluderRec));
-		num_recs += t.count;
-	}
-
-	// ---- Phase 2: deposit, in parallel over strips. ----
-	// Never thinner than gs_sat_min_strip_rows: a strip still reads every record, so thinner strips buy less tile work
-	// each while paying the same scan.
 	const int num_strips = (force_num_strips > 0) ? myClamp(force_num_strips, 1, res) : myClamp(res / gs_sat_min_strip_rows, 1, concurrency);
 	if(out_num_strips) *out_num_strips = num_strips;
+
+	// The occluders are processed in BLOCKS rather than all at once, to bound the record scratch - see
+	// gs_sat_rec_scratch_bytes for the trade-off and the numbers behind the budget.
+	//
+	// Blocking costs nothing in correctness: blocks are processed in order and records within a block are in order, so
+	// each tile still sees its occluders front-to-back.
+	const size_t block_n = myMin(n, myMax((size_t)65536, gs_sat_rec_scratch_bytes / sizeof(GsSatOccluderRec)));
+
+	js::Vector<GsSatOccluderRec, 16> local_recs;
+	js::Vector<GsSatOccluderRec, 16>& recs = scratch_recs ? *scratch_recs : local_recs;
+	recs.resizeNoCopy(block_n);
 
 	js::Vector<float, 16> accum(num_tiles, 1.f);
 
 	GsSatStripStats total;
+
+	for(size_t block_begin=0; block_begin<n; block_begin += block_n)
 	{
+		const size_t block_end = myMin(block_begin + block_n, n);
+		const size_t block_len = block_end - block_begin;
+
+		// ---- Phase 1: geometry, once, in parallel over node ranges within this block. ----
+		const int num_chunks = (int)myMin((size_t)concurrency, block_len);
+		js::Vector<Reference<GsSatRecordTask>, 16> rec_tasks(num_chunks);
+		{
+			glare::TaskGroupRef group = new glare::TaskGroup();
+			for(int c=0; c<num_chunks; ++c)
+			{
+				Reference<GsSatRecordTask> t = new GsSatRecordTask();
+				t->px = px; t->py = py; t->pz = pz; t->radius = radius; t->alpha = alpha;
+				t->i_begin = block_begin + (block_len * (size_t)c)       / (size_t)num_chunks;
+				t->i_end   = block_begin + (block_len * (size_t)(c + 1)) / (size_t)num_chunks;
+				t->count = 0;
+				t->anchor_pos_ws = anchor_pos_ws;
+				t->res = res;
+				t->region_radius = region_radius;
+				t->out = recs.data() + (t->i_begin - block_begin); // Own slice, sized to its input range - see GsSatRecordTask.
+				rec_tasks[c] = t;
+				group->tasks.push_back(t);
+			}
+			task_manager.runTaskGroup(group);
+		}
+
+		// Close the gaps the chunks left, in ascending chunk order so the records stay front-to-back. Each chunk's block
+		// only ever moves to a LOWER offset, so the copies never overlap forwards.
+		size_t num_recs = 0;
+		for(int c=0; c<num_chunks; ++c)
+		{
+			const GsSatRecordTask& t = *rec_tasks[c];
+			const size_t slice_begin = t.i_begin - block_begin;
+			if(t.count > 0 && num_recs != slice_begin)
+				std::memmove(recs.data() + num_recs, recs.data() + slice_begin, t.count * sizeof(GsSatOccluderRec));
+			num_recs += t.count;
+		}
+		if(num_recs == 0)
+			continue;
+
+		// ---- Phase 2: deposit, in parallel over strips. ----
 		glare::TaskGroupRef group = new glare::TaskGroup();
 		js::Vector<Reference<GsSatStripTask>, 16> strip_tasks(num_strips);
 		for(int t=0; t<num_strips; ++t)
@@ -806,7 +834,7 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 			task->recs = recs.data();
 			task->num_recs = num_recs;
 			task->res = res;
-			task->remaining_threshold = myClamp(1.f - saturation_threshold, 0.f, 1.f);
+			task->remaining_threshold = remaining_threshold;
 			task->sat_depth = sat_depth_out.data();
 			task->accum = accum.data() + (size_t)v_lo * (size_t)res; // Strip-local rows start at v_lo - see gsSatDepositRec().
 			task->v_lo = v_lo;
@@ -818,6 +846,7 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 		// runTaskGroup() processes work on the CALLING thread as well as the pool's, and steals back any of its own tasks
 		// the pool has not picked up. That is what makes this safe to call from inside the traversal task, which is itself
 		// running on this same TaskManager - there is no configuration in which it waits on a thread that never arrives.
+		// It is also why a build degrades gracefully to serial where there are no worker threads, with no separate path.
 		task_manager.runTaskGroup(group);
 
 		for(int t=0; t<num_strips; ++t)

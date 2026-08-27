@@ -18,15 +18,12 @@ Copyright Glare Technologies Limited 2026 -
 static const float gs_sat_grid_oct_margin = 1.5f;
 
 
-Vec2f gsDirToOct(const Vec4f& dir)
+// SESSION079 PERF: gsDirToOct()'s body with the L1 norm passed in rather than recomputed. gsSatGridFootprint() below
+// needs that same L1 for the local tile angle, and used to compute it twice - once here, once in the tile-angle helper -
+// on every one of the millions of nodes each of the two passes walks. Split so the two can share it; gsDirToOct() keeps
+// its own one-argument form for callers outside this file.
+static inline Vec2f gsDirToOctWithL1(const Vec4f& dir, float abs_sum)
 {
-	// SESSION074: identical formula to float32x3_to_oct() in opengl/shaders/frag_utils.glsl (Cigolle et al.) - project
-	// the sphere onto the octahedron, then onto the xy plane, then reflect the lower hemisphere's folds over the
-	// diagonals so the whole sphere maps into one [-1, 1]^2 square.
-	//
-	// Note this divides by the vector's own L1 norm, so it is invariant under positive scaling - callers pass raw
-	// offsets, never normalised directions. See the header.
-	const float abs_sum = std::fabs(dir.x[0]) + std::fabs(dir.x[1]) + std::fabs(dir.x[2]);
 	const float inv = abs_sum > 1.0e-12f ? (1.f / abs_sum) : 0.f;
 	const float px = dir.x[0] * inv;
 	const float py = dir.x[1] * inv;
@@ -38,6 +35,18 @@ Vec2f gsDirToOct(const Vec4f& dir)
 	}
 	else
 		return Vec2f(px, py);
+}
+
+
+Vec2f gsDirToOct(const Vec4f& dir)
+{
+	// SESSION074: identical formula to float32x3_to_oct() in opengl/shaders/frag_utils.glsl (Cigolle et al.) - project
+	// the sphere onto the octahedron, then onto the xy plane, then reflect the lower hemisphere's folds over the
+	// diagonals so the whole sphere maps into one [-1, 1]^2 square.
+	//
+	// Note this divides by the vector's own L1 norm, so it is invariant under positive scaling - callers pass raw
+	// offsets, never normalised directions. See the header.
+	return gsDirToOctWithL1(dir, std::fabs(dir.x[0]) + std::fabs(dir.x[1]) + std::fabs(dir.x[2]));
 }
 
 
@@ -147,23 +156,32 @@ int gsSatGridTileForDir(const Vec4f& dir, int res)
 //
 // It is also why sweeping the threshold never helped: the error is a 5x GRADIENT across the sphere, not a gain, so a
 // threshold can only slide the contour along it, never flatten it.
-static inline float gsSatGridLocalTileAngle(const Vec4f& offset, int res)
+//
+// SESSION079 PERF: returns the RECIPROCAL of that angle, and takes l1 and inv_dist rather than deriving them. The value
+// it used to return was only ever divided into an angular radius, and the two quantities it used to recompute -
+// l1 = |dx|+|dy|+|dz| and 1/sqrt(l2_sq) - are both already in the hands of both call sites (the oct mapping needs the
+// first, the angular radius needs the second). So s = l1 * inv_dist costs a multiply here instead of a sqrt and a
+// divide, and returning the reciprocal folds the caller's divide into a multiply as well. Same formula, same result to
+// within float reassociation; three divides and two sqrts per node become one of each.
+static inline float gsSatGridInvLocalTileAngle(float l1, float inv_dist, int res)
 {
 	// s = L1/L2 of the offset, i.e. the L1 norm of the unit direction it points along. Scale-invariant, so callers pass
-	// raw offsets here exactly as they already do to gsDirToOct().
-	const float l1 = std::fabs(offset.x[0]) + std::fabs(offset.x[1]) + std::fabs(offset.x[2]);
-	const float l2_sq = offset.x[0]*offset.x[0] + offset.x[1]*offset.x[1] + offset.x[2]*offset.x[2];
-	const float s = (l2_sq > 1.0e-24f) ? (l1 / std::sqrt(l2_sq)) : 1.f;
-	return (2.f / myMax((float)res, 1.f)) * s * std::sqrt(myMax(s, 1.f)); // (2/res) * s^1.5.
+	// raw offsets here exactly as they already do to gsDirToOct(). The degenerate-length guard this used to carry lives
+	// at both call sites instead, as a stricter dist_sq < 1e-12 test made before inv_dist is formed at all.
+	const float s = l1 * inv_dist;
+	return (myMax((float)res, 1.f) * 0.5f) / (s * std::sqrt(myMax(s, 1.f))); // 1 / ((2/res) * s^1.5).
 }
 
 
-static inline float gsSatGridFootprint(const Vec4f& offset, float ang_radius, int res, float& cu, float& cv)
+// SESSION079 PERF: inv_dist = 1/sqrt(dist_sq) is passed in - see gsSatGridInvLocalTileAngle(). Callers must have
+// rejected degenerate offsets (dist_sq < 1e-12) before calling.
+static inline float gsSatGridFootprint(const Vec4f& offset, float ang_radius, int res, float inv_dist, float& cu, float& cv)
 {
-	const Vec2f oct = gsDirToOct(offset);
+	const float l1 = std::fabs(offset.x[0]) + std::fabs(offset.x[1]) + std::fabs(offset.x[2]);
+	const Vec2f oct = gsDirToOctWithL1(offset, l1);
 	cu = (oct.x * 0.5f + 0.5f) * (float)res;
 	cv = (oct.y * 0.5f + 0.5f) * (float)res;
-	return ang_radius / gsSatGridLocalTileAngle(offset, res);
+	return ang_radius * gsSatGridInvLocalTileAngle(l1, inv_dist, res);
 }
 
 
@@ -230,6 +248,20 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 
 	const float remaining_threshold = myClamp(1.f - saturation_threshold, 0.f, 1.f); // Below this remaining transmittance, a tile counts as saturated.
 
+	// SESSION079 PERF: coefficient for the cheap early-reject bound below. Derivation, from the write loop's own amp
+	// formula further down:
+	//
+	//   tile_angle = (2/res) * s^1.5,  s in [1, sqrt(3)]           => tile_angle is MINIMAL at s=1 (worst case, largest footprint)
+	//   radius_tiles = ang_radius / tile_angle <= (r/dist) * (res/2)
+	//   sigma = radius_tiles/3  =>  sigma^2 <= (r/dist)^2 * res^2/36
+	//   amp = alpha * 2*pi*sigma^2 / max(1, 2*pi*var) <= alpha * 2*pi*sigma^2      (denominator is always >= 1)
+	//   amp <= alpha * (r^2/dist^2) * (pi*res^2/18)
+	//
+	// i.e. amp <= alpha * r^2 * amp_reject_k / dist_sq. This is a genuine upper bound (s=1 is the worst case across the
+	// whole sphere), so a node whose bound already clears gs_sat_min_occluder_amp would have its true amp clear it too -
+	// see the reject test itself for what that buys.
+	const float amp_reject_k = 3.14159265f * (float)res * (float)res / 18.f;
+
 	// SESSION074: nodes are assumed already front-to-back (a filtered subsequence of the traversal's globally sorted
 	// output - see GaussianSplatUnculledFrontier / GaussianSplatLodTraversalTask::run()). This is the ONLY sequential,
 	// order-dependent pass in the whole mechanism - see the header's file comment - so it must not be reordered or
@@ -244,6 +276,23 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 			continue;
 
 		const float r = radius[i];
+
+		// SESSION079 PERF: cheap early reject, BEFORE the sqrt. Measured on the owner's reference viewpoint, only 35.3%
+		// of the occluders handed to this loop ever contribute anything - the other 64.7% are thrown away by the
+		// amp < gs_sat_min_occluder_amp test far below, AFTER paying for the sqrt, the oct unwrap, the local tile angle
+		// and the whole amplitude derivation. That is nearly two million nodes per build billed in full for nothing.
+		//
+		// amp_reject_k above bounds the true amp from above using only dist_sq, r and alpha, in three multiplies and no
+		// sqrt. dist_sq is moved to the right-hand side so there is not even a divide. Because it is an upper bound, a
+		// node rejected here would certainly have been rejected below - so `writers` must come out BIT-IDENTICAL. That
+		// is the whole correctness check for this stage, and it is completely objective.
+		//
+		// The real amp < gs_sat_min_occluder_amp test below stays exactly where it is: this bound is deliberately loose
+		// (it assumes the most favourable direction on the sphere, s=1), so it only catches the clear-cut bulk and the
+		// exact test still has to catch the remainder.
+		const float a = myClamp(alpha[i], 0.f, 1.f); // Hoisted from the amplitude block below, which used to declare it - same value, needed here first.
+		if(a * r * r * amp_reject_k < gs_sat_min_occluder_amp * dist_sq)
+			continue;
 
 
 		// SESSION074: angular radius without trigonometry. The exact value is asin(r/dist); for the small angles this
@@ -274,7 +323,7 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 		const float ang_radius = r * inv_dist;
 
 		float cu, cv;
-		const float radius_tiles = gsSatGridFootprint(Vec4f(dx, dy, dz, 0.f), ang_radius, res, cu, cv);
+		const float radius_tiles = gsSatGridFootprint(Vec4f(dx, dy, dz, 0.f), ang_radius, res, inv_dist, cu, cv);
 
 		// SESSION076: an occluder is a GAUSSIAN, not a uniformly opaque disc, and the whole of this pass's accuracy
 		// turns on that distinction. Both earlier cuts modelled it as a disc and failed in opposite directions:
@@ -328,7 +377,6 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 		const float sigma_tiles = radius_tiles * (1.f / gs_sat_occluder_sigmas);
 		const float sigma_sq = sigma_tiles * sigma_tiles;
 		const float var = sigma_sq + (1.f / 12.f);
-		const float a = myClamp(alpha[i], 0.f, 1.f);
 		const float two_pi = 6.28318531f;
 		const float amp = a * (two_pi * sigma_sq) / myMax(1.f, two_pi * var);
 		if(amp < gs_sat_min_occluder_amp)
@@ -342,7 +390,7 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 		// SESSION078: + region_radius because from the ball point furthest from this occluder its far edge sits a further
 		// R away, and the barrier has to be past it from every position in the ball. This is the build side's whole share
 		// of the region conservatism - see the footprint comment above for why the angular half is not applied here.
-		const float far_edge = (1.f / inv_dist) + r + region_radius;
+		const float far_edge = (dist_sq * inv_dist) + r + region_radius; // SESSION079 PERF: dist_sq/sqrt(dist_sq) is dist - a multiply where 1/inv_dist was a divide.
 
 		// SESSION076: every tile the footprint reaches, weighted - no entitlement test.
 		//
@@ -444,7 +492,7 @@ bool gsSatOccluded(const Vec4f& offset, float dist_sq, float node_radius,
 	const float ang_radius = (node_radius + region_radius) * inv_dist;
 
 	float cu, cv;
-	const float radius_tiles = gsSatGridFootprint(offset, ang_radius, res, cu, cv);
+	const float radius_tiles = gsSatGridFootprint(offset, ang_radius, res, inv_dist, cu, cv);
 
 	// SESSION074: the read side takes every tile the footprint TOUCHES - the opposite rounding from the build pass, see
 	// gsSatGridFootprint()'s comment. floor() on both ends is exactly the touched set in 1D: it names every tile whose

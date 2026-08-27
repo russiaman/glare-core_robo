@@ -7,6 +7,8 @@ Copyright Glare Technologies Limited 2026 -
 
 
 #include "../maths/mathstypes.h"
+#include "../utils/TaskManager.h" // SESSION079: gsBuildSaturationGridParallel().
+#include "../utils/Reference.h"
 #include <cmath>
 #include <limits>
 
@@ -199,6 +201,13 @@ static const float gs_sat_tile_half_diag = 0.70710678f;
 static const float gs_sat_min_occluder_amp = 0.002f;
 
 
+// SESSION079: floor on how thin a strip gsBuildSaturationGridParallel() will cut. Every strip walks the WHOLE occluder
+// array - that is the price of not reordering anything - so thinner strips buy less tile work each while paying the same
+// walk. 8 rows keeps a strip's two accumulators (8*res*4 bytes each) comfortably inside L1 at any res this stage
+// produces, which is the property the split exists for.
+static const int gs_sat_min_strip_rows = 8;
+
+
 // SESSION076: exp(-x) over x in [0, gs_sat_exp_lut_max), sampled at bin centres. The write loop below evaluates one
 // Gaussian per tile touched - tens of millions per grid build - and expf() at ~10-20ns each would put that cost back on
 // the same order as the tree walk we just moved it off. Nearest-bin lookup is ~1.5% relative error, which is far below
@@ -256,26 +265,39 @@ static inline int gsSatCeilToInt(float x)
 }
 
 
-void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, const float* radius, const float* alpha, size_t n,
-	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius,
-	js::Vector<float, 16>& sat_depth_out, size_t* out_writers, size_t* out_tile_writes,
-	js::Vector<float, 16>* out_accum_t, js::Vector<float, 16>* out_amp_sum, size_t* out_tile_iters, int ablate_stage)
+// SESSION079: the accumulation over one horizontal STRIP of the grid's rows, [v_lo, v_hi).
+//
+// Splitting the pass by rows is what makes it both local and parallel, without approximating anything:
+//
+//  - Every tile belongs to exactly one strip, so two strips never touch the same accum/sat_depth entry. No locks, no
+//    atomics, and no false sharing beyond the single cache line a strip boundary may straddle.
+//  - Within a strip the occluders are still walked in the caller's front-to-back order, so each tile sees exactly the
+//    sequence it saw before, and its barrier is still the first crossing's far edge. Results are BIT-IDENTICAL to the
+//    single-strip case. This is deliberately NOT the plan's stage-7 log reformulation, which quantised depth into
+//    buckets and gave up exactness to get the same parallelism.
+//  - A strip's working set is (v_hi-v_lo)*res*4 bytes for each of accum and sat_depth. At res=101 over 8 strips that is
+//    about 10KB, which lives in L1. That matters: the session079 locality probe reordered the occluders by tile and
+//    measured the tile loop 24-50% faster on identical work, which is what put this structure ahead of everything else
+//    left in the plan.
+//
+// accum and amp_sum are STRIP-LOCAL (row v lives at (v - v_lo)*res); sat_depth is the full grid, which the caller owns.
+struct GsSatStripStats
 {
-	const size_t num_tiles = (size_t)res * (size_t)res;
-	sat_depth_out.resizeNoCopy(num_tiles);
-	for(size_t i=0; i<num_tiles; ++i)
-		sat_depth_out[i] = std::numeric_limits<float>::infinity();
+	GsSatStripStats() : writers(0), tile_writes(0), tile_iters(0), tail_rej(0), sat_skip(0) {}
+	size_t writers, tile_writes, tile_iters, tail_rej, sat_skip;
+};
 
-	// SESSION077 DIAGNOSTIC: unbounded companion to accum_t below - see out_amp_sum's header comment.
-	js::Vector<float, 16> amp_sum;
-	if(out_amp_sum)
-		amp_sum.resize(num_tiles, 0.f);
 
-	// SESSION074: running per-tile transmittance, local scratch only (not stored on the frontier - sat_depth_out is
-	// the only thing callers need). Reset to 1 (fully transparent) before the sequential pass below.
-	js::Vector<float, 16> accum_t(num_tiles, 1.f);
-
-	const float remaining_threshold = myClamp(1.f - saturation_threshold, 0.f, 1.f); // Below this remaining transmittance, a tile counts as saturated.
+static void gsSatBuildStrip(const float* px, const float* py, const float* pz, const float* radius, const float* alpha, size_t n,
+	const Vec4f& anchor_pos_ws, int res, float remaining_threshold, float region_radius,
+	float* const sat_depth, float* const accum, float* const amp_sum, bool keep_accumulating_past_saturation,
+	int v_lo, int v_hi, GsSatStripStats* stats, int ablate_stage)
+{
+	// When the strip is the whole grid there is nothing to reject, so the test below is compiled out of the way and the
+	// serial path costs exactly what it did before this split.
+	const bool strip_is_partial = !(v_lo == 0 && v_hi == res);
+	const float strip_lo_f = (float)v_lo;
+	const float strip_hi_f = (float)v_hi;
 
 	// SESSION079 PERF: coefficient for the cheap early-reject bound below. Derivation, from the write loop's own amp
 	// formula further down:
@@ -365,8 +387,25 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 		// a genuinely opaque wall is still dropped. The build side keeps only the depth half of the conservatism below.
 		const float ang_radius = r * inv_dist;
 
-		float cu, cv;
-		const float radius_tiles = gsSatGridFootprint(Vec4f(dx, dy, dz, 0.f), ang_radius, res, inv_dist, cu, cv);
+		// SESSION079: gsSatGridFootprint() unrolled into its two halves - textually the same arithmetic - so the strip test
+		// can sit between them. cv falls out of the oct unwrap alone, while the local tile angle below is the expensive
+		// half; a node that cannot reach this strip should not pay for it.
+		const float l1 = std::fabs(dx) + std::fabs(dy) + std::fabs(dz);
+		const Vec2f oct = gsDirToOctWithL1(Vec4f(dx, dy, dz, 0.f), l1);
+		const float cu = (oct.x * 0.5f + 0.5f) * (float)res;
+		const float cv = (oct.y * 0.5f + 0.5f) * (float)res;
+
+		if(strip_is_partial)
+		{
+			// Same s=1 upper bound the early amp reject rests on: radius_tiles <= ang_radius * res/2, since the local tile
+			// angle is smallest along the world axes. Half a tile's diagonal is added for the same reason the real span adds
+			// it. Bounding from above means a node is only ever skipped when it provably cannot touch this strip.
+			const float span_max = ang_radius * ((float)res * 0.5f) + gs_sat_tile_half_diag;
+			if(cv + span_max < strip_lo_f || cv - span_max >= strip_hi_f)
+				continue;
+		}
+
+		const float radius_tiles = ang_radius * gsSatGridInvLocalTileAngle(l1, inv_dist, res);
 
 		if(ablate_stage == 2) { ablate_sink += radius_tiles + cu + cv; continue; } // SESSION079 DIAGNOSTIC cut B - see ablate_sink.
 
@@ -451,12 +490,24 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 		const float span = radius_tiles + gs_sat_tile_half_diag;
 		const int u0 = myClamp(gsSatCeilToInt(cu - span - 0.5f), 0, res - 1); // SESSION079 PERF: exact, call-free floor/ceil - see gsSatCeilToInt().
 		const int u1 = myClamp((int)                (cu + span - 0.5f), 0, res - 1);
-		const int v0 = myClamp(gsSatCeilToInt(cv - span - 0.5f), 0, res - 1);
-		const int v1 = myClamp((int)                (cv + span - 0.5f), 0, res - 1);
-		if(u1 < u0 || v1 < v0)
+		const int v0_grid = myClamp(gsSatCeilToInt(cv - span - 0.5f), 0, res - 1);
+		const int v1_grid = myClamp((int)                (cv + span - 0.5f), 0, res - 1);
+		if(u1 < u0 || v1_grid < v0_grid)
 			continue;
 
-		if(out_writers) ++(*out_writers); // SESSION076 DIAGNOSTIC: this node contributes something.
+		// SESSION079: the strip is INTERSECTED with the grid-clamped span, never substituted for it. Clamping straight to
+		// [v_lo, v_hi-1] looks equivalent and is not: a node whose whole footprint sits outside the strip has both ends
+		// collapse onto the strip's edge row, so it would deposit onto a row it does not actually touch. That is real -
+		// it showed up as the parallel build reporting 4,815,255 tile writes against the serial build's 4,759,321.
+		//
+		// The grid clamp above stays exactly as the serial path had it, including its own edge behaviour, so a full-grid
+		// strip reproduces the serial result bit for bit.
+		const int v0 = myMax(v0_grid, v_lo);
+		const int v1 = myMin(v1_grid, v_hi - 1);
+		if(v1 < v0)
+			continue; // Footprint does not reach this strip.
+
+		if(stats) ++stats->writers; // SESSION076 DIAGNOSTIC: this node contributes something.
 
 		if(ablate_stage == 3) { ablate_sink += amp + far_edge + (float)(u0 + u1 + v0 + v1); continue; } // SESSION079 DIAGNOSTIC cut C - see ablate_sink.
 
@@ -464,21 +515,23 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 
 		for(int v=v0; v<=v1; ++v)
 		{
-			float* const accum_row = &accum_t[(size_t)v * (size_t)res];
-			float* const depth_row = &sat_depth_out[(size_t)v * (size_t)res];
-			float* const sum_row = out_amp_sum ? &amp_sum[(size_t)v * (size_t)res] : NULL;
+			float* const accum_row = accum     + (size_t)(v - v_lo) * (size_t)res; // SESSION079: strip-local - see gsSatBuildStrip()'s comment.
+			float* const depth_row = sat_depth + (size_t)v           * (size_t)res;
+			float* const sum_row = amp_sum ? (amp_sum + (size_t)(v - v_lo) * (size_t)res) : NULL;
 			const float dv = ((float)v + 0.5f) - cv;
 			const float dv_sq = dv * dv;
 			for(int u=u0; u<=u1; ++u)
 			{
-				if(out_tile_iters) ++(*out_tile_iters); // SESSION079 DIAGNOSTIC - see the parameter.
+				if(stats) ++stats->tile_iters; // SESSION079 DIAGNOSTIC - see the parameter.
 
 				const float du = ((float)u + 0.5f) - cu;
 				const float x = (du * du + dv_sq) * inv_2var;
 				if(x >= gs_sat_exp_lut_max)
+				{
+					if(stats) ++stats->tail_rej; // SESSION079 DIAGNOSTIC: fell off the Gaussian's tail.
 					continue; // Contribution below the lookup's tail - see gs_sat_exp_lut_max.
+				}
 
-				const float w = gsSatExpNeg(x); // Gaussian falloff to this tile - shared by both accumulators below.
 				const bool already_saturated = depth_row[u] != std::numeric_limits<float>::infinity();
 
 				// SESSION077: the fast path (skip a tile once its barrier is set) is unchanged when nobody wants the
@@ -494,10 +547,18 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 				// product, so a tile with ten occluders reads roughly 10x one with a single occluder. depth_row[u]
 				// itself is still only ever set on the FIRST crossing (the `!already_saturated` guard below), so the
 				// barrier this grid actually prunes by is bit-identical either way.
-				if(already_saturated && !out_accum_t && !out_amp_sum)
+				if(already_saturated && !keep_accumulating_past_saturation)
+				{
+					if(stats) ++stats->sat_skip; // SESSION079 DIAGNOSTIC: barrier already set, nothing left to do for this tile.
 					continue;
+				}
 
-				if(out_tile_writes) ++(*out_tile_writes); // SESSION076 DIAGNOSTIC: write amplification.
+				// SESSION079 PERF: the lookup moved below the two rejects above. It used to sit before them, so every tile
+				// that fell off the tail or was already saturated - a third of all iterations on the reference viewpoint -
+				// paid for a multiply, a float-to-int conversion, a clamp and a load it then discarded.
+				const float w = gsSatExpNeg(x); // Gaussian falloff to this tile - shared by both accumulators below.
+
+				if(stats) ++stats->tile_writes; // SESSION076 DIAGNOSTIC: write amplification.
 
 				accum_row[u] *= (1.f - amp * w);
 				if(!already_saturated && accum_row[u] <= remaining_threshold)
@@ -509,12 +570,132 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 	}
 
 	gs_sat_ablate_sink = ablate_sink; // SESSION079 DIAGNOSTIC: keeps the ablated work alive against dead-code elimination.
+}
+
+
+void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, const float* radius, const float* alpha, size_t n,
+	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius,
+	js::Vector<float, 16>& sat_depth_out, size_t* out_writers, size_t* out_tile_writes,
+	js::Vector<float, 16>* out_accum_t, js::Vector<float, 16>* out_amp_sum, size_t* out_tile_stats, int ablate_stage)
+{
+	const size_t num_tiles = (size_t)res * (size_t)res;
+	sat_depth_out.resizeNoCopy(num_tiles);
+	for(size_t i=0; i<num_tiles; ++i)
+		sat_depth_out[i] = std::numeric_limits<float>::infinity();
+
+	// SESSION077 DIAGNOSTIC: unbounded companion to accum_t below - see out_amp_sum's header comment.
+	js::Vector<float, 16> amp_sum;
+	if(out_amp_sum)
+		amp_sum.resize(num_tiles, 0.f);
+
+	// SESSION074: running per-tile transmittance, local scratch only (not stored on the frontier - sat_depth_out is
+	// the only thing callers need). Reset to 1 (fully transparent) before the sequential pass below.
+	js::Vector<float, 16> accum_t(num_tiles, 1.f);
+
+	GsSatStripStats stats;
+	gsSatBuildStrip(px, py, pz, radius, alpha, n, anchor_pos_ws, res,
+		myClamp(1.f - saturation_threshold, 0.f, 1.f), region_radius,
+		sat_depth_out.data(), accum_t.data(), out_amp_sum ? amp_sum.data() : NULL,
+		(out_accum_t != NULL) || (out_amp_sum != NULL),
+		0, res, (out_writers || out_tile_writes || out_tile_stats) ? &stats : NULL, ablate_stage);
+
+	if(out_writers)     *out_writers     = stats.writers;
+	if(out_tile_writes) *out_tile_writes = stats.tile_writes;
+	if(out_tile_stats) { out_tile_stats[0] = stats.tile_iters; out_tile_stats[1] = stats.tail_rej; out_tile_stats[2] = stats.sat_skip; }
 
 	// SESSION077 DIAGNOSTIC: hand the accumulator fields out for the debug overlay - see the header.
 	if(out_accum_t)
 		*out_accum_t = accum_t;
 	if(out_amp_sum)
 		*out_amp_sum = amp_sum;
+}
+
+
+// SESSION079: one strip's worth of work as a Task, so the whole build can run across the pool. See gsSatBuildStrip()
+// for why splitting by rows is exact: strips own disjoint tiles, and each tile still sees the occluders in
+// front-to-back order, so the result is bit-identical to the serial build.
+class GsSatStripTask : public glare::Task
+{
+public:
+	virtual void run(size_t /*thread_index*/)
+	{
+		gsSatBuildStrip(px, py, pz, radius, alpha, n, anchor_pos_ws, res, remaining_threshold, region_radius,
+			sat_depth, accum, NULL, false, v_lo, v_hi, &stats, 0);
+	}
+
+	const float *px, *py, *pz, *radius, *alpha;
+	size_t n;
+	Vec4f anchor_pos_ws;
+	int res;
+	float remaining_threshold, region_radius;
+	float *sat_depth, *accum;
+	int v_lo, v_hi;
+	GsSatStripStats stats;
+};
+
+
+void gsBuildSaturationGridParallel(const float* px, const float* py, const float* pz, const float* radius, const float* alpha, size_t n,
+	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius,
+	js::Vector<float, 16>& sat_depth_out, glare::TaskManager& task_manager,
+	size_t* out_writers, size_t* out_tile_writes, size_t* out_tile_stats, int* out_num_strips)
+{
+	const size_t num_tiles = (size_t)res * (size_t)res;
+	sat_depth_out.resizeNoCopy(num_tiles);
+	for(size_t i=0; i<num_tiles; ++i)
+		sat_depth_out[i] = std::numeric_limits<float>::infinity();
+
+	// One strip per available thread, but never thinner than gs_sat_min_strip_rows: below that the per-strip fixed cost
+	// (a full walk of the occluder array to find the few nodes that reach this strip) dominates the tile work it saves.
+	const int max_strips = myMax(1, (int)task_manager.getConcurrency());
+	const int num_strips = myClamp(res / gs_sat_min_strip_rows, 1, max_strips);
+	if(out_num_strips) *out_num_strips = num_strips;
+
+	// The scratch accumulators are strip-local and allocated as one block, so each strip owns a contiguous run of rows.
+	js::Vector<float, 16> accum(num_tiles, 1.f);
+
+	glare::TaskGroupRef group = new glare::TaskGroup();
+	js::Vector<Reference<GsSatStripTask>, 16> strip_tasks(num_strips);
+	for(int t=0; t<num_strips; ++t)
+	{
+		const int v_lo = (int)(((int64)res * t)       / num_strips);
+		const int v_hi = (int)(((int64)res * (t + 1)) / num_strips);
+
+		Reference<GsSatStripTask> task = new GsSatStripTask();
+		task->px = px; task->py = py; task->pz = pz; task->radius = radius; task->alpha = alpha;
+		task->n = n;
+		task->anchor_pos_ws = anchor_pos_ws;
+		task->res = res;
+		task->remaining_threshold = myClamp(1.f - saturation_threshold, 0.f, 1.f);
+		task->region_radius = region_radius;
+		task->sat_depth = sat_depth_out.data();
+		task->accum = accum.data() + (size_t)v_lo * (size_t)res; // Strip-local rows start at v_lo - see gsSatBuildStrip().
+		task->v_lo = v_lo;
+		task->v_hi = v_hi;
+		strip_tasks[t] = task;
+		group->tasks.push_back(task);
+	}
+
+	// runTaskGroup() processes work on the CALLING thread as well as the pool's, and steals back any of its own tasks the
+	// pool has not picked up. That is what makes this safe to call from inside the traversal task, which is itself running
+	// on this same TaskManager - there is no configuration in which it can wait on a thread that never arrives.
+	task_manager.runTaskGroup(group);
+
+	GsSatStripStats total;
+	for(int t=0; t<num_strips; ++t)
+	{
+		total.writers     += strip_tasks[t]->stats.writers;
+		total.tile_writes += strip_tasks[t]->stats.tile_writes;
+		total.tile_iters  += strip_tasks[t]->stats.tile_iters;
+		total.tail_rej    += strip_tasks[t]->stats.tail_rej;
+		total.sat_skip    += strip_tasks[t]->stats.sat_skip;
+	}
+
+	// NOTE: `writers` is the one counter this path cannot reproduce exactly. It counts nodes that reached the tile loop,
+	// and a node straddling a strip boundary reaches it once per strip it touches - so the parallel total is the serial
+	// one plus the boundary crossings. tile_writes, tile_iters, tail_rej and sat_skip are all per-TILE and so are exact.
+	if(out_writers)     *out_writers     = total.writers;
+	if(out_tile_writes) *out_tile_writes = total.tile_writes;
+	if(out_tile_stats) { out_tile_stats[0] = total.tile_iters; out_tile_stats[1] = total.tail_rej; out_tile_stats[2] = total.sat_skip; }
 }
 
 

@@ -115,6 +115,12 @@ public:
 // finally-selected node needs only its own 3-sigma footprint, not its whole subtree's bounding sphere), and a
 // subsequence of a distance-sorted list stays sorted, so no re-sort is needed. Immutable once built; validity is keyed
 // by the fields below (see drainTraversalResults()/GaussianSplatFilterTask).
+// SESSION079 DIAGNOSTIC, THROWAWAY: repeats per ablation timing - see the build-side ablation for why the minimum of
+// several runs rather than one. 3 repeats x 4 build cuts x ~100ms plus 2 read variants is roughly 1.8s of extra work,
+// paid once per traversal and only while the "sat diag" checkbox is on.
+static const int gs_sat_ablate_repeats = 3;
+
+
 class GaussianSplatUnculledFrontier : public ThreadSafeRefCounted
 {
 public:
@@ -204,9 +210,15 @@ public:
 	size_t sat_diag_coarse_b;     // Captured only because the branch was terminal, while still coarser than the threshold.
 	size_t sat_diag_writers;      // Grid contributors: nodes whose contribution cleared the negligible-amplitude cutoff.
 	size_t sat_diag_tile_writes;  // Total per-tile writes - the build pass's write amplification.
-	size_t sat_diag_tile_iters;   // SESSION079: per-tile loop iterations in the build pass, vs sat_diag_tile_writes which counts only those reaching the accumulator.
+	size_t sat_diag_tile_stats[3]; // SESSION079: per-tile loop iterations in the build pass - [0] total, [1] rejected off the Gaussian's tail, [2] skipped as already saturated. Against sat_diag_tile_writes, which counts only those reaching the accumulator.
 	double sat_diag_ablate_ms[4]; // SESSION079 DIAGNOSTIC, THROWAWAY: build-loop cost decomposition - cuts A, B, C then a second full run. See the call site.
-	double sat_diag_test_occl_ms; // SESSION079 DIAGNOSTIC, THROWAWAY: the read pass with gsSatOccluded() only, no compaction - against sat_test_ms which includes it.
+	double sat_diag_test_occl_ms; // SESSION079 DIAGNOSTIC, THROWAWAY: the read pass with gsSatOccluded() only, no compaction.
+	double sat_diag_test_full_ms; // SESSION079 DIAGNOSTIC, THROWAWAY: the same walk WITH compaction. The difference from sat_diag_test_occl_ms is what compaction costs.
+	double sat_diag_par_ms;       // SESSION079: the strip-parallel build - gsBuildSaturationGridParallel(). Correct, unlike the probe below.
+	size_t sat_diag_par_writes;   // SESSION079: that run's tile_writes, which must match the serial build's exactly.
+	int sat_diag_par_strips;      // SESSION079: how many strips the parallel build split into.
+	double sat_diag_sorted_ms;    // SESSION079 DIAGNOSTIC, THROWAWAY: the build loop over occluders reordered by tile - the locality probe. Result is wrong; only the timing counts.
+	size_t sat_diag_sorted_iters; // SESSION079 DIAGNOSTIC, THROWAWAY: that run's tile-loop iteration count, so the comparison can be made per iteration.
 
 	// SESSION077 DIAGNOSTIC: anisotropy of the occluder set that fed the grid - max(scale.xyz)/min(scale.xyz) per node,
 	// over the SAME nodes occl_radius/occl_alpha were built from. Answers whether the isotropic-disc occluder model
@@ -234,10 +246,11 @@ public:
 	GaussianSplatUnculledFrontier() // SESSION074: defaults are "stage never ran" - only kickOffTraversals() passing the stage-enabled flag sets sat_grid_res non-zero.
 	:	sat_grid_res(0), sat_num_occluders(0), sat_num_tested(0), sat_num_dropped(0), sat_num_dropped_aggr(0),
 		sat_grid_build_ms(0.0), sat_test_ms(0.0),
-		sat_diag_coarse_a(0), sat_diag_coarse_b(0), sat_diag_writers(0), sat_diag_tile_writes(0), sat_diag_tile_iters(0), sat_diag_test_occl_ms(0.0), // SESSION076, SESSION079
+		sat_diag_coarse_a(0), sat_diag_coarse_b(0), sat_diag_writers(0), sat_diag_tile_writes(0), sat_diag_test_occl_ms(0.0), sat_diag_test_full_ms(0.0), sat_diag_par_ms(0.0), sat_diag_par_writes(0), sat_diag_par_strips(0), sat_diag_sorted_ms(0.0), sat_diag_sorted_iters(0), // SESSION076, SESSION079
 		sat_diag_aniso_n(0), sat_diag_aniso_mean(0.0), sat_diag_aniso_max(0.f), sat_diag_aniso_gt5(0), sat_diag_aniso_gt10(0) // SESSION077
 	{
 		for(int i=0; i<4; ++i) sat_diag_ablate_ms[i] = 0.0; // SESSION079 DIAGNOSTIC
+		for(int i=0; i<3; ++i) sat_diag_tile_stats[i] = 0;
 	}
 };
 
@@ -849,7 +862,8 @@ public:
 		float sat_grid_subdiv_ = 1.f, // SESSION076 CALIBRATION - see GaussianSplatRenderer::getSatGridSubdiv().
 		float sat_region_radius_ = 0.f, // SESSION078: region pruning - see GaussianSplatRenderer::getSatRegionRadius(). 0 = the point-anchored behaviour.
 		bool sat_overlay_requested_ = false, // SESSION078: driven by "Show debug" + its mode dropdown (getSatDebugOverlayMode() != Off), NOT sat_diag_log_ - see that getter's comment. Forces the grid to build even with the saturation filter off, and fills sat_accum_t/sat_amp_sum, exactly what sat_diag_log_ used to gate before the overlay was split out of it.
-		float alpha_gain_ = 1.f, float alpha_gamma_ = 1.f) // SESSION078: see GaussianSplatRenderer::getAlphaGain(). Applied to occluder alphas before they feed the saturation grid, matching what the draw path applies - 1/1 (the defaults here) is the identity, i.e. the pre-session078 behaviour.
+		float alpha_gain_ = 1.f, float alpha_gamma_ = 1.f, // SESSION078: see GaussianSplatRenderer::getAlphaGain(). Applied to occluder alphas before they feed the saturation grid, matching what the draw path applies - 1/1 (the defaults here) is the identity, i.e. the pre-session078 behaviour.
+		glare::TaskManager* task_manager_ = NULL) // SESSION079: the pool this task is itself running on, so the saturation build can spread across it - see gsBuildSaturationGridParallel(). NULL keeps the build serial.
 	:	cloud_id(cloud_id_), topology_generation(topology_generation_), scratch(scratch_), cam_pos_ws(cam_pos_ws_),
 		pixel_scale_limit(pixel_scale_limit_), max_splats_budget(max_splats_budget_), max_layer_density(max_layer_density_), max_tree_depth(max_tree_depth_), focal_px(focal_px_),
 		num_frustum_clip_planes(num_frustum_clip_planes_), frustum_cull_enabled(frustum_cull_enabled_),
@@ -864,7 +878,8 @@ public:
 		sat_grid_subdiv(sat_grid_subdiv_), // SESSION076
 		sat_region_radius(sat_region_radius_), // SESSION078
 		sat_overlay_requested(sat_overlay_requested_), // SESSION078
-		alpha_gain(alpha_gain_), alpha_gamma(alpha_gamma_) // SESSION078
+		alpha_gain(alpha_gain_), alpha_gamma(alpha_gamma_), // SESSION078
+		task_manager(task_manager_) // SESSION079
 	{
 		if(num_frustum_clip_planes < 0)
 			num_frustum_clip_planes = 0;
@@ -1305,7 +1320,7 @@ public:
 						cam_pos_ws, uf2->sat_grid_res, sat_saturation_threshold, sat_region_radius, uf2->sat_depth, // SESSION078: sat_region_radius = 0 reproduces the point-anchored behaviour exactly.
 						sat_diag_log ? &uf2->sat_diag_writers : NULL, sat_diag_log ? &uf2->sat_diag_tile_writes : NULL, // SESSION076 DIAGNOSTIC - null (no counting) unless the sat diag checkbox is on.
 					sat_overlay_requested ? &uf2->sat_accum_t : NULL, sat_overlay_requested ? &uf2->sat_amp_sum : NULL, // SESSION077/078 - the two overlay fields, gated on the overlay request, not the sat diag checkbox.
-						sat_diag_log ? &uf2->sat_diag_tile_iters : NULL); // SESSION079 DIAGNOSTIC
+						sat_diag_log ? uf2->sat_diag_tile_stats : NULL); // SESSION079 DIAGNOSTIC
 					uf2->sat_grid_build_ms = sat_grid_timer.elapsed() * 1.0e3;
 
 					// SESSION079 DIAGNOSTIC, THROWAWAY: cost decomposition of the build loop. Re-runs it with the loop cut
@@ -1322,12 +1337,101 @@ public:
 						for(int cut=1; cut<=4; ++cut)
 						{
 							const int ablate_stage = (cut == 4) ? 0 : cut; // 1, 2, 3, then full again.
-							Timer ablate_timer;
-							gsBuildSaturationGrid(occl_px.data(), occl_py.data(), occl_pz.data(), occl_radius.data(), occl_alpha.data(), occl_px.size(),
-								cam_pos_ws, uf2->sat_grid_res, sat_saturation_threshold, sat_region_radius, ablate_depth,
-								NULL, NULL, NULL, NULL, NULL, ablate_stage);
-							uf2->sat_diag_ablate_ms[cut - 1] = ablate_timer.elapsed() * 1.0e3;
+
+							// SESSION079: MINIMUM of several repeats, not the mean. Measured run-to-run spread on a quantity
+							// that provably had not changed was +-10%, which put every remaining micro-optimisation below the
+							// noise floor. The minimum is the least-disturbed run - the one that suffered fewest interrupts,
+							// least thermal throttling and least contention - and it is far more stable than the mean, which
+							// every outlier drags. Repeats also cancel the ordering bias the single-pass version had, where
+							// the last cut measured was always the most throttled.
+							double best_ms = -1.0;
+							for(int rep=0; rep<gs_sat_ablate_repeats; ++rep)
+							{
+								Timer ablate_timer;
+								gsBuildSaturationGrid(occl_px.data(), occl_py.data(), occl_pz.data(), occl_radius.data(), occl_alpha.data(), occl_px.size(),
+									cam_pos_ws, uf2->sat_grid_res, sat_saturation_threshold, sat_region_radius, ablate_depth,
+									NULL, NULL, NULL, NULL, NULL, ablate_stage);
+								const double ms = ablate_timer.elapsed() * 1.0e3;
+								if(best_ms < 0.0 || ms < best_ms) best_ms = ms;
+							}
+							uf2->sat_diag_ablate_ms[cut - 1] = best_ms;
 						}
+					}
+
+					// SESSION079: the strip-parallel build, timed alongside the serial one so the two are compared inside a
+					// single traversal rather than across runs (between-traversal spread was measured at +-11%). Its
+					// tile_writes is printed too and must match the serial build's exactly - that is the correctness check,
+					// since strips own disjoint tiles and preserve front-to-back order within each.
+					if(sat_diag_log && task_manager != NULL)
+					{
+						js::Vector<float, 16> par_depth;
+						double best_ms = -1.0;
+						for(int rep=0; rep<gs_sat_ablate_repeats; ++rep)
+						{
+							size_t par_writes = 0;
+							Timer par_timer;
+							gsBuildSaturationGridParallel(occl_px.data(), occl_py.data(), occl_pz.data(), occl_radius.data(), occl_alpha.data(), occl_px.size(),
+								cam_pos_ws, uf2->sat_grid_res, sat_saturation_threshold, sat_region_radius, par_depth, *task_manager,
+								NULL, &par_writes, NULL, &uf2->sat_diag_par_strips);
+							const double ms = par_timer.elapsed() * 1.0e3;
+							if(best_ms < 0.0 || ms < best_ms) { best_ms = ms; uf2->sat_diag_par_writes = par_writes; }
+						}
+						uf2->sat_diag_par_ms = best_ms;
+					}
+
+					// SESSION079 DIAGNOSTIC, THROWAWAY: locality probe. The tile loop measured ~29 cycles per iteration for
+					// a few cycles' worth of arithmetic, and the suspect is locality: every iteration does a
+					// read-modify-write on accum_t and a read of sat_depth, two arrays of tiles*4 bytes each, while the
+					// occluders arrive sorted by DEPTH, not by direction. Consecutive nodes therefore land on unrelated rows
+					// of both arrays.
+					//
+					// This reorders the occluders by tile index and runs the same loop over them. The result is GARBAGE -
+					// front-to-back order is what makes the sequential accumulation mean anything - but the timing is exact.
+					// The counting sort is outside the timer, and the reordered arrays are materialised so the occluder
+					// reads stay sequential too, leaving locality of the two grid arrays as the only difference.
+					//
+					// Comparison must be per ITERATION, not per run: a wrong order saturates tiles at different times, so
+					// the iteration count moves. Hence tile_stats is collected for this run too.
+					if(sat_diag_log)
+					{
+						const size_t nn = occl_px.size();
+						const int gres = uf2->sat_grid_res;
+						const size_t nbins = (size_t)gres * (size_t)gres;
+
+						js::Vector<int, 16> bin_of(nn);
+						js::Vector<int, 16> bin_start(nbins + 1, 0);
+						for(size_t i=0; i<nn; ++i)
+						{
+							const Vec4f off(occl_px[i] - cam_pos_ws.x[0], occl_py[i] - cam_pos_ws.x[1], occl_pz[i] - cam_pos_ws.x[2], 0.f);
+							const int b = gsSatGridTileForDir(off, gres);
+							bin_of[i] = b;
+							++bin_start[(size_t)b + 1];
+						}
+						for(size_t b=0; b<nbins; ++b)
+							bin_start[b + 1] += bin_start[b];
+
+						js::Vector<float, 16> so_px(nn), so_py(nn), so_pz(nn), so_radius(nn), so_alpha(nn);
+						js::Vector<int, 16> cursor = bin_start;
+						for(size_t i=0; i<nn; ++i)
+						{
+							const size_t d = (size_t)cursor[(size_t)bin_of[i]]++;
+							so_px[d] = occl_px[i]; so_py[d] = occl_py[i]; so_pz[d] = occl_pz[i];
+							so_radius[d] = occl_radius[i]; so_alpha[d] = occl_alpha[i];
+						}
+
+						js::Vector<float, 16> sorted_depth;
+						double best_ms = -1.0;
+						for(int rep=0; rep<gs_sat_ablate_repeats; ++rep)
+						{
+							size_t stats[3] = { 0, 0, 0 };
+							Timer sorted_timer;
+							gsBuildSaturationGrid(so_px.data(), so_py.data(), so_pz.data(), so_radius.data(), so_alpha.data(), nn,
+								cam_pos_ws, gres, sat_saturation_threshold, sat_region_radius, sorted_depth,
+								NULL, NULL, NULL, NULL, stats, 0);
+							const double ms = sorted_timer.elapsed() * 1.0e3;
+							if(best_ms < 0.0 || ms < best_ms) { best_ms = ms; uf2->sat_diag_sorted_iters = stats[0]; }
+						}
+						uf2->sat_diag_sorted_ms = best_ms;
 					}
 
 					// SESSION076 DIAGNOSTIC: carry the DFS-side breakdown across to where [gsr-sat-diag] prints it.
@@ -1395,19 +1499,49 @@ public:
 						// Remove once the plan's priorities are settled.
 						if(sat_diag_log)
 						{
-							Timer occl_only_timer;
+							// Two variants, each the MINIMUM of several repeats - see the build-side ablation for why the
+							// minimum. occl-only walks and tests but discards; full also does the six push_back()s the real
+							// loop does. Their difference is the compaction's cost, measured rather than assumed: the plan's
+							// stage 6 takes for granted that compaction is cheap.
+							js::Vector<float, 16> sc_px, sc_py, sc_pz, sc_radius, sc_is_coarse;
+							js::Vector<int, 16> sc_indices;
 							size_t occl_sink = 0;
-							for(size_t i=0; i<n; ++i)
-								if(uf->is_coarse[i] == 0.f)
+							for(int variant=0; variant<2; ++variant)
+							{
+								const bool with_compaction = (variant == 1);
+								double best_ms = -1.0;
+								for(int rep=0; rep<gs_sat_ablate_repeats; ++rep)
 								{
-									const float dx = uf->px[i] - cam_pos_ws.x[0];
-									const float dy = uf->py[i] - cam_pos_ws.x[1];
-									const float dz = uf->pz[i] - cam_pos_ws.x[2];
-									if(gsSatOccluded(Vec4f(dx, dy, dz, 0.f), dx*dx + dy*dy + dz*dz, uf->radius[i],
-										uf2->sat_depth, uf2->sat_grid_res, sat_region_radius, NULL))
-										++occl_sink;
+									sc_indices.resize(0); sc_px.resize(0); sc_py.resize(0); sc_pz.resize(0); sc_radius.resize(0); sc_is_coarse.resize(0);
+									sc_indices.reserve(n); sc_px.reserve(n); sc_py.reserve(n); sc_pz.reserve(n); sc_radius.reserve(n); sc_is_coarse.reserve(n);
+									Timer variant_timer;
+									for(size_t i=0; i<n; ++i)
+									{
+										bool drop = false;
+										if(uf->is_coarse[i] == 0.f)
+										{
+											const float dx = uf->px[i] - cam_pos_ws.x[0];
+											const float dy = uf->py[i] - cam_pos_ws.x[1];
+											const float dz = uf->pz[i] - cam_pos_ws.x[2];
+											drop = gsSatOccluded(Vec4f(dx, dy, dz, 0.f), dx*dx + dy*dy + dz*dz, uf->radius[i],
+												uf2->sat_depth, uf2->sat_grid_res, sat_region_radius, NULL);
+											if(drop) ++occl_sink;
+										}
+										if(with_compaction)
+										{
+											if(prune && drop)
+												continue;
+											sc_indices.push_back(uf->indices[i]);
+											sc_px.push_back(uf->px[i]); sc_py.push_back(uf->py[i]); sc_pz.push_back(uf->pz[i]);
+											sc_radius.push_back(uf->radius[i]);
+											sc_is_coarse.push_back(uf->is_coarse[i]);
+										}
+									}
+									const double ms = variant_timer.elapsed() * 1.0e3;
+									if(best_ms < 0.0 || ms < best_ms) best_ms = ms;
 								}
-							uf2->sat_diag_test_occl_ms = occl_only_timer.elapsed() * 1.0e3;
+								if(with_compaction) uf2->sat_diag_test_full_ms = best_ms; else uf2->sat_diag_test_occl_ms = best_ms;
+							}
 							uf2->sat_num_dropped_aggr += (occl_sink == (size_t)-1) ? 1 : 0; // Keeps occl_sink live; the condition is never true.
 						}
 
@@ -1499,7 +1633,8 @@ private:
 	float sat_grid_subdiv; // SESSION076 CALIBRATION: see the ctor param.
 	float sat_region_radius; // SESSION078: see the ctor param.
 	bool sat_overlay_requested; // SESSION078: see the ctor param.
-	float alpha_gain, alpha_gamma; // SESSION078: see the ctor param.
+	float alpha_gain, alpha_gamma;
+	glare::TaskManager* task_manager; // SESSION079: may be NULL - see the ctor param. // SESSION078: see the ctor param.
 };
 
 
@@ -5995,8 +6130,10 @@ void GaussianSplatRenderer::drainTraversalResults()
 								" tile_writes=" + uInt64ToStringCommaSeparated(uf.sat_diag_tile_writes) +
 							" per_writer=" + doubleToStringNDecimalPlaces(uf.sat_diag_writers > 0 ? ((double)uf.sat_diag_tile_writes / (double)uf.sat_diag_writers) : 0.0, 1) +
 							" fine=" + uInt64ToStringCommaSeparated(uf.sat_num_tested) +
-							" tile_iters=" + uInt64ToStringCommaSeparated(uf.sat_diag_tile_iters) + // SESSION079: iterations vs writes - how much of the tile loop falls out on the Gaussian tail or an already-saturated tile.
-							" per_writer_iters=" + doubleToStringNDecimalPlaces(uf.sat_diag_writers > 0 ? ((double)uf.sat_diag_tile_iters / (double)uf.sat_diag_writers) : 0.0, 1));
+							" tile_iters=" + uInt64ToStringCommaSeparated(uf.sat_diag_tile_stats[0]) + // SESSION079: iterations vs writes - where the tile loop's wasted work goes.
+							" tail_rej=" + uInt64ToStringCommaSeparated(uf.sat_diag_tile_stats[1]) +
+							" sat_skip=" + uInt64ToStringCommaSeparated(uf.sat_diag_tile_stats[2]) +
+							" per_writer_iters=" + doubleToStringNDecimalPlaces(uf.sat_diag_writers > 0 ? ((double)uf.sat_diag_tile_stats[0] / (double)uf.sat_diag_writers) : 0.0, 1));
 
 						// SESSION079 DIAGNOSTIC, THROWAWAY: the cost decomposition - see the ablation call sites. A = walk +
 						// early reject only, B = + footprint geometry, C = + amplitude and span, D2 = full again (instrument
@@ -6008,7 +6145,15 @@ void GaussianSplatRenderer::drainTraversalResults()
 							" D2=" + doubleToStringNDecimalPlaces(uf.sat_diag_ablate_ms[3], 2) +
 							" (grid_ms=" + doubleToStringNDecimalPlaces(uf.sat_grid_build_ms, 2) + ")" +
 							" test_occl=" + doubleToStringNDecimalPlaces(uf.sat_diag_test_occl_ms, 2) +
-							" (test_ms=" + doubleToStringNDecimalPlaces(uf.sat_test_ms, 2) + ")");
+							" test_full=" + doubleToStringNDecimalPlaces(uf.sat_diag_test_full_ms, 2) +
+							" compact=" + doubleToStringNDecimalPlaces(uf.sat_diag_test_full_ms - uf.sat_diag_test_occl_ms, 2) +
+							" (test_ms=" + doubleToStringNDecimalPlaces(uf.sat_test_ms, 2) + ")" +
+							" | par=" + doubleToStringNDecimalPlaces(uf.sat_diag_par_ms, 2) +
+							" par_writes=" + uInt64ToStringCommaSeparated(uf.sat_diag_par_writes) +
+							" strips=" + toString(uf.sat_diag_par_strips) +
+							" | sorted=" + doubleToStringNDecimalPlaces(uf.sat_diag_sorted_ms, 2) +
+							" sorted_iters=" + uInt64ToStringCommaSeparated(uf.sat_diag_sorted_iters) +
+							" sorted_ns_per_iter=" + doubleToStringNDecimalPlaces(uf.sat_diag_sorted_iters > 0 ? (uf.sat_diag_sorted_ms * 1.0e6 / (double)uf.sat_diag_sorted_iters) : 0.0, 2));
 
 						// SESSION077 DIAGNOSTIC: separate line again, same reasoning as the split above - see
 						// GaussianSplatUnculledFrontier::sat_diag_aniso_n. aniso=max(scale.xyz)/min(scale.xyz) per occluder,
@@ -6577,7 +6722,8 @@ void GaussianSplatRenderer::kickOffTraversals()
 			/*sat_grid_subdiv=*/sat_grid_subdiv,
 			/*sat_region_radius=*/sat_region_radius, // SESSION078
 			/*sat_overlay_requested=*/sat_debug_overlay_mode != GaussianSplatSatDebugOverlayMode_Off, // SESSION078
-			/*alpha_gain=*/splat_alpha_gain, /*alpha_gamma=*/splat_alpha_gamma)); // SESSION078
+			/*alpha_gain=*/splat_alpha_gain, /*alpha_gamma=*/splat_alpha_gamma, // SESSION078
+			/*task_manager=*/task_manager)); // SESSION079: lets the saturation build spread across the same pool - safe, see gsBuildSaturationGridParallel().
 	}
 
 	// SESSION055 diag: after the while-loop, detect *unmet* rotation demand - a cloud whose forward has shifted past the

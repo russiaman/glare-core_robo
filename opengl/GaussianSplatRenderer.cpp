@@ -205,6 +205,8 @@ public:
 	size_t sat_diag_writers;      // Grid contributors: nodes whose contribution cleared the negligible-amplitude cutoff.
 	size_t sat_diag_tile_writes;  // Total per-tile writes - the build pass's write amplification.
 	size_t sat_diag_tile_iters;   // SESSION079: per-tile loop iterations in the build pass, vs sat_diag_tile_writes which counts only those reaching the accumulator.
+	double sat_diag_ablate_ms[4]; // SESSION079 DIAGNOSTIC, THROWAWAY: build-loop cost decomposition - cuts A, B, C then a second full run. See the call site.
+	double sat_diag_test_occl_ms; // SESSION079 DIAGNOSTIC, THROWAWAY: the read pass with gsSatOccluded() only, no compaction - against sat_test_ms which includes it.
 
 	// SESSION077 DIAGNOSTIC: anisotropy of the occluder set that fed the grid - max(scale.xyz)/min(scale.xyz) per node,
 	// over the SAME nodes occl_radius/occl_alpha were built from. Answers whether the isotropic-disc occluder model
@@ -232,8 +234,11 @@ public:
 	GaussianSplatUnculledFrontier() // SESSION074: defaults are "stage never ran" - only kickOffTraversals() passing the stage-enabled flag sets sat_grid_res non-zero.
 	:	sat_grid_res(0), sat_num_occluders(0), sat_num_tested(0), sat_num_dropped(0), sat_num_dropped_aggr(0),
 		sat_grid_build_ms(0.0), sat_test_ms(0.0),
-		sat_diag_coarse_a(0), sat_diag_coarse_b(0), sat_diag_writers(0), sat_diag_tile_writes(0), sat_diag_tile_iters(0), // SESSION076, SESSION079
-		sat_diag_aniso_n(0), sat_diag_aniso_mean(0.0), sat_diag_aniso_max(0.f), sat_diag_aniso_gt5(0), sat_diag_aniso_gt10(0) {} // SESSION077
+		sat_diag_coarse_a(0), sat_diag_coarse_b(0), sat_diag_writers(0), sat_diag_tile_writes(0), sat_diag_tile_iters(0), sat_diag_test_occl_ms(0.0), // SESSION076, SESSION079
+		sat_diag_aniso_n(0), sat_diag_aniso_mean(0.0), sat_diag_aniso_max(0.f), sat_diag_aniso_gt5(0), sat_diag_aniso_gt10(0) // SESSION077
+	{
+		for(int i=0; i<4; ++i) sat_diag_ablate_ms[i] = 0.0; // SESSION079 DIAGNOSTIC
+	}
 };
 
 
@@ -1303,6 +1308,28 @@ public:
 						sat_diag_log ? &uf2->sat_diag_tile_iters : NULL); // SESSION079 DIAGNOSTIC
 					uf2->sat_grid_build_ms = sat_grid_timer.elapsed() * 1.0e3;
 
+					// SESSION079 DIAGNOSTIC, THROWAWAY: cost decomposition of the build loop. Re-runs it with the loop cut
+					// short at three known points, timing each; the results go into a scratch grid and are thrown away, only
+					// the timings matter. Differences between consecutive cuts attribute the cost exactly, with no
+					// assumption about clock rate or IPC - which is what the plan's stage-3 post mortem asked for.
+					//
+					// D2 is a second full run. It exists to check the instrument: the arrays are ~60MB, larger than L3, so
+					// if D2 comes back much faster than the production run above, these numbers are being read warm and the
+					// whole decomposition has to be discounted. Remove all of this once the plan's priorities are settled.
+					if(sat_diag_log)
+					{
+						js::Vector<float, 16> ablate_depth;
+						for(int cut=1; cut<=4; ++cut)
+						{
+							const int ablate_stage = (cut == 4) ? 0 : cut; // 1, 2, 3, then full again.
+							Timer ablate_timer;
+							gsBuildSaturationGrid(occl_px.data(), occl_py.data(), occl_pz.data(), occl_radius.data(), occl_alpha.data(), occl_px.size(),
+								cam_pos_ws, uf2->sat_grid_res, sat_saturation_threshold, sat_region_radius, ablate_depth,
+								NULL, NULL, NULL, NULL, NULL, ablate_stage);
+							uf2->sat_diag_ablate_ms[cut - 1] = ablate_timer.elapsed() * 1.0e3;
+						}
+					}
+
 					// SESSION076 DIAGNOSTIC: carry the DFS-side breakdown across to where [gsr-sat-diag] prints it.
 					uf2->sat_diag_coarse_a = diag_coarse_a;
 					uf2->sat_diag_coarse_b = diag_coarse_b;
@@ -1360,6 +1387,29 @@ public:
 						uf2->sat_num_dropped = num_dropped;
 						uf2->sat_num_dropped_aggr = num_dropped_aggr;
 						uf2->sat_test_ms = sat_test_timer.elapsed() * 1.0e3;
+
+						// SESSION079 DIAGNOSTIC, THROWAWAY: the same walk with gsSatOccluded() alone and no compaction.
+						// test_ms measures ~50ns per node, MORE than the build pass despite doing less arithmetic per node
+						// and having no tile loop to speak of; the loop above also does six push_back()s into six separate
+						// vectors for every surviving node, ~15M of them, and nothing has ever measured which half that is.
+						// Remove once the plan's priorities are settled.
+						if(sat_diag_log)
+						{
+							Timer occl_only_timer;
+							size_t occl_sink = 0;
+							for(size_t i=0; i<n; ++i)
+								if(uf->is_coarse[i] == 0.f)
+								{
+									const float dx = uf->px[i] - cam_pos_ws.x[0];
+									const float dy = uf->py[i] - cam_pos_ws.x[1];
+									const float dz = uf->pz[i] - cam_pos_ws.x[2];
+									if(gsSatOccluded(Vec4f(dx, dy, dz, 0.f), dx*dx + dy*dy + dz*dz, uf->radius[i],
+										uf2->sat_depth, uf2->sat_grid_res, sat_region_radius, NULL))
+										++occl_sink;
+								}
+							uf2->sat_diag_test_occl_ms = occl_only_timer.elapsed() * 1.0e3;
+							uf2->sat_num_dropped_aggr += (occl_sink == (size_t)-1) ? 1 : 0; // Keeps occl_sink live; the condition is never true.
+						}
 
 						Reference<GaussianSplatLodTraversalResultMsg> sat_msg = new GaussianSplatLodTraversalResultMsg();
 						sat_msg->cloud_id = cloud_id;
@@ -5947,6 +5997,18 @@ void GaussianSplatRenderer::drainTraversalResults()
 							" fine=" + uInt64ToStringCommaSeparated(uf.sat_num_tested) +
 							" tile_iters=" + uInt64ToStringCommaSeparated(uf.sat_diag_tile_iters) + // SESSION079: iterations vs writes - how much of the tile loop falls out on the Gaussian tail or an already-saturated tile.
 							" per_writer_iters=" + doubleToStringNDecimalPlaces(uf.sat_diag_writers > 0 ? ((double)uf.sat_diag_tile_iters / (double)uf.sat_diag_writers) : 0.0, 1));
+
+						// SESSION079 DIAGNOSTIC, THROWAWAY: the cost decomposition - see the ablation call sites. A = walk +
+						// early reject only, B = + footprint geometry, C = + amplitude and span, D2 = full again (instrument
+						// check against grid_ms). test_occl = the read pass without its compaction.
+						conPrint("[gsr-sat-cost] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms" +
+							" A=" + doubleToStringNDecimalPlaces(uf.sat_diag_ablate_ms[0], 2) +
+							" B=" + doubleToStringNDecimalPlaces(uf.sat_diag_ablate_ms[1], 2) +
+							" C=" + doubleToStringNDecimalPlaces(uf.sat_diag_ablate_ms[2], 2) +
+							" D2=" + doubleToStringNDecimalPlaces(uf.sat_diag_ablate_ms[3], 2) +
+							" (grid_ms=" + doubleToStringNDecimalPlaces(uf.sat_grid_build_ms, 2) + ")" +
+							" test_occl=" + doubleToStringNDecimalPlaces(uf.sat_diag_test_occl_ms, 2) +
+							" (test_ms=" + doubleToStringNDecimalPlaces(uf.sat_test_ms, 2) + ")");
 
 						// SESSION077 DIAGNOSTIC: separate line again, same reasoning as the split above - see
 						// GaussianSplatUnculledFrontier::sat_diag_aniso_n. aniso=max(scale.xyz)/min(scale.xyz) per occluder,

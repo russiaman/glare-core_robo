@@ -276,7 +276,8 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius,
 	js::Vector<float, 16>& sat_depth_out, size_t* out_writers = NULL, size_t* out_tile_writes = NULL,
 	js::Vector<float, 16>* out_accum_t = NULL, js::Vector<float, 16>* out_amp_sum = NULL,
-	size_t* out_tile_iters = NULL); // SESSION079 DIAGNOSTIC: per-tile loop iterations, against out_tile_writes which counts only those reaching the accumulator - the two together say how much of the tile loop is wasted work.
+	size_t* out_tile_iters = NULL, // SESSION079 DIAGNOSTIC: per-tile loop iterations, against out_tile_writes which counts only those reaching the accumulator - the two together say how much of the tile loop is wasted work.
+	int ablate_stage = 0); // SESSION079 DIAGNOSTIC, THROWAWAY: cut the build loop short to decompose its cost - 0 = full, 1/2/3 = progressively later cut points. See the definition.
 
 
 // SESSION074: pass 2's per-node read - true if this fine node is unambiguously behind saturated coarse geometry, so

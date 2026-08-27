@@ -227,10 +227,39 @@ static inline float gsSatExpNeg(float x) // x >= 0; caller has already rejected 
 }
 
 
+// SESSION079 DIAGNOSTIC, THROWAWAY: see ablate_sink inside gsBuildSaturationGrid().
+volatile float gs_sat_ablate_sink = 0.f;
+
+
+// SESSION079 PERF: floor/ceil without a library call.
+//
+// This project builds MSVC x64 with no /arch: flag (cmake/shared_cxx_settings.cmake defines -D__SSE4_1__ as a
+// PREPROCESSOR symbol only, and -D__NO_AVX__ besides), so the codegen baseline is SSE2 and std::floor/std::ceil are CRT
+// calls, not a single roundss. This loop makes 4 of them per writer and gsSatOccluded() makes 4 per node - 4.2M and
+// 11.9M calls respectively on the owner's reference viewpoint - which the session079 cost decomposition placed in the
+// two most expensive slices of both passes.
+//
+// Every one of these results is immediately clamped to [0, res-1], and that is what makes the replacement exact rather
+// than approximate:
+//
+//  - floor vs truncation differ ONLY for negative arguments, and every negative argument clamps to 0 either way. So
+//    myClamp((int)x, 0, res-1) == myClamp((int)std::floor(x), 0, res-1) for all x. No helper needed - just drop the call.
+//  - ceil needs the real thing, but t + ((float)t < x) is exactly ceil for every finite x: for x > 0 it adds one iff x
+//    has a fractional part, and for x <= 0 truncation already IS ceil.
+//
+// Out-of-range inputs behave as before: cvttss2si returns INT_MIN, which clamps the same way the old (int)std::floor()
+// of the same value did.
+static inline int gsSatCeilToInt(float x)
+{
+	const int t = (int)x;
+	return t + (((float)t < x) ? 1 : 0);
+}
+
+
 void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, const float* radius, const float* alpha, size_t n,
 	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius,
 	js::Vector<float, 16>& sat_depth_out, size_t* out_writers, size_t* out_tile_writes,
-	js::Vector<float, 16>* out_accum_t, js::Vector<float, 16>* out_amp_sum, size_t* out_tile_iters)
+	js::Vector<float, 16>* out_accum_t, js::Vector<float, 16>* out_amp_sum, size_t* out_tile_iters, int ablate_stage)
 {
 	const size_t num_tiles = (size_t)res * (size_t)res;
 	sat_depth_out.resizeNoCopy(num_tiles);
@@ -261,6 +290,18 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 	// whole sphere), so a node whose bound already clears gs_sat_min_occluder_amp would have its true amp clear it too -
 	// see the reject test itself for what that buys.
 	const float amp_reject_k = 3.14159265f * (float)res * (float)res / 18.f;
+
+	// SESSION079 DIAGNOSTIC, THROWAWAY: cost decomposition. Three of this plan's stages predicted their effect and two
+	// missed badly (stage 2 by 3x, stage 3 entirely), which says the cost model of this loop is guesswork. Rather than
+	// keep guessing, ablate_stage cuts the loop short at a known point and lets the caller time each cut. The timings
+	// are exact and assume nothing about clock rate or IPC; the results of the cut runs are garbage and are discarded.
+	//
+	// ablate_stage: 0 = full loop (production). 1 = stop after the early reject. 2 = stop after radius_tiles.
+	// 3 = stop before the tile loop. Each cut adds its own last computed value into ablate_sink, which is stored to a
+	// volatile at the end - without that the optimiser deletes the very work we are trying to time.
+	//
+	// Remove this and the ablate_stage parameter once the plan's priorities are settled.
+	float ablate_sink = 0.f;
 
 	// SESSION074: nodes are assumed already front-to-back (a filtered subsequence of the traversal's globally sorted
 	// output - see GaussianSplatUnculledFrontier / GaussianSplatLodTraversalTask::run()). This is the ONLY sequential,
@@ -294,6 +335,8 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 		if(a * r * r * amp_reject_k < gs_sat_min_occluder_amp * dist_sq)
 			continue;
 
+		if(ablate_stage == 1) { ablate_sink += dist_sq; continue; } // SESSION079 DIAGNOSTIC cut A - see ablate_sink.
+
 
 		// SESSION074: angular radius without trigonometry. The exact value is asin(r/dist); for the small angles this
 		// pass deals with, r/dist is within a fraction of a percent of it, and it is only ever compared against tile
@@ -324,6 +367,8 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 
 		float cu, cv;
 		const float radius_tiles = gsSatGridFootprint(Vec4f(dx, dy, dz, 0.f), ang_radius, res, inv_dist, cu, cv);
+
+		if(ablate_stage == 2) { ablate_sink += radius_tiles + cu + cv; continue; } // SESSION079 DIAGNOSTIC cut B - see ablate_sink.
 
 		// SESSION076: an occluder is a GAUSSIAN, not a uniformly opaque disc, and the whole of this pass's accuracy
 		// turns on that distinction. Both earlier cuts modelled it as a disc and failed in opposite directions:
@@ -404,14 +449,16 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 		// open space accumulates towards half-opacity and does not reach the threshold, so nothing behind it is dropped.
 		// Under the coarse source that same cell was claimed outright by whichever blob's disc happened to reach it.
 		const float span = radius_tiles + gs_sat_tile_half_diag;
-		const int u0 = myClamp((int)std::ceil (cu - span - 0.5f), 0, res - 1);
-		const int u1 = myClamp((int)std::floor(cu + span - 0.5f), 0, res - 1);
-		const int v0 = myClamp((int)std::ceil (cv - span - 0.5f), 0, res - 1);
-		const int v1 = myClamp((int)std::floor(cv + span - 0.5f), 0, res - 1);
+		const int u0 = myClamp(gsSatCeilToInt(cu - span - 0.5f), 0, res - 1); // SESSION079 PERF: exact, call-free floor/ceil - see gsSatCeilToInt().
+		const int u1 = myClamp((int)                (cu + span - 0.5f), 0, res - 1);
+		const int v0 = myClamp(gsSatCeilToInt(cv - span - 0.5f), 0, res - 1);
+		const int v1 = myClamp((int)                (cv + span - 0.5f), 0, res - 1);
 		if(u1 < u0 || v1 < v0)
 			continue;
 
 		if(out_writers) ++(*out_writers); // SESSION076 DIAGNOSTIC: this node contributes something.
+
+		if(ablate_stage == 3) { ablate_sink += amp + far_edge + (float)(u0 + u1 + v0 + v1); continue; } // SESSION079 DIAGNOSTIC cut C - see ablate_sink.
 
 		const float inv_2var = 0.5f / var;
 
@@ -461,6 +508,8 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 		}
 	}
 
+	gs_sat_ablate_sink = ablate_sink; // SESSION079 DIAGNOSTIC: keeps the ablated work alive against dead-code elimination.
+
 	// SESSION077 DIAGNOSTIC: hand the accumulator fields out for the debug overlay - see the header.
 	if(out_accum_t)
 		*out_accum_t = accum_t;
@@ -499,10 +548,10 @@ bool gsSatOccluded(const Vec4f& offset, float dist_sq, float node_radius,
 	// SESSION074: the read side takes every tile the footprint TOUCHES - the opposite rounding from the build pass, see
 	// gsSatGridFootprint()'s comment. floor() on both ends is exactly the touched set in 1D: it names every tile whose
 	// [u, u+1) interval meets [cu - radius, cu + radius].
-	const int u0 = myClamp((int)std::floor(cu - radius_tiles), 0, res - 1);
-	const int u1 = myClamp((int)std::floor(cu + radius_tiles), 0, res - 1);
-	const int v0 = myClamp((int)std::floor(cv - radius_tiles), 0, res - 1);
-	const int v1 = myClamp((int)std::floor(cv + radius_tiles), 0, res - 1);
+	const int u0 = myClamp((int)(cu - radius_tiles), 0, res - 1); // SESSION079 PERF: truncation is exact here - see gsSatCeilToInt()'s comment.
+	const int u1 = myClamp((int)(cu + radius_tiles), 0, res - 1);
+	const int v0 = myClamp((int)(cv - radius_tiles), 0, res - 1);
+	const int v1 = myClamp((int)(cv + radius_tiles), 0, res - 1);
 	if(u1 < u0 || v1 < v0)
 		return false;
 

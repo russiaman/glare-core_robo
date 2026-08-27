@@ -308,7 +308,21 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius,
 	js::Vector<float, 16>& sat_depth_out, glare::TaskManager& task_manager,
 	size_t* out_writers = NULL, size_t* out_tile_writes = NULL, size_t* out_tile_stats = NULL,
-	js::Vector<GsSatOccluderRec, 16>* scratch_recs = NULL); // Optional caller-owned scratch for the phase-1 records, to keep the allocation out of the per-build cost.
+	js::Vector<GsSatOccluderRec, 16>* scratch_recs = NULL, // Optional caller-owned scratch for the phase-1 records, to keep the allocation out of the per-build cost.
+
+	// SESSION079 DIAGNOSTIC, THROWAWAY: the saturation-vs-depth profile. Occluders arrive front-to-back and blocks
+	// are contiguous ranges of them, so per-block totals ARE a curve of "what had the grid gained by the time the
+	// nearest K occluders had been consumed". Two scene sizes now say the output stops moving long before the
+	// input does (+14.9% occluders changed tile_writes by 0.03%); this says WHERE it stops.
+	//
+	// out_block_writes / out_block_sat_frac must have room for gs_sat_max_diag_blocks entries. force_block_n
+	// overrides the byte budget's block size purely to get more points on the curve - it makes the build slower
+	// (more sync barriers) and changes nothing about the result.
+	size_t* out_block_writes = NULL, float* out_block_sat_frac = NULL, int* out_num_blocks = NULL, size_t force_block_n = 0);
+
+
+// SESSION079 DIAGNOSTIC, THROWAWAY: cap on the profile arrays above.
+static const int gs_sat_max_diag_blocks = 64;
 
 
 // SESSION074: pass 2's per-node read - true if this fine node is unambiguously behind saturated coarse geometry, so

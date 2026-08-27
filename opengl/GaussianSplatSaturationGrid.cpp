@@ -723,7 +723,8 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius,
 	js::Vector<float, 16>& sat_depth_out, glare::TaskManager& task_manager,
 	size_t* out_writers, size_t* out_tile_writes, size_t* out_tile_stats,
-	js::Vector<GsSatOccluderRec, 16>* scratch_recs)
+	js::Vector<GsSatOccluderRec, 16>* scratch_recs,
+	size_t* out_block_writes, float* out_block_sat_frac, int* out_num_blocks, size_t force_block_n)
 {
 	const size_t num_tiles = (size_t)res * (size_t)res;
 	sat_depth_out.resizeNoCopy(num_tiles);
@@ -740,7 +741,8 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 	//
 	// Blocking costs nothing in correctness: blocks are processed in order and records within a block are in order, so
 	// each tile still sees its occluders front-to-back.
-	const size_t block_n = myMin(n, myMax((size_t)65536, gs_sat_rec_scratch_bytes / sizeof(GsSatOccluderRec)));
+	const size_t block_n = (force_block_n > 0) ? myMax((size_t)1, force_block_n)
+		: myMin(n, myMax((size_t)65536, gs_sat_rec_scratch_bytes / sizeof(GsSatOccluderRec)));
 
 	js::Vector<GsSatOccluderRec, 16> local_recs;
 	js::Vector<GsSatOccluderRec, 16>& recs = scratch_recs ? *scratch_recs : local_recs;
@@ -749,6 +751,7 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 	js::Vector<float, 16> accum(num_tiles, 1.f);
 
 	GsSatStripStats total;
+	int block_idx = 0;
 
 	for(size_t block_begin=0; block_begin<n; block_begin += block_n)
 	{
@@ -826,7 +829,24 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 			total.tail_rej    += strip_tasks[t]->stats.tail_rej;
 			total.sat_skip    += strip_tasks[t]->stats.sat_skip;
 		}
+
+		// SESSION079 DIAGNOSTIC, THROWAWAY: one point on the saturation-vs-depth curve - see the header. Cumulative, so
+		// the last entry equals out_tile_writes. The tile scan is res*res per block, which is nothing beside the block.
+		if(out_block_writes && block_idx < gs_sat_max_diag_blocks)
+		{
+			out_block_writes[block_idx] = total.tile_writes;
+			if(out_block_sat_frac)
+			{
+				size_t num_sat = 0;
+				for(size_t t=0; t<num_tiles; ++t)
+					if(sat_depth_out[t] != std::numeric_limits<float>::infinity())
+						++num_sat;
+				out_block_sat_frac[block_idx] = (float)((double)num_sat / (double)num_tiles);
+			}
+			++block_idx;
+		}
 	}
+	if(out_num_blocks) *out_num_blocks = block_idx;
 
 	// NOTE: `writers` counts records that reached the tile loop, so one straddling a strip boundary is counted once per
 	// strip it touches - the parallel total is the serial one plus the boundary crossings. The per-TILE counters

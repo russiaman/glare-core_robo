@@ -177,6 +177,9 @@ public:
 	size_t sat_num_tested;       // DIAGNOSTIC: fine nodes the verdict was computed for.
 	size_t sat_num_dropped;      // DIAGNOSTIC: of those, how many the conservative test found occluded (counted in Count mode too, where nothing is actually removed).
 	size_t sat_num_dropped_aggr; // DIAGNOSTIC: the deliberately-wrong upper bound - see gsSatOccluded()'s out_aggressive.
+	double sat_gather_ms;        // SESSION079 DIAGNOSTIC: cost of building the occluder SoA the grid is fed from - see the loop.
+	double sat_gather_reserved_ms;  // SESSION079 DIAGNOSTIC, THROWAWAY: the same loop with the outputs reserved. Difference from sat_gather_ms = the push_back reallocation cost.
+	double sat_gather_noscatter_ms; // SESSION079 DIAGNOSTIC, THROWAWAY: reserved AND without the scattered scales/rotations reads. Difference from the above = the gather-by-index cost.
 	double sat_grid_build_ms;    // DIAGNOSTIC: pure gsBuildSaturationGrid() cost on the worker.
 	double sat_test_ms;          // DIAGNOSTIC: cost of testing (and, in Drop mode, compacting) the frontier.
 
@@ -219,6 +222,13 @@ public:
 	size_t sat_diag_aniso_gt5;
 	size_t sat_diag_aniso_gt10;
 
+	// SESSION079 DIAGNOSTIC, THROWAWAY: the saturation-vs-depth curve - see gsBuildSaturationGridParallel()'s
+	// out_block_writes. Cumulative tile_writes and saturated-tile fraction after each equal slice of the front-to-back
+	// occluder list, so the shape says how deep into the scene the grid is still learning anything.
+	size_t sat_diag_block_writes[gs_sat_max_diag_blocks];
+	float sat_diag_block_sat_frac[gs_sat_max_diag_blocks];
+	int sat_diag_num_blocks;
+
 	// Key this frontier was built for; drainTraversalResults() checks these before reusing it, so a settings change that
 	// alters the selection can't be answered from a stale U(P).  Orientation is deliberately NOT here - that's the point.
 	uint64 topology_generation;
@@ -231,11 +241,14 @@ public:
 
 	GaussianSplatUnculledFrontier() // SESSION074: defaults are "stage never ran" - only kickOffTraversals() passing the stage-enabled flag sets sat_grid_res non-zero.
 	:	sat_grid_res(0), sat_num_occluders(0), sat_num_tested(0), sat_num_dropped(0), sat_num_dropped_aggr(0),
+		sat_gather_ms(0.0), sat_gather_reserved_ms(0.0), sat_gather_noscatter_ms(0.0), // SESSION079
 		sat_grid_build_ms(0.0), sat_test_ms(0.0),
 		sat_diag_coarse_a(0), sat_diag_coarse_b(0), sat_diag_writers(0), sat_diag_tile_writes(0), // SESSION076
 		sat_diag_aniso_n(0), sat_diag_aniso_mean(0.0), sat_diag_aniso_max(0.f), sat_diag_aniso_gt5(0), sat_diag_aniso_gt10(0) // SESSION077
 	{
 		for(int i=0; i<3; ++i) sat_diag_tile_stats[i] = 0;
+		for(int i=0; i<gs_sat_max_diag_blocks; ++i) { sat_diag_block_writes[i] = 0; sat_diag_block_sat_frac[i] = 0.f; } // SESSION079
+		sat_diag_num_blocks = 0;
 	}
 };
 
@@ -837,6 +850,86 @@ struct FrontierNodeRecord
 // walks, which is the other half of why a per-node frustum test added now would be work thrown away.
 
 
+// SESSION079: one slice of the occluder gather - see GsSatGatherTask.
+struct GsSatGatherChunk
+{
+	size_t i_begin, i_end;
+	size_t count;        // Survivors this chunk wrote into its own slice.
+	double aniso_sum;    // Diagnostic, accumulated per chunk so the threads never share a counter.
+	float aniso_max;
+	size_t aniso_gt5, aniso_gt10, aniso_n;
+};
+
+
+// SESSION079: builds the occluder SoA the saturation grid is fed from, split across the pool.
+//
+// This turned out to be the largest single cost in the whole stage and had never been timed: ~845ms of a ~1010ms
+// stage on the owner's full scene (11.49M nodes), against 96ms for the grid build and 73ms for the read. Of that,
+// ~512ms is the two scattered reads below - scales[idx] and rotations[idx] land wherever the node's cloud index
+// points, in arrays of 30M entries (~840MB), so this is ~45ns per node of pure DRAM miss latency and almost no
+// arithmetic.
+//
+// That is exactly the shape that gains MOST from threading: the limit is outstanding misses, not issue width, so
+// N threads give close to N times the memory-level parallelism. (The other ~228ms was the five outputs growing
+// from empty by push_back; they are sized up front now, which is what let each chunk own a slice.)
+//
+// Each chunk writes into its own slice of full-size arrays and reports how many it kept; the caller closes the
+// gaps afterwards. Same shape as the grid build's phase 1, deliberately - and where the coarse floor is off
+// nothing is dropped at all, so the compaction is a no-op.
+class GsSatGatherTask : public glare::Task
+{
+public:
+	virtual void run(size_t /*thread_index*/)
+	{
+		size_t c = 0;
+		double a_sum = 0.0; float a_max = 0.f; size_t a_gt5 = 0, a_gt10 = 0, a_n = 0;
+		for(size_t i=chunk->i_begin; i<chunk->i_end; ++i)
+		{
+			if(is_coarse[i] != 0.f) // Coarse nodes are a second, redundant description of the same surfaces - see the call site.
+				continue;
+			const uint32 idx = indices[i];
+
+			out_px[c] = px[i]; out_py[c] = py[i]; out_pz[c] = pz[i];
+
+			const float ddx = px[i] - cam_pos_ws.x[0];
+			const float ddy = py[i] - cam_pos_ws.x[1];
+			const float ddz = pz[i] - cam_pos_ws.x[2];
+			const float d_len = std::sqrt(ddx*ddx + ddy*ddy + ddz*ddz);
+			const float inv_d = d_len > 1.0e-6f ? (1.f / d_len) : 0.f; // Degenerate (node at the anchor) - the grid build skips such nodes anyway.
+			const Vec4f unit_dir(ddx * inv_d, ddy * inv_d, ddz * inv_d, 0.f);
+
+			out_radius[c] = gs_sat_occluder_sigmas * gsSatProjectedRadius(scales[idx], rotations[idx], unit_dir);
+			out_alpha[c] = adjustSplatAlpha(alphas[idx], alpha_gain, alpha_gamma); // The DRAWN opacity, not the stored one - see GaussianSplatRenderer::getAlphaGain().
+
+			if(want_aniso) // SESSION077 DIAGNOSTIC - scales[idx] is already hot from the line above, so this costs a max/min, not a miss.
+			{
+				const Vec3f& sc = scales[idx];
+				const float max_s = myMax(sc.x, myMax(sc.y, sc.z));
+				const float min_s = myMax(myMin(sc.x, myMin(sc.y, sc.z)), 1.0e-6f); // Floor avoids a divide-by-zero on a degenerate/near-planar splat.
+				const float ratio = max_s / min_s;
+				a_sum += ratio;
+				a_max = myMax(a_max, ratio);
+				if(ratio > 5.f) ++a_gt5;
+				if(ratio > 10.f) ++a_gt10;
+				++a_n;
+			}
+			++c;
+		}
+		chunk->count = c;
+		chunk->aniso_sum = a_sum; chunk->aniso_max = a_max;
+		chunk->aniso_gt5 = a_gt5; chunk->aniso_gt10 = a_gt10; chunk->aniso_n = a_n;
+	}
+
+	const uint32* indices; const float* px; const float* py; const float* pz; const float* is_coarse;
+	const Vec3f* scales; const Vec4f* rotations; const float* alphas;
+	float* out_px; float* out_py; float* out_pz; float* out_radius; float* out_alpha;
+	Vec4f cam_pos_ws;
+	float alpha_gain, alpha_gamma;
+	bool want_aniso;
+	GsSatGatherChunk* chunk;
+};
+
+
 // SESSION079: one slice of the saturation read pass. Both phases below are cut the same way and share these, so a
 // chunk's verdict pass and its copy pass agree on the range by construction rather than by two matching divisions.
 struct GsSatTestChunk
@@ -1327,56 +1420,133 @@ public:
 				const size_t n = uf->indices.size();
 				js::Vector<float, 16> occl_px, occl_py, occl_pz, occl_radius, occl_alpha;
 
-				// SESSION077 DIAGNOSTIC: see GaussianSplatUnculledFrontier::sat_diag_aniso_n's comment. Only accumulated
-				// while sat_diag_log is on - geom_ref->scales is always populated (see GaussianSplatCachedGeom::scales),
-				// but the per-node max/min and the branch it costs are skipped entirely otherwise.
+				// SESSION079 DIAGNOSTIC: this loop had never been timed, and the wall clock says it is the largest single
+				// cost in the whole stage. On the owner's full scene the gap between publishing the unpruned frontier and
+				// publishing the pruned one was 905-940ms, of which grid+test accounted for only 180-191ms; the remainder
+				// scaled with node count (+16.2% for +14.9% occluders), which is this loop's shape. We spent a session
+				// making a fifth of the latency five times faster without ever looking at the other four fifths.
+				Timer sat_gather_timer;
+
+				// SESSION079: split across the pool - see GsSatGatherTask for why this loop is worth threading and what it
+				// measured before. Chunks are cut four to a thread for the same reason as the read pass: a coarse node exits
+				// immediately while a kept one pays two cache misses, so an even split of the index range is not an even
+				// split of the work.
+				//
+				// SESSION077 DIAGNOSTIC: the anisotropy sample rides along inside the same pass - see sat_diag_aniso_n.
 				double aniso_sum = 0.0;
 				float aniso_max = 0.f;
 				size_t aniso_gt5 = 0, aniso_gt10 = 0, aniso_n = 0;
-
-				for(size_t i=0; i<n; ++i)
 				{
-					if(uf->is_coarse[i] != 0.f)
-						continue;
-					const uint32 idx = uf->indices[i];
-					occl_px.push_back(uf->px[i]); occl_py.push_back(uf->py[i]); occl_pz.push_back(uf->pz[i]);
-					// SESSION074: the node's OWN drawn radius, NOT cull_radii[]. cull_radius is the enclosing sphere of
-					// this node's whole SUBTREE (see GaussianSplatLodNode::bounding_radius_os) - correct as a frustum-cull
-					// margin, catastrophically wrong as an occluder footprint: it spans a large part of the scene on the
-					// strength of a splat that paints a few pixels. Only the node itself is ever drawn at the frontier,
-					// never its subtree, and the shader cuts it at splat_cutoff_sigmas of max(scale) = half that many
-					// feature_sizes - so this is the radius that can actually occlude anything.
-					//
-					// SESSION077: ...and it is now the ANISOTROPIC one. 0.5*feature_size is max(scale.xyz), the splat's
-					// bounding radius - the same in every direction, so a thin wall-aligned splat claimed a sphere of its
-					// longest axis even along its own thin axis. Measured here: mean max/min extent ratio 101, 67% past
-					// 10:1 (see sat_diag_aniso_* below), so that was overstating most occluders' footprints by orders of
-					// magnitude, and by an angle-dependent factor - which is what made an opaque wall's mask break up by
-					// distance-from-normal instead of covering it uniformly. gsSatProjectedRadius() returns the
-					// equal-area radius of the splat's actual cross-section from the anchor; the sigma multiple it is
-					// scaled by is unchanged, so this only corrects the shape, not how far out a node is allowed to
-					// occlude.
-					const float ddx = uf->px[i] - cam_pos_ws.x[0];
-					const float ddy = uf->py[i] - cam_pos_ws.x[1];
-					const float ddz = uf->pz[i] - cam_pos_ws.x[2];
-					const float d_len = std::sqrt(ddx*ddx + ddy*ddy + ddz*ddz);
-					const float inv_d = d_len > 1.0e-6f ? (1.f / d_len) : 0.f; // Degenerate (node at the anchor) - direction is meaningless; the grid build skips such nodes anyway.
-					const Vec4f unit_dir(ddx * inv_d, ddy * inv_d, ddz * inv_d, 0.f);
+					// Sized to the input, not grown from empty: at 11.5M nodes the push_back version spent ~228ms of the
+					// loop's ~845ms reallocating and copying ~230MB. n is a strict upper bound on the survivors.
+					occl_px.resizeNoCopy(n); occl_py.resizeNoCopy(n); occl_pz.resizeNoCopy(n);
+					occl_radius.resizeNoCopy(n); occl_alpha.resizeNoCopy(n);
 
-					occl_radius.push_back(gs_sat_occluder_sigmas * gsSatProjectedRadius(geom_ref->scales[idx], geom_ref->rotations[idx], unit_dir));
-					occl_alpha.push_back(adjustSplatAlpha(alphas[idx], alpha_gain, alpha_gamma)); // SESSION078: the DRAWN opacity, not the stored one - see GaussianSplatRenderer::getAlphaGain()'s comment and gsBuildSaturationGrid()'s header.
+					const int gather_concurrency = (task_manager != NULL) ? myMax(1, (int)task_manager->getConcurrency()) : 1;
+					const size_t num_gather_chunks = myMax<size_t>(1, myMin((size_t)gather_concurrency * 4, n / 16384));
 
-					if(sat_diag_log)
+					js::Vector<GsSatGatherChunk, 16> chunks(num_gather_chunks);
+					glare::TaskGroupRef group = new glare::TaskGroup();
+					for(size_t c=0; c<num_gather_chunks; ++c)
 					{
-						const Vec3f& sc = geom_ref->scales[idx];
-						const float max_s = myMax(sc.x, myMax(sc.y, sc.z));
-						const float min_s = myMax(myMin(sc.x, myMin(sc.y, sc.z)), 1.0e-6f); // Floor avoids a divide-by-zero on a degenerate/near-planar splat.
-						const float ratio = max_s / min_s;
-						aniso_sum += ratio;
-						aniso_max = myMax(aniso_max, ratio);
-						if(ratio > 5.f) ++aniso_gt5;
-						if(ratio > 10.f) ++aniso_gt10;
-						++aniso_n;
+						chunks[c].i_begin = (n * c)       / num_gather_chunks;
+						chunks[c].i_end   = (n * (c + 1)) / num_gather_chunks;
+						chunks[c].count = 0;
+						chunks[c].aniso_sum = 0.0; chunks[c].aniso_max = 0.f;
+						chunks[c].aniso_gt5 = chunks[c].aniso_gt10 = chunks[c].aniso_n = 0;
+
+						Reference<GsSatGatherTask> t = new GsSatGatherTask();
+						t->indices = uf->indices.data(); t->px = uf->px.data(); t->py = uf->py.data(); t->pz = uf->pz.data();
+						t->is_coarse = uf->is_coarse.data();
+						t->scales = geom_ref->scales.data(); t->rotations = geom_ref->rotations.data(); t->alphas = alphas.data();
+						// Own slice, sized to its input range - the survivors are compacted down afterwards.
+						t->out_px = occl_px.data() + chunks[c].i_begin; t->out_py = occl_py.data() + chunks[c].i_begin;
+						t->out_pz = occl_pz.data() + chunks[c].i_begin; t->out_radius = occl_radius.data() + chunks[c].i_begin;
+						t->out_alpha = occl_alpha.data() + chunks[c].i_begin;
+						t->cam_pos_ws = cam_pos_ws;
+						t->alpha_gain = alpha_gain; t->alpha_gamma = alpha_gamma;
+						t->want_aniso = sat_diag_log;
+						t->chunk = &chunks[c];
+						if(task_manager != NULL) group->tasks.push_back(t); else t->run(0); // No pool: same code, run here.
+					}
+					if(task_manager != NULL) task_manager->runTaskGroup(group);
+
+					// Close the gaps the chunks left, in ascending order so the occluders stay front-to-back - which is what
+					// makes the grid's sequential accumulation mean anything. Each chunk only ever moves to a LOWER offset,
+					// so the copies never overlap forwards. With the coarse floor off nothing is dropped and this does nothing.
+					size_t kept = 0;
+					for(size_t c=0; c<num_gather_chunks; ++c)
+					{
+						const size_t slice_begin = chunks[c].i_begin, cnt = chunks[c].count;
+						if(cnt > 0 && kept != slice_begin)
+						{
+							std::memmove(occl_px.data() + kept, occl_px.data() + slice_begin, cnt * sizeof(float));
+							std::memmove(occl_py.data() + kept, occl_py.data() + slice_begin, cnt * sizeof(float));
+							std::memmove(occl_pz.data() + kept, occl_pz.data() + slice_begin, cnt * sizeof(float));
+							std::memmove(occl_radius.data() + kept, occl_radius.data() + slice_begin, cnt * sizeof(float));
+							std::memmove(occl_alpha.data() + kept, occl_alpha.data() + slice_begin, cnt * sizeof(float));
+						}
+						kept += cnt;
+
+						aniso_sum += chunks[c].aniso_sum;
+						aniso_max = myMax(aniso_max, chunks[c].aniso_max);
+						aniso_gt5 += chunks[c].aniso_gt5; aniso_gt10 += chunks[c].aniso_gt10; aniso_n += chunks[c].aniso_n;
+					}
+					occl_px.resize(kept); occl_py.resize(kept); occl_pz.resize(kept);
+					occl_radius.resize(kept); occl_alpha.resize(kept);
+				}
+				const double sat_gather_ms = sat_gather_timer.elapsed() * 1.0e3;
+
+				// SESSION079 DIAGNOSTIC, THROWAWAY: decompose the loop above into its two suspects, each the minimum of
+				// several repeats (see the build-side ablation for why the minimum).
+				//
+				//  - reserved: the same loop with the five output vectors reserved up front. They are currently grown from
+				//    empty by push_back, and at 11.5M nodes that is ~230MB accumulated through repeated reallocate-and-copy.
+				//    The difference from the production loop is what that costs.
+				//  - noscatter: the same again, but with the two scattered reads into the cloud's 30M-entry scales/rotations
+				//    arrays replaced by a constant. The difference from `reserved` is what the gather-by-index costs, which
+				//    is the number that matters for the streaming phase - it is a fact about data layout, not arithmetic.
+				double sat_gather_reserved_ms = 0.0, sat_gather_noscatter_ms = 0.0;
+				if(sat_diag_log)
+				{
+					js::Vector<float, 16> g_px, g_py, g_pz, g_radius, g_alpha;
+					for(int variant=0; variant<2; ++variant)
+					{
+						const bool scatter = (variant == 0);
+						double best_ms = -1.0;
+						for(int rep=0; rep<3; ++rep)
+						{
+							g_px.resize(0); g_py.resize(0); g_pz.resize(0); g_radius.resize(0); g_alpha.resize(0);
+							g_px.reserve(n); g_py.reserve(n); g_pz.reserve(n); g_radius.reserve(n); g_alpha.reserve(n);
+							Timer variant_timer;
+							for(size_t i=0; i<n; ++i)
+							{
+								if(uf->is_coarse[i] != 0.f)
+									continue;
+								const uint32 idx = uf->indices[i];
+								g_px.push_back(uf->px[i]); g_py.push_back(uf->py[i]); g_pz.push_back(uf->pz[i]);
+								const float ddx = uf->px[i] - cam_pos_ws.x[0];
+								const float ddy = uf->py[i] - cam_pos_ws.x[1];
+								const float ddz = uf->pz[i] - cam_pos_ws.x[2];
+								const float d_len = std::sqrt(ddx*ddx + ddy*ddy + ddz*ddz);
+								const float inv_d = d_len > 1.0e-6f ? (1.f / d_len) : 0.f;
+								const Vec4f unit_dir(ddx * inv_d, ddy * inv_d, ddz * inv_d, 0.f);
+								if(scatter)
+								{
+									g_radius.push_back(gs_sat_occluder_sigmas * gsSatProjectedRadius(geom_ref->scales[idx], geom_ref->rotations[idx], unit_dir));
+									g_alpha.push_back(adjustSplatAlpha(alphas[idx], alpha_gain, alpha_gamma));
+								}
+								else
+								{
+									// Same arithmetic shape, no index-scattered load. unit_dir keeps the sqrt above live.
+									g_radius.push_back(gs_sat_occluder_sigmas * unit_dir[0]);
+									g_alpha.push_back(unit_dir[1]);
+								}
+							}
+							const double ms = variant_timer.elapsed() * 1.0e3;
+							if(best_ms < 0.0 || ms < best_ms) best_ms = ms;
+						}
+						if(scatter) sat_gather_reserved_ms = best_ms; else sat_gather_noscatter_ms = best_ms;
 					}
 				}
 
@@ -1417,6 +1587,31 @@ public:
 					sat_overlay_requested ? &uf2->sat_accum_t : NULL, sat_overlay_requested ? &uf2->sat_amp_sum : NULL, // SESSION077/078 - the two overlay fields, gated on the overlay request, not the sat diag checkbox.
 						sat_diag_log ? uf2->sat_diag_tile_stats : NULL); // SESSION079
 					uf2->sat_grid_build_ms = sat_grid_timer.elapsed() * 1.0e3;
+
+					uf2->sat_gather_ms = sat_gather_ms; // SESSION079 - see the loop's timer.
+					uf2->sat_gather_reserved_ms = sat_gather_reserved_ms;
+					uf2->sat_gather_noscatter_ms = sat_gather_noscatter_ms;
+
+					// SESSION079 DIAGNOSTIC, THROWAWAY: the saturation-vs-depth curve. One extra build, with the block size
+					// forced small purely to get points on the curve rather than the three the byte budget would give.
+					// Answers "how deep into the front-to-back list is the grid still learning anything?" - and two scene
+					// sizes already say the answer is "not very": +14.9% more occluders moved tile_writes by 0.03%.
+					//
+					// This is measured rather than acted on deliberately. The obvious lever it implies - drop an occluder
+					// whose whole footprint is already saturated - optimises a walk over a flat per-node array that the
+					// cluster/streaming phase deletes outright. The CURVE, though, is a fact about how occlusion saturates
+					// with depth, and that survives into the design of what to stream.
+					if(sat_diag_log && task_manager != NULL)
+					{
+						js::Vector<float, 16> prof_depth;
+						js::Vector<GsSatOccluderRec, 16> prof_recs;
+						const int want_blocks = 32;
+						gsBuildSaturationGridParallel(occl_px.data(), occl_py.data(), occl_pz.data(), occl_radius.data(), occl_alpha.data(), occl_px.size(),
+							cam_pos_ws, uf2->sat_grid_res, sat_saturation_threshold, sat_region_radius, prof_depth, *task_manager,
+							NULL, NULL, NULL, &prof_recs,
+							uf2->sat_diag_block_writes, uf2->sat_diag_block_sat_frac, &uf2->sat_diag_num_blocks,
+							myMax<size_t>(1, (occl_px.size() + want_blocks - 1) / want_blocks));
+					}
 
 					// SESSION076 DIAGNOSTIC: carry the DFS-side breakdown across to where [gsr-sat-diag] prints it.
 					uf2->sat_diag_coarse_a = diag_coarse_a;
@@ -6088,6 +6283,7 @@ void GaussianSplatRenderer::drainTraversalResults()
 					conPrint("[gsr-sat] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms occl=" + uInt64ToStringCommaSeparated(uf.sat_num_occluders) +
 						" tiles=" + uInt64ToStringCommaSeparated(num_tiles) +
 						" sat_tiles=" + doubleToStringNDecimalPlaces(num_tiles > 0 ? (100.0 * (double)sat_tiles / (double)num_tiles) : 0.0, 1) + "%" +
+						" gather_ms=" + doubleToStringNDecimalPlaces(uf.sat_gather_ms, 2) + // SESSION079: building the occluder SoA - see the loop.
 						" grid_ms=" + doubleToStringNDecimalPlaces(uf.sat_grid_build_ms, 2) +
 						" test_ms=" + doubleToStringNDecimalPlaces(uf.sat_test_ms, 2) +
 						" tested=" + uInt64ToStringCommaSeparated(uf.sat_num_tested) +
@@ -6131,6 +6327,31 @@ void GaussianSplatRenderer::drainTraversalResults()
 							" (" + doubleToStringNDecimalPlaces(uf.sat_diag_aniso_n > 0 ? (100.0 * (double)uf.sat_diag_aniso_gt5 / (double)uf.sat_diag_aniso_n) : 0.0, 1) + "%)" +
 							" >10x=" + uInt64ToStringCommaSeparated(uf.sat_diag_aniso_gt10) +
 							" (" + doubleToStringNDecimalPlaces(uf.sat_diag_aniso_n > 0 ? (100.0 * (double)uf.sat_diag_aniso_gt10 / (double)uf.sat_diag_aniso_n) : 0.0, 1) + "%)");
+
+						// SESSION079 DIAGNOSTIC, THROWAWAY: what the gather loop's time is made of - see sat_gather_reserved_ms.
+						// realloc = what growing the five outputs from empty costs; scatter = what the indexed reads into the
+						// cloud's scales/rotations arrays cost. The second is the one that matters beyond this pipeline.
+						conPrint("[gsr-sat-gather] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms" +
+							" gather=" + doubleToStringNDecimalPlaces(uf.sat_gather_ms, 2) +
+							" reserved=" + doubleToStringNDecimalPlaces(uf.sat_gather_reserved_ms, 2) +
+							" noscatter=" + doubleToStringNDecimalPlaces(uf.sat_gather_noscatter_ms, 2) +
+							" | realloc=" + doubleToStringNDecimalPlaces(uf.sat_gather_ms - uf.sat_gather_reserved_ms, 2) +
+							" scatter=" + doubleToStringNDecimalPlaces(uf.sat_gather_reserved_ms - uf.sat_gather_noscatter_ms, 2));
+
+						// SESSION079 DIAGNOSTIC, THROWAWAY: the saturation-vs-depth curve. Each entry is one equal slice of
+						// the front-to-back occluder list; w= is cumulative tile_writes as a percentage of the final total,
+						// s= the saturated-tile fraction at that point. If w reaches ~100 in the first few slices, everything
+						// after them is input the grid cannot learn from.
+						if(uf.sat_diag_num_blocks > 0)
+						{
+							const double final_writes = (double)uf.sat_diag_block_writes[uf.sat_diag_num_blocks - 1];
+							std::string curve;
+							for(int b=0; b<uf.sat_diag_num_blocks; ++b)
+								curve += " " + toString(b) + ":w=" + doubleToStringNDecimalPlaces(final_writes > 0 ? (100.0 * (double)uf.sat_diag_block_writes[b] / final_writes) : 0.0, 1) +
+									"/s=" + doubleToStringNDecimalPlaces(100.0 * (double)uf.sat_diag_block_sat_frac[b], 1);
+							conPrint("[gsr-sat-depth] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms slices=" + toString(uf.sat_diag_num_blocks) +
+								" per_slice=" + uInt64ToStringCommaSeparated(uf.sat_num_occluders / (size_t)myMax(1, uf.sat_diag_num_blocks)) + curve);
+						}
 					}
 				}
 			}

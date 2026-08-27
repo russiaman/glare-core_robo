@@ -121,6 +121,12 @@ public:
 static const int gs_sat_ablate_repeats = 3;
 
 
+// SESSION079 DIAGNOSTIC, THROWAWAY: strip counts to sweep. 0 means "whatever the function derives", i.e. the real
+// setting. See the sweep's own comment for what the sweep answers.
+static const int gs_sat_strip_sweep[] = { 0, 2, 3, 4, 6, 8 };
+static const int gs_sat_strip_sweep_n = (int)(sizeof(gs_sat_strip_sweep) / sizeof(gs_sat_strip_sweep[0]));
+
+
 class GaussianSplatUnculledFrontier : public ThreadSafeRefCounted
 {
 public:
@@ -217,6 +223,9 @@ public:
 	double sat_diag_par_ms;       // SESSION079: the strip-parallel build - gsBuildSaturationGridParallel(). Correct, unlike the probe below.
 	size_t sat_diag_par_writes;   // SESSION079: that run's tile_writes, which must match the serial build's exactly.
 	int sat_diag_par_strips;      // SESSION079: how many strips the parallel build split into.
+	double sat_diag_par_floor_ms[2]; // SESSION079 DIAGNOSTIC, THROWAWAY: parallel run cut short - [0] after the early reject, [1] after the strip test. The floor the strip split cannot go below.
+	double sat_diag_sweep_ms[8];  // SESSION079 DIAGNOSTIC, THROWAWAY: the strip-count sweep - see gs_sat_strip_sweep.
+	int sat_diag_sweep_strips[8];
 	double sat_diag_sorted_ms;    // SESSION079 DIAGNOSTIC, THROWAWAY: the build loop over occluders reordered by tile - the locality probe. Result is wrong; only the timing counts.
 	size_t sat_diag_sorted_iters; // SESSION079 DIAGNOSTIC, THROWAWAY: that run's tile-loop iteration count, so the comparison can be made per iteration.
 
@@ -251,6 +260,8 @@ public:
 	{
 		for(int i=0; i<4; ++i) sat_diag_ablate_ms[i] = 0.0; // SESSION079 DIAGNOSTIC
 		for(int i=0; i<3; ++i) sat_diag_tile_stats[i] = 0;
+		for(int i=0; i<8; ++i) { sat_diag_sweep_ms[i] = 0.0; sat_diag_sweep_strips[i] = 0; } // SESSION079 DIAGNOSTIC
+		sat_diag_par_floor_ms[0] = sat_diag_par_floor_ms[1] = 0.0;
 	}
 };
 
@@ -497,6 +508,11 @@ public:
 	bool hit_budget_cap; // True if max_splats_budget stopped further expansion before pixel_scale converged - i.e. detail is being truncated by the budget, not just naturally coarse at this distance. Consumed by the diagnostics display from stage 6 onward.
 	bool hit_density_cap; // True if getMaxLayerDensity() stopped at least one node's expansion this traversal - see GaussianSplatLodNode::layer_density.
 	bool hit_depth_cap; // True if getMaxTreeDepth() stopped at least one node's expansion this traversal.
+
+	// SESSION079: scratch for the parallel saturation build's phase-1 records. Lives here, on the reused per-kick
+	// scratch, rather than inside the build: at ~2.98M occluders it is a 71MB buffer, and paying its allocation and
+	// first-touch page faults on every build would be a large fraction of the build's own 35ms.
+	js::Vector<GsSatOccluderRec, 16> sat_occluder_recs;
 };
 
 
@@ -1316,6 +1332,20 @@ public:
 					uf2->sat_num_occluders = occl_px.size();
 					uf2->sat_grid_res = gsSatGridResForFocal(focal_px, coarse_pixel_scale, sat_grid_subdiv); // SESSION076 CALIBRATION
 					Timer sat_grid_timer; // SESSION074 DIAGNOSTIC - see sat_grid_build_ms / [gsr-sat]'s grid_ms.
+
+					// SESSION079: the parallel build where it can be used - bit-identical to the serial one (strips own
+					// disjoint tiles and each tile still sees its occluders front-to-back), and measured 118 -> 35ms on the
+					// owner's reference viewpoint. The serial path remains for the two cases the parallel one does not
+					// serve: no task manager, and the debug overlays, which want the running accumulators the strips do
+					// not keep.
+					if(task_manager != NULL && !sat_overlay_requested)
+					{
+						gsBuildSaturationGridParallel(occl_px.data(), occl_py.data(), occl_pz.data(), occl_radius.data(), occl_alpha.data(), occl_px.size(),
+							cam_pos_ws, uf2->sat_grid_res, sat_saturation_threshold, sat_region_radius, uf2->sat_depth, *task_manager,
+							sat_diag_log ? &uf2->sat_diag_writers : NULL, sat_diag_log ? &uf2->sat_diag_tile_writes : NULL,
+							sat_diag_log ? uf2->sat_diag_tile_stats : NULL, NULL, 0, &scratch->sat_occluder_recs);
+					}
+					else
 					gsBuildSaturationGrid(occl_px.data(), occl_py.data(), occl_pz.data(), occl_radius.data(), occl_alpha.data(), occl_px.size(),
 						cam_pos_ws, uf2->sat_grid_res, sat_saturation_threshold, sat_region_radius, uf2->sat_depth, // SESSION078: sat_region_radius = 0 reproduces the point-anchored behaviour exactly.
 						sat_diag_log ? &uf2->sat_diag_writers : NULL, sat_diag_log ? &uf2->sat_diag_tile_writes : NULL, // SESSION076 DIAGNOSTIC - null (no counting) unless the sat diag checkbox is on.
@@ -1364,19 +1394,33 @@ public:
 					// since strips own disjoint tiles and preserve front-to-back order within each.
 					if(sat_diag_log && task_manager != NULL)
 					{
+						// SESSION079 DIAGNOSTIC, THROWAWAY: sweep the strip count. Every strip re-walks the whole occluder
+						// array, so more strips buy parallelism on the tile work while multiplying the memory traffic -
+						// 12 strips is 12 x 60MB per build. If the walk is what binds, fewer strips will be FASTER, and
+						// that is a direct test of the hypothesis rather than an argument about it.
 						js::Vector<float, 16> par_depth;
-						double best_ms = -1.0;
-						for(int rep=0; rep<gs_sat_ablate_repeats; ++rep)
+						js::Vector<GsSatOccluderRec, 16> par_recs; // Reused across the sweep so the allocation is not timed.
+						for(int si=0; si<gs_sat_strip_sweep_n; ++si)
 						{
-							size_t par_writes = 0;
-							Timer par_timer;
-							gsBuildSaturationGridParallel(occl_px.data(), occl_py.data(), occl_pz.data(), occl_radius.data(), occl_alpha.data(), occl_px.size(),
-								cam_pos_ws, uf2->sat_grid_res, sat_saturation_threshold, sat_region_radius, par_depth, *task_manager,
-								NULL, &par_writes, NULL, &uf2->sat_diag_par_strips);
-							const double ms = par_timer.elapsed() * 1.0e3;
-							if(best_ms < 0.0 || ms < best_ms) { best_ms = ms; uf2->sat_diag_par_writes = par_writes; }
+							double best_ms = -1.0;
+							size_t best_writes = 0;
+							int got_strips = 0;
+							for(int rep=0; rep<gs_sat_ablate_repeats; ++rep)
+							{
+								size_t par_writes = 0;
+								Timer par_timer;
+								gsBuildSaturationGridParallel(occl_px.data(), occl_py.data(), occl_pz.data(), occl_radius.data(), occl_alpha.data(), occl_px.size(),
+									cam_pos_ws, uf2->sat_grid_res, sat_saturation_threshold, sat_region_radius, par_depth, *task_manager,
+									NULL, &par_writes, NULL, &got_strips, gs_sat_strip_sweep[si], &par_recs);
+								const double ms = par_timer.elapsed() * 1.0e3;
+								if(best_ms < 0.0 || ms < best_ms) { best_ms = ms; best_writes = par_writes; }
+							}
+							uf2->sat_diag_sweep_ms[si] = best_ms;
+							uf2->sat_diag_sweep_strips[si] = got_strips;
+							uf2->sat_diag_par_writes = best_writes; // Must be identical for every strip count - that is the correctness check.
+							if(gs_sat_strip_sweep[si] == 0) { uf2->sat_diag_par_ms = best_ms; uf2->sat_diag_par_strips = got_strips; }
 						}
-						uf2->sat_diag_par_ms = best_ms;
+
 					}
 
 					// SESSION079 DIAGNOSTIC, THROWAWAY: locality probe. The tile loop measured ~29 cycles per iteration for
@@ -6154,6 +6198,16 @@ void GaussianSplatRenderer::drainTraversalResults()
 							" | sorted=" + doubleToStringNDecimalPlaces(uf.sat_diag_sorted_ms, 2) +
 							" sorted_iters=" + uInt64ToStringCommaSeparated(uf.sat_diag_sorted_iters) +
 							" sorted_ns_per_iter=" + doubleToStringNDecimalPlaces(uf.sat_diag_sorted_iters > 0 ? (uf.sat_diag_sorted_ms * 1.0e6 / (double)uf.sat_diag_sorted_iters) : 0.0, 2));
+
+						// SESSION079 DIAGNOSTIC, THROWAWAY: the strip-count sweep, own line to keep [gsr-sat-cost] readable.
+						{
+							std::string sweep_str;
+							for(int si=0; si<gs_sat_strip_sweep_n; ++si)
+								sweep_str += " n" + toString(uf.sat_diag_sweep_strips[si]) + "=" + doubleToStringNDecimalPlaces(uf.sat_diag_sweep_ms[si], 2);
+							conPrint("[gsr-sat-strips] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms" + sweep_str +
+								" | par_writes=" + uInt64ToStringCommaSeparated(uf.sat_diag_par_writes) +
+								" (serial tile_writes=" + uInt64ToStringCommaSeparated(uf.sat_diag_tile_writes) + ")");
+						}
 
 						// SESSION077 DIAGNOSTIC: separate line again, same reasoning as the split above - see
 						// GaussianSplatUnculledFrontier::sat_diag_aniso_n. aniso=max(scale.xyz)/min(scale.xyz) per occluder,

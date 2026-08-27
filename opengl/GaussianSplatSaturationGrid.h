@@ -14,6 +14,18 @@ Copyright Glare Technologies Limited 2026 -
 namespace glare { class TaskManager; } // SESSION079: gsBuildSaturationGridParallel().
 
 
+// SESSION079: one occluder's finished geometry, the hand-off between the parallel build's two phases. Defined here only
+// so callers can own the scratch array; nothing outside the build needs to look inside it.
+struct GsSatOccluderRec
+{
+	float cu, cv;   // Footprint centre, in tile units.
+	float span;     // Footprint radius in tiles, including the tile half-diagonal.
+	float amp;      // Peak per-tile contribution.
+	float far_edge; // Barrier distance to record if this occluder saturates a tile.
+	float inv_2var; // 0.5/var, the Gaussian falloff's coefficient.
+};
+
+
 /*=====================================================================
 GaussianSplatSaturationGrid
 -----------------------------
@@ -297,7 +309,9 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius,
 	js::Vector<float, 16>& sat_depth_out, glare::TaskManager& task_manager,
 	size_t* out_writers = NULL, size_t* out_tile_writes = NULL, size_t* out_tile_stats = NULL,
-	int* out_num_strips = NULL); // SESSION079 DIAGNOSTIC: how many strips it actually split into.
+	int* out_num_strips = NULL, // SESSION079 DIAGNOSTIC: how many strips it actually split into.
+	int force_num_strips = 0, // SESSION079 DIAGNOSTIC, THROWAWAY: override the strip count, to sweep it. 0 = the derived count.
+	js::Vector<GsSatOccluderRec, 16>* scratch_recs = NULL); // Optional caller-owned scratch for the phase-1 records, to keep the allocation out of the per-build cost.
 
 
 // SESSION074: pass 2's per-node read - true if this fine node is unambiguously behind saturated coarse geometry, so

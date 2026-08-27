@@ -204,6 +204,7 @@ public:
 	size_t sat_diag_coarse_b;     // Captured only because the branch was terminal, while still coarser than the threshold.
 	size_t sat_diag_writers;      // Grid contributors: nodes whose contribution cleared the negligible-amplitude cutoff.
 	size_t sat_diag_tile_writes;  // Total per-tile writes - the build pass's write amplification.
+	size_t sat_diag_tile_iters;   // SESSION079: per-tile loop iterations in the build pass, vs sat_diag_tile_writes which counts only those reaching the accumulator.
 
 	// SESSION077 DIAGNOSTIC: anisotropy of the occluder set that fed the grid - max(scale.xyz)/min(scale.xyz) per node,
 	// over the SAME nodes occl_radius/occl_alpha were built from. Answers whether the isotropic-disc occluder model
@@ -231,7 +232,7 @@ public:
 	GaussianSplatUnculledFrontier() // SESSION074: defaults are "stage never ran" - only kickOffTraversals() passing the stage-enabled flag sets sat_grid_res non-zero.
 	:	sat_grid_res(0), sat_num_occluders(0), sat_num_tested(0), sat_num_dropped(0), sat_num_dropped_aggr(0),
 		sat_grid_build_ms(0.0), sat_test_ms(0.0),
-		sat_diag_coarse_a(0), sat_diag_coarse_b(0), sat_diag_writers(0), sat_diag_tile_writes(0), // SESSION076
+		sat_diag_coarse_a(0), sat_diag_coarse_b(0), sat_diag_writers(0), sat_diag_tile_writes(0), sat_diag_tile_iters(0), // SESSION076, SESSION079
 		sat_diag_aniso_n(0), sat_diag_aniso_mean(0.0), sat_diag_aniso_max(0.f), sat_diag_aniso_gt5(0), sat_diag_aniso_gt10(0) {} // SESSION077
 };
 
@@ -1298,7 +1299,8 @@ public:
 					gsBuildSaturationGrid(occl_px.data(), occl_py.data(), occl_pz.data(), occl_radius.data(), occl_alpha.data(), occl_px.size(),
 						cam_pos_ws, uf2->sat_grid_res, sat_saturation_threshold, sat_region_radius, uf2->sat_depth, // SESSION078: sat_region_radius = 0 reproduces the point-anchored behaviour exactly.
 						sat_diag_log ? &uf2->sat_diag_writers : NULL, sat_diag_log ? &uf2->sat_diag_tile_writes : NULL, // SESSION076 DIAGNOSTIC - null (no counting) unless the sat diag checkbox is on.
-					sat_overlay_requested ? &uf2->sat_accum_t : NULL, sat_overlay_requested ? &uf2->sat_amp_sum : NULL); // SESSION077/078 - the two overlay fields, gated on the overlay request, not the sat diag checkbox.
+					sat_overlay_requested ? &uf2->sat_accum_t : NULL, sat_overlay_requested ? &uf2->sat_amp_sum : NULL, // SESSION077/078 - the two overlay fields, gated on the overlay request, not the sat diag checkbox.
+						sat_diag_log ? &uf2->sat_diag_tile_iters : NULL); // SESSION079 DIAGNOSTIC
 					uf2->sat_grid_build_ms = sat_grid_timer.elapsed() * 1.0e3;
 
 					// SESSION076 DIAGNOSTIC: carry the DFS-side breakdown across to where [gsr-sat-diag] prints it.
@@ -5942,7 +5944,9 @@ void GaussianSplatRenderer::drainTraversalResults()
 							" (" + doubleToStringNDecimalPlaces(occl > 0 ? (100.0 * (double)uf.sat_diag_writers / occl) : 0.0, 1) + "%)" +
 								" tile_writes=" + uInt64ToStringCommaSeparated(uf.sat_diag_tile_writes) +
 							" per_writer=" + doubleToStringNDecimalPlaces(uf.sat_diag_writers > 0 ? ((double)uf.sat_diag_tile_writes / (double)uf.sat_diag_writers) : 0.0, 1) +
-							" fine=" + uInt64ToStringCommaSeparated(uf.sat_num_tested));
+							" fine=" + uInt64ToStringCommaSeparated(uf.sat_num_tested) +
+							" tile_iters=" + uInt64ToStringCommaSeparated(uf.sat_diag_tile_iters) + // SESSION079: iterations vs writes - how much of the tile loop falls out on the Gaussian tail or an already-saturated tile.
+							" per_writer_iters=" + doubleToStringNDecimalPlaces(uf.sat_diag_writers > 0 ? ((double)uf.sat_diag_tile_iters / (double)uf.sat_diag_writers) : 0.0, 1));
 
 						// SESSION077 DIAGNOSTIC: separate line again, same reasoning as the split above - see
 						// GaussianSplatUnculledFrontier::sat_diag_aniso_n. aniso=max(scale.xyz)/min(scale.xyz) per occluder,

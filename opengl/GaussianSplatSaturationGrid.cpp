@@ -230,7 +230,7 @@ static inline float gsSatExpNeg(float x) // x >= 0; caller has already rejected 
 void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, const float* radius, const float* alpha, size_t n,
 	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius,
 	js::Vector<float, 16>& sat_depth_out, size_t* out_writers, size_t* out_tile_writes,
-	js::Vector<float, 16>* out_accum_t, js::Vector<float, 16>* out_amp_sum)
+	js::Vector<float, 16>* out_accum_t, js::Vector<float, 16>* out_amp_sum, size_t* out_tile_iters)
 {
 	const size_t num_tiles = (size_t)res * (size_t)res;
 	sat_depth_out.resizeNoCopy(num_tiles);
@@ -424,6 +424,8 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 			const float dv_sq = dv * dv;
 			for(int u=u0; u<=u1; ++u)
 			{
+				if(out_tile_iters) ++(*out_tile_iters); // SESSION079 DIAGNOSTIC - see the parameter.
+
 				const float du = ((float)u + 0.5f) - cu;
 				const float x = (du * du + dv_sq) * inv_2var;
 				if(x >= gs_sat_exp_lut_max)

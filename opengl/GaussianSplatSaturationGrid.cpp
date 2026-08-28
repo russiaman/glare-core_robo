@@ -587,10 +587,172 @@ static void gsSatBuildStrip(const float* px, const float* py, const float* pz, c
 }
 
 
+// SESSION080 - REGION EROSION. One max-filter over the finished grid, radius set per tile by R/sat_depth. This is the
+// angular half of the ball guarantee, and it belongs HERE - on the finished aggregate mask - for the reason the build's
+// footprint comment spells out: eroding individual occluder atoms destroys a dense surface's interior (session078's
+// failure), while eroding the aggregate only eats into it from its silhouettes, which is exactly what parallax does.
+//
+// Why a max-filter is the whole operation. Unsaturated tiles are +inf, so a single max over the window does both halves
+// at once:
+//   - mask erosion: any +inf in the window makes the result +inf, i.e. a tile within reach of open sky stops being
+//     trusted. This is the silhouette band, and its width is the parallax swing.
+//   - depth worst case: among tiles that all agree, the barrier taken is the furthest any of them claims.
+//
+// The consequence worth stating plainly, because it is what makes a large R useful rather than useless: an ENCLOSING
+// occluder (the inside of a room, a cave, an interior inside a much larger outdoor scene) has no +inf anywhere in the
+// directions it covers, so no amount of erosion removes anything, and everything outside the shell stays prunable at
+// any R. The cost falls entirely on silhouettes - a doorway, a window, the edge of a wall you can step around - which
+// is precisely where a moving camera does reveal new geometry and where pruning therefore must stop.
+//
+// Boundary handling matches gsSatOccluded()'s: the window is clamped to the grid rather than wrapped across the
+// octahedral seam. Consistent with the read side, and the under-coverage is confined to the map's edge rows.
+
+
+// SESSION080 DIAGNOSTIC: the erosion's two kill mechanisms, kept apart because they say opposite things about what to
+// do next. by_ceiling means R is simply too large next to that direction's occluder (an honest refusal - the ball
+// reaches past the occluding mass); by_window means the tile lost to a nearby unsaturated tile, which is the intended
+// silhouette behaviour but is ALSO how a noisy, pinholed mask destroys itself once max_radius reaches 1. Which of the
+// two dominates decides whether the answer is a different R or a different erosion rule.
+struct GsSatErodeStats
+{
+	GsSatErodeStats() : by_ceiling(0), by_window(0), max_radius(0) {}
+	size_t by_ceiling, by_window, max_radius;
+};
+static void gsSatErodeRegionRows(const float* const src, float* const dst, int res,
+	float region_radius, int v_begin, int v_end, GsSatErodeStats* out_stats)
+{
+	const float inf = std::numeric_limits<float>::infinity();
+	GsSatErodeStats st;
+	for(int v=v_begin; v<v_end; ++v)
+		for(int u=0; u<res; ++u)
+		{
+			const size_t idx = (size_t)v * (size_t)res + (size_t)u;
+			const float here = src[idx];
+			if(here == inf)
+			{
+				dst[idx] = inf; // Already unusable; nothing a max could do to it.
+				continue;
+			}
+
+			const float rad_f = gsSatRegionErosionTiles(region_radius, here, res); // `here` IS the barrier - see gsSatRegionErosionTiles().
+			if(rad_f > (float)gs_sat_region_max_erosion_tiles)
+			{
+				dst[idx] = inf; // Past the ceiling: R is not small next to this occluder - see the constant.
+				++st.by_ceiling;
+				continue;
+			}
+
+			const int rad = (int)rad_f;
+			if((size_t)rad > st.max_radius) st.max_radius = (size_t)rad; // SESSION080 DIAGNOSTIC: over tiles that were saturated, so it reports the radius actually in use, not one derived from an empty direction.
+			if(rad <= 0)
+			{
+				dst[idx] = here; // Swing is under a tile - the grid cannot express anything finer.
+				continue;
+			}
+
+			const int u0 = myMax(u - rad, 0), u1 = myMin(u + rad, res - 1);
+			const int v0 = myMax(v - rad, 0), v1 = myMin(v + rad, res - 1);
+			float worst = here;
+			for(int vv=v0; vv<=v1 && worst != inf; ++vv)
+			{
+				const float* const row = src + (size_t)vv * (size_t)res;
+				for(int uu=u0; uu<=u1; ++uu)
+					if(row[uu] > worst)
+					{
+						worst = row[uu];
+						if(worst == inf)
+							break; // Cannot get worse - the rest of the window is irrelevant.
+					}
+			}
+			dst[idx] = worst;
+			if(worst == inf)
+				++st.by_window;
+		}
+
+	if(out_stats)
+		*out_stats = st;
+}
+
+
+// SESSION080: the erosion split over the task manager by rows. Read-only source, disjoint destination rows - nothing to
+// synchronise, same shape as the build's strips.
+class GsSatErodeTask : public glare::Task
+{
+public:
+	virtual void run(size_t /*thread_index*/)
+	{
+		gsSatErodeRegionRows(src, dst, res, region_radius, v_begin, v_end, &stats);
+	}
+
+	const float* src;
+	float* dst;
+	int res, v_begin, v_end;
+	float region_radius;
+	GsSatErodeStats stats;
+};
+
+
+// SESSION080: shared tail of both builds - allocate the destination, run the erosion (parallel where a pool was handed
+// in), swap it into place. No-op when region_radius is 0, which keeps the R = 0 path bit-identical to before.
+static void gsSatApplyRegionErosion(js::Vector<float, 16>& sat_depth, int res,
+	float region_radius, glare::TaskManager* task_manager, size_t* out_erode_stats)
+{
+	if(out_erode_stats)
+		out_erode_stats[0] = out_erode_stats[1] = out_erode_stats[2] = 0;
+	if(!(region_radius > 0.f) || res == 0)
+		return;
+
+	js::Vector<float, 16> eroded(sat_depth.size());
+
+	const int concurrency = task_manager ? myMax(1, (int)task_manager->getConcurrency()) : 1;
+	const int num_strips = myClamp(res / gs_sat_min_strip_rows, 1, concurrency);
+	GsSatErodeStats total;
+	if(num_strips <= 1)
+	{
+		gsSatErodeRegionRows(sat_depth.data(), eroded.data(), res, region_radius, 0, res, &total);
+	}
+	else
+	{
+		glare::TaskGroupRef group = new glare::TaskGroup();
+		js::Vector<Reference<GsSatErodeTask>, 16> tasks(num_strips);
+		for(int t=0; t<num_strips; ++t)
+		{
+			Reference<GsSatErodeTask> task = new GsSatErodeTask();
+			task->src = sat_depth.data();
+			task->dst = eroded.data();
+			task->res = res;
+			task->region_radius = region_radius;
+			task->v_begin = (int)(((int64)res * t)       / num_strips);
+			task->v_end   = (int)(((int64)res * (t + 1)) / num_strips);
+			tasks[t] = task;
+			group->tasks.push_back(task);
+		}
+		task_manager->runTaskGroup(group);
+
+		for(int t=0; t<num_strips; ++t)
+		{
+			total.by_ceiling += tasks[t]->stats.by_ceiling;
+			total.by_window  += tasks[t]->stats.by_window;
+			total.max_radius = myMax(total.max_radius, tasks[t]->stats.max_radius);
+		}
+	}
+
+	if(out_erode_stats)
+	{
+		out_erode_stats[0] = total.by_ceiling;
+		out_erode_stats[1] = total.by_window;
+		out_erode_stats[2] = total.max_radius;
+	}
+
+	sat_depth = eroded;
+}
+
+
 void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, const float* radius, const float* alpha, size_t n,
 	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius,
 	js::Vector<float, 16>& sat_depth_out, size_t* out_writers, size_t* out_tile_writes,
-	js::Vector<float, 16>* out_accum_t, js::Vector<float, 16>* out_amp_sum, size_t* out_tile_stats)
+	js::Vector<float, 16>* out_accum_t, js::Vector<float, 16>* out_amp_sum, size_t* out_tile_stats,
+	size_t* out_erode_stats)
 {
 	const size_t num_tiles = (size_t)res * (size_t)res;
 	sat_depth_out.resizeNoCopy(num_tiles);
@@ -616,6 +778,10 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 	if(out_writers)     *out_writers     = stats.writers;
 	if(out_tile_writes) *out_tile_writes = stats.tile_writes;
 	if(out_tile_stats) { out_tile_stats[0] = stats.tile_iters; out_tile_stats[1] = stats.tail_rej; out_tile_stats[2] = stats.sat_skip; }
+
+	// SESSION080: the erosion runs LAST, on the finished mask - see gsSatApplyRegionErosion(). Serial entry point, so no
+	// pool: this path is the overlay/no-TaskManager one, where a few ms more is not what anyone is measuring.
+	gsSatApplyRegionErosion(sat_depth_out, res, region_radius, NULL, out_erode_stats);
 
 	// SESSION077 DIAGNOSTIC: hand the accumulator fields out for the debug overlay - see the header.
 	if(out_accum_t)
@@ -723,7 +889,7 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius,
 	js::Vector<float, 16>& sat_depth_out, glare::TaskManager& task_manager,
 	size_t* out_writers, size_t* out_tile_writes, size_t* out_tile_stats,
-	js::Vector<GsSatOccluderRec, 16>* scratch_recs)
+	js::Vector<GsSatOccluderRec, 16>* scratch_recs, size_t* out_erode_stats)
 {
 	const size_t num_tiles = (size_t)res * (size_t)res;
 	sat_depth_out.resizeNoCopy(num_tiles);
@@ -836,6 +1002,10 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 	if(out_writers)     *out_writers     = total.writers;
 	if(out_tile_writes) *out_tile_writes = total.tile_writes;
 	if(out_tile_stats) { out_tile_stats[0] = total.tile_iters; out_tile_stats[1] = total.tail_rej; out_tile_stats[2] = total.sat_skip; }
+
+	// SESSION080: after every block has deposited, never per block - the mask has to be complete before it is eroded,
+	// or a silhouette would be measured against a half-built neighbourhood.
+	gsSatApplyRegionErosion(sat_depth_out, res, region_radius, &task_manager, out_erode_stats);
 }
 
 

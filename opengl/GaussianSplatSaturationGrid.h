@@ -131,6 +131,57 @@ static const int gsSatGridMinRes = 8;
 static const float gs_sat_occluder_sigmas = 3.f;
 
 
+// SESSION080 - REGION EROSION, the angular half of the ball guarantee that session078 left out. See the long note above
+// gsBuildSaturationGrid() for why the read side's R/d_node cannot supply it.
+//
+// Ceiling on how far the erosion will reach, in tiles. Two jobs, and they happen to want the same number:
+//
+//  - Cost. The pass is a max-filter with a per-tile radius, so its work is quadratic in this: at 40 the window is 81x81
+//    over a 101x101 grid, ~67M tile reads, which parallelises to a few ms. Much past that and the pass stops being
+//    free next to the ~40ms build it follows.
+//  - Honesty. R/sat_depth exceeding this means the ball reaches a substantial fraction of the way around the occluding
+//    mass - i.e. R is no longer small next to the occluder's own distance, and the whole "the barrier still holds
+//    anywhere in the ball" premise has failed for that direction. Rather than silently under-eroding (which would
+//    quietly hand back an unsound barrier, the exact bug session078 shipped), such a tile is marked unusable outright.
+//
+// A tile that needs more erosion than this is therefore set to +inf: nothing behind it may be pruned. That is what
+// makes "stand 0.5m from a wall with R=2" come out as "no pruning behind that wall" rather than as a hole - the
+// geometrically correct answer, since a 2m ball around that viewpoint genuinely reaches past the wall.
+static const int gs_sat_region_max_erosion_tiles = 40;
+
+
+// SESSION080: the erosion radius for one tile, in tiles.
+//
+// The distance it is measured against is the tile's OWN BARRIER, sat_depth. That choice is the whole correctness of
+// this pass, and the first cut got it wrong in an instructive way, so the reasoning is recorded here.
+//
+// What the radius has to represent is the angular swing, over the ball, of the mass that actually HOLDS this tile's
+// barrier. The first cut instead tracked the nearest of every occluder that deposited anything into the tile before it
+// saturated. That is far too pessimistic, because an occluder's angular footprint is r/dist: a splat 0.4m from the
+// camera smears a large fraction of the whole grid, contributing a percent of opacity to thousands of tiles it has
+// nothing to do with. Measured (owner, third-person camera backing into near geometry): one such near population
+// dragged the radius from 1 tile to 12 across the grid, which then bloomed every pinhole in a 13%-saturated mask and
+// collapsed dropped% from 42.3% to 4.2% in a single wheel click - pruning visibly switching off.
+//
+// sat_depth is the right distance and needs no extra tracking at all. Occluders are accumulated strictly front-to-back,
+// so the one that crosses the threshold is the FURTHEST of the set that mattered, and everything nearer was by
+// construction insufficient on its own. Its far edge is the barrier. Using the barrier therefore says "how far away is
+// the mass this tile's claim rests on", which is exactly the quantity whose parallax matters - and it is
+// self-consistent: the barrier and its own reliability radius come from the same occluder.
+//
+// Converting radians to tiles needs a tile angle, and the octahedral map's varies over the sphere (see
+// gsSatGridInvLocalTileAngle()). The SMALLEST it gets is 2/res, which yields the LARGEST tile count for a given angle -
+// so this over-covers in every direction, the safe side. Same s=1 bound the build's early amp reject and its strip test
+// already rest on, kept identical on purpose.
+static inline float gsSatRegionErosionTiles(float region_radius, float barrier_dist, int res)
+{
+	if(!(barrier_dist > 0.f)) // +inf (this direction never saturated) or a degenerate zero - nothing to erode either way.
+		return 0.f;
+	const float ang = region_radius / barrier_dist; // Radians, small-angle; the exact asin is larger, but only where this is already past the ceiling above.
+	return ang * ((float)res * 0.5f);
+}
+
+
 // Octahedral direction -> unit-square coordinate, in [-1, 1]^2.
 //
 // SESSION074: 'dir' does NOT have to be unit length. The mapping divides by the vector's own L1 norm, so it is
@@ -286,11 +337,28 @@ float gsSatGridTileAngle(int res);
 // The cost is concentrated near the camera and negligible far away, which is the useful shape: R/d is the angular
 // penalty, so at the owner's settings (tile ~= 4.8 deg) an R of 0.6m costs 0.35 tiles at 20m but 2.4 tiles at 3m - and
 // what this stage drops is distant geometry, while what does the occluding is near.
+//
+// SESSION080 CORRECTION - the "EVERY ball point" claim above is narrower than it reads. Both dilations above (build's
+// depth-only +R, read's node-side R/d) move the CANDIDATE node's own barrier and footprint over the ball; neither one
+// moves the OCCLUDER's apparent direction. The build side says so explicitly (line ~459: occluder angular radius is
+// deliberately NOT eroded by R) - but that also means it is never DILATED by R either, so an occluder's shadow is only
+// ever the one cast from anchor_pos_ws, not from every ball point. Moving the camera by delta swings an occluder's
+// apparent direction by ~delta/d_occluder, same as it swings the candidate's by ~delta/d_node (what R/d approximates) -
+// but only the candidate side of that parallax is covered. When the occluder is much nearer than the candidate
+// (textbook case: standing beside a wall, something far behind it) delta/d_occluder >> R/d_node for any R small enough
+// not to also erode real occluders, and the ball guarantee fails: a node can be correctly built as occluded from
+// anchor_pos_ws, still be inside the R-ball's read-side test, and yet be plainly visible from the true camera position.
+// Reproduced session080: wall ~0.5m away, room behind it ~10m, R=2.0m, anchor_dist=0.4m (deep inside the ball) - hole
+// still visible, because delta/d_wall (~46 deg) dwarfs R/d_room (~11 deg). Practically: R only buys real slack in the
+// regime this file's calibration note (session078, R=0.01-0.03) already lives in, where R is small next to every
+// occluder's own distance - it is not a general fix for camera motion, and does not by itself bound how stale a prune
+// can be. See the session080 snapshot for the reproduction log ([gsr-sat-apply]/[gsr-sat] thr=/sub=/R=).
 void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, const float* radius, const float* alpha, size_t n,
 	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius,
 	js::Vector<float, 16>& sat_depth_out, size_t* out_writers = NULL, size_t* out_tile_writes = NULL,
 	js::Vector<float, 16>* out_accum_t = NULL, js::Vector<float, 16>* out_amp_sum = NULL,
-	size_t* out_tile_stats = NULL); // SESSION079 DIAGNOSTIC: 3-element array - [0] total per-tile loop iterations, [1] of those, rejected off the Gaussian's tail, [2] skipped because the tile's barrier was already set. Against out_tile_writes, which counts only the iterations that reached the accumulator.
+	size_t* out_tile_stats = NULL, // SESSION079 DIAGNOSTIC: 3-element array - [0] total per-tile loop iterations, [1] of those, rejected off the Gaussian's tail, [2] skipped because the tile's barrier was already set. Against out_tile_writes, which counts only the iterations that reached the accumulator.
+	size_t* out_erode_stats = NULL); // SESSION080 DIAGNOSTIC: 3-element array - [0] tiles the region erosion killed by the R/sat_depth ceiling, [1] tiles it killed by finding an unsaturated tile in the window, [2] the largest erosion radius, in tiles, actually used on a saturated tile. All zero when region_radius is 0 (the pass does not run at all). See [gsr-sat]'s er_ceil=/er_win=/er_radmax=.
 
 
 // SESSION079: the same build, split across the task manager by horizontal strips of grid rows. Bit-identical to
@@ -308,7 +376,8 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius,
 	js::Vector<float, 16>& sat_depth_out, glare::TaskManager& task_manager,
 	size_t* out_writers = NULL, size_t* out_tile_writes = NULL, size_t* out_tile_stats = NULL,
-	js::Vector<GsSatOccluderRec, 16>* scratch_recs = NULL); // Optional caller-owned scratch for the phase-1 records, to keep the allocation out of the per-build cost.
+	js::Vector<GsSatOccluderRec, 16>* scratch_recs = NULL, // Optional caller-owned scratch for the phase-1 records, to keep the allocation out of the per-build cost.
+	size_t* out_erode_stats = NULL); // SESSION080 DIAGNOSTIC - see the serial entry point's.
 
 
 // SESSION074: pass 2's per-node read - true if this fine node is unambiguously behind saturated coarse geometry, so

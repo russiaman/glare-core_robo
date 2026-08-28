@@ -273,10 +273,33 @@ public:
 	// OpenGLEngine::draw(), after the frame's camera transform has been set.
 	void think();
 
+private:
+	void updateAdaptivePixelScale(); // SESSION079 - see getAdaptivePixelScale(). Called at the top of think().
+public:
+
 	// Live-tunable LoD traversal parameters (GaussianSplatSettingsWidget, Qt only) - take effect on a cloud's next
 	// traversal kick-off, no reload needed.  See kickOffTraversals()/GaussianSplatLodTraversalTask for how each is used.
 	float getPixelScaleLimit() const { return lod_pixel_scale_limit; }
 	void setPixelScaleLimit(float v) { lod_pixel_scale_limit = v; }
+
+	// SESSION079: hand pixel_scale_limit to a controller that holds a frame-time target instead of a fixed value - the
+	// "adaptive" box next to the spin box. What the right limit is depends on the view, not on the scene: the owner
+	// measured 2 vs 4 as barely distinguishable flying over the forest and clearly different in the interior, because
+	// what the limit costs is set by how much detail is NEAR the camera. A single number cannot be right for both, and
+	// picking one per viewpoint by hand is exactly what this project does not do.
+	//
+	// While enabled, setPixelScaleLimit() is overwritten every frame and the spin box is disabled - see
+	// updateAdaptivePixelScale() for the controller and its limitations (chiefly: with vsync on, frame time cannot
+	// report headroom, only its absence).
+	bool getAdaptivePixelScale() const { return adaptive_pixel_scale_enabled; }
+	void setAdaptivePixelScale(bool v) { adaptive_pixel_scale_enabled = v; }
+	float getAdaptivePixelScaleValue() const { return adaptive_pixel_scale; } // What the controller currently holds - for the UI's readout.
+	float getAdaptiveFrameMs() const { return (float)adaptive_frame_ms_ema; } // Smoothed frame time the controller is acting on - for the UI's readout.
+
+	// Frame time the controller aims to hold. Not a promise: it can only trade detail for speed within its clamp range,
+	// and where even the coarsest limit is not enough it simply sits at the clamp.
+	float getAdaptiveTargetFPS() const { return adaptive_target_fps; }
+	void setAdaptiveTargetFPS(float v) { adaptive_target_fps = v; }
 
 	// Note what this budget is counting: selected nodes, wherever they are, including the ones behind the camera - the
 	// traversal has no frustum test, on purpose, for reasons set out at GaussianSplatLodTraversalTask.  At the default
@@ -1492,6 +1515,19 @@ private:
 	// resort_move_threshold_ws is kickOffTraversals()'s own move-threshold floor, separate from the plain sort's
 	// min_resort_move_threshold_ws constant (non-LoD clouds aren't affected by this setting).
 	float lod_pixel_scale_limit;
+
+	// SESSION079: the adaptive controller's state - see updateAdaptivePixelScale() and getAdaptivePixelScale().
+	bool adaptive_pixel_scale_enabled;
+	float adaptive_pixel_scale;        // The value it currently holds; written into lod_pixel_scale_limit each frame while enabled.
+	float adaptive_target_fps;
+	double adaptive_frame_ms_ema;      // Mean frame period over the last evaluation window - what the readout shows and what the step acts on.
+	double adaptive_frame_ms_sum;      // Accumulating this window. Every frame contributes; the decision is taken once per gs_adaptive_eval_interval_s.
+	size_t adaptive_frame_samples;
+	double adaptive_last_frame_time_s; // Timestamp of the previous think(), for the frame period.
+	double adaptive_last_eval_time_s;  // When the controller last took a decision.
+	double adaptive_last_force_time_s; // When it last forced a traversal, so a static camera cannot make it force continuously.
+	Timer adaptive_timer;              // Own clock, started at construction.
+
 	size_t lod_max_splats_budget;
 	float lod_resort_move_threshold_ws;
 

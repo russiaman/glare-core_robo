@@ -501,6 +501,27 @@ namespace
 
 
 const size_t texels_per_splat = 4; // See the texel layout in gaussian_splat_vert_shader.glsl.
+
+
+// SESSION079: the adaptive pixel_scale_limit controller's fixed limits - see updateAdaptivePixelScale().
+//
+// The range is deliberately narrow at the bottom and generous at the top. Below ~1 the selected splat count climbs
+// steeply for detail the display cannot resolve, so there is nothing down there worth the frames; the owner measured
+// 2 against 4 as barely distinguishable over open ground and merely noticeable in a detailed interior, which says the
+// useful working range sits above 1 and that giving up several of these costs less than it sounds.
+const float gs_adaptive_pixel_scale_min = 1.0f;
+const float gs_adaptive_pixel_scale_max = 10.0f;
+
+// How often the controller takes a decision. Every frame contributes a timing sample, but acting on each one would
+// steer by noise, and each change that lands can cost a re-traversal - so decisions are slow and the samples in
+// between are averaged.
+const double gs_adaptive_eval_interval_s = 1.0;
+
+// The bottom of the band, as a fraction of the target rate. The owner's zones: 50fps is the aim and 40 is where this
+// mechanism should start working, so 0.8. Between the two the controller deliberately does nothing - that band is the
+// answer to vsync being unable to report headroom, and it has to be genuinely wide or the controller either freezes
+// inside it or ratchets one way out of it.
+const float gs_adaptive_floor_fraction = 0.8f;
 const size_t splat_tex_width = 4096; // Gives ~16.7M splat capacity where GL_MAX_TEXTURE_SIZE >= 16384, which is common.
 const int splat_index_attribute_loc = 1; // Forced in buildShadersIfNeeded().  Slot 1 is otherwise "normal_in", which splats have no use for.
 
@@ -1736,7 +1757,23 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 :	opengl_engine(&opengl_engine_), next_handle(1), next_cloud_id(1), num_sorts_in_flight(0),
 	num_traversals_in_flight(0), num_filters_in_flight(0), lod_pixel_scale_limit(1.0f), lod_max_splats_budget(10000000), lod_resort_move_threshold_ws(0.1f),
 	lod_max_layer_density(0.0f), lod_max_tree_depth(0), lod_frustum_cull_enabled(true), split_filter_enabled(false),
-	filter_dilation_latency(0.17f), filter_min_rot_rate_deg_per_s(45.f), filter_max_rot_rate_deg_per_s(40.f), filter_min_trans_rate_m_per_s(2.0f), // SESSION063 K3 (K4 defaults: coarse floor covers the edge, so the fine dilation can be tight/cheap); SESSION071 max: 40deg/s default, owner-confirmed no visible holes at the canonical test scene; SESSION072: 0.06->0.17 - measured kick-to-drain round trip is 136-166ms during a fast flick (owner's [gsr-filter-kick]/[gsr-filter-drain] log), not the ~13ms the filter task itself takes - the gap is real frame time (millions of survivors to issue/draw), not queueing, and existed under the old isotropic dilation too, just masked by its uniform over-padding on every plane.
+	adaptive_pixel_scale_enabled(false), adaptive_pixel_scale(2.0f), adaptive_target_fps(50.f), // SESSION079 - see updateAdaptivePixelScale(). Off by default: it overrides a value the user may have set by hand.
+	adaptive_frame_ms_ema(0.0), adaptive_frame_ms_sum(0.0), adaptive_frame_samples(0),
+	adaptive_last_frame_time_s(-1.0), adaptive_last_eval_time_s(0.0), adaptive_last_force_time_s(-1.0),
+	// SESSION079: latency 0.17 -> 0.2, max rot rate 40 -> 200 deg/s, min 45 -> 50, all confirmed on the owner's
+	// bridge-and-forest scene, which is the first one heavy enough to stress them.
+	//
+	// The max rate mattered most and was the most wrong. At 40 deg/s the band is pinned to 8 deg while the camera turns
+	// at 350; over the forest the filter's kick-to-drain round trip is 85ms against the interior's 34 (7.2M survivors
+	// against 2.9M - open sky occludes nothing, so the saturation prefilter drops 16.8% there against 76.8% indoors), so
+	// the applied list went 31 deg stale against a 16 deg band and tore a visible hole along the frustum edge. The old
+	// default was confirmed on the interior, where the same knob never binds - a value fitted to the one scene that
+	// could not disprove it.
+	//
+	// The latency change follows the same measurement: a list is on screen from its own kick until the NEXT drain, so
+	// the envelope to cover is roughly twice the round trip, ~170ms over the forest. See [gsr-filter-drain]'s deficit=,
+	// which is exactly stale minus band and goes positive precisely when a hole is visible.
+	filter_dilation_latency(0.2f), filter_min_rot_rate_deg_per_s(50.f), filter_max_rot_rate_deg_per_s(200.f), filter_min_trans_rate_m_per_s(2.0f), // SESSION063 K3, SESSION072, SESSION079 - see above.
 	split_coarse_floor_enabled(true), split_coarse_pixel_scale(30.f), filter_coarse_dilation_latency(0.9f), coarse_layer_debug(false), // SESSION063 K4
 	filter_debug_log(false), kick_debug_log(false), cpu_prof_log(false), // SESSION072: default off - see getFilterDebugLog()'s comment.
 	sat_prefilter_mode(GaussianSplatSatPrefilterMode_Off), filter_frustum_planes_enabled(true), // SESSION074: stage off by default, frustum planes on (i.e. unchanged pipeline) - see getSatPrefilterMode()/getFilterFrustumPlanesEnabled().
@@ -6839,8 +6876,91 @@ void GaussianSplatRenderer::kickOffTraversals()
 }
 
 
+// SESSION079: hold a frame-time target by trading LoD detail for speed - see getAdaptivePixelScale() for why a fixed
+// pixel_scale_limit cannot be right for both an interior and an open flyover.
+//
+// The band is what makes this work under vsync. Frame time cannot report HEADROOM - a frame that could have been drawn
+// in 4ms and one that took 16 both read as 16 - so a controller aiming at a single number would sit in its own
+// deadband and never move, and a narrow deadband would ratchet one way. Instead there are two thresholds with real
+// distance between them, taken from the owner's own zones: at or above the target rate there is room, so refine;
+// below the floor (0.8x the target - 40fps against a 50fps target) it is too slow, so coarsen; the band between is
+// where it is meant to sit and nothing happens. Quantisation does not hurt this: vsync forces individual frames to
+// 1/60, 1/30 and so on, but the MEAN over a second of mixed frames moves continuously across the band.
+//
+// The signal is wall frame time rather than the GL splat-pass timer query, which is gated behind
+// query_profiling_enabled and is unreliable-to-absent under WebGL2 - and the web client is the target, so a controller
+// built on it would not ship.
+//
+// It deliberately does NOT force a traversal for every adjustment. The value is picked up by whatever traversal
+// happens next, and traversals happen naturally whenever the camera moves - which is when performance matters. A
+// forced refresh is only for the standing-still case, where nothing else would ever apply the new value, and is rate
+// limited so a static camera cannot turn this into a traversal treadmill (that failure mode is session064's).
+void GaussianSplatRenderer::updateAdaptivePixelScale()
+{
+	const double now_s = adaptive_timer.elapsed();
+	const double prev_s = adaptive_last_frame_time_s;
+	adaptive_last_frame_time_s = now_s;
+	if(!adaptive_pixel_scale_enabled || prev_s < 0.0)
+		return; // First frame after enabling has no period to measure.
+
+	// Every frame contributes a sample; the DECISION is taken on a slow cadence (see gs_adaptive_eval_interval_s).
+	// Sampling every frame is not the expensive part it looks like - the clock read below is one this function needs
+	// anyway, leaving an add and an increment - and sampling less often would be strictly worse data: one frame in
+	// fifty, picked arbitrarily, is as likely to land on a hitch as on a fast frame, whereas the mean over the whole
+	// window is stable.
+	//
+	// Clamped so a hitch, a breakpoint or a minimised window cannot drag the average to a limit.
+	adaptive_frame_ms_sum += myClamp((now_s - prev_s) * 1000.0, 1.0, 200.0);
+	++adaptive_frame_samples;
+	if(now_s - adaptive_last_eval_time_s < gs_adaptive_eval_interval_s)
+		return;
+	adaptive_last_eval_time_s = now_s;
+
+	const double window_ms = adaptive_frame_ms_sum / (double)myMax<size_t>(1, adaptive_frame_samples);
+	adaptive_frame_ms_sum = 0.0;
+	adaptive_frame_samples = 0;
+	adaptive_frame_ms_ema = window_ms; // What the readout shows, and what the step below acts on.
+
+	// The owner's zones: target 50fps, and 40 is where this mechanism is supposed to start working. Above the target
+	// there is room to spend; below the floor there is not; between them is the band it should live in.
+	const double refine_ms  = 1000.0 / (double)myMax(1.f, adaptive_target_fps);                              // >= target rate: room to spend.
+	const double coarsen_ms = 1000.0 / (double)myMax(1.f, adaptive_target_fps * gs_adaptive_floor_fraction); // < floor rate: too slow.
+
+	// Asymmetric on purpose. Backing off has to outrun the drop that caused it; creeping forward has to be slow enough
+	// that it does not read as detail pumping. ~6s from 2 to the ceiling, ~22s back - a drop is fixed quickly and the
+	// recovery is meant to go unnoticed.
+	float v = adaptive_pixel_scale;
+	if(window_ms > coarsen_ms)
+		v *= 1.30f; // Too slow: one firm step coarser.
+	else if(window_ms <= refine_ms)
+		v *= 0.93f; // Room to spare: edge back towards detail.
+
+	// The clamp is the honest statement of what this can do. Below the floor the splat count explodes for detail no
+	// display resolves; above the ceiling the scene is visibly blocky and giving up more buys little.
+	adaptive_pixel_scale = myClamp(v, gs_adaptive_pixel_scale_min, gs_adaptive_pixel_scale_max);
+	lod_pixel_scale_limit = adaptive_pixel_scale;
+
+	// Standing-still case only - see the note above. Compared against what the frontier ON SCREEN was actually built
+	// with, so a natural traversal that already picked the value up costs nothing here.
+	if(adaptive_last_force_time_s >= 0.0 && now_s - adaptive_last_force_time_s < 2.0)
+		return;
+	for(size_t i=0; i<clouds.size(); ++i)
+		if(clouds[i]->cached_ufrontier.nonNull())
+		{
+			const float applied = clouds[i]->cached_ufrontier->pixel_scale_limit;
+			if(applied > 0.f && (adaptive_pixel_scale / applied > 1.15f || applied / adaptive_pixel_scale > 1.15f))
+			{
+				forceTraversalRefresh();
+				adaptive_last_force_time_s = now_s;
+				break;
+			}
+		}
+}
+
+
 void GaussianSplatRenderer::think()
 {
+	updateAdaptivePixelScale(); // SESSION079 - must precede kickOffTraversals() below so a kick this frame uses the new value.
 	// Applying a completed sort or traversal is the only GL call in either background pipeline, which is why both happen
 	// here on the main thread rather than in the worker tasks.
 	drainSortResults();

@@ -25,6 +25,7 @@ Copyright Glare Technologies Limited 2026 -
 #include "../utils/Exception.h"
 #include "../utils/RefCounted.h"
 #include "../utils/StringUtils.h"
+#include "../utils/Clock.h" // SESSION080 DIAGNOSTIC: Clock::getCurTimeRealSec() stamps GaussianSplatUnculledFrontier::built_time_real_s from the worker thread - see [gsr-sat-apply].
 #include "../utils/Sort.h"
 #include "../utils/Task.h"
 #include "../utils/TaskManager.h"
@@ -230,14 +231,39 @@ public:
 	int max_tree_depth;
 	float focal_px;
 
+	// SESSION080 DIAGNOSTIC: Clock::getCurTimeRealSec() at the moment this frontier was built on the worker thread (set
+	// alongside anchor_pos_ws below) - answers "how stale is the prune drainTraversalResults() is about to apply", which
+	// cloud->last_traversal_kick_time_s cannot: that field gets overwritten by kickOffTraversals() the moment message 1
+	// clears traversal_in_flight, which can happen (a new kick for the same cloud) before message 2 - the saturation
+	// follow-up carrying THIS frontier - has even arrived. See [gsr-sat-apply] in drainTraversalResults().
+	double built_time_real_s;
+
+	// SESSION080 DIAGNOSTIC: the three calibration knobs this frontier's saturation grid was actually built with -
+	// GaussianSplatLodTraversalTask's own sat_saturation_threshold/sat_grid_subdiv/sat_region_radius at the moment this
+	// task ran, NOT whatever the renderer's live settings happen to be when [gsr-sat] prints (those can differ if the
+	// owner drags a spinbox while a traversal is in flight). Printed as thr=/sub=/R= on [gsr-sat] so a log capture is
+	// self-describing - answers exactly the "what was R set to during this measurement" question that came up trying
+	// to reconcile the region-pruning math against an observed hole at R=2.
+	float sat_prefilter_threshold_used, sat_grid_subdiv_used, sat_region_radius_used;
+
+	// SESSION080 DIAGNOSTIC: what the region erosion did to this grid - see gsSatApplyRegionErosion(). 3 elements:
+	// [0] killed by the R/sat_depth ceiling, [1] killed by an unsaturated tile inside the window, [2] the largest erosion
+	// radius in tiles actually used. This is the visible price of the ball guarantee, and the split is what says which
+	// regime a view is in: near zero means the occluders in view are an enclosing shell (a room, an interior inside a
+	// larger scene) and a large R costs nothing; a large [1] means silhouettes - or a pinholed mask - dominate.
+	size_t sat_erode_stats[3];
+
 	GaussianSplatUnculledFrontier() // SESSION074: defaults are "stage never ran" - only kickOffTraversals() passing the stage-enabled flag sets sat_grid_res non-zero.
 	:	sat_grid_res(0), sat_num_occluders(0), sat_num_tested(0), sat_num_dropped(0), sat_num_dropped_aggr(0),
 		sat_gather_ms(0.0), // SESSION079
 		sat_grid_build_ms(0.0), sat_test_ms(0.0),
 		sat_diag_coarse_a(0), sat_diag_coarse_b(0), sat_diag_writers(0), sat_diag_tile_writes(0), // SESSION076
-		sat_diag_aniso_n(0), sat_diag_aniso_mean(0.0), sat_diag_aniso_max(0.f), sat_diag_aniso_gt5(0), sat_diag_aniso_gt10(0) // SESSION077
+		sat_diag_aniso_n(0), sat_diag_aniso_mean(0.0), sat_diag_aniso_max(0.f), sat_diag_aniso_gt5(0), sat_diag_aniso_gt10(0), // SESSION077
+		built_time_real_s(0.0), // SESSION080
+		sat_prefilter_threshold_used(0.f), sat_grid_subdiv_used(0.f), sat_region_radius_used(0.f) // SESSION080
 	{
 		for(int i=0; i<3; ++i) sat_diag_tile_stats[i] = 0;
+		for(int i=0; i<3; ++i) sat_erode_stats[i] = 0; // SESSION080
 	}
 };
 
@@ -1378,6 +1404,7 @@ public:
 				}
 				uf->topology_generation = topology_generation;
 				uf->anchor_pos_ws = cam_pos_ws;
+				uf->built_time_real_s = Clock::getCurTimeRealSec(); // SESSION080 DIAGNOSTIC - see the field's comment.
 				uf->pixel_scale_limit = pixel_scale_limit;
 				uf->max_splats_budget = max_splats_budget;
 				uf->max_layer_density = max_layer_density;
@@ -1515,6 +1542,10 @@ public:
 					Reference<GaussianSplatUnculledFrontier> uf2 = new GaussianSplatUnculledFrontier();
 					uf2->topology_generation = uf->topology_generation;
 					uf2->anchor_pos_ws = uf->anchor_pos_ws;
+					uf2->built_time_real_s = uf->built_time_real_s; // SESSION080: verbatim, same reasoning as anchor_pos_ws above - this describes when THAT camera position was seen, not when this pruned copy was made moments later.
+					uf2->sat_prefilter_threshold_used = sat_saturation_threshold; // SESSION080: the task's OWN knobs, not the renderer's live settings - see the fields' comment.
+					uf2->sat_grid_subdiv_used = sat_grid_subdiv;
+					uf2->sat_region_radius_used = sat_region_radius;
 					uf2->pixel_scale_limit = uf->pixel_scale_limit;
 					uf2->max_splats_budget = uf->max_splats_budget;
 					uf2->max_layer_density = uf->max_layer_density;
@@ -1535,14 +1566,16 @@ public:
 						gsBuildSaturationGridParallel(occl_px.data(), occl_py.data(), occl_pz.data(), occl_radius.data(), occl_alpha.data(), occl_px.size(),
 							cam_pos_ws, uf2->sat_grid_res, sat_saturation_threshold, sat_region_radius, uf2->sat_depth, *task_manager,
 							sat_diag_log ? &uf2->sat_diag_writers : NULL, sat_diag_log ? &uf2->sat_diag_tile_writes : NULL,
-							sat_diag_log ? uf2->sat_diag_tile_stats : NULL, &scratch->sat_occluder_recs);
+							sat_diag_log ? uf2->sat_diag_tile_stats : NULL, &scratch->sat_occluder_recs,
+							uf2->sat_erode_stats); // SESSION080: unconditional - three counters, and they are what explains an unexpected dropped%.
 					}
 					else
 					gsBuildSaturationGrid(occl_px.data(), occl_py.data(), occl_pz.data(), occl_radius.data(), occl_alpha.data(), occl_px.size(),
 						cam_pos_ws, uf2->sat_grid_res, sat_saturation_threshold, sat_region_radius, uf2->sat_depth, // SESSION078: sat_region_radius = 0 reproduces the point-anchored behaviour exactly.
 						sat_diag_log ? &uf2->sat_diag_writers : NULL, sat_diag_log ? &uf2->sat_diag_tile_writes : NULL, // SESSION076 DIAGNOSTIC - null (no counting) unless the sat diag checkbox is on.
 					sat_overlay_requested ? &uf2->sat_accum_t : NULL, sat_overlay_requested ? &uf2->sat_amp_sum : NULL, // SESSION077/078 - the two overlay fields, gated on the overlay request, not the sat diag checkbox.
-						sat_diag_log ? uf2->sat_diag_tile_stats : NULL); // SESSION079
+						sat_diag_log ? uf2->sat_diag_tile_stats : NULL, // SESSION079
+						uf2->sat_erode_stats); // SESSION080
 					uf2->sat_grid_build_ms = sat_grid_timer.elapsed() * 1.0e3;
 
 					uf2->sat_gather_ms = sat_gather_ms; // SESSION079 - see the loop's timer.
@@ -6203,6 +6236,24 @@ void GaussianSplatRenderer::drainTraversalResults()
 				cloud->cached_ufrontier = msg->unculled_frontier;
 				cloud->ufrontier_needs_filter = true; // Re-filter against the pruned frontier; until that lands the previous S(P,R) keeps drawing.
 
+				// SESSION080 DIAGNOSTIC: how stale is the prune being applied THIS frame, at the moment it takes effect.
+				// anchor_pos_ws is where the camera was when the traversal that fed this saturation grid ran; if the
+				// camera has since moved, the barrier this prune enforces was computed for a viewpoint that no longer
+				// exists (session080's "hole while stepping past a wall" question - see the session snapshot). Shares
+				// the filter trace's toggle rather than getting its own, same reasoning as [gsr-sat] below.
+				if(filter_debug_log)
+				{
+					const OpenGLScene* const cur_scene = opengl_engine->getCurrentScene();
+					if(cur_scene != NULL)
+					{
+						const Vec4f cam_pos_now_ws = cur_scene->cam_to_world.getColumn(3);
+						const float anchor_dist_m = cam_pos_now_ws.getDist(msg->unculled_frontier->anchor_pos_ws);
+						const double anchor_age_ms = (Clock::getCurTimeRealSec() - msg->unculled_frontier->built_time_real_s) * 1.0e3;
+						conPrint("[gsr-sat-apply] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms anchor_age=" +
+							doubleToStringNDecimalPlaces(anchor_age_ms, 1) + "ms anchor_dist=" + doubleToStringNDecimalPlaces(anchor_dist_m, 3) + "m");
+					}
+				}
+
 				// SESSION076 §9, SESSION078: rebuild the sat_depth debug texture alongside cached_ufrontier, gated on
 				// getSatDebugOverlayMode() != Off ("Show debug" + the mode dropdown - see that getter's comment; this
 				// used to be the "diag" checkbox, sat_diag_log, before the overlay was split out of it), independent of
@@ -6229,9 +6280,20 @@ void GaussianSplatRenderer::drainTraversalResults()
 						if(std::isfinite(uf.sat_depth[t]))
 							++sat_tiles;
 					const double tested = (double)uf.sat_num_tested;
-					conPrint("[gsr-sat] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms occl=" + uInt64ToStringCommaSeparated(uf.sat_num_occluders) +
+					conPrint("[gsr-sat] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms " +
+						"thr=" + doubleToStringNDecimalPlaces(uf.sat_prefilter_threshold_used, 3) + // SESSION080: the knobs THIS grid was built with - see the fields' comment. Self-describes the log capture instead of relying on remembering what the UI said.
+						" sub=" + doubleToStringNDecimalPlaces(uf.sat_grid_subdiv_used, 3) +
+						" R=" + doubleToStringNDecimalPlaces(uf.sat_region_radius_used, 3) +
+						" occl=" + uInt64ToStringCommaSeparated(uf.sat_num_occluders) +
 						" tiles=" + uInt64ToStringCommaSeparated(num_tiles) +
 						" sat_tiles=" + doubleToStringNDecimalPlaces(num_tiles > 0 ? (100.0 * (double)sat_tiles / (double)num_tiles) : 0.0, 1) + "%" +
+						// SESSION080: what the ball guarantee cost this build - see the field's comment. sat_tiles above is
+						// AFTER this, so eroded tiles are already excluded from it; add er_ceil+er_win back to recover the
+						// pre-erosion mask. The two kill mechanisms are printed apart on purpose - see GsSatErodeStats.
+						" er_ceil=" + uInt64ToStringCommaSeparated(uf.sat_erode_stats[0]) +
+						" er_win=" + uInt64ToStringCommaSeparated(uf.sat_erode_stats[1]) +
+						" (" + doubleToStringNDecimalPlaces(num_tiles > 0 ? (100.0 * (double)(uf.sat_erode_stats[0] + uf.sat_erode_stats[1]) / (double)num_tiles) : 0.0, 1) + "%)" +
+						" er_radmax=" + uInt64ToStringCommaSeparated(uf.sat_erode_stats[2]) +
 						" gather_ms=" + doubleToStringNDecimalPlaces(uf.sat_gather_ms, 2) + // SESSION079: building the occluder SoA - see the loop.
 						" grid_ms=" + doubleToStringNDecimalPlaces(uf.sat_grid_build_ms, 2) +
 						" test_ms=" + doubleToStringNDecimalPlaces(uf.sat_test_ms, 2) +

@@ -485,6 +485,33 @@ public:
 	void setSatRegionRadius(float v);
 
 
+	// SESSION080 STEP B: FRONTIER REUSE. Distance, in world units, beyond which a traversal stops re-walking the tree and
+	// instead copies the previous traversal's own selection for that region. 0 disables it, reproducing the current
+	// behaviour bit-for-bit.
+	//
+	// Why this is safe rather than a gamble: session080's STEP A measured that 99.2-99.9% of one traversal's frontier is
+	// selected again by the next one at a normal walking step (95.2% even on an 8.2m dash), so the walk beyond the split
+	// distance is re-deriving a set it already had. And re-using it cannot show a hole: a traversal runs cull-off, so a
+	// frontier computed from ANY camera position is a complete, hole-free cut of the tree - the worst a stale piece can
+	// be is slightly wrong in detail level.
+	//
+	// What it costs is ORDER, not coverage. The reused part keeps the front-to-back order it was sorted into at the
+	// previous anchor, so within it the sort is one traversal stale. That is the same staleness the whole frontier
+	// already carries today - what is on screen is always the selection built for where the camera was 0.5-1.6s ago -
+	// and the near part, which is what the eye is actually resolving, comes out FRESHER than it is now, because the
+	// traversal is shorter. See the plan doc's section 5 for the full argument and for the two traps in the geometry.
+	//
+	// The split is applied to whole SUBTREES via a conservative sphere test, never to a flat distance on the output
+	// list: a flat split cuts across root-to-leaf paths and produces double-drawn nodes and holes. Because the test is
+	// conservative both ways, the rebuilt part and the reused part are depth-separated, so simply concatenating them is
+	// already front-to-back and no merge or re-sort is needed.
+	//
+	// A live knob to find the working value, to be frozen once found (project rule: no manual per-scene tuning).
+	// Changes what a traversal PRODUCES, so the setter drops cached frontiers, as setSatRegionRadius() does.
+	float getFrontierReuseSplitDist() const { return frontier_reuse_split_dist; }
+	void setFrontierReuseSplitDist(float v);
+
+
 	// SESSION074: whether the per-orientation filter applies the frustum planes at all. On (the default) is the normal
 	// pipeline. Off keeps the whole split-filter machinery running - U(P) is still built and streamed, the saturation
 	// pre-filter above still runs on every node - but no node is ever rejected for being outside the view, so the two
@@ -1565,6 +1592,7 @@ private:
 	GaussianSplatSatDebugOverlayMode sat_debug_overlay_mode; // SESSION078 - see getSatDebugOverlayMode().
 	float sat_grid_subdiv;                           // SESSION076 CALIBRATION - see getSatGridSubdiv().
 	float sat_region_radius;                         // SESSION078 - see getSatRegionRadius().
+	float frontier_reuse_split_dist;                 // SESSION080 STEP B - see getFrontierReuseSplitDist(). 0 = disabled.
 
 	// SESSION055: camera-motion tracker for anisotropic frustum-cull dilation. think() diffs the current cam pose against
 	// the previous one to compute an instantaneous velocity and angular speed, feeds them through an EMA with a

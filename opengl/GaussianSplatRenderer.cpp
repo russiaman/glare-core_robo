@@ -20,6 +20,7 @@ Copyright Glare Technologies Limited 2026 -
 #include "../maths/mathstypes.h"
 #include "../maths/vec2.h" // For the screen-space ellipse axes in splatFootprint().
 #include "../utils/ArrayRef.h"
+#include "../utils/AtomicInt.h" // SESSION080 DIAGNOSTIC: counts saturation phases running at once - see gs_sat_phases_running.
 #include "../utils/BitUtils.h"
 #include "../utils/ConPrint.h"
 #include "../utils/Exception.h"
@@ -178,6 +179,14 @@ public:
 	size_t sat_num_tested;       // DIAGNOSTIC: fine nodes the verdict was computed for.
 	size_t sat_num_dropped;      // DIAGNOSTIC: of those, how many the conservative test found occluded (counted in Count mode too, where nothing is actually removed).
 	size_t sat_num_dropped_aggr; // DIAGNOSTIC: the deliberately-wrong upper bound - see gsSatOccluded()'s out_aggressive.
+	// SESSION080 DIAGNOSTIC: how many traversals were inside their saturation phase when this one entered its own
+	// (on_entry counts the OTHERS, so 0 means it had the stage to itself), and the most that were running at any point
+	// while it was there - see gs_sat_phases_running for why this is the number STEP B's pipeline question turns on.
+	// The three timings below are only readable against these two: they are wall-clock on a shared pool, so a doubled
+	// gather_ms with sat_concurrency_peak=3 is contention, not a change in the work.
+	size_t sat_concurrency_on_entry;
+	size_t sat_concurrency_peak;
+
 	double sat_gather_ms;        // SESSION079 DIAGNOSTIC: cost of building the occluder SoA the grid is fed from - see the loop.
 	double sat_grid_build_ms;    // DIAGNOSTIC: pure gsBuildSaturationGrid() cost on the worker.
 	double sat_test_ms;          // DIAGNOSTIC: cost of testing (and, in Drop mode, compacting) the frontier.
@@ -292,7 +301,7 @@ public:
 	// replacement (uf2): it shrinks to pool_after, which would misattribute expand_ms/sort_ms's cost to the wrong N.
 
 	// SESSION080 DIAGNOSTIC (plan doc session080-plan.md STEP A): how much this frontier's front-to-back order has
-	// moved since sort_staleness_prev_frontier - the cloud's cached_ufrontier at kick time, i.e. whatever was
+	// moved since prev_frontier - the cloud's cached_ufrontier at kick time, i.e. whatever was
 	// actually being drawn just before this traversal started. Matches nodes by identity (cloud_idx = member
 	// offset + tree_local_idx), NOT by array position - see the computation site in run() for why. Zero/default
 	// when there was no previous frontier (first kick for this cloud) or its topology_generation didn't match
@@ -311,8 +320,38 @@ public:
 	size_t sort_staleness_gt10k;     // Common nodes displaced more than 10000 positions.
 	double sort_staleness_ms;        // Cost of computing the above, so this diagnostic's own overhead is visible.
 
+	// SESSION080 STEP B: what frontier reuse did for this traversal - see GaussianSplatRenderer::getFrontierReuseSplitDist().
+	// All zero when the knob is off or a precondition declined it (see GaussianSplatLodTraversalTask::reuse_enabled), which
+	// is also how a log capture says which of the two regimes it was taken in.
+	size_t reuse_roots;   // Subtrees the walk inherited whole rather than descending into.
+	size_t reuse_n;       // Nodes those subtrees contributed, i.e. the size of the inherited tail of this frontier.
+	double reuse_ms;      // Cost of producing that tail: one filtered copy of the previous frontier's SoA.
+	float reuse_split_dist_used; // The knob's value for THIS traversal, not the renderer's live setting - same reasoning as sat_region_radius_used.
+
+	// SESSION080 STEP B: camera position of the OLDEST data in this frontier - its own anchor_pos_ws when it was walked
+	// in full, otherwise inherited unchanged from the frontier it took its tail from.
+	//
+	// This exists to bound something inheritance would otherwise let run away. Each traversal re-tests the previous
+	// frontier's nodes and keeps the ones still beyond the split distance, so a node in a region the camera is moving
+	// AWAY from can stay inherited for an unbounded number of traversals, and its front-to-back key stays the one it was
+	// given the last time it was actually walked. One traversal of sort staleness is the tolerance this scheme is
+	// designed around (see the reuse block in run()); an unbounded number is not, and the retreating case does not
+	// self-correct - retreating makes MORE of the tree far, so less of it gets refreshed, not more. Carrying the oldest
+	// anchor forward lets the next traversal measure the accumulated drift in one subtraction and rebuild from scratch
+	// when it grows too large - see GaussianSplatLodTraversalTask's reuse_enabled.
+	Vec4f reuse_base_anchor_ws;
+
+	// SESSION080 STEP B: did the walk that produced this frontier get truncated by the splat budget? Reuse needs it
+	// because the budget cap is the one stop rule that cannot be re-derived out of context - it depends on how much of
+	// the walk had already been emitted when the node was reached, not on the node alone (see oldWalkStopsHere()). A
+	// truncated predecessor could therefore have stopped ABOVE where we deduce its cut lies, and inheriting a subtree
+	// on that deduction would inherit nothing at all: a hole, not a wrong detail level. So a truncated frontier is
+	// simply never inherited from. Measured false in every capture to date, so this costs nothing in practice.
+	bool hit_budget_cap;
+
 	GaussianSplatUnculledFrontier() // SESSION074: defaults are "stage never ran" - only kickOffTraversals() passing the stage-enabled flag sets sat_grid_res non-zero.
 	:	sat_grid_res(0), sat_num_occluders(0), sat_num_tested(0), sat_num_dropped(0), sat_num_dropped_aggr(0),
+		sat_concurrency_on_entry(0), sat_concurrency_peak(0), // SESSION080 DIAGNOSTIC
 		sat_gather_ms(0.0), // SESSION079
 		sat_grid_build_ms(0.0), sat_test_ms(0.0),
 		sat_diag_coarse_a(0), sat_diag_coarse_b(0), sat_diag_writers(0), sat_diag_tile_writes(0), // SESSION076
@@ -323,7 +362,8 @@ public:
 		expand_seeds(0), expand_num_tasks(0), expand_prologue_ms(0.0), expand_task_max_ms(0.0), expand_task_sum_ms(0.0), soa_ms(0.0), // SESSION080
 		traversal_output_n(0), // SESSION080
 		sort_staleness_delta_ws(0.0), sort_staleness_prev_n(0), sort_staleness_common_n(0), sort_staleness_max_disp(0), // SESSION080
-		sort_staleness_mean_disp(0.0), sort_staleness_gt1k(0), sort_staleness_gt10k(0), sort_staleness_ms(0.0) // SESSION080
+		sort_staleness_mean_disp(0.0), sort_staleness_gt1k(0), sort_staleness_gt10k(0), sort_staleness_ms(0.0), // SESSION080
+		reuse_roots(0), reuse_n(0), reuse_ms(0.0), reuse_split_dist_used(0.f), reuse_base_anchor_ws(0.f), hit_budget_cap(false) // SESSION080 STEP B
 	{
 		for(int i=0; i<3; ++i) sat_diag_tile_stats[i] = 0;
 		for(int i=0; i<3; ++i) sat_erode_stats[i] = 0; // SESSION080
@@ -629,6 +669,45 @@ const int splat_index_attribute_loc = 1; // Forced in buildShadersIfNeeded().  S
 const int coarse_key_bits = 16; // How many high bits of the sort key the coarse stage buckets on, i.e. 65536 evenly spaced depth slices.
 
 const int max_concurrent_traversals = 2; // Mirrors max_concurrent_sorts above, for the same reason: caps traversal scratch memory at roughly this many clouds' worth rather than letting it scale with the world.
+
+
+// SESSION080 DIAGNOSTIC: how many traversal tasks are inside their saturation phase (gather -> grid -> test) right now.
+//
+// This measures a quantity nothing in the pipeline currently bounds. max_concurrent_traversals above caps traversals,
+// but num_traversals_in_flight is decremented when message 1 is drained - which happens BEFORE the saturation phase
+// starts, since session076 deliberately publishes the frontier first so the picture does not wait for the prune. The
+// saturation phase therefore runs entirely outside that accounting, and any number of them can be in flight at once:
+// each traversal's own saturation continues while the next traversal, and the next, are kicked off and run.
+//
+// That is fine while a traversal's front half (expand+sort+soa) outlasts its saturation, because then the next kick
+// cannot arrive before the previous prune is finished. Session080's STEP B inverts that relation by design - it makes
+// the front half much cheaper without touching saturation - so this number is the direct test of whether saturations
+// then start stacking up and competing for the pool with each other and with the per-frame filter. It is the hypothesis
+// the pipeline restructuring would be built on, so it is measured rather than assumed.
+//
+// Reported per traversal as sat_conc= (value on entry, i.e. how many others were already running) and sat_conc_peak=
+// (highest value seen while this one ran) - see [gsr-sat].
+glare::AtomicInt gs_sat_phases_running(0);
+
+
+// SESSION080 DIAGNOSTIC: keeps gs_sat_phases_running correct on every exit from the saturation phase, including the
+// early-out when a traversal finds no occluders at all.
+struct GsSatPhaseScope
+{
+	GsSatPhaseScope() : peak(0)
+	{
+		on_entry = (size_t)gs_sat_phases_running.increment(); // Returns the value BEFORE the increment: how many others were already inside.
+		peak = on_entry + 1;
+	}
+	~GsSatPhaseScope() { gs_sat_phases_running.decrement(); }
+
+	// Called at the phase's internal boundaries: the count can rise after we entered, and the peak is what says whether
+	// this traversal actually had to share the pool, rather than merely how things looked at the instant it started.
+	void sample() { peak = myMax(peak, (size_t)gs_sat_phases_running.getVal()); }
+
+	size_t on_entry;
+	size_t peak;
+};
 
 
 // Whether any member of this cloud has a built LoD tree.  Drives two things: whether kickOffTraversals() bothers picking
@@ -988,6 +1067,78 @@ public:
 };
 
 
+// SESSION080 STEP B: one slice of the inherited-tail pass - see GaussianSplatLodTraversalTask::run()'s reuse block.
+//
+// The predicate is the SAME conservative sphere test the tree walk applies to decide it may skip a subtree, evaluated
+// here on the previous frontier's own nodes: a node is inherited iff its whole bounding sphere lies beyond the split
+// distance, measured from the anchor that frontier was built for. Both sides testing the identical quantity is what
+// makes them agree exactly on which paths each covers - see the walk's comment for the coverage argument.
+//
+// Everything it reads is sequential and everything it writes is sequential, and it never touches the geometry arrays:
+// world-space positions are baked, so the previous frontier's SoA rows are still correct for this one and are simply
+// copied across. That is why the inherited part costs neither a tree walk, nor a sort, nor a scattered position gather.
+struct GsReuseChunk
+{
+	size_t i_begin, i_end;
+	size_t count;     // Survivors in this chunk.
+	size_t out_begin; // Where they go, filled in from the prefix sum between the two passes.
+};
+
+
+// Pass 1: count only. Split from the copy for the same reason the saturation test/compact pair is: no chunk can know
+// where to write until every chunk before it has finished counting.
+class GsReuseCountTask : public glare::Task
+{
+public:
+	virtual void run(size_t /*thread_index*/)
+	{
+		size_t n = 0;
+		for(size_t i=chunk->i_begin; i<chunk->i_end; ++i)
+		{
+			const Vec4f p(in_px[i], in_py[i], in_pz[i], 1.f);
+			if(prev_anchor_ws.getDist(p) - in_radius[i] >= split_dist)
+				++n;
+		}
+		chunk->count = n;
+	}
+
+	const float* in_px; const float* in_py; const float* in_pz; const float* in_radius;
+	Vec4f prev_anchor_ws;
+	float split_dist;
+	GsReuseChunk* chunk;
+};
+
+
+// Pass 2: copy the survivors to the offsets the prefix sum handed out, which keeps the previous frontier's own
+// front-to-back order - the order this tail is inherited WITH, and the one thing about it that is a traversal stale.
+class GsReuseCopyTask : public glare::Task
+{
+public:
+	virtual void run(size_t /*thread_index*/)
+	{
+		size_t d = chunk->out_begin;
+		for(size_t i=chunk->i_begin; i<chunk->i_end; ++i)
+		{
+			const Vec4f p(in_px[i], in_py[i], in_pz[i], 1.f);
+			if(prev_anchor_ws.getDist(p) - in_radius[i] >= split_dist)
+			{
+				out_indices[d] = in_indices[i];
+				out_px[d] = in_px[i]; out_py[d] = in_py[i]; out_pz[d] = in_pz[i];
+				out_radius[d] = in_radius[i];
+				out_is_coarse[d] = in_is_coarse[i];
+				++d;
+			}
+		}
+	}
+
+	const uint32* in_indices; const float* in_px; const float* in_py; const float* in_pz; const float* in_radius; const float* in_is_coarse;
+	uint32* out_indices; float* out_px; float* out_py; float* out_pz; float* out_radius; float* out_is_coarse;
+	Vec4f prev_anchor_ws;
+	float split_dist;
+	GsReuseChunk* chunk;
+};
+
+
 // SESSION079: one slice of the occluder gather - see GsSatGatherTask.
 struct GsSatGatherChunk
 {
@@ -1184,8 +1335,9 @@ public:
 		bool sat_overlay_requested_ = false, // SESSION078: driven by "Show debug" + its mode dropdown (getSatDebugOverlayMode() != Off), NOT sat_diag_log_ - see that getter's comment. Forces the grid to build even with the saturation filter off, and fills sat_accum_t/sat_amp_sum, exactly what sat_diag_log_ used to gate before the overlay was split out of it.
 		float alpha_gain_ = 1.f, float alpha_gamma_ = 1.f, // SESSION078: see GaussianSplatRenderer::getAlphaGain(). Applied to occluder alphas before they feed the saturation grid, matching what the draw path applies - 1/1 (the defaults here) is the identity, i.e. the pre-session078 behaviour.
 		glare::TaskManager* task_manager_ = NULL, // SESSION079: the pool this task is itself running on, so the saturation build can spread across it - see gsBuildSaturationGridParallel(). NULL keeps the build serial.
-		const Reference<GaussianSplatUnculledFrontier>& sort_staleness_prev_frontier_ = Reference<GaussianSplatUnculledFrontier>(), // SESSION080 DIAGNOSTIC (plan doc STEP A) - see the field's comment.
-		bool sort_staleness_diag_enabled_ = false)
+		const Reference<GaussianSplatUnculledFrontier>& prev_frontier_ = Reference<GaussianSplatUnculledFrontier>(), // SESSION080 DIAGNOSTIC (plan doc STEP A) - see the field's comment.
+		bool sort_staleness_diag_enabled_ = false,
+		float reuse_split_dist_ = 0.f) // SESSION080 STEP B: 0 = walk the whole tree, the pre-session080 behaviour - see GaussianSplatRenderer::getFrontierReuseSplitDist() and reuse_enabled below.
 	:	cloud_id(cloud_id_), topology_generation(topology_generation_), scratch(scratch_), cam_pos_ws(cam_pos_ws_),
 		pixel_scale_limit(pixel_scale_limit_), max_splats_budget(max_splats_budget_), max_layer_density(max_layer_density_), max_tree_depth(max_tree_depth_), focal_px(focal_px_),
 		num_frustum_clip_planes(num_frustum_clip_planes_), frustum_cull_enabled(frustum_cull_enabled_),
@@ -1203,7 +1355,8 @@ public:
 		alpha_gain(alpha_gain_), alpha_gamma(alpha_gamma_), // SESSION078
 		task_manager(task_manager_), // SESSION079
 		expand_seeds(0), expand_num_tasks(0), expand_prologue_ms(0.0), expand_task_max_ms(0.0), expand_task_sum_ms(0.0), // SESSION080 DIAGNOSTIC
-		sort_staleness_prev_frontier(sort_staleness_prev_frontier_), sort_staleness_diag_enabled(sort_staleness_diag_enabled_) // SESSION080 DIAGNOSTIC
+		prev_frontier(prev_frontier_), sort_staleness_diag_enabled(sort_staleness_diag_enabled_), // SESSION080 DIAGNOSTIC
+		reuse_enabled(false), reuse_prev_anchor_ws(0.f), reuse_split_dist(0.f) // SESSION080 STEP B - derived below.
 	{
 		if(num_frustum_clip_planes < 0)
 			num_frustum_clip_planes = 0;
@@ -1213,6 +1366,39 @@ public:
 			frustum_clip_planes[i] = frustum_clip_planes_[i];
 		for(int i=0; i<(int)staticArrayNumElems(translation_dilation); ++i)
 			translation_dilation[i] = translation_dilation_ ? translation_dilation_[i] : 0.f;
+
+		// SESSION080 STEP B: decide once, here, whether this traversal may inherit from its predecessor - see
+		// reuse_enabled's comment for what each clause protects. Doing it in the constructor rather than in the walk
+		// keeps the per-node test down to one bool, and keeps every precondition in one readable place.
+		if(reuse_split_dist_ > 0.f && build_unculled_frontier && prev_frontier.nonNull() &&
+			!frustum_cull_enabled && !dist_clamp_enabled && !coarse_floor_enabled &&
+			// The predecessor must describe the same selection, or its nodes are not the ones our own stop rules would
+			// have picked and the reuse test below (which re-derives those rules at the old anchor) would be answering
+			// a different question. Same key set drainTraversalResults() checks, and for the same reason.
+			prev_frontier->topology_generation == topology_generation &&
+			prev_frontier->pixel_scale_limit == pixel_scale_limit &&
+			prev_frontier->max_splats_budget == max_splats_budget &&
+			prev_frontier->max_layer_density == max_layer_density &&
+			prev_frontier->max_tree_depth == max_tree_depth &&
+			prev_frontier->focal_px == focal_px &&
+			// The accumulated-drift bound, i.e. the full-rebuild safety trigger. Inheritance is designed around ONE
+			// traversal of sort staleness in the far field; without this, a node in a region the camera keeps retreating
+			// from would stay inherited indefinitely and keep the key it was given many traversals ago. See
+			// GaussianSplatUnculledFrontier::reuse_base_anchor_ws for why the retreating case cannot self-correct.
+			//
+			// Expressed as a fraction of the split distance rather than as an absolute, because that is the quantity it
+			// is answerable to: an ordering error of size E among nodes at range D matters in proportion to E/D, and the
+			// split distance is the range at which we have declared order to stop mattering much. So capping drift at a
+			// fixed fraction of it caps the relative error, at any scene scale and any knob setting, with no second
+			// number to tune. A traversal that trips this walks the whole tree and becomes the fresh base for the ones
+			// after it - visible in the log as reuse_n dropping to 0 for one traversal.
+			cam_pos_ws_.getDist(prev_frontier->reuse_base_anchor_ws) <= reuse_split_dist_ * reuse_max_drift_fraction &&
+			!prev_frontier->hit_budget_cap) // See the field - a budget-truncated predecessor's cut cannot be located node-locally, and guessing it wrong puts a hole in the picture.
+		{
+			reuse_enabled = true;
+			reuse_prev_anchor_ws = prev_frontier->anchor_pos_ws;
+			reuse_split_dist = reuse_split_dist_;
+		}
 	}
 
 	virtual void run(size_t /*thread_index*/) override
@@ -1252,6 +1438,7 @@ public:
 		// knows WHY each node was captured - the flag array downstream records only that it was). All three stay zero
 		// unless the "sat diag" checkbox is on. See GaussianSplatUnculledFrontier::sat_diag_coarse_a.
 		size_t diag_coarse_a = 0, diag_coarse_b = 0;
+		size_t diag_reuse_roots = 0; // SESSION080 STEP B DIAGNOSTIC: subtrees inherited whole from the previous frontier - see GaussianSplatUnculledFrontier::reuse_roots.
 
 		Timer expand_timer; // SESSION080 DIAGNOSTIC - see GaussianSplatUnculledFrontier::expand_ms.
 
@@ -1295,11 +1482,11 @@ public:
 		// path's per-node records are pushed to one shared vector and it is a debug report, not a hot path).
 		const bool expand_in_parallel = (task_manager != NULL) && (frontier_record == NULL);
 		if(expand_in_parallel && !stack.empty())
-			expandParallel(stack, decorated, positions, feature_sizes, cull_radii, diag_coarse_a, diag_coarse_b,
+			expandParallel(stack, decorated, positions, feature_sizes, cull_radii, diag_coarse_a, diag_coarse_b, diag_reuse_roots,
 				hit_budget_cap, hit_density_cap, hit_depth_cap);
 		else
 			expandStack(stack, decorated, positions, feature_sizes, cull_radii, /*enforce_budget=*/true, /*breadth_first=*/false, /*pause_at_stack_size=*/0,
-				diag_coarse_a, diag_coarse_b, hit_budget_cap, hit_density_cap, hit_depth_cap);
+				diag_coarse_a, diag_coarse_b, diag_reuse_roots, hit_budget_cap, hit_density_cap, hit_depth_cap);
 
 		const double expand_ms = expand_timer.elapsed() * 1.0e3; // SESSION080 DIAGNOSTIC - stops here, before the sort.
 
@@ -1378,9 +1565,67 @@ public:
 				Timer soa_timer; // SESSION080 DIAGNOSTIC - see GaussianSplatUnculledFrontier::soa_ms.
 				uf = new GaussianSplatUnculledFrontier();
 				const size_t n = output.size();
-				uf->indices.resizeNoCopy(n);
-				uf->px.resizeNoCopy(n); uf->py.resizeNoCopy(n); uf->pz.resizeNoCopy(n); uf->radius.resizeNoCopy(n);
-				uf->is_coarse.resizeNoCopy(n);
+
+				// SESSION080 STEP B: size the array for the walked part plus the inherited tail. The tail's length is
+				// only known after counting it, so the count pass runs here, ahead of the allocation; the copy runs
+				// after the walked part is written, into the slots past it. See GsReuseChunk for the pass itself.
+				//
+				// The two ranges are concatenated rather than merged, and that is correct without a re-sort: the walk
+				// only inherits a subtree whose whole sphere is beyond the split distance and only keeps for itself
+				// nodes whose sphere is not, so [walked][inherited] is already ordered front-to-back to within the
+				// camera's movement since the previous anchor - the same tolerance every frame already carries, since
+				// what is on screen is always the selection built for where the camera was one traversal ago.
+				// SESSION080 STEP B DIAGNOSTIC: accumulated across the two reuse passes ONLY. It was originally a single timer
+				// spanning this whole block, which made it identical to soa_ms in every log line - a reading that looks like a
+				// measurement but is really just its neighbour, and so could never answer what the tail copy costs.
+				double reuse_ms_accum = 0.0;
+				js::Vector<GsReuseChunk, 16> reuse_chunks;
+				size_t reuse_n = 0;
+				if(reuse_enabled)
+				{
+					Timer reuse_count_timer;
+					const size_t prev_n = prev_frontier->indices.size();
+
+					// Scanned in full, deliberately. It is tempting to binary-search for the first node past the split
+					// distance and skip the near half, since the predicate cannot hold nearer than that - but the
+					// previous frontier is NOT sorted by distance from its own anchor. It is itself [walked][inherited],
+					// and its inherited tail is ordered by an OLDER anchor still, so distance along the array is not
+					// monotone and a search would cut in the wrong place. Cutting it short would silently drop nodes the
+					// walk has already stopped above, which is a hole rather than a slightly wrong detail level. The
+					// scan is sequential over six flat arrays and splits across the pool, so the saving was small and
+					// the risk is not.
+					const size_t scan_n = prev_n;
+					const size_t reuse_concurrency = (task_manager != NULL) ? myMax<size_t>(1, (size_t)task_manager->getConcurrency()) : 1;
+					const size_t num_reuse_chunks = myMax<size_t>(1, myMin(reuse_concurrency * 4, scan_n / 16384));
+					reuse_chunks.resize(num_reuse_chunks);
+					glare::TaskGroupRef count_group = new glare::TaskGroup();
+					for(size_t c=0; c<num_reuse_chunks; ++c)
+					{
+						reuse_chunks[c].i_begin = (scan_n * c)       / num_reuse_chunks;
+						reuse_chunks[c].i_end   = (scan_n * (c + 1)) / num_reuse_chunks;
+						reuse_chunks[c].count = 0;
+						reuse_chunks[c].out_begin = 0;
+
+						Reference<GsReuseCountTask> t = new GsReuseCountTask();
+						t->in_px = prev_frontier->px.data(); t->in_py = prev_frontier->py.data(); t->in_pz = prev_frontier->pz.data();
+						t->in_radius = prev_frontier->radius.data();
+						t->prev_anchor_ws = reuse_prev_anchor_ws; t->split_dist = reuse_split_dist;
+						t->chunk = &reuse_chunks[c];
+						if(task_manager != NULL) count_group->tasks.push_back(t); else t->run(0);
+					}
+					if(task_manager != NULL) task_manager->runTaskGroup(count_group);
+
+					for(size_t c=0; c<num_reuse_chunks; ++c) // Prefix sum: each chunk's slice of the tail, in order, so the copy keeps the previous frontier's ordering.
+					{
+						reuse_chunks[c].out_begin = n + reuse_n;
+						reuse_n += reuse_chunks[c].count;
+					}
+					reuse_ms_accum += reuse_count_timer.elapsed() * 1.0e3;
+				}
+
+				uf->indices.resizeNoCopy(n + reuse_n);
+				uf->px.resizeNoCopy(n + reuse_n); uf->py.resizeNoCopy(n + reuse_n); uf->pz.resizeNoCopy(n + reuse_n); uf->radius.resizeNoCopy(n + reuse_n);
+				uf->is_coarse.resizeNoCopy(n + reuse_n);
 				// SESSION080: split across the pool. Measured at ~218ms on the owner's interior - the largest single phase
 				// of the whole async pipeline, and the last serial one, having gone untimed until soa_ms was added.
 				//
@@ -1422,6 +1667,31 @@ public:
 						uf->is_coarse[i] = coarse_flags[i];
 					}
 				}
+				// SESSION080 STEP B: the inherited tail, written into the slots past the walked part. Pure copy - no
+				// geometry lookup, no distance, no sort. See the count pass above and GsReuseCopyTask.
+				if(reuse_n > 0)
+				{
+					Timer reuse_copy_timer;
+					glare::TaskGroupRef copy_group = new glare::TaskGroup();
+					for(size_t c=0; c<reuse_chunks.size(); ++c)
+					{
+						if(reuse_chunks[c].count == 0)
+							continue;
+						Reference<GsReuseCopyTask> t = new GsReuseCopyTask();
+						t->in_indices = prev_frontier->indices.data();
+						t->in_px = prev_frontier->px.data(); t->in_py = prev_frontier->py.data(); t->in_pz = prev_frontier->pz.data();
+						t->in_radius = prev_frontier->radius.data(); t->in_is_coarse = prev_frontier->is_coarse.data();
+						t->out_indices = uf->indices.data();
+						t->out_px = uf->px.data(); t->out_py = uf->py.data(); t->out_pz = uf->pz.data();
+						t->out_radius = uf->radius.data(); t->out_is_coarse = uf->is_coarse.data();
+						t->prev_anchor_ws = reuse_prev_anchor_ws; t->split_dist = reuse_split_dist;
+						t->chunk = &reuse_chunks[c];
+						if(task_manager != NULL) copy_group->tasks.push_back(t); else t->run(0);
+					}
+					if(task_manager != NULL) task_manager->runTaskGroup(copy_group);
+					reuse_ms_accum += reuse_copy_timer.elapsed() * 1.0e3;
+				}
+
 				uf->topology_generation = topology_generation;
 				uf->anchor_pos_ws = cam_pos_ws;
 				uf->built_time_real_s = Clock::getCurTimeRealSec(); // SESSION080 DIAGNOSTIC - see the field's comment.
@@ -1438,7 +1708,15 @@ public:
 				uf->expand_prologue_ms = expand_prologue_ms;
 				uf->expand_task_max_ms = expand_task_max_ms;
 				uf->expand_task_sum_ms = expand_task_sum_ms;
-				uf->soa_ms = soa_timer.elapsed() * 1.0e3; // SESSION080 DIAGNOSTIC - the loop just above, which nothing timed before.
+				uf->soa_ms = soa_timer.elapsed() * 1.0e3; // SESSION080 DIAGNOSTIC - the loop just above, which nothing timed before. Includes the reuse passes; reuse_ms below is their own share of it.
+				uf->reuse_roots = diag_reuse_roots; // SESSION080 STEP B DIAGNOSTIC
+				uf->reuse_n = reuse_n;
+				uf->reuse_ms = reuse_ms_accum; // The two reuse passes only - the walked part's SoA build sits between them and is NOT included, which is the whole point. See the accumulator's comment.
+				uf->reuse_split_dist_used = reuse_enabled ? reuse_split_dist : 0.f;
+				// SESSION080 STEP B: carry the oldest contributing anchor forward - see the field. Nothing inherited means
+				// everything here was walked at THIS anchor, which resets the drift the next traversal will measure.
+				uf->reuse_base_anchor_ws = (reuse_n > 0) ? prev_frontier->reuse_base_anchor_ws : cam_pos_ws;
+				uf->hit_budget_cap = hit_budget_cap; // SESSION080 STEP B - see the field. Whether THIS walk was truncated, which decides if the next one may inherit from it.
 				for(int k=0; k<5; ++k) uf->dist_pctile[k] = dist_pctile[k]; // SESSION080 DIAGNOSTIC
 
 				msg->unculled_frontier = uf;
@@ -1463,7 +1741,7 @@ public:
 			//  - before the saturation stage rather than inside it, because the numbers describe the TRAVERSAL, and
 			//    nesting them in the uf2 block would silently tie them to the saturation stage being switched on.
 			//
-			// Both sides are UNPRUNED frontiers: sort_staleness_prev_frontier is fed from SplatCloud::
+			// Both sides are UNPRUNED frontiers: prev_frontier is fed from SplatCloud::
 			// last_unpruned_ufrontier, not cached_ufrontier - ranking against a saturation-pruned list would measure
 			// that prune's compaction (55-80% of the pool at R=0) rather than the camera's motion.
 			//
@@ -1475,20 +1753,20 @@ public:
 			// ~13M entries would cost more to build than the walk it serves.
 			double staleness_delta_ws = 0.0, staleness_mean_disp = 0.0, staleness_ms = 0.0;
 			size_t staleness_prev_n = 0, staleness_common_n = 0, staleness_max_disp = 0, staleness_gt1k = 0, staleness_gt10k = 0;
-			if(uf.nonNull() && sort_staleness_diag_enabled && sort_staleness_prev_frontier.nonNull() &&
+			if(uf.nonNull() && sort_staleness_diag_enabled && prev_frontier.nonNull() &&
 				// The previous frontier has to have been built for the same SELECTION, or the differences are the
 				// settings change rather than the motion. This is the key set GaussianSplatUnculledFrontier documents
 				// and that drainTraversalResults() checks for the same reason; checked here rather than by clearing
 				// last_unpruned_ufrontier at each setter, so a setter added later cannot silently skip it.
-				sort_staleness_prev_frontier->topology_generation == topology_generation &&
-				sort_staleness_prev_frontier->pixel_scale_limit == pixel_scale_limit &&
-				sort_staleness_prev_frontier->max_splats_budget == max_splats_budget &&
-				sort_staleness_prev_frontier->max_layer_density == max_layer_density &&
-				sort_staleness_prev_frontier->max_tree_depth == max_tree_depth &&
-				sort_staleness_prev_frontier->focal_px == focal_px)
+				prev_frontier->topology_generation == topology_generation &&
+				prev_frontier->pixel_scale_limit == pixel_scale_limit &&
+				prev_frontier->max_splats_budget == max_splats_budget &&
+				prev_frontier->max_layer_density == max_layer_density &&
+				prev_frontier->max_tree_depth == max_tree_depth &&
+				prev_frontier->focal_px == focal_px)
 			{
 				Timer staleness_timer;
-				const GaussianSplatUnculledFrontier& prev_uf = *sort_staleness_prev_frontier; // Not `prev` - that name shadows glare::Task::prev, the intrusive task-list link.
+				const GaussianSplatUnculledFrontier& prev_uf = *prev_frontier; // Not `prev` - that name shadows glare::Task::prev, the intrusive task-list link.
 				staleness_prev_n = prev_uf.indices.size();
 
 				// Coarse-floor nodes are excluded from BOTH sides. A coarse node re-uses the cloud_idx of the fine node
@@ -1553,6 +1831,12 @@ public:
 			// this is meant to be.
 			if(uf.nonNull() && (sat_prefilter_mode != GaussianSplatSatPrefilterMode_Off || sat_overlay_requested))
 			{
+				// SESSION080 DIAGNOSTIC: mark this traversal as being inside the saturation phase, for as long as it is.
+				// Scoped rather than a bare increment/decrement pair because the phase has two exits - the normal one and
+				// the "no occluders at all" early-out below - and a leaked increment would silently poison every later
+				// reading. See gs_sat_phases_running for what the number is for.
+				GsSatPhaseScope sat_phase_scope;
+
 				// SESSION076: the grid is accumulated from the FINE frontier, not from the coarse floor it was originally
 				// written against. The coarse source was measured to a dead end - at the only setting that preserved
 				// visible geometry it dropped 1.0% against a 10.8% ceiling, and no tuning moved that - because a coarse
@@ -1646,6 +1930,7 @@ public:
 					occl_radius.resize(kept); occl_alpha.resize(kept);
 				}
 				const double sat_gather_ms = sat_gather_timer.elapsed() * 1.0e3;
+				sat_phase_scope.sample(); // SESSION080 DIAGNOSTIC - another traversal may have entered the phase during the gather.
 
 				if(!occl_px.empty())
 				{
@@ -1682,6 +1967,12 @@ public:
 					uf2->sort_staleness_gt1k = staleness_gt1k;
 					uf2->sort_staleness_gt10k = staleness_gt10k;
 					uf2->sort_staleness_ms = staleness_ms;
+					uf2->reuse_roots = uf->reuse_roots; // SESSION080 STEP B: verbatim - this pruned copy describes the same traversal.
+					uf2->reuse_n = uf->reuse_n;
+					uf2->reuse_ms = uf->reuse_ms;
+					uf2->reuse_split_dist_used = uf->reuse_split_dist_used;
+					uf2->reuse_base_anchor_ws = uf->reuse_base_anchor_ws;
+					uf2->hit_budget_cap = uf->hit_budget_cap;
 
 					uf2->sat_num_occluders = occl_px.size();
 					uf2->sat_grid_res = gsSatGridResForFocal(focal_px, coarse_pixel_scale, sat_grid_subdiv); // SESSION076 CALIBRATION
@@ -1708,6 +1999,7 @@ public:
 						sat_diag_log ? uf2->sat_diag_tile_stats : NULL, // SESSION079
 						uf2->sat_erode_stats); // SESSION080
 					uf2->sat_grid_build_ms = sat_grid_timer.elapsed() * 1.0e3;
+					sat_phase_scope.sample(); // SESSION080 DIAGNOSTIC
 
 					uf2->sat_gather_ms = sat_gather_ms; // SESSION079 - see the loop's timer.
 					// SESSION076 DIAGNOSTIC: carry the DFS-side breakdown across to where [gsr-sat-diag] prints it.
@@ -1820,6 +2112,12 @@ public:
 						uf2->sat_num_dropped = num_dropped;
 						uf2->sat_num_dropped_aggr = num_dropped_aggr;
 						uf2->sat_test_ms = sat_test_timer.elapsed() * 1.0e3;
+						// SESSION080 DIAGNOSTIC: last sample, then publish both numbers - see GaussianSplatUnculledFrontier::
+						// sat_concurrency_on_entry. Written here rather than with the other verbatim copies because the peak is
+						// only final once the phase's work is done.
+						sat_phase_scope.sample();
+						uf2->sat_concurrency_on_entry = sat_phase_scope.on_entry;
+						uf2->sat_concurrency_peak = sat_phase_scope.peak;
 
 						Reference<GaussianSplatLodTraversalResultMsg> sat_msg = new GaussianSplatLodTraversalResultMsg();
 						sat_msg->cloud_id = cloud_id;
@@ -1861,6 +2159,13 @@ private:
 		uint32 tree_local_idx;
 		uint32 depth; // 0 for a tree root, parent's depth + 1 for each expansion - see max_tree_depth's use in run().
 		bool coarse_captured; // SESSION063 K4: true once some ancestor on this branch was recorded into the coarse floor, so it's captured once per branch (the first node fine enough at the coarse pixel_scale). Set false at the root by makeHeapItem, propagated to children in run().
+
+		// SESSION080 STEP B: true once some STRICT ancestor on this branch would have been a stop for the PREVIOUS
+		// traversal - i.e. we are below the old cut, so this node's subtree contains none of the old frontier's nodes
+		// and there is nothing here to inherit. Propagated exactly like coarse_captured above, and derived the same way
+		// the old walk derived its own stops (see oldWalkStopsHere()), so it needs no lookup into the old frontier at
+		// all - which is what keeps the whole scheme free of a per-node membership structure over the pool.
+		bool passed_old_cut;
 	};
 
 	HeapItem makeHeapItem(uint32 member_idx, uint32 tree_local_idx, size_t member_offset, uint32 depth, const js::Vector<Vec3f, 16>& positions, const js::Vector<float, 16>& feature_sizes) const
@@ -1877,7 +2182,22 @@ private:
 		item.tree_local_idx = tree_local_idx;
 		item.depth = depth;
 		item.coarse_captured = false; // SESSION063 K4: set by the caller for children; false at the root.
+		item.passed_old_cut = false; // SESSION080 STEP B: as above - a root is never below the old cut.
 		return item;
+	}
+
+	// SESSION080 STEP B: would the PREVIOUS traversal's walk have stopped at this node rather than descending past it?
+	// Re-derives that walk's own stop rules at the old anchor, which is exact because reuse_enabled (see its comment)
+	// already guarantees the previous frontier was built with these very parameters. Budget cap is deliberately not
+	// among them: it is order-dependent, so it cannot be re-derived out of context - and it has measured false in every
+	// capture (see [gsr-traversal]'s budget_cap), while a wrong answer here can only make us conclude "the old cut is
+	// deeper than it is", which declines a reuse rather than inventing one.
+	inline bool oldWalkStopsHere(const GaussianSplatLodNode& node, float old_pixel_scale, uint32 depth) const
+	{
+		return (old_pixel_scale <= pixel_scale_limit) ||
+			(node.child_count == 0) ||
+			(max_layer_density > 0.f && node.layer_density > max_layer_density) ||
+			(max_tree_depth > 0 && depth >= (uint32)max_tree_depth);
 	}
 
 	// SESSION080: the DFS itself, lifted out of run() unchanged so that the serial path and each parallel task run
@@ -1897,7 +2217,7 @@ private:
 	void expandStack(std::vector<HeapItem>& stack, js::Vector<DistIdx, 16>& decorated,
 		const js::Vector<Vec3f, 16>& positions, const js::Vector<float, 16>& feature_sizes, const js::Vector<float, 16>& cull_radii,
 		bool enforce_budget, bool breadth_first, size_t pause_at_stack_size,
-		size_t& diag_coarse_a, size_t& diag_coarse_b,
+		size_t& diag_coarse_a, size_t& diag_coarse_b, size_t& diag_reuse_roots,
 		bool& hit_budget_cap, bool& hit_density_cap, bool& hit_depth_cap)
 	{
 		size_t head = 0; // Read cursor; breadth-first only.
@@ -1979,6 +2299,55 @@ private:
 				}
 			}
 
+			// SESSION080 STEP B: frontier reuse. Three-way classification of this node against the PREVIOUS traversal's
+			// anchor - see GaussianSplatRenderer::getFrontierReuseSplitDist() for the idea, and the plan doc's section 5
+			// for the full argument. Everything here is O(1) and needs no membership structure over the pool.
+			//
+			// The reused set is defined by a predicate on the OLD frontier's own nodes: node A is inherited iff
+			// dist(old_anchor, A) - cull_radius(A) >= split_dist. The far pass at the end of run() applies exactly that
+			// predicate, over the old frontier's SoA, to produce the inherited part. The test below is the SAME
+			// predicate applied to the node this walk is standing on, which is what makes the two sides agree:
+			//
+			//   - PASS (whole subtree beyond the split, in the old metric): every old frontier node beneath this one
+			//     also passes, because its bounding sphere is contained in this one's. So the far pass emits a complete
+			//     cut of this subtree and we must emit nothing, or the paths would be covered twice.
+			//   - STRADDLE (sphere spans the split): some descendants may be inherited and some not, so this walk may
+			//     not stop here - stopping would cover paths the far pass also covers. Forced to descend until each
+			//     branch resolves one way or the other. A leaf cannot descend, but a leaf that straddles fails the
+			//     predicate itself, so it is not inherited and emitting it is correct.
+			//   - INSIDE (sphere entirely within the split): nothing beneath can be inherited, so the normal rules
+			//     apply untouched.
+			//
+			// passed_old_cut is the fourth case and the one that would otherwise put a hole in the picture: below the
+			// old cut there are no old frontier nodes left to inherit, so a PASS there would emit nothing and the far
+			// pass would supply nothing either. Note the walk can never get below an INHERITED node - the PASS branch
+			// stops it at or above one - so this only ever means "the old walk stopped shallower than we are", i.e. the
+			// camera has come closer, which is exactly the case that must be rebuilt anyway.
+			bool force_descend = false;
+			bool child_passed_old_cut = false; // Meaningful only when reuse_enabled; propagated to this node's children below.
+			if(reuse_enabled && !top.passed_old_cut)
+			{
+				const Vec3f& p = positions[cloud_idx_u32];
+				const float dist_old = reuse_prev_anchor_ws.getDist(Vec4f(p.x, p.y, p.z, 1.f));
+				const float radius = cull_radii[cloud_idx_u32]; // Subtree enclosing sphere, NOT feature_size - see GaussianSplatLodNode::bounding_radius_os.
+
+				if(dist_old - radius >= reuse_split_dist)
+				{
+					++diag_reuse_roots;
+					continue; // Inherited whole - see PASS above.
+				}
+				force_descend = (dist_old + radius >= reuse_split_dist);
+
+				// Propagate "we are below the old cut" to the children, re-deriving the old walk's own stop decision at
+				// this node. dist_old is clamped away from zero exactly as makeHeapItem() does, so a node sitting on the
+				// old anchor cannot produce an infinite pixel scale and read as "the old walk descended past it".
+				const float old_pixel_scale = (feature_sizes[cloud_idx_u32] / myMax(dist_old, 1.0e-6f)) * focal_px;
+				if(oldWalkStopsHere(node, old_pixel_scale, top.depth))
+					child_passed_old_cut = true;
+			}
+			else if(reuse_enabled)
+				child_passed_old_cut = true; // Already below the old cut; stays true for the whole branch.
+
 			// SESSION063 K4: complete coarse-floor cut. A node becomes its branch's single coarse representative if no
 			// ancestor already took the role AND it is either coarse enough (pixel_scale <= coarse_pixel_scale) or terminal
 			// (the branch stops here - converged/leaf/capped). So every branch contributes exactly one coarse node and the
@@ -2019,7 +2388,10 @@ private:
 			const bool child_coarse_captured = top.coarse_captured || captured_here;
 
 			// Converged - already fine enough, no need to expand further.
-			if(top.pixel_scale <= pixel_scale_limit)
+			// SESSION080 STEP B: force_descend suppresses this and the two caps below - see the STRADDLE case above. The
+			// leaf branch is deliberately NOT suppressed: a leaf has nothing to descend into, and a straddling leaf
+			// fails the inheritance predicate itself, so emitting it covers its path exactly once.
+			if(top.pixel_scale <= pixel_scale_limit && !force_descend)
 			{
 				DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32;
 				decorated.push_back(d);
@@ -2040,7 +2412,7 @@ private:
 			// (see GaussianSplatLodNode::layer_density) - stop here and use this node's own merged approximation
 			// instead, regardless of how coarse its pixel_scale still looks. max_layer_density <= 0 disables this check
 			// (the "0 = unlimited" convention GaussianSplatSettingsWidget's other debug knobs use).
-			if(max_layer_density > 0.f && node.layer_density > max_layer_density)
+			if(max_layer_density > 0.f && node.layer_density > max_layer_density && !force_descend)
 			{
 				hit_density_cap = true;
 				DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32;
@@ -2051,7 +2423,7 @@ private:
 
 			// Depth-capped: a hard, global ceiling on how many levels traversal may unfold, independent of pixel_scale/
 			// density/budget - "the tree will never unfold finer than this, anywhere". max_tree_depth <= 0 disables it.
-			if(max_tree_depth > 0 && top.depth >= (uint32)max_tree_depth)
+			if(max_tree_depth > 0 && top.depth >= (uint32)max_tree_depth && !force_descend)
 			{
 				hit_depth_cap = true;
 				DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32;
@@ -2062,7 +2434,11 @@ private:
 
 			// Budget cap: expanding would push us over the ceiling. Keep this node's own merged representation instead.
 			// Current node is already popped, so the projected total after pushing children is decorated.size() + stack.size() + child_count.
-			if(enforce_budget && (decorated.size() + stack.size() + node.child_count > max_splats_budget))
+			// SESSION080 STEP B: force_descend suppresses this too. Stopping here would cover paths the far pass also
+			// covers, which is a double draw - a worse outcome than overshooting a soft target by the size of one
+			// straddle band. hit_budget_cap is still raised on the unsuppressed path, so the over-budget rebuild in
+			// expandParallel() still sees the same signal it always did.
+			if(enforce_budget && (decorated.size() + stack.size() + node.child_count > max_splats_budget) && !force_descend)
 			{
 				hit_budget_cap = true;
 				DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32;
@@ -2075,6 +2451,7 @@ private:
 			{
 				HeapItem child = makeHeapItem(top.member_idx, c, m.offset, top.depth + 1, positions, feature_sizes);
 				child.coarse_captured = child_coarse_captured; // SESSION063 K4: propagate the once-per-branch capture flag.
+				child.passed_old_cut = child_passed_old_cut;   // SESSION080 STEP B: likewise, once-per-branch - see the field.
 				stack.push_back(child);
 			}
 		}
@@ -2089,7 +2466,7 @@ private:
 	class GsExpandTask : public glare::Task
 	{
 	public:
-		GsExpandTask() : diag_coarse_a(0), diag_coarse_b(0), hit_density_cap(false), hit_depth_cap(false), run_ms(0.0) {}
+		GsExpandTask() : diag_coarse_a(0), diag_coarse_b(0), diag_reuse_roots(0), hit_density_cap(false), hit_depth_cap(false), run_ms(0.0) {}
 
 		virtual void run(size_t /*thread_index*/) override
 		{
@@ -2097,7 +2474,7 @@ private:
 			bool unused_budget_cap = false; // Not enforced here - see expandParallel().
 			parent->expandStack(stack, decorated, *positions, *feature_sizes, *cull_radii,
 				/*enforce_budget=*/false, /*breadth_first=*/false, /*pause_at_stack_size=*/0,
-				diag_coarse_a, diag_coarse_b, unused_budget_cap, hit_density_cap, hit_depth_cap);
+				diag_coarse_a, diag_coarse_b, diag_reuse_roots, unused_budget_cap, hit_density_cap, hit_depth_cap);
 			run_ms = task_timer.elapsed() * 1.0e3;
 		}
 
@@ -2107,7 +2484,7 @@ private:
 		const js::Vector<float, 16>* cull_radii;
 		std::vector<HeapItem> stack; // This task's seeds, and its own working stack thereafter.
 		js::Vector<DistIdx, 16> decorated;
-		size_t diag_coarse_a, diag_coarse_b;
+		size_t diag_coarse_a, diag_coarse_b, diag_reuse_roots;
 		bool hit_density_cap, hit_depth_cap;
 		double run_ms; // SESSION080 DIAGNOSTIC
 	};
@@ -2129,7 +2506,7 @@ private:
 	// measured false in every capture - see [gsr-traversal]), so its cost is theoretical.
 	void expandParallel(std::vector<HeapItem>& stack, js::Vector<DistIdx, 16>& decorated,
 		const js::Vector<Vec3f, 16>& positions, const js::Vector<float, 16>& feature_sizes, const js::Vector<float, 16>& cull_radii,
-		size_t& diag_coarse_a, size_t& diag_coarse_b,
+		size_t& diag_coarse_a, size_t& diag_coarse_b, size_t& diag_reuse_roots,
 		bool& hit_budget_cap, bool& hit_density_cap, bool& hit_depth_cap)
 	{
 		// Seeds are cut far finer than the thread count on purpose, for the same reason session079's saturation chunks
@@ -2146,7 +2523,7 @@ private:
 		// the first part of the identical DFS, and anything it finishes on the way lands in `decorated` directly.
 		Timer prologue_timer; // SESSION080 DIAGNOSTIC
 		expandStack(stack, decorated, positions, feature_sizes, cull_radii, /*enforce_budget=*/false, /*breadth_first=*/true, /*pause_at_stack_size=*/target_seeds,
-			diag_coarse_a, diag_coarse_b, hit_budget_cap, hit_density_cap, hit_depth_cap);
+			diag_coarse_a, diag_coarse_b, diag_reuse_roots, hit_budget_cap, hit_density_cap, hit_depth_cap);
 		expand_prologue_ms = prologue_timer.elapsed() * 1.0e3;
 		expand_seeds = stack.size();
 
@@ -2186,7 +2563,7 @@ private:
 		if(total > max_splats_budget)
 		{
 			decorated.resize(initial_decorated); // NOT 0 - see initial_decorated's comment.
-			diag_coarse_a = diag_coarse_b = 0;
+			diag_coarse_a = diag_coarse_b = diag_reuse_roots = 0;
 			hit_density_cap = hit_depth_cap = false;
 			stack.clear();
 			for(size_t mi=0; mi<scratch->members_snapshot.size(); ++mi)
@@ -2197,7 +2574,7 @@ private:
 				stack.push_back(makeHeapItem((uint32)mi, /*tree_local_idx=*/0, m.offset, /*depth=*/0, positions, feature_sizes));
 			}
 			expandStack(stack, decorated, positions, feature_sizes, cull_radii, /*enforce_budget=*/true, /*breadth_first=*/false, /*pause_at_stack_size=*/0,
-				diag_coarse_a, diag_coarse_b, hit_budget_cap, hit_density_cap, hit_depth_cap);
+				diag_coarse_a, diag_coarse_b, diag_reuse_roots, hit_budget_cap, hit_density_cap, hit_depth_cap);
 			return;
 		}
 
@@ -2209,6 +2586,7 @@ private:
 				decorated.push_back(task->decorated[i]);
 			diag_coarse_a += task->diag_coarse_a;
 			diag_coarse_b += task->diag_coarse_b;
+			diag_reuse_roots += task->diag_reuse_roots; // SESSION080 STEP B
 			hit_density_cap = hit_density_cap || task->hit_density_cap;
 			hit_depth_cap   = hit_depth_cap   || task->hit_depth_cap;
 		}
@@ -2251,14 +2629,42 @@ private:
 	size_t expand_seeds, expand_num_tasks;
 	double expand_prologue_ms, expand_task_max_ms, expand_task_sum_ms;
 
-	// SESSION080 DIAGNOSTIC (plan doc STEP A): the cloud's cached_ufrontier at kick time, captured by
-	// kickOffTraversals() before this task was created - i.e. whatever was actually being drawn just before this
-	// traversal started. NULL on a cloud's first kick. See GaussianSplatUnculledFrontier::sort_staleness_* for what
-	// the comparison computes; sort_staleness_diag_enabled gates the cost (an O(positions.size()) rank array plus
-	// an O(N) pass), off by default since it's meaningful only during the dedicated walking test - see the plan doc.
-	Reference<GaussianSplatUnculledFrontier> sort_staleness_prev_frontier;
+	// SESSION080: the previous traversal's UNPRUNED frontier for this cloud, captured by kickOffTraversals() before this
+	// task was created - SplatCloud::last_unpruned_ufrontier, NOT cached_ufrontier (see that field's comment for why the
+	// pruned one will not do). NULL on a cloud's first kick. Serves two consumers:
+	//   - STEP A, the sort-staleness diagnostic, gated by sort_staleness_diag_enabled (see
+	//     GaussianSplatUnculledFrontier::sort_staleness_*);
+	//   - STEP B, frontier reuse, gated by reuse_enabled below.
+	Reference<GaussianSplatUnculledFrontier> prev_frontier;
 	bool sort_staleness_diag_enabled;
+
+	// SESSION080 STEP B - see GaussianSplatRenderer::getFrontierReuseSplitDist() for the idea and the plan doc's
+	// section 5 for the geometry. reuse_enabled folds the knob together with every precondition the scheme needs, so
+	// the hot loop tests one bool; reuse_prev_anchor_ws/reuse_split_dist are the two quantities its test needs.
+	//
+	// Preconditions, each of which would otherwise break the cut invariant or the reused nodes' meaning:
+	//   - a previous frontier exists, and was built for the SAME selection (the key set the frontier documents), so its
+	//     nodes are the ones this walk's own stop rules would have chosen;
+	//   - frustum cull is off (it is, in split-filter mode): a culled traversal's frontier is not a complete cut, so
+	//     inheriting a piece of it could inherit a hole;
+	//   - the distance clamp is off, for the same reason - it prunes whole subtrees out of the cut;
+	//   - the coarse floor is off. Not a correctness problem but a scope one: the coarse layer is captured once per
+	//     branch on the way down, and a reused subtree's branch is never walked, so the two capture rules would have to
+	//     be reconciled. The owner runs coarse off; revisit if that changes.
+	bool reuse_enabled;
+	Vec4f reuse_prev_anchor_ws; // Camera position the reused frontier was built from. The reuse test is evaluated against THIS, not cam_pos_ws - see expandStack().
+	float reuse_split_dist;
+
+	// How far the camera may drift from the oldest inherited data's anchor before a traversal gives up on inheritance
+	// and walks the whole tree - see the clause that uses it in the constructor, and
+	// GaussianSplatUnculledFrontier::reuse_base_anchor_ws for what it protects against. A fraction of the split distance,
+	// not an absolute: 1/4 keeps the accumulated ordering error inside the inherited region well under the range at which
+	// that region sits, which is the ratio that decides whether it can be seen.
+	static const float reuse_max_drift_fraction;
 };
+
+
+const float GaussianSplatLodTraversalTask::reuse_max_drift_fraction = 0.25f; // SESSION080 STEP B - see the declaration.
 
 
 } // end anonymous namespace
@@ -2290,6 +2696,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	sat_prefilter_mode(GaussianSplatSatPrefilterMode_Off), filter_frustum_planes_enabled(true), // SESSION074: stage off by default, frustum planes on (i.e. unchanged pipeline) - see getSatPrefilterMode()/getFilterFrustumPlanesEnabled().
 	sat_prefilter_threshold(0.98f), // SESSION079 - see getSatPrefilterThreshold().
 	sat_diag_log(false), sat_debug_overlay_mode(GaussianSplatSatDebugOverlayMode_Off), sat_grid_subdiv(0.3f), sat_region_radius(0.f), // SESSION076/078: diagnostics off by default - see getSatDiagLog()/getSatDebugOverlayMode(). Calibration defaults are the values reasoned to on paper, not yet confirmed on a scene.
+	frontier_reuse_split_dist(0.f), // SESSION080 STEP B: off by default - 0 is the pre-session080 walk-everything behaviour, bit-for-bit. See getFrontierReuseSplitDist().
 	splat_point_size_px(1.f),
 	splat_merge_spread_widen(3.0f), // SESSION071: analytic minimum is sqrt(3) (see widenedMergedScale()); owner default set higher for extra margin.
 	// SESSION071: GaussianSplatMergeColourParams defaults to Energy - owner-confirmed better at every pixel scale limit tested; Legacy is kept only as the A/B comparison.
@@ -5670,6 +6077,26 @@ void GaussianSplatRenderer::setSatRegionRadius(float v)
 }
 
 
+// SESSION080 STEP B: same reasoning as the two setters above - this changes what a traversal PRODUCES (a frontier
+// partly inherited from its predecessor rather than walked from scratch), so cached frontiers built under the old value
+// are not valid inputs under the new one. Dropping last_unpruned_ufrontier too is what makes turning the knob back to 0
+// exact rather than approximately exact: the next traversal then has no predecessor to inherit from and walks the whole
+// tree, which is the pre-session080 behaviour bit-for-bit. See getFrontierReuseSplitDist().
+void GaussianSplatRenderer::setFrontierReuseSplitDist(float v)
+{
+	if(v == frontier_reuse_split_dist)
+		return;
+	frontier_reuse_split_dist = v;
+
+	for(size_t i=0; i<clouds.size(); ++i)
+	{
+		clouds[i]->cached_ufrontier = NULL;
+		clouds[i]->last_unpruned_ufrontier = NULL;
+		clouds[i]->have_last_traversal_cam_pos = false;
+	}
+}
+
+
 void GaussianSplatRenderer::setMergeColourMode(GaussianSplatMergeColourMode v)
 {
 	if(v == splat_merge_colour_params.mode)
@@ -6751,56 +7178,12 @@ void GaussianSplatRenderer::drainTraversalResults()
 				// repeat identical values every frame of a rotation). Shares the filter trace's toggle.
 				const GaussianSplatUnculledFrontier& uf = *msg->unculled_frontier;
 
-				// SESSION080 DIAGNOSTIC: the traversal task's own cost, split into tree walk/selection vs. sort - see
-				// GaussianSplatUnculledFrontier::expand_ms/sort_ms. Printed once per traversal (same cadence as [gsr-sat]
-				// below, but NOT gated on sat_grid_res>0 - this fires with the saturation stage off too, since the DFS and
-				// sort happen regardless). Answers whether session054's "sort was ~76% of traversal time" figure - measured
-				// against std::sort, before the switch to radix - is still the shape of the cost today.
-				if(filter_debug_log)
-					conPrint("[gsr-traversal] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms " +
-						"expand_ms=" + doubleToStringNDecimalPlaces(uf.expand_ms, 2) +
-						" sort_ms=" + doubleToStringNDecimalPlaces(uf.sort_ms, 2) +
-						" total_ms=" + doubleToStringNDecimalPlaces(uf.expand_ms + uf.sort_ms, 2) +
-						// SESSION080: traversal_output_n, NOT uf.indices.size() - on this (pruned) frontier indices.size()
-						// is pool_after, which undercounts what expand_ms/sort_ms actually walked/sorted. See the field's comment.
-						" n=" + uInt64ToStringCommaSeparated(uf.traversal_output_n) +
-						// SESSION080: whether this traversal's DFS was truncated rather than run to convergence - see
-						// GaussianSplatLodTraversalScratch::hit_budget_cap and session054's note (above, in the sort
-						// block's comment) that expand's DFS-order budget-clip policy assumed this never fires. Read off
-						// the cloud, not the scratch (already freed by the time this - message 2 - branch runs) - safe
-						// because the derived_from equality check above guarantees this is still THIS traversal's msg1.
-						" budget_cap=" + boolToString(cloud->last_traversal_hit_budget_cap) +
-						" density_cap=" + boolToString(cloud->last_traversal_hit_density_cap) +
-						" depth_cap=" + boolToString(cloud->last_traversal_hit_depth_cap) +
-						// SESSION080 DIAGNOSTIC: the parallel expand's own shape - see the fields' comment. par= is
-						// task_sum/task_max, the parallelism the seed split actually offers; compare it against how much
-						// of expand_ms the longest task accounts for.
-						" seeds=" + uInt64ToStringCommaSeparated(uf.expand_seeds) +
-						" tasks=" + uInt64ToStringCommaSeparated(uf.expand_num_tasks) +
-						" prologue_ms=" + doubleToStringNDecimalPlaces(uf.expand_prologue_ms, 2) +
-						" task_max_ms=" + doubleToStringNDecimalPlaces(uf.expand_task_max_ms, 2) +
-						" task_sum_ms=" + doubleToStringNDecimalPlaces(uf.expand_task_sum_ms, 2) +
-						" soa_ms=" + doubleToStringNDecimalPlaces(uf.soa_ms, 2) + // SESSION080: was untimed before - see the field.
-						// SESSION080: node distance distribution, metres - sizes the far-tail-reuse question. See the field.
-						" d10=" + doubleToStringNDecimalPlaces(uf.dist_pctile[0], 1) +
-						" d25=" + doubleToStringNDecimalPlaces(uf.dist_pctile[1], 1) +
-						" d50=" + doubleToStringNDecimalPlaces(uf.dist_pctile[2], 1) +
-						" d75=" + doubleToStringNDecimalPlaces(uf.dist_pctile[3], 1) +
-						" d90=" + doubleToStringNDecimalPlaces(uf.dist_pctile[4], 1) +
-						" par=" + doubleToStringNDecimalPlaces(uf.expand_task_max_ms > 0.0 ? (uf.expand_task_sum_ms / uf.expand_task_max_ms) : 0.0, 2) +
-						// SESSION080 DIAGNOSTIC (plan doc STEP A): sort staleness vs. whatever this cloud was drawing off
-						// just before this kick - see GaussianSplatUnculledFrontier::sort_staleness_*. All zero when
-						// sort_staleness_diag_enabled was off, there was no previous frontier, or topology changed.
-						" delta_ws=" + doubleToStringNDecimalPlaces(uf.sort_staleness_delta_ws, 3) +
-						" stale_common=" + uInt64ToStringCommaSeparated(uf.sort_staleness_common_n) +
-						"/" + uInt64ToStringCommaSeparated(uf.sort_staleness_prev_n) +
-						" stale_max=" + uInt64ToStringCommaSeparated(uf.sort_staleness_max_disp) +
-						" stale_mean=" + doubleToStringNDecimalPlaces(uf.sort_staleness_mean_disp, 1) +
-						" stale_gt1k=" + uInt64ToStringCommaSeparated(uf.sort_staleness_gt1k) +
-						" (" + doubleToStringNDecimalPlaces(uf.sort_staleness_common_n > 0 ? (100.0 * (double)uf.sort_staleness_gt1k / (double)uf.sort_staleness_common_n) : 0.0, 2) + "%)" +
-						" stale_gt10k=" + uInt64ToStringCommaSeparated(uf.sort_staleness_gt10k) +
-						" (" + doubleToStringNDecimalPlaces(uf.sort_staleness_common_n > 0 ? (100.0 * (double)uf.sort_staleness_gt10k / (double)uf.sort_staleness_common_n) : 0.0, 2) + "%)" +
-						" stale_ms=" + doubleToStringNDecimalPlaces(uf.sort_staleness_ms, 2));
+				// SESSION080: [gsr-traversal] does NOT live here. It used to, and the comment on it claimed it "fires with
+				// the saturation stage off too" - which was false, because this whole branch is the saturation follow-up
+				// (derived_from non-null) and no such message exists when the stage is off. That made the isolated
+				// measurement the split-pipeline stage model calls for - reuse timed with saturation and frustum both off -
+				// silently impossible: the run produced no traversal line at all. It now prints from message 1's branch
+				// below, which every traversal sends unconditionally.
 
 				if(filter_debug_log && uf.sat_grid_res > 0)
 				{
@@ -6824,6 +7207,12 @@ void GaussianSplatRenderer::drainTraversalResults()
 						" er_win=" + uInt64ToStringCommaSeparated(uf.sat_erode_stats[1]) +
 						" (" + doubleToStringNDecimalPlaces(num_tiles > 0 ? (100.0 * (double)(uf.sat_erode_stats[0] + uf.sat_erode_stats[1]) / (double)num_tiles) : 0.0, 1) + "%)" +
 						" er_radmax=" + uInt64ToStringCommaSeparated(uf.sat_erode_stats[2]) +
+						// SESSION080 DIAGNOSTIC: how many saturation phases shared the pool with this one - see
+						// GaussianSplatUnculledFrontier::sat_concurrency_on_entry. The three timings after it are wall-clock on a
+						// shared pool, so they are only comparable between captures at the same concurrency: peak=1 means this
+						// traversal had the stage to itself, and anything above that means the numbers include contention.
+						" sat_conc=" + uInt64ToStringCommaSeparated(uf.sat_concurrency_on_entry) +
+						" sat_conc_peak=" + uInt64ToStringCommaSeparated(uf.sat_concurrency_peak) +
 						" gather_ms=" + doubleToStringNDecimalPlaces(uf.sat_gather_ms, 2) + // SESSION079: building the occluder SoA - see the loop.
 						" grid_ms=" + doubleToStringNDecimalPlaces(uf.sat_grid_build_ms, 2) +
 						" test_ms=" + doubleToStringNDecimalPlaces(uf.sat_test_ms, 2) +
@@ -6905,11 +7294,12 @@ void GaussianSplatRenderer::drainTraversalResults()
 			cloud->cached_ufrontier = msg->unculled_frontier;
 			cloud->ufrontier_needs_filter = true; // Produce the first S(P,R) for this fresh U(P) even with no rotation.
 
-			// SESSION080 DIAGNOSTIC (plan doc STEP A): this branch is the only place the UNPRUNED frontier is ever seen -
-			// the saturation follow-up overwrites cached_ufrontier with its pruned copy - so it is the only place the
-			// sort-staleness comparison's "previous frontier" can be captured. See the field's comment for why the pruned
-			// one will not do. Assigned NULL when the trace is off so the extra frontier is released rather than pinned.
-			cloud->last_unpruned_ufrontier = filter_debug_log ? msg->unculled_frontier : Reference<GaussianSplatUnculledFrontier>();
+			// SESSION080: this branch is the only place the UNPRUNED frontier is ever seen - the saturation follow-up
+			// overwrites cached_ufrontier with its pruned copy - so it is the only place the "previous frontier" that
+			// STEP A's staleness comparison and STEP B's reuse both need can be captured. See the field's comment for
+			// why the pruned one will not do for either. Assigned NULL when neither consumer wants it, so the extra
+			// frontier is released rather than pinned.
+			cloud->last_unpruned_ufrontier = (sat_diag_log || frontier_reuse_split_dist > 0.f) ? msg->unculled_frontier : Reference<GaussianSplatUnculledFrontier>();
 
 			cloud->last_traversal_hit_budget_cap = msg->scratch->hit_budget_cap;
 			cloud->last_traversal_hit_density_cap = msg->scratch->hit_density_cap;
@@ -6918,6 +7308,84 @@ void GaussianSplatRenderer::drainTraversalResults()
 			// SESSION076: no saturation numbers to print here any more. A traversal's first message carries the
 			// UNPRUNED frontier - the grid has not been built at this point - so [gsr-sat] moved to the follow-up
 			// message's branch at the top of this loop, which is where those numbers now come into existence.
+			//
+			// SESSION080: the traversal's OWN cost is the opposite case and belongs here rather than there. It is fully
+			// known by message 1 - the walk, the sort and the SoA build are all finished before this message is sent -
+			// and, unlike the saturation numbers, it exists whether or not the saturation stage runs at all. Printing it
+			// from the follow-up branch (where it originally sat) tied it to a message that is never sent with that stage
+			// off, which is exactly the configuration the stage-by-stage measurement model wants it in. Still once per
+			// traversal either way: message 1 is sent unconditionally, exactly once, by every traversal.
+			{
+				const GaussianSplatUnculledFrontier& uf = *msg->unculled_frontier;
+
+				// SESSION080 STEP B: read once here for reuse_drift= below. A null scene (no current scene at drain time)
+				// reads as the origin, which only makes that one log field meaningless.
+				const OpenGLScene* const drift_scene = opengl_engine->getCurrentScene();
+				const Vec4f cam_pos_now_for_drift = (drift_scene != NULL) ? drift_scene->cam_to_world.getColumn(3) : Vec4f(0.f);
+
+				// SESSION080 DIAGNOSTIC: the traversal task's own cost, split into tree walk/selection vs. sort - see
+				// GaussianSplatUnculledFrontier::expand_ms/sort_ms. Answers whether session054's "sort was ~76% of
+				// traversal time" figure - measured against std::sort, before the switch to radix - is still the shape of
+				// the cost today.
+				if(filter_debug_log)
+					conPrint("[gsr-traversal] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms " +
+						"expand_ms=" + doubleToStringNDecimalPlaces(uf.expand_ms, 2) +
+						" sort_ms=" + doubleToStringNDecimalPlaces(uf.sort_ms, 2) +
+						" total_ms=" + doubleToStringNDecimalPlaces(uf.expand_ms + uf.sort_ms, 2) +
+						// SESSION080: traversal_output_n rather than uf.indices.size(). They are equal on THIS (unpruned)
+						// frontier, but the field is the one that stays right if this line is ever read off a pruned copy,
+						// where indices.size() has shrunk to pool_after. See the field's comment.
+						" n=" + uInt64ToStringCommaSeparated(uf.traversal_output_n) +
+						// SESSION080: whether this traversal's DFS was truncated rather than run to convergence - see
+						// GaussianSplatLodTraversalScratch::hit_budget_cap and session054's note (in the sort block's
+						// comment) that expand's DFS-order budget-clip policy assumed this never fires. Read off the cloud,
+						// which the three lines just above set from this very message's scratch.
+						" budget_cap=" + boolToString(cloud->last_traversal_hit_budget_cap) +
+						" density_cap=" + boolToString(cloud->last_traversal_hit_density_cap) +
+						" depth_cap=" + boolToString(cloud->last_traversal_hit_depth_cap) +
+						// SESSION080 DIAGNOSTIC: the parallel expand's own shape - see the fields' comment. par= is
+						// task_sum/task_max, the parallelism the seed split actually offers; compare it against how much
+						// of expand_ms the longest task accounts for.
+						" seeds=" + uInt64ToStringCommaSeparated(uf.expand_seeds) +
+						" tasks=" + uInt64ToStringCommaSeparated(uf.expand_num_tasks) +
+						" prologue_ms=" + doubleToStringNDecimalPlaces(uf.expand_prologue_ms, 2) +
+						" task_max_ms=" + doubleToStringNDecimalPlaces(uf.expand_task_max_ms, 2) +
+						" task_sum_ms=" + doubleToStringNDecimalPlaces(uf.expand_task_sum_ms, 2) +
+						" soa_ms=" + doubleToStringNDecimalPlaces(uf.soa_ms, 2) + // SESSION080: was untimed before - see the field.
+						// SESSION080: node distance distribution, metres - sizes the far-tail-reuse question. See the field.
+						" d10=" + doubleToStringNDecimalPlaces(uf.dist_pctile[0], 1) +
+						" d25=" + doubleToStringNDecimalPlaces(uf.dist_pctile[1], 1) +
+						" d50=" + doubleToStringNDecimalPlaces(uf.dist_pctile[2], 1) +
+						" d75=" + doubleToStringNDecimalPlaces(uf.dist_pctile[3], 1) +
+						" d90=" + doubleToStringNDecimalPlaces(uf.dist_pctile[4], 1) +
+						" par=" + doubleToStringNDecimalPlaces(uf.expand_task_max_ms > 0.0 ? (uf.expand_task_sum_ms / uf.expand_task_max_ms) : 0.0, 2) +
+						// SESSION080 DIAGNOSTIC (plan doc STEP A): sort staleness vs. whatever this cloud was drawing off
+						// just before this kick - see GaussianSplatUnculledFrontier::sort_staleness_*. All zero when
+						// sort_staleness_diag_enabled was off, there was no previous frontier, or topology changed.
+						" delta_ws=" + doubleToStringNDecimalPlaces(uf.sort_staleness_delta_ws, 3) +
+						" stale_common=" + uInt64ToStringCommaSeparated(uf.sort_staleness_common_n) +
+						"/" + uInt64ToStringCommaSeparated(uf.sort_staleness_prev_n) +
+						" stale_max=" + uInt64ToStringCommaSeparated(uf.sort_staleness_max_disp) +
+						" stale_mean=" + doubleToStringNDecimalPlaces(uf.sort_staleness_mean_disp, 1) +
+						" stale_gt1k=" + uInt64ToStringCommaSeparated(uf.sort_staleness_gt1k) +
+						" (" + doubleToStringNDecimalPlaces(uf.sort_staleness_common_n > 0 ? (100.0 * (double)uf.sort_staleness_gt1k / (double)uf.sort_staleness_common_n) : 0.0, 2) + "%)" +
+						" stale_gt10k=" + uInt64ToStringCommaSeparated(uf.sort_staleness_gt10k) +
+						" (" + doubleToStringNDecimalPlaces(uf.sort_staleness_common_n > 0 ? (100.0 * (double)uf.sort_staleness_gt10k / (double)uf.sort_staleness_common_n) : 0.0, 2) + "%)" +
+						" stale_ms=" + doubleToStringNDecimalPlaces(uf.sort_staleness_ms, 2) +
+						// SESSION080 STEP B: what frontier reuse did - see GaussianSplatUnculledFrontier::reuse_roots. split=0
+						// means the knob was off OR a precondition declined it (see the task's reuse_enabled), so a non-zero
+						// split with reuse_n=0 is the interesting failure: the scheme ran and inherited nothing.
+						" reuse_split=" + doubleToStringNDecimalPlaces(uf.reuse_split_dist_used, 2) +
+						" reuse_roots=" + uInt64ToStringCommaSeparated(uf.reuse_roots) +
+						" reuse_n=" + uInt64ToStringCommaSeparated(uf.reuse_n) +
+						" (" + doubleToStringNDecimalPlaces(uf.traversal_output_n + uf.reuse_n > 0 ? (100.0 * (double)uf.reuse_n / (double)(uf.traversal_output_n + uf.reuse_n)) : 0.0, 1) + "%)" +
+						" reuse_ms=" + doubleToStringNDecimalPlaces(uf.reuse_ms, 2) +
+						// How far this frontier's OLDEST inherited data's anchor is from where the camera is now - the quantity
+						// the full-rebuild safety trigger watches. Rising towards split*0.25 and then reuse_n dropping to 0 for
+						// one traversal is the trigger firing, which is working as intended, not a fault.
+						" reuse_drift=" + doubleToStringNDecimalPlaces(cam_pos_now_for_drift.getDist(uf.reuse_base_anchor_ws), 2));
+			}
+
 			continue;
 		}
 
@@ -7433,8 +7901,14 @@ void GaussianSplatRenderer::kickOffTraversals()
 			/*sat_overlay_requested=*/sat_debug_overlay_mode != GaussianSplatSatDebugOverlayMode_Off, // SESSION078
 			/*alpha_gain=*/splat_alpha_gain, /*alpha_gamma=*/splat_alpha_gamma, // SESSION078
 			/*task_manager=*/task_manager, // SESSION079: lets the saturation build spread across the same pool - safe, see gsBuildSaturationGridParallel().
-			/*sort_staleness_prev_frontier=*/best_cloud->last_unpruned_ufrontier, // SESSION080 DIAGNOSTIC (plan doc STEP A): the previous traversal's UNPRUNED output - NOT cached_ufrontier, see that field's comment.
-			/*sort_staleness_diag_enabled=*/filter_debug_log)); // Same toggle as [gsr-traversal]/[gsr-sat] - this diagnostic's cost is only meaningful while that trace is being read.
+			/*prev_frontier=*/best_cloud->last_unpruned_ufrontier, // SESSION080: the previous traversal's UNPRUNED output, for STEP A's diagnostic and STEP B's reuse - NOT cached_ufrontier, see that field's comment.
+			/*sort_staleness_diag_enabled=*/sat_diag_log, // SESSION080: the "diag" checkbox, NOT the filter log that prints the line.
+			// The two have to be separate because this measurement costs 185-848ms of single-threaded, memory-hungry work
+			// and visibly inflates the NEXT traversal's timings through contention (soa_ms, a pure map, was seen to swing
+			// 72 -> 529ms). Sharing the filter log's toggle made "print the timings" and "corrupt the timings" the same
+			// switch, so the pipeline could not be timed and traced at once. This checkbox already means exactly that
+			// trade for the saturation counters - see getSatDiagLog() - so it is the right home for it.
+			/*reuse_split_dist=*/frontier_reuse_split_dist)); // SESSION080 STEP B - see getFrontierReuseSplitDist(). 0 = walk the whole tree, as before.
 	}
 
 	// SESSION055 diag: after the while-loop, detect *unmet* rotation demand - a cloud whose forward has shifted past the

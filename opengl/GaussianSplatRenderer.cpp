@@ -253,6 +253,34 @@ public:
 	// larger scene) and a large R costs nothing; a large [1] means silhouettes - or a pinholed mask - dominate.
 	size_t sat_erode_stats[3];
 
+	// SESSION080 DIAGNOSTIC: splits the traversal task's own cost (everything above the saturation stage) into the tree
+	// walk/selection (the while(!stack.empty()) loop in run()) versus the front-to-back radix sort of its output - see
+	// [gsr-traversal]. Answers whether a "keep the far frontier, only re-walk/re-sort the near shell" scheme (discussed
+	// re: the region-radius topology) is worth it for the walk, the sort, or both - session054's own note that the sort
+	// was ~76% of traversal time predates the switch from std::sort to radix and was never re-measured after.
+	double expand_ms; // The DFS/selection loop: frustum cull, coarse capture, pixel_scale convergence checks, cap tests.
+	double sort_ms;   // Sort::floatKeyAscendingSort() over the selection, plus unpacking into output/coarse_flags.
+	// SESSION080 DIAGNOSTIC: why the parallel expand did or did not pay off - see expandParallel(). The pair that matters
+	// is sum vs max: task_sum_ms is the total work the tasks did, task_max_ms the longest single one, i.e. the critical
+	// path. sum/max is the parallelism actually available in the seed split. If max ~= expand_ms one subtree dominates
+	// and the seeds need cutting finer; if sum ~= expand_ms while max is much smaller, the tasks ran one after another
+	// and the problem is the dispatch, not the split.
+	size_t expand_seeds;        // Subtree roots the serial prologue handed to the pool.
+	size_t expand_num_tasks;    // Tasks they were distributed into.
+	double expand_prologue_ms;  // The serial top-of-tree walk before any of them started.
+	double expand_task_max_ms;
+	double expand_task_sum_ms;
+
+	// SESSION080 DIAGNOSTIC: building this frontier's SoA (indices/px/py/pz/radius/is_coarse) from the sorted selection.
+	// Sat between sort_ms and sat_gather_ms and was covered by NEITHER, so the stage timings did not sum to the traversal
+	// task's real duration. It is a scattered read of positions[idx]/cull_radius[idx] over the whole selection - the same
+	// shape as, and over the same indices as, the occluder gather that follows it.
+	double soa_ms;
+
+	size_t traversal_output_n; // SESSION080 DIAGNOSTIC: decorated.size() at the point expand_ms/sort_ms were measured -
+	// i.e. what the DFS actually walked/sorted, BEFORE the saturation prune. indices.size() is NOT this on the pruned
+	// replacement (uf2): it shrinks to pool_after, which would misattribute expand_ms/sort_ms's cost to the wrong N.
+
 	GaussianSplatUnculledFrontier() // SESSION074: defaults are "stage never ran" - only kickOffTraversals() passing the stage-enabled flag sets sat_grid_res non-zero.
 	:	sat_grid_res(0), sat_num_occluders(0), sat_num_tested(0), sat_num_dropped(0), sat_num_dropped_aggr(0),
 		sat_gather_ms(0.0), // SESSION079
@@ -260,7 +288,10 @@ public:
 		sat_diag_coarse_a(0), sat_diag_coarse_b(0), sat_diag_writers(0), sat_diag_tile_writes(0), // SESSION076
 		sat_diag_aniso_n(0), sat_diag_aniso_mean(0.0), sat_diag_aniso_max(0.f), sat_diag_aniso_gt5(0), sat_diag_aniso_gt10(0), // SESSION077
 		built_time_real_s(0.0), // SESSION080
-		sat_prefilter_threshold_used(0.f), sat_grid_subdiv_used(0.f), sat_region_radius_used(0.f) // SESSION080
+		sat_prefilter_threshold_used(0.f), sat_grid_subdiv_used(0.f), sat_region_radius_used(0.f), // SESSION080
+		expand_ms(0.0), sort_ms(0.0), // SESSION080
+		expand_seeds(0), expand_num_tasks(0), expand_prologue_ms(0.0), expand_task_max_ms(0.0), expand_task_sum_ms(0.0), soa_ms(0.0), // SESSION080
+		traversal_output_n(0) // SESSION080
 	{
 		for(int i=0; i<3; ++i) sat_diag_tile_stats[i] = 0;
 		for(int i=0; i<3; ++i) sat_erode_stats[i] = 0; // SESSION080
@@ -886,6 +917,33 @@ struct FrontierNodeRecord
 // walks, which is the other half of why a per-node frustum test added now would be work thrown away.
 
 
+// SESSION080: one slice of the frontier SoA build - see the call site in GaussianSplatLodTraversalTask::run(). Carries no
+// chunk struct of its own because, unlike the occluder gather below, it reports nothing back: every slot it writes is
+// determined by its own index, so there is no count to return and no compaction afterwards.
+class GsFrontierSoATask : public glare::Task
+{
+public:
+	virtual void run(size_t /*thread_index*/)
+	{
+		for(size_t i=i_begin; i<i_end; ++i)
+		{
+			const uint32 idx = output[i];
+			const Vec3f& p = positions[idx];
+			out_indices[i] = idx;
+			out_px[i] = p.x; out_py[i] = p.y; out_pz[i] = p.z;
+			out_radius[i] = cull_radii[idx];
+			out_is_coarse[i] = coarse_flags[i];
+		}
+	}
+
+	size_t i_begin, i_end;
+	const uint32* output; const float* coarse_flags;
+	const Vec3f* positions; const float* cull_radii;
+	uint32* out_indices;
+	float* out_px; float* out_py; float* out_pz; float* out_radius; float* out_is_coarse;
+};
+
+
 // SESSION079: one slice of the occluder gather - see GsSatGatherTask.
 struct GsSatGatherChunk
 {
@@ -1054,6 +1112,14 @@ public:
 class GaussianSplatLodTraversalTask : public glare::Task
 {
 public:
+	// SESSION054: build (dist_sq, idx) pairs directly during traversal, so the sort phase reuses the distance already
+	// computed for pixel_scale rather than re-scanning positions[] a second time. Squared distance is a monotone key,
+	// preserves ascending sort order, and skips 3-8M sqrt calls that the previous getDist()-per-item scan cost.
+	// SESSION080: at class scope rather than inside run(), so the parallel expand's tasks can name it too.
+	struct DistIdx { float dist_sq; uint32 idx; };
+	struct DistIdxLess { inline bool operator () (const DistIdx& a, const DistIdx& b) const { return a.dist_sq < b.dist_sq; } }; // Nearest first (matches GaussianSplatSortResultMsg's convention for the front-to-back "under" blend). Used only by the small-N std::sort fallback inside floatKeyAscendingSort.
+	struct DistIdxKey  { inline float operator () (const DistIdx& x) const { return x.dist_sq; } }; // Sort::floatKeyAscendingSort keys on this float; squared distance is non-negative so FloatFlip's positive-branch monotone mapping applies.
+
 	// result_queue_ may be null, and frontier_record_ non-null, for a synchronous run made purely to inspect the frontier -
 	// see GaussianSplatRenderer::getFrustumStructureReport().  Both are null/absent for the normal per-frame traversal,
 	// where the enqueued result is the whole point and nothing wants the per-node breakdown.
@@ -1089,7 +1155,8 @@ public:
 		sat_region_radius(sat_region_radius_), // SESSION078
 		sat_overlay_requested(sat_overlay_requested_), // SESSION078
 		alpha_gain(alpha_gain_), alpha_gamma(alpha_gamma_), // SESSION078
-		task_manager(task_manager_) // SESSION079
+		task_manager(task_manager_), // SESSION079
+		expand_seeds(0), expand_num_tasks(0), expand_prologue_ms(0.0), expand_task_max_ms(0.0), expand_task_sum_ms(0.0) // SESSION080 DIAGNOSTIC
 	{
 		if(num_frustum_clip_planes < 0)
 			num_frustum_clip_planes = 0;
@@ -1127,13 +1194,6 @@ public:
 		std::vector<HeapItem> stack;
 		stack.reserve(4096); // Peak is O(depth * branching); 4096 covers deep trees comfortably without reallocating.
 
-		// SESSION054: build (dist_sq, idx) pairs directly during traversal, so the sort phase reuses the distance already
-		// computed for pixel_scale rather than re-scanning positions[] a second time. Squared distance is a monotone key,
-		// preserves ascending sort order, and skips 3-8M sqrt calls that the previous getDist()-per-item scan cost.
-		struct DistIdx { float dist_sq; uint32 idx; };
-		struct DistIdxLess { inline bool operator () (const DistIdx& a, const DistIdx& b) const { return a.dist_sq < b.dist_sq; } }; // Nearest first (matches GaussianSplatSortResultMsg's convention for the front-to-back "under" blend). Used only by the small-N std::sort fallback inside floatKeyAscendingSort.
-		struct DistIdxKey  { inline float operator () (const DistIdx& x) const { return x.dist_sq; } }; // Sort::floatKeyAscendingSort keys on this float; squared distance is non-negative so FloatFlip's positive-branch monotone mapping applies.
-
 		// SESSION063 K4: fine frontier nodes (is_coarse bit 0) and coarse-floor nodes (bit 31 of idx set) go into the SAME
 		// list and are sorted together by distance, so the draw is globally front-to-back across both layers - a near coarse
 		// node correctly occludes a far fine one. The bit is packed into the top of idx (cloud indices are well under 2^31)
@@ -1146,6 +1206,7 @@ public:
 		// unless the "sat diag" checkbox is on. See GaussianSplatUnculledFrontier::sat_diag_coarse_a.
 		size_t diag_coarse_a = 0, diag_coarse_b = 0;
 
+		Timer expand_timer; // SESSION080 DIAGNOSTIC - see GaussianSplatUnculledFrontier::expand_ms.
 
 		for(size_t mi=0; mi<scratch->members_snapshot.size(); ++mi)
 		{
@@ -1174,175 +1235,26 @@ public:
 		bool hit_budget_cap = false;
 		bool hit_density_cap = false;
 		bool hit_depth_cap = false;
-		while(!stack.empty())
-		{
-			const HeapItem top = stack.back();
-			stack.pop_back();
 
-			const GaussianSplatLodTraversalScratch::MemberSnapshot& m = scratch->members_snapshot[top.member_idx];
-			const GaussianSplatLodNode& node = m.splat_data->lod_tree[top.tree_local_idx];
-			const uint32 cloud_idx_u32 = (uint32)(m.offset + top.tree_local_idx);
+		// SESSION080: spread the DFS across the pool. Measured at 52% of the whole async pipeline once session079 had
+		// parallelised gather/grid/test and session080 the sort - by some distance the largest remaining serial stage.
+		//
+		// The branches are independent by construction: positions/feature_sizes/cull_radii are read-only snapshots,
+		// `stack` is per-walk, coarse_captured propagates only downwards inside one branch, and the density/depth caps are
+		// per-node. The ONE thing that couples them is the budget cap, whose test reads the running decorated.size() +
+		// stack.size(); that is handled below rather than approximated - see expandParallel()'s comment.
+		//
+		// Not taken when: no pool (the synchronous getFrustumStructureReport() path), or frontier_record is wanted (that
+		// path's per-node records are pushed to one shared vector and it is a debug report, not a hot path).
+		const bool expand_in_parallel = (task_manager != NULL) && (frontier_record == NULL);
+		if(expand_in_parallel && !stack.empty())
+			expandParallel(stack, decorated, positions, feature_sizes, cull_radii, diag_coarse_a, diag_coarse_b,
+				hit_budget_cap, hit_density_cap, hit_depth_cap);
+		else
+			expandStack(stack, decorated, positions, feature_sizes, cull_radii, /*enforce_budget=*/true, /*breadth_first=*/false, /*pause_at_stack_size=*/0,
+				diag_coarse_a, diag_coarse_b, hit_budget_cap, hit_density_cap, hit_depth_cap);
 
-			// SESSION055/059: frustum-cull check. Each plane's margin has three parts:
-			//   base_margin = cull_radius          - SESSION059: enclosing-sphere radius of this node's whole subtree
-			//                                       (see GaussianSplatLodNode::bounding_radius_os), NOT feature_size.
-			//                                       feature_size is a statistical fit of this node's own merged
-			//                                       appearance and can be smaller than the true spread of its
-			//                                       descendants - using it here was session055's original choice and
-			//                                       worked at the small scenes tested then, but under-culls (drops
-			//                                       visible subtrees) at real-world/km scale - see session059 snapshot.
-			//   translation_dilation[i]           - anisotropic pad for camera movement toward this plane over the async
-			//                                       traversal latency window; ~zero for planes the camera moves away from.
-			//   rotation_dilation_rate * dist     - rotational pad: r*theta tangential shift at distance r from camera.
-			// The whole point of the cull is to skip the subtree entirely when the parent is outside, so on cull we neither
-			// push children nor add the node to decorated. Overrides the "no frustum test here" property called out at the
-			// top of the class; the paired re-kick-on-rotation trigger in kickOffTraversals() puts back the property that
-			// turning on the spot updates the selection.
-			// SESSION072: shared by the frustum-cull block below and the distance-slice block right after it - both need
-			// distance-to-camera, and dist_sq is already sitting in top from makeHeapItem() (session054), so computing the
-			// one sqrt here instead of inside each block avoids paying it twice when both culls are active.
-			const bool need_dist_to_node = frustum_cull_enabled || dist_clamp_enabled;
-			const float dist_to_node = need_dist_to_node ? std::sqrt(top.dist_sq) : 0.f;
-
-			if(frustum_cull_enabled)
-			{
-				const Vec3f& p = positions[cloud_idx_u32];
-				const float base_margin = cull_radii[cloud_idx_u32];
-				const float rot_pad = rotation_dilation_rate * dist_to_node;
-				const Vec4f pos4(p.x, p.y, p.z, 1.f);
-				bool outside = false;
-				for(int i=0; i<num_frustum_clip_planes; ++i)
-				{
-					const float margin_i = base_margin + translation_dilation[i] + rot_pad;
-					if(dot(frustum_clip_planes[i].getNormal(), pos4) >= frustum_clip_planes[i].getD() + margin_i)
-					{ outside = true; break; }
-				}
-				if(outside)
-				{
-					recordFrontierNode(cloud_idx_u32, top.member_idx, top.tree_local_idx, top.depth, FrontierStop_OutOfFrustum);
-					continue;
-				}
-			}
-
-			// SESSION072: distance-slice early-cull - moves the "isolate a distance shell" debug tool (GaussianSplatSettingsWidget's
-			// distClamp* controls, previously a per-instance vertex-shader discard only - see countSplatsInFrustum()) up to a real
-			// subtree prune here, gated by its own checkbox rather than by "min/max still at the keep-everything default" (that
-			// implicit check stays where it always was, in the shader and the two CPU diagnostics - this is a separate, additive
-			// early-out). A whole subtree is only skippable when EVERY point in it is provably on the excluded side: normal mode
-			// prunes when the node's whole bounding sphere lies entirely outside [min, max]; inverted mode (hiding the shell)
-			// prunes when the whole sphere lies entirely inside it - the mirror image of the same margin test frustum-cull uses.
-			if(dist_clamp_enabled)
-			{
-				const float radius = cull_radii[cloud_idx_u32];
-				const bool outside = dist_clamp_invert
-					? (dist_to_node - radius >= dist_clamp_min && dist_to_node + radius <= dist_clamp_max)
-					: (dist_to_node + radius < dist_clamp_min || dist_to_node - radius > dist_clamp_max);
-				if(outside)
-				{
-					recordFrontierNode(cloud_idx_u32, top.member_idx, top.tree_local_idx, top.depth, FrontierStop_OutOfDistRange);
-					continue;
-				}
-			}
-
-			// SESSION063 K4: complete coarse-floor cut. A node becomes its branch's single coarse representative if no
-			// ancestor already took the role AND it is either coarse enough (pixel_scale <= coarse_pixel_scale) or terminal
-			// (the branch stops here - converged/leaf/capped). So every branch contributes exactly one coarse node and the
-			// coarse layer covers the scene as fully as the fine set, only coarser. A branch that terminates finer than
-			// coarse_pixel_scale takes its own (coarsest-available) terminal node, duplicating the fine node there - fine:
-			// drawn after the fine set, the duplicate is gated wherever the fine node already covered. The terminal test
-			// mirrors the stop checks below (read-only, no side effects; the real branches still set the hit_*_cap flags).
-			bool captured_here = false;
-			if(coarse_floor_enabled && !top.coarse_captured)
-			{
-				const bool terminal =
-					(top.pixel_scale <= pixel_scale_limit) ||
-					(node.child_count == 0) ||
-					(max_layer_density > 0.f && node.layer_density > max_layer_density) ||
-					(max_tree_depth > 0 && top.depth >= (uint32)max_tree_depth) ||
-					(decorated.size() + stack.size() + node.child_count > max_splats_budget);
-				const bool by_threshold = top.pixel_scale <= coarse_pixel_scale;
-
-				// SESSION076: the capture-time skip that used to sit here is gone with the binary write rule it depended
-				// on - see gsSatGridMinWritingPixelScaleFactor's removal note in GaussianSplatSaturationGrid.h. Under the
-				// Gaussian model every node contributes in proportion to its integrated occlusion, so there is no
-				// pixel_scale below which a node is provably useless to the grid.
-				if(by_threshold || terminal)
-				{
-					DistIdx cd; cd.dist_sq = top.dist_sq; cd.idx = cloud_idx_u32 | 0x80000000u; // Bit 31 marks a coarse-floor node.
-					decorated.push_back(cd);
-					captured_here = true;
-
-					// SESSION076 DIAGNOSTIC: split the capture into its two populations and predict, from pixel_scale
-					// alone, whether the grid will accept this node - see GaussianSplatUnculledFrontier::sat_diag_coarse_a
-					// for what the split means and why the prediction is printed next to the measured count.
-					if(sat_diag_log)
-					{
-						if(by_threshold) ++diag_coarse_a; else ++diag_coarse_b;
-					}
-				}
-			}
-			const bool child_coarse_captured = top.coarse_captured || captured_here;
-
-			// Converged - already fine enough, no need to expand further.
-			if(top.pixel_scale <= pixel_scale_limit)
-			{
-				DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32;
-				decorated.push_back(d);
-				recordFrontierNode(cloud_idx_u32, top.member_idx, top.tree_local_idx, top.depth, FrontierStop_Converged);
-				continue;
-			}
-
-			if(node.child_count == 0)
-			{
-				// A leaf can't be expanded regardless of pixel_scale - it's already the finest detail this tree has.
-				DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32;
-				decorated.push_back(d);
-				recordFrontierNode(cloud_idx_u32, top.member_idx, top.tree_local_idx, top.depth, FrontierStop_Leaf);
-				continue;
-			}
-
-			// Density-capped: expanding this node would recurse into a region estimated to be this dense with overdraw
-			// (see GaussianSplatLodNode::layer_density) - stop here and use this node's own merged approximation
-			// instead, regardless of how coarse its pixel_scale still looks. max_layer_density <= 0 disables this check
-			// (the "0 = unlimited" convention GaussianSplatSettingsWidget's other debug knobs use).
-			if(max_layer_density > 0.f && node.layer_density > max_layer_density)
-			{
-				hit_density_cap = true;
-				DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32;
-				decorated.push_back(d);
-				recordFrontierNode(cloud_idx_u32, top.member_idx, top.tree_local_idx, top.depth, FrontierStop_DensityCap);
-				continue;
-			}
-
-			// Depth-capped: a hard, global ceiling on how many levels traversal may unfold, independent of pixel_scale/
-			// density/budget - "the tree will never unfold finer than this, anywhere". max_tree_depth <= 0 disables it.
-			if(max_tree_depth > 0 && top.depth >= (uint32)max_tree_depth)
-			{
-				hit_depth_cap = true;
-				DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32;
-				decorated.push_back(d);
-				recordFrontierNode(cloud_idx_u32, top.member_idx, top.tree_local_idx, top.depth, FrontierStop_DepthCap);
-				continue;
-			}
-
-			// Budget cap: expanding would push us over the ceiling. Keep this node's own merged representation instead.
-			// Current node is already popped, so the projected total after pushing children is decorated.size() + stack.size() + child_count.
-			if(decorated.size() + stack.size() + node.child_count > max_splats_budget)
-			{
-				hit_budget_cap = true;
-				DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32;
-				decorated.push_back(d);
-				recordFrontierNode(cloud_idx_u32, top.member_idx, top.tree_local_idx, top.depth, FrontierStop_BudgetCap);
-				continue;
-			}
-
-			for(uint32 c = node.child_start; c < (uint32)node.child_start + node.child_count; ++c)
-			{
-				HeapItem child = makeHeapItem(top.member_idx, c, m.offset, top.depth + 1, positions, feature_sizes);
-				child.coarse_captured = child_coarse_captured; // SESSION063 K4: propagate the once-per-branch capture flag.
-				stack.push_back(child);
-			}
-		}
+		const double expand_ms = expand_timer.elapsed() * 1.0e3; // SESSION080 DIAGNOSTIC - stops here, before the sort.
 
 		// Sort the selection front-to-back by camera distance. Each node's dist_sq was computed once in makeHeapItem (or
 		// inline in the NoTree branch) and carried through, so this pass is pure sort - no positions[] lookup or sqrt.
@@ -1353,8 +1265,24 @@ public:
 		// already budget-bounded, so one exact radix pass here is both simpler and fast enough - see kickOffSorts()'s
 		// cloudHasLodTree() guard, which leaves an LoD-active cloud to this sort instead of the old one.
 		// SESSION063 K4: one global front-to-back sort over fine + coarse nodes together (see the decorated declaration).
+		// SESSION080 DIAGNOSTIC: that 76% figure predates the radix switch and was never re-measured after - see
+		// expand_ms/sort_ms and [gsr-traversal]. Re-measured session080: 29-36% of traversal time, second only to the
+		// expand/DFS loop above - still the largest easy target, since gather/grid/test were already parallelised in
+		// session079.
+		//
+		// SESSION080: parallel radix when a task_manager is available and the pool clears the dispatch overhead -
+		// Sort::radixSortWithParallelPartition() is the SAME 11-bit-chunk radix as the serial path below, just with
+		// each of its 3 passes split across 32 partition tasks instead of running on this one thread; the output order
+		// is identical. Existing precedent for this exact call shape: NonBinningBVHBuilder.cpp's use of it to sort BVH
+		// build centres. Threshold mirrors the sat-test/gather passes' own min_chunk_nodes (session079) - below it the
+		// 3-pass task dispatch overhead isn't worth it, so small/no-tree-yet clouds fall through to the serial sort.
+		Timer sort_timer;
 		js::Vector<DistIdx, 16> sort_scratch(decorated.size());
-		Sort::floatKeyAscendingSort(decorated.data(), decorated.size(), DistIdxLess(), DistIdxKey(), sort_scratch.data(), /*put_result_in_working_space=*/false);
+		const size_t parallel_sort_min_elements = 16384;
+		if(task_manager != NULL && decorated.size() >= parallel_sort_min_elements)
+			Sort::radixSortWithParallelPartition<DistIdx, DistIdxKey>(*task_manager, decorated.data(), (uint32)decorated.size(), DistIdxKey(), sort_scratch.data(), /*put_result_in_working_space=*/false);
+		else
+			Sort::floatKeyAscendingSort(decorated.data(), decorated.size(), DistIdxLess(), DistIdxKey(), sort_scratch.data(), /*put_result_in_working_space=*/false);
 
 		output.resizeNoCopy(decorated.size());
 		coarse_flags.resizeNoCopy(decorated.size());
@@ -1364,6 +1292,7 @@ public:
 			output[i] = packed & 0x7FFFFFFFu;                  // Real cloud index (bit 31 stripped).
 			coarse_flags[i] = (packed >> 31) ? 1.f : 0.f;      // 1 = coarse-floor node, for the filter's per-node dilation.
 		}
+		const double sort_ms = sort_timer.elapsed() * 1.0e3; // SESSION080 DIAGNOSTIC - includes the unpack loop above, not just the sort call.
 
 		scratch->hit_budget_cap = hit_budget_cap;
 		scratch->hit_density_cap = hit_density_cap;
@@ -1388,19 +1317,52 @@ public:
 			Reference<GaussianSplatUnculledFrontier> uf;
 			if(build_unculled_frontier)
 			{
+				Timer soa_timer; // SESSION080 DIAGNOSTIC - see GaussianSplatUnculledFrontier::soa_ms.
 				uf = new GaussianSplatUnculledFrontier();
 				const size_t n = output.size();
 				uf->indices.resizeNoCopy(n);
 				uf->px.resizeNoCopy(n); uf->py.resizeNoCopy(n); uf->pz.resizeNoCopy(n); uf->radius.resizeNoCopy(n);
 				uf->is_coarse.resizeNoCopy(n);
-				for(size_t i=0; i<n; ++i)
+				// SESSION080: split across the pool. Measured at ~218ms on the owner's interior - the largest single phase
+				// of the whole async pipeline, and the last serial one, having gone untimed until soa_ms was added.
+				//
+				// It is a pure map: iteration i reads positions[idx]/cull_radius[idx] for its own idx and writes only its
+				// own slot in five pre-sized arrays. No filtering (unlike the occluder gather below, which has to compact),
+				// no ordering, no shared accumulator - so the chunks need nothing from each other and the result is
+				// bit-identical to the serial loop. Chunked exactly like that gather, for the same reason: the cost here is
+				// DRAM miss latency on the scattered reads into the 30M-entry geometry arrays, not arithmetic, so what
+				// threads buy is outstanding misses.
+				const size_t soa_concurrency = (task_manager != NULL) ? myMax<size_t>(1, (size_t)task_manager->getConcurrency()) : 1;
+				const size_t num_soa_chunks = myMax<size_t>(1, myMin(soa_concurrency * 4, n / 16384));
+				if(task_manager != NULL && num_soa_chunks > 1)
 				{
-					const uint32 idx = output[i];
-					const Vec3f& p = positions[idx];
-					uf->indices[i] = idx;
-					uf->px[i] = p.x; uf->py[i] = p.y; uf->pz[i] = p.z;
-					uf->radius[i] = cull_radii[idx];
-					uf->is_coarse[i] = coarse_flags[i];
+					glare::TaskGroupRef soa_group = new glare::TaskGroup();
+					soa_group->tasks.resize(num_soa_chunks);
+					for(size_t c=0; c<num_soa_chunks; ++c)
+					{
+						Reference<GsFrontierSoATask> t = new GsFrontierSoATask();
+						t->i_begin = (n * c)       / num_soa_chunks;
+						t->i_end   = (n * (c + 1)) / num_soa_chunks;
+						t->output = output.data(); t->coarse_flags = coarse_flags.data();
+						t->positions = positions.data(); t->cull_radii = cull_radii.data();
+						t->out_indices = uf->indices.data();
+						t->out_px = uf->px.data(); t->out_py = uf->py.data(); t->out_pz = uf->pz.data();
+						t->out_radius = uf->radius.data(); t->out_is_coarse = uf->is_coarse.data();
+						soa_group->tasks[c] = t;
+					}
+					task_manager->runTaskGroup(soa_group);
+				}
+				else
+				{
+					for(size_t i=0; i<n; ++i)
+					{
+						const uint32 idx = output[i];
+						const Vec3f& p = positions[idx];
+						uf->indices[i] = idx;
+						uf->px[i] = p.x; uf->py[i] = p.y; uf->pz[i] = p.z;
+						uf->radius[i] = cull_radii[idx];
+						uf->is_coarse[i] = coarse_flags[i];
+					}
 				}
 				uf->topology_generation = topology_generation;
 				uf->anchor_pos_ws = cam_pos_ws;
@@ -1410,6 +1372,15 @@ public:
 				uf->max_layer_density = max_layer_density;
 				uf->max_tree_depth = max_tree_depth;
 				uf->focal_px = focal_px;
+				uf->expand_ms = expand_ms; // SESSION080 DIAGNOSTIC
+				uf->sort_ms = sort_ms;
+				uf->traversal_output_n = n;
+				uf->expand_seeds = expand_seeds;
+				uf->expand_num_tasks = expand_num_tasks;
+				uf->expand_prologue_ms = expand_prologue_ms;
+				uf->expand_task_max_ms = expand_task_max_ms;
+				uf->expand_task_sum_ms = expand_task_sum_ms;
+				uf->soa_ms = soa_timer.elapsed() * 1.0e3; // SESSION080 DIAGNOSTIC - the loop just above, which nothing timed before.
 
 				msg->unculled_frontier = uf;
 			}
@@ -1551,6 +1522,15 @@ public:
 					uf2->max_layer_density = uf->max_layer_density;
 					uf2->max_tree_depth = uf->max_tree_depth;
 					uf2->focal_px = uf->focal_px;
+					uf2->expand_ms = uf->expand_ms; // SESSION080: verbatim - same tree walk/sort this pruned copy is derived from.
+					uf2->sort_ms = uf->sort_ms;
+					uf2->traversal_output_n = uf->traversal_output_n;
+					uf2->expand_seeds = uf->expand_seeds;
+					uf2->expand_num_tasks = uf->expand_num_tasks;
+					uf2->expand_prologue_ms = uf->expand_prologue_ms;
+					uf2->expand_task_max_ms = uf->expand_task_max_ms;
+					uf2->expand_task_sum_ms = uf->expand_task_sum_ms;
+					uf2->soa_ms = uf->soa_ms;
 
 					uf2->sat_num_occluders = occl_px.size();
 					uf2->sat_grid_res = gsSatGridResForFocal(focal_px, coarse_pixel_scale, sat_grid_subdiv); // SESSION076 CALIBRATION
@@ -1749,6 +1729,340 @@ private:
 		return item;
 	}
 
+	// SESSION080: the DFS itself, lifted out of run() unchanged so that the serial path and each parallel task run
+	// literally the same code rather than two copies that can drift apart.
+	//
+	// enforce_budget=false omits ONLY the budget-cap branch - see expandParallel() for why that is exact rather than an
+	// approximation. pause_at_stack_size > 0 stops the walk once at least that many unconsumed entries are pending and
+	// leaves them in `stack` for the caller to distribute; 0 means run to exhaustion.
+	//
+	// breadth_first swaps the LIFO pop for a FIFO one (a read cursor over the same vector; the consumed prefix is erased
+	// on the way out). It exists solely to make pause_at_stack_size reachable: DFS is defined by diving, so its stack
+	// stays at O(depth * branching) - ~100 entries, per session054's note above - and can never accumulate the breadth a
+	// seed split needs. Only the prologue uses it; the walks that do the actual work stay depth-first, which is what
+	// keeps their stacks small and cache-friendly. Order does not change the result - every decision in the loop below
+	// depends on the node itself and on coarse_captured inherited down its own branch, never on what was visited before -
+	// with the single exception of the budget cap, which is why breadth_first is only ever paired with enforce_budget=false.
+	void expandStack(std::vector<HeapItem>& stack, js::Vector<DistIdx, 16>& decorated,
+		const js::Vector<Vec3f, 16>& positions, const js::Vector<float, 16>& feature_sizes, const js::Vector<float, 16>& cull_radii,
+		bool enforce_budget, bool breadth_first, size_t pause_at_stack_size,
+		size_t& diag_coarse_a, size_t& diag_coarse_b,
+		bool& hit_budget_cap, bool& hit_density_cap, bool& hit_depth_cap)
+	{
+		size_t head = 0; // Read cursor; breadth-first only.
+		for(;;)
+		{
+			const size_t pending = breadth_first ? (stack.size() - head) : stack.size();
+			if(pending == 0)
+				break;
+			if(pause_at_stack_size != 0 && pending >= pause_at_stack_size)
+				break; // Enough independent subtrees for the caller to spread; the pending entries are the seeds.
+
+			// Copied, not referenced: the pushes below can reallocate `stack`.
+			const HeapItem top = breadth_first ? stack[head++] : stack.back();
+			if(!breadth_first)
+				stack.pop_back();
+
+			const GaussianSplatLodTraversalScratch::MemberSnapshot& m = scratch->members_snapshot[top.member_idx];
+			const GaussianSplatLodNode& node = m.splat_data->lod_tree[top.tree_local_idx];
+			const uint32 cloud_idx_u32 = (uint32)(m.offset + top.tree_local_idx);
+
+			// SESSION055/059: frustum-cull check. Each plane's margin has three parts:
+			//   base_margin = cull_radius          - SESSION059: enclosing-sphere radius of this node's whole subtree
+			//                                       (see GaussianSplatLodNode::bounding_radius_os), NOT feature_size.
+			//                                       feature_size is a statistical fit of this node's own merged
+			//                                       appearance and can be smaller than the true spread of its
+			//                                       descendants - using it here was session055's original choice and
+			//                                       worked at the small scenes tested then, but under-culls (drops
+			//                                       visible subtrees) at real-world/km scale - see session059 snapshot.
+			//   translation_dilation[i]           - anisotropic pad for camera movement toward this plane over the async
+			//                                       traversal latency window; ~zero for planes the camera moves away from.
+			//   rotation_dilation_rate * dist     - rotational pad: r*theta tangential shift at distance r from camera.
+			// The whole point of the cull is to skip the subtree entirely when the parent is outside, so on cull we neither
+			// push children nor add the node to decorated. Overrides the "no frustum test here" property called out at the
+			// top of the class; the paired re-kick-on-rotation trigger in kickOffTraversals() puts back the property that
+			// turning on the spot updates the selection.
+			// SESSION072: shared by the frustum-cull block below and the distance-slice block right after it - both need
+			// distance-to-camera, and dist_sq is already sitting in top from makeHeapItem() (session054), so computing the
+			// one sqrt here instead of inside each block avoids paying it twice when both culls are active.
+			const bool need_dist_to_node = frustum_cull_enabled || dist_clamp_enabled;
+			const float dist_to_node = need_dist_to_node ? std::sqrt(top.dist_sq) : 0.f;
+
+			if(frustum_cull_enabled)
+			{
+				const Vec3f& p = positions[cloud_idx_u32];
+				const float base_margin = cull_radii[cloud_idx_u32];
+				const float rot_pad = rotation_dilation_rate * dist_to_node;
+				const Vec4f pos4(p.x, p.y, p.z, 1.f);
+				bool outside = false;
+				for(int i=0; i<num_frustum_clip_planes; ++i)
+				{
+					const float margin_i = base_margin + translation_dilation[i] + rot_pad;
+					if(dot(frustum_clip_planes[i].getNormal(), pos4) >= frustum_clip_planes[i].getD() + margin_i)
+					{ outside = true; break; }
+				}
+				if(outside)
+				{
+					recordFrontierNode(cloud_idx_u32, top.member_idx, top.tree_local_idx, top.depth, FrontierStop_OutOfFrustum);
+					continue;
+				}
+			}
+
+			// SESSION072: distance-slice early-cull - moves the "isolate a distance shell" debug tool (GaussianSplatSettingsWidget's
+			// distClamp* controls, previously a per-instance vertex-shader discard only - see countSplatsInFrustum()) up to a real
+			// subtree prune here, gated by its own checkbox rather than by "min/max still at the keep-everything default" (that
+			// implicit check stays where it always was, in the shader and the two CPU diagnostics - this is a separate, additive
+			// early-out). A whole subtree is only skippable when EVERY point in it is provably on the excluded side: normal mode
+			// prunes when the node's whole bounding sphere lies entirely outside [min, max]; inverted mode (hiding the shell)
+			// prunes when the whole sphere lies entirely inside it - the mirror image of the same margin test frustum-cull uses.
+			if(dist_clamp_enabled)
+			{
+				const float radius = cull_radii[cloud_idx_u32];
+				const bool outside = dist_clamp_invert
+					? (dist_to_node - radius >= dist_clamp_min && dist_to_node + radius <= dist_clamp_max)
+					: (dist_to_node + radius < dist_clamp_min || dist_to_node - radius > dist_clamp_max);
+				if(outside)
+				{
+					recordFrontierNode(cloud_idx_u32, top.member_idx, top.tree_local_idx, top.depth, FrontierStop_OutOfDistRange);
+					continue;
+				}
+			}
+
+			// SESSION063 K4: complete coarse-floor cut. A node becomes its branch's single coarse representative if no
+			// ancestor already took the role AND it is either coarse enough (pixel_scale <= coarse_pixel_scale) or terminal
+			// (the branch stops here - converged/leaf/capped). So every branch contributes exactly one coarse node and the
+			// coarse layer covers the scene as fully as the fine set, only coarser. A branch that terminates finer than
+			// coarse_pixel_scale takes its own (coarsest-available) terminal node, duplicating the fine node there - fine:
+			// drawn after the fine set, the duplicate is gated wherever the fine node already covered. The terminal test
+			// mirrors the stop checks below (read-only, no side effects; the real branches still set the hit_*_cap flags).
+			bool captured_here = false;
+			if(coarse_floor_enabled && !top.coarse_captured)
+			{
+				const bool terminal =
+					(top.pixel_scale <= pixel_scale_limit) ||
+					(node.child_count == 0) ||
+					(max_layer_density > 0.f && node.layer_density > max_layer_density) ||
+					(max_tree_depth > 0 && top.depth >= (uint32)max_tree_depth) ||
+					(enforce_budget && (decorated.size() + stack.size() + node.child_count > max_splats_budget));
+				const bool by_threshold = top.pixel_scale <= coarse_pixel_scale;
+
+				// SESSION076: the capture-time skip that used to sit here is gone with the binary write rule it depended
+				// on - see gsSatGridMinWritingPixelScaleFactor's removal note in GaussianSplatSaturationGrid.h. Under the
+				// Gaussian model every node contributes in proportion to its integrated occlusion, so there is no
+				// pixel_scale below which a node is provably useless to the grid.
+				if(by_threshold || terminal)
+				{
+					DistIdx cd; cd.dist_sq = top.dist_sq; cd.idx = cloud_idx_u32 | 0x80000000u; // Bit 31 marks a coarse-floor node.
+					decorated.push_back(cd);
+					captured_here = true;
+
+					// SESSION076 DIAGNOSTIC: split the capture into its two populations and predict, from pixel_scale
+					// alone, whether the grid will accept this node - see GaussianSplatUnculledFrontier::sat_diag_coarse_a
+					// for what the split means and why the prediction is printed next to the measured count.
+					if(sat_diag_log)
+					{
+						if(by_threshold) ++diag_coarse_a; else ++diag_coarse_b;
+					}
+				}
+			}
+			const bool child_coarse_captured = top.coarse_captured || captured_here;
+
+			// Converged - already fine enough, no need to expand further.
+			if(top.pixel_scale <= pixel_scale_limit)
+			{
+				DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32;
+				decorated.push_back(d);
+				recordFrontierNode(cloud_idx_u32, top.member_idx, top.tree_local_idx, top.depth, FrontierStop_Converged);
+				continue;
+			}
+
+			if(node.child_count == 0)
+			{
+				// A leaf can't be expanded regardless of pixel_scale - it's already the finest detail this tree has.
+				DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32;
+				decorated.push_back(d);
+				recordFrontierNode(cloud_idx_u32, top.member_idx, top.tree_local_idx, top.depth, FrontierStop_Leaf);
+				continue;
+			}
+
+			// Density-capped: expanding this node would recurse into a region estimated to be this dense with overdraw
+			// (see GaussianSplatLodNode::layer_density) - stop here and use this node's own merged approximation
+			// instead, regardless of how coarse its pixel_scale still looks. max_layer_density <= 0 disables this check
+			// (the "0 = unlimited" convention GaussianSplatSettingsWidget's other debug knobs use).
+			if(max_layer_density > 0.f && node.layer_density > max_layer_density)
+			{
+				hit_density_cap = true;
+				DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32;
+				decorated.push_back(d);
+				recordFrontierNode(cloud_idx_u32, top.member_idx, top.tree_local_idx, top.depth, FrontierStop_DensityCap);
+				continue;
+			}
+
+			// Depth-capped: a hard, global ceiling on how many levels traversal may unfold, independent of pixel_scale/
+			// density/budget - "the tree will never unfold finer than this, anywhere". max_tree_depth <= 0 disables it.
+			if(max_tree_depth > 0 && top.depth >= (uint32)max_tree_depth)
+			{
+				hit_depth_cap = true;
+				DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32;
+				decorated.push_back(d);
+				recordFrontierNode(cloud_idx_u32, top.member_idx, top.tree_local_idx, top.depth, FrontierStop_DepthCap);
+				continue;
+			}
+
+			// Budget cap: expanding would push us over the ceiling. Keep this node's own merged representation instead.
+			// Current node is already popped, so the projected total after pushing children is decorated.size() + stack.size() + child_count.
+			if(enforce_budget && (decorated.size() + stack.size() + node.child_count > max_splats_budget))
+			{
+				hit_budget_cap = true;
+				DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32;
+				decorated.push_back(d);
+				recordFrontierNode(cloud_idx_u32, top.member_idx, top.tree_local_idx, top.depth, FrontierStop_BudgetCap);
+				continue;
+			}
+
+			for(uint32 c = node.child_start; c < (uint32)node.child_start + node.child_count; ++c)
+			{
+				HeapItem child = makeHeapItem(top.member_idx, c, m.offset, top.depth + 1, positions, feature_sizes);
+				child.coarse_captured = child_coarse_captured; // SESSION063 K4: propagate the once-per-branch capture flag.
+				stack.push_back(child);
+			}
+		}
+
+		if(head > 0) // Breadth-first only: drop what was consumed, so `stack` holds exactly the unfinished seeds.
+			stack.erase(stack.begin(), stack.begin() + head);
+	}
+
+	// SESSION080: one seed subtree's worth of DFS, on a pool thread, into its own output vector. No shared mutable state
+	// at all: every array it reads is a frozen snapshot, and the two diag counters and two cap flags are per-task and
+	// reduced by the caller.
+	class GsExpandTask : public glare::Task
+	{
+	public:
+		GsExpandTask() : diag_coarse_a(0), diag_coarse_b(0), hit_density_cap(false), hit_depth_cap(false), run_ms(0.0) {}
+
+		virtual void run(size_t /*thread_index*/) override
+		{
+			Timer task_timer; // SESSION080 DIAGNOSTIC - see GaussianSplatUnculledFrontier::expand_task_max_ms.
+			bool unused_budget_cap = false; // Not enforced here - see expandParallel().
+			parent->expandStack(stack, decorated, *positions, *feature_sizes, *cull_radii,
+				/*enforce_budget=*/false, /*breadth_first=*/false, /*pause_at_stack_size=*/0,
+				diag_coarse_a, diag_coarse_b, unused_budget_cap, hit_density_cap, hit_depth_cap);
+			run_ms = task_timer.elapsed() * 1.0e3;
+		}
+
+		GaussianSplatLodTraversalTask* parent; // Outlives every task: runTaskGroup() below blocks until they have all finished.
+		const js::Vector<Vec3f, 16>* positions;
+		const js::Vector<float, 16>* feature_sizes;
+		const js::Vector<float, 16>* cull_radii;
+		std::vector<HeapItem> stack; // This task's seeds, and its own working stack thereafter.
+		js::Vector<DistIdx, 16> decorated;
+		size_t diag_coarse_a, diag_coarse_b;
+		bool hit_density_cap, hit_depth_cap;
+		double run_ms; // SESSION080 DIAGNOSTIC
+	};
+
+	// SESSION080: the parallel expand. Walks the top of the tree serially just far enough to have a good supply of
+	// independent subtrees, hands one task per subtree to the pool, then concatenates the fragments.
+	//
+	// Fragment order does not matter: the caller sorts the whole of `decorated` by dist_sq immediately afterwards. The
+	// only observable difference from the serial walk is the relative order of nodes at EXACTLY equal dist_sq, which the
+	// (stable) radix sort would otherwise have left in DFS order - cosmetic, since they are at the same depth in the
+	// front-to-back blend.
+	//
+	// The budget cap is the one piece of shared state, and it is handled exactly rather than approximately. The tasks run
+	// with it switched off; afterwards, if the total is within budget, the serial walk provably could not have fired it
+	// either - at every step of that walk decorated.size() + stack.size() + child_count is a lower bound on its own final
+	// output size (every stacked entry yields at least one node), so if the final total is <= budget the test never
+	// tripped. If the total DOES exceed budget the parallel result is discarded and the whole walk is redone serially,
+	// which keeps the DFS-order truncation policy bit-for-bit. That path has never been observed to run (budget_cap has
+	// measured false in every capture - see [gsr-traversal]), so its cost is theoretical.
+	void expandParallel(std::vector<HeapItem>& stack, js::Vector<DistIdx, 16>& decorated,
+		const js::Vector<Vec3f, 16>& positions, const js::Vector<float, 16>& feature_sizes, const js::Vector<float, 16>& cull_radii,
+		size_t& diag_coarse_a, size_t& diag_coarse_b,
+		bool& hit_budget_cap, bool& hit_density_cap, bool& hit_depth_cap)
+	{
+		// Seeds are cut far finer than the thread count on purpose, for the same reason session079's saturation chunks
+		// are: subtree cost is wildly uneven (the member the camera is standing inside dwarfs the others), so an even
+		// split of the SUBTREES is not an even split of the work. Many small tasks let the pool even that out itself.
+		const size_t concurrency = myMax<size_t>(1, (size_t)task_manager->getConcurrency());
+		const size_t target_seeds = concurrency * 16;
+
+		// run()'s seed loop has already written any no-tree member's splats into `decorated`, and this function never
+		// revisits those - so the over-budget fallback below must rewind to here, not to empty.
+		const size_t initial_decorated = decorated.size();
+
+		// Walk the top serially until the stack holds enough subtree roots. Same code, same decisions - this is simply
+		// the first part of the identical DFS, and anything it finishes on the way lands in `decorated` directly.
+		Timer prologue_timer; // SESSION080 DIAGNOSTIC
+		expandStack(stack, decorated, positions, feature_sizes, cull_radii, /*enforce_budget=*/false, /*breadth_first=*/true, /*pause_at_stack_size=*/target_seeds,
+			diag_coarse_a, diag_coarse_b, hit_budget_cap, hit_density_cap, hit_depth_cap);
+		expand_prologue_ms = prologue_timer.elapsed() * 1.0e3;
+		expand_seeds = stack.size();
+
+		if(stack.empty()) // The whole tree fitted in the serial prologue (a small or heavily culled scene).
+			return;
+
+		// One task per seed, round-robined into `num_tasks` buckets so that a task gets a spread of the tree rather than
+		// a contiguous run of siblings, whose costs are correlated.
+		const size_t num_tasks = myMin(stack.size(), concurrency * 4);
+		expand_num_tasks = num_tasks;
+		glare::TaskGroupRef group = new glare::TaskGroup();
+		group->tasks.resize(num_tasks);
+		for(size_t t=0; t<num_tasks; ++t)
+		{
+			Reference<GsExpandTask> task = new GsExpandTask();
+			task->parent = this;
+			task->positions = &positions; task->feature_sizes = &feature_sizes; task->cull_radii = &cull_radii;
+			for(size_t s=t; s<stack.size(); s += num_tasks)
+				task->stack.push_back(stack[s]);
+			group->tasks[t] = task;
+		}
+		stack.clear();
+
+		task_manager->runTaskGroup(group);
+
+		size_t total = decorated.size();
+		for(size_t t=0; t<num_tasks; ++t)
+		{
+			const GsExpandTask* const task = static_cast<const GsExpandTask*>(group->tasks[t].ptr());
+			total += task->decorated.size();
+			expand_task_sum_ms += task->run_ms; // SESSION080 DIAGNOSTIC - see the fields' comment.
+			expand_task_max_ms = myMax(expand_task_max_ms, task->run_ms);
+		}
+
+		// Over budget: the parallel walk's truncation would not match the serial one's, so throw it away and redo the
+		// whole thing serially. See this function's comment for why reaching here at all is a theoretical case.
+		if(total > max_splats_budget)
+		{
+			decorated.resize(initial_decorated); // NOT 0 - see initial_decorated's comment.
+			diag_coarse_a = diag_coarse_b = 0;
+			hit_density_cap = hit_depth_cap = false;
+			stack.clear();
+			for(size_t mi=0; mi<scratch->members_snapshot.size(); ++mi)
+			{
+				const GaussianSplatLodTraversalScratch::MemberSnapshot& m = scratch->members_snapshot[mi];
+				if(m.hidden || m.splat_data->lod_tree.empty())
+					continue; // The no-tree members' nodes are already in `decorated` from run()'s seed loop, which this does not redo.
+				stack.push_back(makeHeapItem((uint32)mi, /*tree_local_idx=*/0, m.offset, /*depth=*/0, positions, feature_sizes));
+			}
+			expandStack(stack, decorated, positions, feature_sizes, cull_radii, /*enforce_budget=*/true, /*breadth_first=*/false, /*pause_at_stack_size=*/0,
+				diag_coarse_a, diag_coarse_b, hit_budget_cap, hit_density_cap, hit_depth_cap);
+			return;
+		}
+
+		decorated.reserve(total);
+		for(size_t t=0; t<num_tasks; ++t)
+		{
+			const GsExpandTask* const task = static_cast<const GsExpandTask*>(group->tasks[t].ptr());
+			for(size_t i=0; i<task->decorated.size(); ++i)
+				decorated.push_back(task->decorated[i]);
+			diag_coarse_a += task->diag_coarse_a;
+			diag_coarse_b += task->diag_coarse_b;
+			hit_density_cap = hit_density_cap || task->hit_density_cap;
+			hit_depth_cap   = hit_depth_cap   || task->hit_depth_cap;
+		}
+	}
+
 	uint64 cloud_id;
 	uint64 topology_generation;
 	Reference<GaussianSplatLodTraversalScratch> scratch;
@@ -1780,6 +2094,11 @@ private:
 	bool sat_overlay_requested; // SESSION078: see the ctor param.
 	float alpha_gain, alpha_gamma;
 	glare::TaskManager* task_manager; // SESSION079: may be NULL - see the ctor param. // SESSION078: see the ctor param.
+
+	// SESSION080 DIAGNOSTIC: filled by expandParallel(), copied onto the frontier at the end of run() - see
+	// GaussianSplatUnculledFrontier's matching fields for what the numbers are for. All stay zero on the serial path.
+	size_t expand_seeds, expand_num_tasks;
+	double expand_prologue_ms, expand_task_max_ms, expand_task_sum_ms;
 };
 
 
@@ -6272,6 +6591,39 @@ void GaussianSplatRenderer::drainTraversalResults()
 				// per traversal, not per filter kick (the verdict is orientation-independent, so per-kick printing would
 				// repeat identical values every frame of a rotation). Shares the filter trace's toggle.
 				const GaussianSplatUnculledFrontier& uf = *msg->unculled_frontier;
+
+				// SESSION080 DIAGNOSTIC: the traversal task's own cost, split into tree walk/selection vs. sort - see
+				// GaussianSplatUnculledFrontier::expand_ms/sort_ms. Printed once per traversal (same cadence as [gsr-sat]
+				// below, but NOT gated on sat_grid_res>0 - this fires with the saturation stage off too, since the DFS and
+				// sort happen regardless). Answers whether session054's "sort was ~76% of traversal time" figure - measured
+				// against std::sort, before the switch to radix - is still the shape of the cost today.
+				if(filter_debug_log)
+					conPrint("[gsr-traversal] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms " +
+						"expand_ms=" + doubleToStringNDecimalPlaces(uf.expand_ms, 2) +
+						" sort_ms=" + doubleToStringNDecimalPlaces(uf.sort_ms, 2) +
+						" total_ms=" + doubleToStringNDecimalPlaces(uf.expand_ms + uf.sort_ms, 2) +
+						// SESSION080: traversal_output_n, NOT uf.indices.size() - on this (pruned) frontier indices.size()
+						// is pool_after, which undercounts what expand_ms/sort_ms actually walked/sorted. See the field's comment.
+						" n=" + uInt64ToStringCommaSeparated(uf.traversal_output_n) +
+						// SESSION080: whether this traversal's DFS was truncated rather than run to convergence - see
+						// GaussianSplatLodTraversalScratch::hit_budget_cap and session054's note (above, in the sort
+						// block's comment) that expand's DFS-order budget-clip policy assumed this never fires. Read off
+						// the cloud, not the scratch (already freed by the time this - message 2 - branch runs) - safe
+						// because the derived_from equality check above guarantees this is still THIS traversal's msg1.
+						" budget_cap=" + boolToString(cloud->last_traversal_hit_budget_cap) +
+						" density_cap=" + boolToString(cloud->last_traversal_hit_density_cap) +
+						" depth_cap=" + boolToString(cloud->last_traversal_hit_depth_cap) +
+						// SESSION080 DIAGNOSTIC: the parallel expand's own shape - see the fields' comment. par= is
+						// task_sum/task_max, the parallelism the seed split actually offers; compare it against how much
+						// of expand_ms the longest task accounts for.
+						" seeds=" + uInt64ToStringCommaSeparated(uf.expand_seeds) +
+						" tasks=" + uInt64ToStringCommaSeparated(uf.expand_num_tasks) +
+						" prologue_ms=" + doubleToStringNDecimalPlaces(uf.expand_prologue_ms, 2) +
+						" task_max_ms=" + doubleToStringNDecimalPlaces(uf.expand_task_max_ms, 2) +
+						" task_sum_ms=" + doubleToStringNDecimalPlaces(uf.expand_task_sum_ms, 2) +
+						" soa_ms=" + doubleToStringNDecimalPlaces(uf.soa_ms, 2) + // SESSION080: was untimed before - see the field.
+						" par=" + doubleToStringNDecimalPlaces(uf.expand_task_max_ms > 0.0 ? (uf.expand_task_sum_ms / uf.expand_task_max_ms) : 0.0, 2));
+
 				if(filter_debug_log && uf.sat_grid_res > 0)
 				{
 					const size_t num_tiles = (size_t)uf.sat_grid_res * (size_t)uf.sat_grid_res;

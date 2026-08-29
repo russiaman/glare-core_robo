@@ -1125,7 +1125,11 @@ public:
 // SESSION079: one slice of the occluder gather - see GsSatGatherTask.
 struct GsSatGatherChunk
 {
-	size_t i_begin, i_end;
+	size_t i_begin, i_end; // Input range, LOCAL to this chunk's segment - see out_base.
+	// SESSION080 §4.3: where this chunk's slice starts in the (single, shared) output. A frontier is two segments whose
+	// input indices both start at 0, so the input range above can no longer double as the output offset the way it did
+	// when a frontier was one flat array.
+	size_t out_base;
 	size_t count;        // Survivors this chunk wrote into its own slice.
 	double aniso_sum;    // Diagnostic, accumulated per chunk so the threads never share a counter.
 	float aniso_max;
@@ -1206,7 +1210,16 @@ public:
 // chunk's verdict pass and its copy pass agree on the range by construction rather than by two matching divisions.
 struct GsSatTestChunk
 {
-	size_t i_begin, i_end;   // Input range, into the source frontier.
+	size_t i_begin, i_end;   // Input range, LOCAL to this chunk's segment - see mask_base.
+	// SESSION080 §4.3: which segment this chunk reads, and where that segment starts in the (single, shared) keep mask.
+	// The tasks index the mask by their segment-local i, so the dispatch hands them a pointer already displaced by
+	// mask_base - which keeps both task bodies exactly as they were when a frontier was one flat array.
+	//
+	// seg_idx is carried explicitly rather than deduced from mask_base: a frontier whose near part is empty (the camera
+	// far enough that every root sits beyond the frozen cut) gives BOTH segments a base of 0, and deducing from that
+	// would send the far chunks to read the empty near arrays.
+	size_t seg_idx;
+	size_t mask_base;
 	size_t out_begin;        // Where this chunk's survivors start in the output. Filled by the prefix sum between the phases.
 	size_t kept, tested, dropped, dropped_aggr;
 };
@@ -1364,14 +1377,7 @@ public:
 			// The cut's geometry is defined on the unculled tree. With any of these on, the walk prunes for reasons the
 			// frozen predicate knows nothing about, so a later traversal's near part and the block would no longer be
 			// complementary.
-			!frustum_cull_enabled && !dist_clamp_enabled && !coarse_floor_enabled &&
-			// SESSION080 §4.3, STAGING: the saturation stage's occluder gather still reads a frontier as ONE flat array
-			// (see the GsSatGatherTask dispatch in run()), so it would silently see only the near segment and build its
-			// barrier from a quarter of the scene. Until that pass is taught the second segment, a traversal that will
-			// run saturation simply does not split - it produces one self-contained frontier, exactly as before. Note
-			// this is NOT implied by coarse_floor_enabled above: since session076 the grid accumulates the FINE frontier
-			// and needs no coarse capture, so saturation can be on with the coarse floor off.
-			sat_prefilter_mode_ == GaussianSplatSatPrefilterMode_Off && !sat_overlay_requested_)
+			!frustum_cull_enabled && !dist_clamp_enabled && !coarse_floor_enabled)
 		{
 			reuse_enabled = true;
 			reuse_split_dist = reuse_split_dist_;
@@ -1853,7 +1859,14 @@ public:
 				// Read off the published frontier, not the traversal's own output/coarse_flags arrays, which alias the
 				// recyclable scratch. Order is preserved either way - a filtered subsequence of a front-to-back list is
 				// still front-to-back, as gsBuildSaturationGrid()'s sequential accumulation requires.
-				const size_t n = uf->indices.size();
+				// SESSION080 §4.3: a frontier is its own arrays followed by its far block's, so every pass over one enumerates
+				// segments rather than indexing [0, n). Both passes below chunk each segment separately and never let a chunk
+				// straddle the boundary, which is what lets the per-chunk tasks stay exactly as they were: each is handed its
+				// segment's base pointers and a segment-local range, plus a GLOBAL output offset for the one shared destination.
+				const GaussianSplatUnculledFrontier* const segs[2] = { uf.ptr(), uf->far_block.ptr() };
+				const size_t num_segs = uf->far_block.nonNull() ? 2 : 1;
+				const size_t seg_base[2] = { 0, uf->indices.size() };
+				const size_t n = uf->indices.size() + (uf->far_block.nonNull() ? uf->far_block->indices.size() : 0);
 				js::Vector<float, 16> occl_px, occl_py, occl_pz, occl_radius, occl_alpha;
 
 				// SESSION079 DIAGNOSTIC: this loop had never been timed, and the wall clock says it is the largest single
@@ -1881,29 +1894,53 @@ public:
 					const int gather_concurrency = (task_manager != NULL) ? myMax(1, (int)task_manager->getConcurrency()) : 1;
 					const size_t num_gather_chunks = myMax<size_t>(1, myMin((size_t)gather_concurrency * 4, n / 16384));
 
-					js::Vector<GsSatGatherChunk, 16> chunks(num_gather_chunks);
-					glare::TaskGroupRef group = new glare::TaskGroup();
-					for(size_t c=0; c<num_gather_chunks; ++c)
+					js::Vector<GsSatGatherChunk, 16> chunks;
+					chunks.reserve(num_gather_chunks + num_segs);
+					for(size_t sg=0; sg<num_segs; ++sg) // Sizing pass first: chunks must not move once a task holds a pointer into it.
 					{
-						chunks[c].i_begin = (n * c)       / num_gather_chunks;
-						chunks[c].i_end   = (n * (c + 1)) / num_gather_chunks;
-						chunks[c].count = 0;
-						chunks[c].aniso_sum = 0.0; chunks[c].aniso_max = 0.f;
-						chunks[c].aniso_gt5 = chunks[c].aniso_gt10 = chunks[c].aniso_n = 0;
+						const size_t seg_n = segs[sg]->indices.size();
+						if(seg_n == 0)
+							continue;
+						// Split the chunk budget between the segments in proportion to their size, so the total stays what the
+						// concurrency calculation above asked for.
+						const size_t seg_chunks = myMax<size_t>(1, (num_gather_chunks * seg_n) / myMax<size_t>(1, n));
+						for(size_t c=0; c<seg_chunks; ++c)
+						{
+							GsSatGatherChunk ch;
+							ch.i_begin = (seg_n * c)       / seg_chunks;
+							ch.i_end   = (seg_n * (c + 1)) / seg_chunks;
+							ch.out_base = seg_base[sg] + ch.i_begin;
+							ch.count = 0;
+							ch.aniso_sum = 0.0; ch.aniso_max = 0.f;
+							ch.aniso_gt5 = ch.aniso_gt10 = ch.aniso_n = 0;
+							chunks.push_back(ch);
+						}
+					}
 
-						Reference<GsSatGatherTask> t = new GsSatGatherTask();
-						t->indices = uf->indices.data(); t->px = uf->px.data(); t->py = uf->py.data(); t->pz = uf->pz.data();
-						t->is_coarse = uf->is_coarse.data();
-						t->scales = geom_ref->scales.data(); t->rotations = geom_ref->rotations.data(); t->alphas = alphas.data();
-						// Own slice, sized to its input range - the survivors are compacted down afterwards.
-						t->out_px = occl_px.data() + chunks[c].i_begin; t->out_py = occl_py.data() + chunks[c].i_begin;
-						t->out_pz = occl_pz.data() + chunks[c].i_begin; t->out_radius = occl_radius.data() + chunks[c].i_begin;
-						t->out_alpha = occl_alpha.data() + chunks[c].i_begin;
-						t->cam_pos_ws = cam_pos_ws;
-						t->alpha_gain = alpha_gain; t->alpha_gamma = alpha_gamma;
-						t->want_aniso = sat_diag_log;
-						t->chunk = &chunks[c];
-						if(task_manager != NULL) group->tasks.push_back(t); else t->run(0); // No pool: same code, run here.
+					glare::TaskGroupRef group = new glare::TaskGroup();
+					{
+						size_t c = 0;
+						for(size_t sg=0; sg<num_segs; ++sg)
+						{
+							const GaussianSplatUnculledFrontier& seg = *segs[sg];
+							const size_t seg_end = seg_base[sg] + seg.indices.size();
+							for(; c<chunks.size() && chunks[c].out_base < seg_end; ++c)
+							{
+								Reference<GsSatGatherTask> t = new GsSatGatherTask();
+								t->indices = seg.indices.data(); t->px = seg.px.data(); t->py = seg.py.data(); t->pz = seg.pz.data();
+								t->is_coarse = seg.is_coarse.data();
+								t->scales = geom_ref->scales.data(); t->rotations = geom_ref->rotations.data(); t->alphas = alphas.data();
+								// Own slice, sized to its input range - the survivors are compacted down afterwards.
+								t->out_px = occl_px.data() + chunks[c].out_base; t->out_py = occl_py.data() + chunks[c].out_base;
+								t->out_pz = occl_pz.data() + chunks[c].out_base; t->out_radius = occl_radius.data() + chunks[c].out_base;
+								t->out_alpha = occl_alpha.data() + chunks[c].out_base;
+								t->cam_pos_ws = cam_pos_ws;
+								t->alpha_gain = alpha_gain; t->alpha_gamma = alpha_gamma;
+								t->want_aniso = sat_diag_log;
+								t->chunk = &chunks[c];
+								if(task_manager != NULL) group->tasks.push_back(t); else t->run(0); // No pool: same code, run here.
+							}
+						}
 					}
 					if(task_manager != NULL) task_manager->runTaskGroup(group);
 
@@ -1911,9 +1948,9 @@ public:
 					// makes the grid's sequential accumulation mean anything. Each chunk only ever moves to a LOWER offset,
 					// so the copies never overlap forwards. With the coarse floor off nothing is dropped and this does nothing.
 					size_t kept = 0;
-					for(size_t c=0; c<num_gather_chunks; ++c)
+					for(size_t c=0; c<chunks.size(); ++c)
 					{
-						const size_t slice_begin = chunks[c].i_begin, cnt = chunks[c].count;
+						const size_t slice_begin = chunks[c].out_base, cnt = chunks[c].count;
 						if(cnt > 0 && kept != slice_begin)
 						{
 							std::memmove(occl_px.data() + kept, occl_px.data() + slice_begin, cnt * sizeof(float));
@@ -2047,13 +2084,26 @@ public:
 						const size_t min_chunk_nodes = 16384; // Below this the per-task overhead starts to matter against the work.
 						const size_t num_chunks = myMax<size_t>(1, myMin((size_t)concurrency * 4, n / min_chunk_nodes));
 
-						js::Vector<GsSatTestChunk, 16> chunks(num_chunks);
-						for(size_t c=0; c<num_chunks; ++c)
+						// SESSION080 §4.3: chunked per segment, never straddling the boundary - see the segment enumeration above.
+						js::Vector<GsSatTestChunk, 16> chunks;
+						chunks.reserve(num_chunks + num_segs);
+						for(size_t sg=0; sg<num_segs; ++sg)
 						{
-							chunks[c].i_begin = (n * c)       / num_chunks;
-							chunks[c].i_end   = (n * (c + 1)) / num_chunks;
-							chunks[c].out_begin = 0;
-							chunks[c].kept = chunks[c].tested = chunks[c].dropped = chunks[c].dropped_aggr = 0;
+							const size_t seg_n = segs[sg]->indices.size();
+							if(seg_n == 0)
+								continue;
+							const size_t seg_chunks = myMax<size_t>(1, (num_chunks * seg_n) / myMax<size_t>(1, n));
+							for(size_t c=0; c<seg_chunks; ++c)
+							{
+								GsSatTestChunk ch;
+								ch.i_begin = (seg_n * c)       / seg_chunks;
+								ch.i_end   = (seg_n * (c + 1)) / seg_chunks;
+								ch.seg_idx = sg;
+								ch.mask_base = seg_base[sg];
+								ch.out_begin = 0;
+								ch.kept = ch.tested = ch.dropped = ch.dropped_aggr = 0;
+								chunks.push_back(ch);
+							}
 						}
 
 						js::Vector<uint8, 16>& keep_mask = scratch->sat_keep_mask;
@@ -2062,17 +2112,18 @@ public:
 						// ---- Phase 1: the verdict, per node. ----
 						{
 							glare::TaskGroupRef group = new glare::TaskGroup();
-							for(size_t c=0; c<num_chunks; ++c)
+							for(size_t c=0; c<chunks.size(); ++c)
 							{
+								const GaussianSplatUnculledFrontier& seg = *segs[chunks[c].seg_idx];
 								Reference<GsSatTestTask> t = new GsSatTestTask();
-								t->px = uf->px.data(); t->py = uf->py.data(); t->pz = uf->pz.data();
-								t->radius = uf->radius.data(); t->is_coarse = uf->is_coarse.data();
+								t->px = seg.px.data(); t->py = seg.py.data(); t->pz = seg.pz.data();
+								t->radius = seg.radius.data(); t->is_coarse = seg.is_coarse.data();
 								t->sat_depth = &uf2->sat_depth;
 								t->cam_pos_ws = cam_pos_ws;
 								t->res = uf2->sat_grid_res;
 								t->region_radius = sat_region_radius;
 								t->prune = prune;
-								t->keep_mask = keep_mask.data();
+								t->keep_mask = keep_mask.data() + chunks[c].mask_base; // Indexed by segment-local i - see GsSatTestChunk::mask_base.
 								t->chunk = &chunks[c];
 								if(task_manager != NULL) group->tasks.push_back(t); else t->run(0); // No pool: same code, run here.
 							}
@@ -2080,7 +2131,7 @@ public:
 						}
 
 						size_t num_tested = 0, num_dropped = 0, num_dropped_aggr = 0, num_kept = 0;
-						for(size_t c=0; c<num_chunks; ++c)
+						for(size_t c=0; c<chunks.size(); ++c)
 						{
 							chunks[c].out_begin = num_kept;
 							num_kept        += chunks[c].kept;
@@ -2098,14 +2149,15 @@ public:
 						if(num_kept > 0)
 						{
 							glare::TaskGroupRef group = new glare::TaskGroup();
-							for(size_t c=0; c<num_chunks; ++c)
+							for(size_t c=0; c<chunks.size(); ++c)
 							{
+								const GaussianSplatUnculledFrontier& seg = *segs[chunks[c].seg_idx];
 								Reference<GsSatCompactTask> t = new GsSatCompactTask();
-								t->in_indices = uf->indices.data(); t->in_px = uf->px.data(); t->in_py = uf->py.data();
-								t->in_pz = uf->pz.data(); t->in_radius = uf->radius.data(); t->in_is_coarse = uf->is_coarse.data();
+								t->in_indices = seg.indices.data(); t->in_px = seg.px.data(); t->in_py = seg.py.data();
+								t->in_pz = seg.pz.data(); t->in_radius = seg.radius.data(); t->in_is_coarse = seg.is_coarse.data();
 								t->out_indices = uf2->indices.data(); t->out_px = uf2->px.data(); t->out_py = uf2->py.data();
 								t->out_pz = uf2->pz.data(); t->out_radius = uf2->radius.data(); t->out_is_coarse = uf2->is_coarse.data();
-								t->keep_mask = keep_mask.data();
+								t->keep_mask = keep_mask.data() + chunks[c].mask_base; // Indexed by segment-local i - see GsSatTestChunk::mask_base.
 								t->chunk = &chunks[c];
 								if(task_manager != NULL) group->tasks.push_back(t); else t->run(0);
 							}

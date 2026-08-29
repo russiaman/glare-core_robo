@@ -269,6 +269,11 @@ public:
 	// was ~76% of traversal time predates the switch from std::sort to radix and was never re-measured after.
 	double expand_ms; // The DFS/selection loop: frustum cull, coarse capture, pixel_scale convergence checks, cap tests.
 	double sort_ms;   // Sort::floatKeyAscendingSort() over the selection, plus unpacking into output/coarse_flags.
+	// SESSION080 DIAGNOSTIC (plan2 §4.1): the share of sort_ms that is just allocating the sort's scratch buffer, which
+	// is a local sized to the selection - so a fresh ~106MB allocation per traversal at full frontier size, first-touch
+	// page faults included. Same question, and the same candidate fix (pool it on the traversal scratch), as
+	// expand_splice_reserve_ms - measured together because one rebuild answers both.
+	double sort_alloc_ms;
 	// SESSION080 DIAGNOSTIC: why the parallel expand did or did not pay off - see expandParallel(). The pair that matters
 	// is sum vs max: task_sum_ms is the total work the tasks did, task_max_ms the longest single one, i.e. the critical
 	// path. sum/max is the parallelism actually available in the seed split. If max ~= expand_ms one subtree dominates
@@ -279,6 +284,21 @@ public:
 	double expand_prologue_ms;  // The serial top-of-tree walk before any of them started.
 	double expand_task_max_ms;
 	double expand_task_sum_ms;
+	// SESSION080 DIAGNOSTIC (plan2 §4.1): the serial concatenation of the tasks' per-thread output vectors into
+	// `decorated`, AFTER runTaskGroup() returns - not covered by task_max_ms/task_sum_ms, which are the tasks' own
+	// wall-clock. Suspected (from expand_ms minus an estimate of the parallel section) to be roughly half of expand
+	// at reuse=25, but that was an inference, not a measurement - see the field's use for why it needed its own timer
+	// before anything was optimised on the strength of it.
+	//
+	// Split in two because the two halves want opposite fixes and the aggregate cannot tell them apart:
+	//   reserve_ms - growing `decorated` to the final size. It is a local in run(), so this is a FRESH allocation every
+	//     traversal, and at 13.2M nodes x 8 bytes it is a ~106MB one whose first-touch page faults are paid here. If
+	//     this dominates, the fix is to pool the buffer on GaussianSplatLodTraversalScratch - exactly what session079
+	//     did for sat_occluder_recs, and for exactly this reason (see that field's comment).
+	//   copy_ms - the element-by-element push_back loop itself. If THIS dominates, the fix is a memcpy per task block
+	//     (offsets are known from the same prefix pass that computes `total`), optionally dispatched across the pool.
+	double expand_splice_reserve_ms;
+	double expand_splice_copy_ms;
 
 	// SESSION080 DIAGNOSTIC: building this frontier's SoA (indices/px/py/pz/radius/is_coarse) from the sorted selection.
 	// Sat between sort_ms and sat_gather_ms and was covered by NEITHER, so the stage timings did not sum to the traversal
@@ -359,7 +379,8 @@ public:
 		built_time_real_s(0.0), // SESSION080
 		sat_prefilter_threshold_used(0.f), sat_grid_subdiv_used(0.f), sat_region_radius_used(0.f), // SESSION080
 		expand_ms(0.0), sort_ms(0.0), // SESSION080
-		expand_seeds(0), expand_num_tasks(0), expand_prologue_ms(0.0), expand_task_max_ms(0.0), expand_task_sum_ms(0.0), soa_ms(0.0), // SESSION080
+		expand_seeds(0), expand_num_tasks(0), expand_prologue_ms(0.0), expand_task_max_ms(0.0), expand_task_sum_ms(0.0), // SESSION080
+		expand_splice_reserve_ms(0.0), expand_splice_copy_ms(0.0), sort_alloc_ms(0.0), soa_ms(0.0), // SESSION080 (plan2 §4.1)
 		traversal_output_n(0), // SESSION080
 		sort_staleness_delta_ws(0.0), sort_staleness_prev_n(0), sort_staleness_common_n(0), sort_staleness_max_disp(0), // SESSION080
 		sort_staleness_mean_disp(0.0), sort_staleness_gt1k(0), sort_staleness_gt10k(0), sort_staleness_ms(0.0), // SESSION080
@@ -602,6 +623,15 @@ public:
 };
 
 
+// One selected node, as the traversal's sort sees it: the squared camera distance it is keyed on, and the cloud index it
+// carries. SESSION080: hoisted to file scope out of GaussianSplatLodTraversalTask so the buffers of these can be pooled
+// on the scratch below, which is declared before that task - see the scratch's `decorated`/`sort_scratch`.
+//
+// SESSION063 K4: bit 31 of idx flags a coarse-floor node. Cloud indices are well under 2^31, and the radix sort keys
+// only on dist_sq, so the flag rides along for free and is unpacked after the sort.
+struct GsDistIdx { float dist_sq; uint32 idx; };
+
+
 // Reusable working buffers for the background LoD traversals - pooled the same way GaussianSplatSortScratch is, and for
 // the same reason (selected_indices can run to a non-trivial size for a large tree, so N clouds shouldn't mean N sets of
 // these). SESSION058: geom below is no longer one of these per-scratch allocations - it's a Reference<> into a shared,
@@ -634,6 +664,18 @@ public:
 	// SESSION079: scratch for the parallel read pass's keep mask - one byte per frontier node. Kept here for the same
 	// reason as the records above, though it is small by comparison (~3.5MB where they are 32).
 	js::Vector<uint8, 16> sat_keep_mask;
+
+	// SESSION080 (plan2 §4.1): the traversal's selection and the sort's working space. Pooled here for the same reason
+	// as sat_occluder_recs above: both are sized to the frontier - ~106MB each at 13.2M nodes - and as locals in run()
+	// they were allocated, first-touched and freed on EVERY traversal. The allocation itself measured free
+	// (splice_res_ms/sort_alloc_ms, 0.01-0.05ms: js::Vector::reserve does not touch the pages), so the cost that
+	// pooling removes is the first-touch faulting spread through the copy that follows. run() clear()s them - which
+	// keeps the capacity - rather than resizing, so a steady-state traversal reuses already-faulted pages.
+	//
+	// Scratches are pooled globally rather than per cloud, so a differently-sized cloud may inherit these; that is
+	// harmless, since both are grown on demand and never read past the size the current traversal sets.
+	js::Vector<GsDistIdx, 16> decorated;
+	js::Vector<GsDistIdx, 16> sort_scratch;
 };
 
 
@@ -1311,7 +1353,7 @@ public:
 	// computed for pixel_scale rather than re-scanning positions[] a second time. Squared distance is a monotone key,
 	// preserves ascending sort order, and skips 3-8M sqrt calls that the previous getDist()-per-item scan cost.
 	// SESSION080: at class scope rather than inside run(), so the parallel expand's tasks can name it too.
-	struct DistIdx { float dist_sq; uint32 idx; };
+	typedef GsDistIdx DistIdx; // SESSION080: hoisted to file scope so the scratch can pool buffers of it - see GsDistIdx.
 	struct DistIdxLess { inline bool operator () (const DistIdx& a, const DistIdx& b) const { return a.dist_sq < b.dist_sq; } }; // Nearest first (matches GaussianSplatSortResultMsg's convention for the front-to-back "under" blend). Used only by the small-N std::sort fallback inside floatKeyAscendingSort.
 	struct DistIdxKey  { inline float operator () (const DistIdx& x) const { return x.dist_sq; } }; // Sort::floatKeyAscendingSort keys on this float; squared distance is non-negative so FloatFlip's positive-branch monotone mapping applies.
 
@@ -1355,6 +1397,7 @@ public:
 		alpha_gain(alpha_gain_), alpha_gamma(alpha_gamma_), // SESSION078
 		task_manager(task_manager_), // SESSION079
 		expand_seeds(0), expand_num_tasks(0), expand_prologue_ms(0.0), expand_task_max_ms(0.0), expand_task_sum_ms(0.0), // SESSION080 DIAGNOSTIC
+		expand_splice_reserve_ms(0.0), expand_splice_copy_ms(0.0), // SESSION080 DIAGNOSTIC (plan2 §4.1)
 		prev_frontier(prev_frontier_), sort_staleness_diag_enabled(sort_staleness_diag_enabled_), // SESSION080 DIAGNOSTIC
 		reuse_enabled(false), reuse_prev_anchor_ws(0.f), reuse_split_dist(0.f) // SESSION080 STEP B - derived below.
 	{
@@ -1431,7 +1474,11 @@ public:
 		// list and are sorted together by distance, so the draw is globally front-to-back across both layers - a near coarse
 		// node correctly occludes a far fine one. The bit is packed into the top of idx (cloud indices are well under 2^31)
 		// so the radix sort, which keys only on dist_sq, carries it for free; it's unpacked when the output is built.
-		js::Vector<DistIdx, 16> decorated;
+		//
+		// SESSION080 (plan2 §4.1): pooled on the scratch rather than a local - see the field's comment. clear() keeps the
+		// capacity, so a steady-state traversal writes into pages that are already faulted in.
+		js::Vector<DistIdx, 16>& decorated = scratch->decorated;
+		decorated.clear();
 		js::Vector<float, 16> coarse_flags; // SESSION063 K4: parallel to output after the sort - 1 per coarse-floor node, 0 per fine node.
 
 		// SESSION076 DIAGNOSTIC: coarse-capture breakdown, counted inline in the DFS below (the only place that still
@@ -1511,7 +1558,12 @@ public:
 		// build centres. Threshold mirrors the sat-test/gather passes' own min_chunk_nodes (session079) - below it the
 		// 3-pass task dispatch overhead isn't worth it, so small/no-tree-yet clouds fall through to the serial sort.
 		Timer sort_timer;
-		js::Vector<DistIdx, 16> sort_scratch(decorated.size());
+		// SESSION080 DIAGNOSTIC (plan2 §4.1): timed apart from the sort itself - see sort_alloc_ms. Pooled on the scratch
+		// alongside `decorated`, for the same reason; resizeNoCopy because the sort overwrites it wholesale.
+		Timer sort_alloc_timer;
+		js::Vector<DistIdx, 16>& sort_scratch = scratch->sort_scratch;
+		sort_scratch.resizeNoCopy(decorated.size());
+		const double sort_alloc_ms = sort_alloc_timer.elapsed() * 1.0e3;
 		const size_t parallel_sort_min_elements = 16384;
 		if(task_manager != NULL && decorated.size() >= parallel_sort_min_elements)
 			Sort::radixSortWithParallelPartition<DistIdx, DistIdxKey>(*task_manager, decorated.data(), (uint32)decorated.size(), DistIdxKey(), sort_scratch.data(), /*put_result_in_working_space=*/false);
@@ -1708,6 +1760,9 @@ public:
 				uf->expand_prologue_ms = expand_prologue_ms;
 				uf->expand_task_max_ms = expand_task_max_ms;
 				uf->expand_task_sum_ms = expand_task_sum_ms;
+				uf->expand_splice_reserve_ms = expand_splice_reserve_ms; // SESSION080 DIAGNOSTIC (plan2 §4.1)
+				uf->expand_splice_copy_ms = expand_splice_copy_ms;
+				uf->sort_alloc_ms = sort_alloc_ms;
 				uf->soa_ms = soa_timer.elapsed() * 1.0e3; // SESSION080 DIAGNOSTIC - the loop just above, which nothing timed before. Includes the reuse passes; reuse_ms below is their own share of it.
 				uf->reuse_roots = diag_reuse_roots; // SESSION080 STEP B DIAGNOSTIC
 				uf->reuse_n = reuse_n;
@@ -1957,6 +2012,9 @@ public:
 					uf2->expand_prologue_ms = uf->expand_prologue_ms;
 					uf2->expand_task_max_ms = uf->expand_task_max_ms;
 					uf2->expand_task_sum_ms = uf->expand_task_sum_ms;
+					uf2->expand_splice_reserve_ms = uf->expand_splice_reserve_ms; // SESSION080 DIAGNOSTIC (plan2 §4.1)
+					uf2->expand_splice_copy_ms = uf->expand_splice_copy_ms;
+					uf2->sort_alloc_ms = uf->sort_alloc_ms;
 					uf2->soa_ms = uf->soa_ms;
 					for(int k=0; k<5; ++k) uf2->dist_pctile[k] = uf->dist_pctile[k];
 					uf2->sort_staleness_delta_ws = staleness_delta_ws; // SESSION080 DIAGNOSTIC - computed above, right after the enqueue.
@@ -2549,7 +2607,12 @@ private:
 
 		task_manager->runTaskGroup(group);
 
-		size_t total = decorated.size();
+		// SESSION080: what the serial part (run()'s no-tree seeds plus this function's prologue) already put in - NOT
+		// initial_decorated, which predates the prologue. This is where the tasks' blocks start, and it is the same
+		// value `total` is seeded with below, so the two agree by construction.
+		const size_t serial_prefix_n = decorated.size();
+
+		size_t total = serial_prefix_n;
 		for(size_t t=0; t<num_tasks; ++t)
 		{
 			const GsExpandTask* const task = static_cast<const GsExpandTask*>(group->tasks[t].ptr());
@@ -2578,18 +2641,43 @@ private:
 			return;
 		}
 
-		decorated.reserve(total);
+		// SESSION080 DIAGNOSTIC (plan2 §4.1): serial - see expand_splice_reserve_ms/expand_splice_copy_ms. Timed on its
+		// own, separately from expand_ms as a whole, because a prior estimate of this cost (task_max_ms/task_sum_ms
+		// subtracted from expand_ms) was an inference, not a measurement, and plan2 §4.1 explicitly calls for a real
+		// timer before optimising it. The reserve is timed apart from the copy because the two want opposite fixes.
+		//
+		// SESSION080 (plan2 §4.1): resize, not reserve + push_back. `total` is already exact - the loop above summed
+		// every task's output - so the destination can be sized once and the blocks memcpy'd into their own slices.
+		// DistIdx is trivially copyable (two scalars), the slices are disjoint and written in task order, so the result
+		// is bit-identical to the element-by-element append it replaces.
+		//
+		// js::Vector::resize(n) placement-news each new element as `T` without parentheses, which is deliberately NOT
+		// value-initialisation for a POD (see the note in Vector.h), so this does not memset 106MB. The loop around it
+		// should compile away entirely for a trivial T - and expand_splice_reserve_ms, which brackets exactly this line,
+		// is what says whether it did: it measured 0.02-0.05ms as a bare reserve, so any jump here is that loop.
+		Timer splice_reserve_timer;
+		decorated.resize(total);
+		expand_splice_reserve_ms = splice_reserve_timer.elapsed() * 1.0e3;
+
+		Timer splice_copy_timer;
+		size_t write_pos = serial_prefix_n; // Where the tasks' output starts - see that variable.
 		for(size_t t=0; t<num_tasks; ++t)
 		{
 			const GsExpandTask* const task = static_cast<const GsExpandTask*>(group->tasks[t].ptr());
-			for(size_t i=0; i<task->decorated.size(); ++i)
-				decorated.push_back(task->decorated[i]);
+			const size_t task_n = task->decorated.size();
+			if(task_n > 0)
+			{
+				std::memcpy(decorated.data() + write_pos, task->decorated.data(), task_n * sizeof(DistIdx));
+				write_pos += task_n;
+			}
 			diag_coarse_a += task->diag_coarse_a;
 			diag_coarse_b += task->diag_coarse_b;
 			diag_reuse_roots += task->diag_reuse_roots; // SESSION080 STEP B
 			hit_density_cap = hit_density_cap || task->hit_density_cap;
 			hit_depth_cap   = hit_depth_cap   || task->hit_depth_cap;
 		}
+		assert(write_pos == total); // The sizing pass and this one walk the same tasks in the same order.
+		expand_splice_copy_ms = splice_copy_timer.elapsed() * 1.0e3;
 	}
 
 	uint64 cloud_id;
@@ -2628,6 +2716,7 @@ private:
 	// GaussianSplatUnculledFrontier's matching fields for what the numbers are for. All stay zero on the serial path.
 	size_t expand_seeds, expand_num_tasks;
 	double expand_prologue_ms, expand_task_max_ms, expand_task_sum_ms;
+	double expand_splice_reserve_ms, expand_splice_copy_ms; // SESSION080 DIAGNOSTIC (plan2 §4.1)
 
 	// SESSION080: the previous traversal's UNPRUNED frontier for this cloud, captured by kickOffTraversals() before this
 	// task was created - SplatCloud::last_unpruned_ufrontier, NOT cached_ufrontier (see that field's comment for why the
@@ -7351,6 +7440,13 @@ void GaussianSplatRenderer::drainTraversalResults()
 						" prologue_ms=" + doubleToStringNDecimalPlaces(uf.expand_prologue_ms, 2) +
 						" task_max_ms=" + doubleToStringNDecimalPlaces(uf.expand_task_max_ms, 2) +
 						" task_sum_ms=" + doubleToStringNDecimalPlaces(uf.expand_task_sum_ms, 2) +
+						// SESSION080 DIAGNOSTIC (plan2 §4.1): the serial concatenation after runTaskGroup() returns, split
+						// into the destination's allocation and the copy loop itself - see expand_splice_reserve_ms. Both
+						// 0 on the serial path (expandParallel() never ran). sort_alloc is the same question asked of the
+						// sort's own scratch, and is a SUBSET of sort_ms, not an addition to it.
+						" splice_res_ms=" + doubleToStringNDecimalPlaces(uf.expand_splice_reserve_ms, 2) +
+						" splice_cpy_ms=" + doubleToStringNDecimalPlaces(uf.expand_splice_copy_ms, 2) +
+						" sort_alloc_ms=" + doubleToStringNDecimalPlaces(uf.sort_alloc_ms, 2) +
 						" soa_ms=" + doubleToStringNDecimalPlaces(uf.soa_ms, 2) + // SESSION080: was untimed before - see the field.
 						// SESSION080: node distance distribution, metres - sizes the far-tail-reuse question. See the field.
 						" d10=" + doubleToStringNDecimalPlaces(uf.dist_pctile[0], 1) +

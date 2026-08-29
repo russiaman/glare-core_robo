@@ -340,34 +340,42 @@ public:
 	size_t sort_staleness_gt10k;     // Common nodes displaced more than 10000 positions.
 	double sort_staleness_ms;        // Cost of computing the above, so this diagnostic's own overhead is visible.
 
-	// SESSION080 STEP B: what frontier reuse did for this traversal - see GaussianSplatRenderer::getFrontierReuseSplitDist().
-	// All zero when the knob is off or a precondition declined it (see GaussianSplatLodTraversalTask::reuse_enabled), which
-	// is also how a log capture says which of the two regimes it was taken in.
-	size_t reuse_roots;   // Subtrees the walk inherited whole rather than descending into.
-	size_t reuse_n;       // Nodes those subtrees contributed, i.e. the size of the inherited tail of this frontier.
-	double reuse_ms;      // Cost of producing that tail: one filtered copy of the previous frontier's SoA.
-	float reuse_split_dist_used; // The knob's value for THIS traversal, not the renderer's live setting - same reasoning as sat_region_radius_used.
-
-	// SESSION080 STEP B: camera position of the OLDEST data in this frontier - its own anchor_pos_ws when it was walked
-	// in full, otherwise inherited unchanged from the frontier it took its tail from.
+	// SESSION080 §4.3: the far half of this frontier, held BY REFERENCE instead of copied into the arrays above.
 	//
-	// This exists to bound something inheritance would otherwise let run away. Each traversal re-tests the previous
-	// frontier's nodes and keeps the ones still beyond the split distance, so a node in a region the camera is moving
-	// AWAY from can stay inherited for an unbounded number of traversals, and its front-to-back key stays the one it was
-	// given the last time it was actually walked. One traversal of sort staleness is the tolerance this scheme is
-	// designed around (see the reuse block in run()); an unbounded number is not, and the retreating case does not
-	// self-correct - retreating makes MORE of the tree far, so less of it gets refreshed, not more. Carrying the oldest
-	// anchor forward lets the next traversal measure the accumulated drift in one subtraction and rebuild from scratch
-	// when it grows too large - see GaussianSplatLodTraversalTask's reuse_enabled.
-	Vec4f reuse_base_anchor_ws;
+	// A frontier is therefore two segments: this object's own arrays [0, indices.size()), which the traversal that built
+	// it walked fresh, followed by far_block's arrays [0, far_block->indices.size()), which it inherited untouched. Every
+	// consumer that streams a frontier has to walk both - see filterUnculledFrontier(), and materialiseFlat() for the
+	// consumers that still want one flat array.
+	//
+	// What makes the two halves fit together exactly is that the cut between them is FROZEN for the block's whole life.
+	// far_block->anchor_pos_ws and far_block->reuse_split_dist_used are the anchor and distance the cut predicate
+	// P(node) = dist(anchor, centre) - cull_radius >= split was evaluated against when the block was built, and every
+	// later traversal in the generation re-evaluates that same P against those same frozen values. So all of them stop
+	// at exactly the same nodes, and the block holds exactly the selection below that cut - no per-traversal scan of the
+	// predecessor is needed, and none is done. (The previous cut of this, session080 STEP B, re-derived the cut from the
+	// PREVIOUS traversal's own anchor, which moved every kick and so forced a full rescan and copy every time - 44.7ms.)
+	//
+	// Null means the frontier is self-contained: the whole selection is in its own arrays. That is the state of a
+	// generation's first traversal, of every traversal while the reuse knob is 0, and of a far block itself.
+	Reference<GaussianSplatUnculledFrontier> far_block;
 
-	// SESSION080 STEP B: did the walk that produced this frontier get truncated by the splat budget? Reuse needs it
-	// because the budget cap is the one stop rule that cannot be re-derived out of context - it depends on how much of
-	// the walk had already been emitted when the node was reached, not on the node alone (see oldWalkStopsHere()). A
-	// truncated predecessor could therefore have stopped ABOVE where we deduce its cut lies, and inheriting a subtree
-	// on that deduction would inherit nothing at all: a hole, not a wrong detail level. So a truncated frontier is
-	// simply never inherited from. Measured false in every capture to date, so this costs nothing in practice.
-	bool hit_budget_cap;
+	// SESSION080: diagnostics for the above - see [gsr-traversal]. reuse_n is far_block's size, repeated here so a log
+	// line describes the whole frontier without dereferencing anything.
+	size_t reuse_roots;          // Subtrees this walk stopped at and left to the far block.
+	size_t reuse_n;              // Nodes the far block contributes, i.e. how much of the frontier was not walked.
+	double reuse_ms;             // Cost of producing the far segment: 0 when it was inherited, the partition+SoA cost when it was built.
+	float reuse_split_dist_used; // The frozen split distance this frontier's cut was made at - see far_block.
+
+	// SESSION080: the camera position the far block's cut was frozen at, carried on every frontier that references it so
+	// the next traversal can measure drift in one subtraction. Equal to anchor_pos_ws on a self-contained frontier.
+	//
+	// This bounds something inheritance would otherwise let run away. The cut is frozen, so a node beyond it is never
+	// re-examined however far the camera travels, and its front-to-back key stays the one it was given when the block was
+	// built. One traversal of staleness is the tolerance this scheme is designed around; an unbounded number is not, and
+	// the retreating case does not self-correct - retreating makes MORE of the tree far, so less of it gets refreshed,
+	// not more. When drift passes reuse_max_drift_fraction of the split distance the block is discarded and the next
+	// traversal walks in full - see GaussianSplatLodTraversalTask's reuse_enabled.
+	Vec4f reuse_base_anchor_ws;
 
 	GaussianSplatUnculledFrontier() // SESSION074: defaults are "stage never ran" - only kickOffTraversals() passing the stage-enabled flag sets sat_grid_res non-zero.
 	:	sat_grid_res(0), sat_num_occluders(0), sat_num_tested(0), sat_num_dropped(0), sat_num_dropped_aggr(0),
@@ -384,7 +392,7 @@ public:
 		traversal_output_n(0), // SESSION080
 		sort_staleness_delta_ws(0.0), sort_staleness_prev_n(0), sort_staleness_common_n(0), sort_staleness_max_disp(0), // SESSION080
 		sort_staleness_mean_disp(0.0), sort_staleness_gt1k(0), sort_staleness_gt10k(0), sort_staleness_ms(0.0), // SESSION080
-		reuse_roots(0), reuse_n(0), reuse_ms(0.0), reuse_split_dist_used(0.f), reuse_base_anchor_ws(0.f), hit_budget_cap(false) // SESSION080 STEP B
+		reuse_roots(0), reuse_n(0), reuse_ms(0.0), reuse_split_dist_used(0.f), reuse_base_anchor_ws(0.f) // SESSION080 §4.3
 	{
 		for(int i=0; i<3; ++i) sat_diag_tile_stats[i] = 0;
 		for(int i=0; i<3; ++i) sat_erode_stats[i] = 0; // SESSION080
@@ -676,6 +684,11 @@ public:
 	// harmless, since both are grown on demand and never read past the size the current traversal sets.
 	js::Vector<GsDistIdx, 16> decorated;
 	js::Vector<GsDistIdx, 16> sort_scratch;
+
+	// SESSION080 §4.3: scratch for the near/far partition of a sorted selection, used only by the traversal that BUILDS
+	// a far block (roughly one in ten - see reuse_max_drift_fraction). Pooled for the same reason as the two above.
+	js::Vector<uint32, 16> partition_near, partition_far;
+	js::Vector<float, 16> partition_near_coarse, partition_far_coarse;
 };
 
 
@@ -1109,78 +1122,6 @@ public:
 };
 
 
-// SESSION080 STEP B: one slice of the inherited-tail pass - see GaussianSplatLodTraversalTask::run()'s reuse block.
-//
-// The predicate is the SAME conservative sphere test the tree walk applies to decide it may skip a subtree, evaluated
-// here on the previous frontier's own nodes: a node is inherited iff its whole bounding sphere lies beyond the split
-// distance, measured from the anchor that frontier was built for. Both sides testing the identical quantity is what
-// makes them agree exactly on which paths each covers - see the walk's comment for the coverage argument.
-//
-// Everything it reads is sequential and everything it writes is sequential, and it never touches the geometry arrays:
-// world-space positions are baked, so the previous frontier's SoA rows are still correct for this one and are simply
-// copied across. That is why the inherited part costs neither a tree walk, nor a sort, nor a scattered position gather.
-struct GsReuseChunk
-{
-	size_t i_begin, i_end;
-	size_t count;     // Survivors in this chunk.
-	size_t out_begin; // Where they go, filled in from the prefix sum between the two passes.
-};
-
-
-// Pass 1: count only. Split from the copy for the same reason the saturation test/compact pair is: no chunk can know
-// where to write until every chunk before it has finished counting.
-class GsReuseCountTask : public glare::Task
-{
-public:
-	virtual void run(size_t /*thread_index*/)
-	{
-		size_t n = 0;
-		for(size_t i=chunk->i_begin; i<chunk->i_end; ++i)
-		{
-			const Vec4f p(in_px[i], in_py[i], in_pz[i], 1.f);
-			if(prev_anchor_ws.getDist(p) - in_radius[i] >= split_dist)
-				++n;
-		}
-		chunk->count = n;
-	}
-
-	const float* in_px; const float* in_py; const float* in_pz; const float* in_radius;
-	Vec4f prev_anchor_ws;
-	float split_dist;
-	GsReuseChunk* chunk;
-};
-
-
-// Pass 2: copy the survivors to the offsets the prefix sum handed out, which keeps the previous frontier's own
-// front-to-back order - the order this tail is inherited WITH, and the one thing about it that is a traversal stale.
-class GsReuseCopyTask : public glare::Task
-{
-public:
-	virtual void run(size_t /*thread_index*/)
-	{
-		size_t d = chunk->out_begin;
-		for(size_t i=chunk->i_begin; i<chunk->i_end; ++i)
-		{
-			const Vec4f p(in_px[i], in_py[i], in_pz[i], 1.f);
-			if(prev_anchor_ws.getDist(p) - in_radius[i] >= split_dist)
-			{
-				out_indices[d] = in_indices[i];
-				out_px[d] = in_px[i]; out_py[d] = in_py[i]; out_pz[d] = in_pz[i];
-				out_radius[d] = in_radius[i];
-				out_is_coarse[d] = in_is_coarse[i];
-				++d;
-			}
-		}
-	}
-
-	const uint32* in_indices; const float* in_px; const float* in_py; const float* in_pz; const float* in_radius; const float* in_is_coarse;
-	uint32* out_indices; float* out_px; float* out_py; float* out_pz; float* out_radius; float* out_is_coarse;
-	Vec4f prev_anchor_ws;
-	float split_dist;
-	GsReuseChunk* chunk;
-};
-
-
 // SESSION079: one slice of the occluder gather - see GsSatGatherTask.
 struct GsSatGatherChunk
 {
@@ -1399,7 +1340,7 @@ public:
 		expand_seeds(0), expand_num_tasks(0), expand_prologue_ms(0.0), expand_task_max_ms(0.0), expand_task_sum_ms(0.0), // SESSION080 DIAGNOSTIC
 		expand_splice_reserve_ms(0.0), expand_splice_copy_ms(0.0), // SESSION080 DIAGNOSTIC (plan2 §4.1)
 		prev_frontier(prev_frontier_), sort_staleness_diag_enabled(sort_staleness_diag_enabled_), // SESSION080 DIAGNOSTIC
-		reuse_enabled(false), reuse_prev_anchor_ws(0.f), reuse_split_dist(0.f) // SESSION080 STEP B - derived below.
+		reuse_enabled(false), far_cut_is_frozen(false), reuse_prev_anchor_ws(0.f), reuse_split_dist(0.f) // SESSION080 §4.3 - derived below.
 	{
 		if(num_frustum_clip_planes < 0)
 			num_frustum_clip_planes = 0;
@@ -1410,39 +1351,114 @@ public:
 		for(int i=0; i<(int)staticArrayNumElems(translation_dilation); ++i)
 			translation_dilation[i] = translation_dilation_ ? translation_dilation_[i] : 0.f;
 
-		// SESSION080 STEP B: decide once, here, whether this traversal may inherit from its predecessor - see
-		// reuse_enabled's comment for what each clause protects. Doing it in the constructor rather than in the walk
-		// keeps the per-node test down to one bool, and keeps every precondition in one readable place.
-		if(reuse_split_dist_ > 0.f && build_unculled_frontier && prev_frontier.nonNull() &&
+		// SESSION080 §4.3: decide once, here, which of the three modes this traversal runs in - see reuse_enabled and
+		// far_cut_is_frozen. Doing it in the constructor rather than in the walk keeps the per-node test down to two
+		// bools and keeps every precondition in one readable place.
+		//
+		//   reuse off                          - walk everything, one self-contained frontier. The knob at 0, or a
+		//                                        setting the cut cannot coexist with.
+		//   building a block (frozen = false)  - walk everything, but mark the part beyond the cut so run() can split it
+		//                                        off into a fresh far block. The generation's first traversal.
+		//   frozen cut (frozen = true)         - walk only the near part and reference the existing block.
+		if(reuse_split_dist_ > 0.f && build_unculled_frontier &&
+			// The cut's geometry is defined on the unculled tree. With any of these on, the walk prunes for reasons the
+			// frozen predicate knows nothing about, so a later traversal's near part and the block would no longer be
+			// complementary.
 			!frustum_cull_enabled && !dist_clamp_enabled && !coarse_floor_enabled &&
-			// The predecessor must describe the same selection, or its nodes are not the ones our own stop rules would
-			// have picked and the reuse test below (which re-derives those rules at the old anchor) would be answering
-			// a different question. Same key set drainTraversalResults() checks, and for the same reason.
-			prev_frontier->topology_generation == topology_generation &&
-			prev_frontier->pixel_scale_limit == pixel_scale_limit &&
-			prev_frontier->max_splats_budget == max_splats_budget &&
-			prev_frontier->max_layer_density == max_layer_density &&
-			prev_frontier->max_tree_depth == max_tree_depth &&
-			prev_frontier->focal_px == focal_px &&
-			// The accumulated-drift bound, i.e. the full-rebuild safety trigger. Inheritance is designed around ONE
-			// traversal of sort staleness in the far field; without this, a node in a region the camera keeps retreating
-			// from would stay inherited indefinitely and keep the key it was given many traversals ago. See
-			// GaussianSplatUnculledFrontier::reuse_base_anchor_ws for why the retreating case cannot self-correct.
-			//
-			// Expressed as a fraction of the split distance rather than as an absolute, because that is the quantity it
-			// is answerable to: an ordering error of size E among nodes at range D matters in proportion to E/D, and the
-			// split distance is the range at which we have declared order to stop mattering much. So capping drift at a
-			// fixed fraction of it caps the relative error, at any scene scale and any knob setting, with no second
-			// number to tune. A traversal that trips this walks the whole tree and becomes the fresh base for the ones
-			// after it - visible in the log as reuse_n dropping to 0 for one traversal.
-			cam_pos_ws_.getDist(prev_frontier->reuse_base_anchor_ws) <= reuse_split_dist_ * reuse_max_drift_fraction &&
-			!prev_frontier->hit_budget_cap) // See the field - a budget-truncated predecessor's cut cannot be located node-locally, and guessing it wrong puts a hole in the picture.
+			// SESSION080 §4.3, STAGING: the saturation stage's occluder gather still reads a frontier as ONE flat array
+			// (see the GsSatGatherTask dispatch in run()), so it would silently see only the near segment and build its
+			// barrier from a quarter of the scene. Until that pass is taught the second segment, a traversal that will
+			// run saturation simply does not split - it produces one self-contained frontier, exactly as before. Note
+			// this is NOT implied by coarse_floor_enabled above: since session076 the grid accumulates the FINE frontier
+			// and needs no coarse capture, so saturation can be on with the coarse floor off.
+			sat_prefilter_mode_ == GaussianSplatSatPrefilterMode_Off && !sat_overlay_requested_)
 		{
 			reuse_enabled = true;
-			reuse_prev_anchor_ws = prev_frontier->anchor_pos_ws;
 			reuse_split_dist = reuse_split_dist_;
+
+			const GaussianSplatUnculledFrontier* const block = prev_frontier.nonNull() ? prev_frontier->far_block.ptr() : NULL;
+			if(block != NULL &&
+				// The block must describe the same selection, or the nodes in it are not the ones our own stop rules
+				// would have picked and the two halves would disagree about what a cut even means. Same key set
+				// drainTraversalResults() checks, and for the same reason.
+				prev_frontier->topology_generation == topology_generation &&
+				prev_frontier->pixel_scale_limit == pixel_scale_limit &&
+				prev_frontier->max_splats_budget == max_splats_budget &&
+				prev_frontier->max_layer_density == max_layer_density &&
+				prev_frontier->max_tree_depth == max_tree_depth &&
+				prev_frontier->focal_px == focal_px &&
+				prev_frontier->reuse_split_dist_used == reuse_split_dist_ && // The knob moved: the frozen cut is at the wrong distance now.
+				// The accumulated-drift bound, i.e. the full-rebuild safety trigger. The cut is frozen, so a node beyond
+				// it is never re-examined however far the camera travels; without this it would keep the key it was given
+				// when the block was built, for an unbounded number of traversals. See
+				// GaussianSplatUnculledFrontier::reuse_base_anchor_ws for why the retreating case cannot self-correct.
+				//
+				// Expressed as a fraction of the split distance rather than as an absolute, because that is the quantity
+				// it is answerable to: an ordering error of size E among nodes at range D matters in proportion to E/D,
+				// and the split distance is the range at which we have declared order to stop mattering much. So capping
+				// drift at a fixed fraction of it caps the relative error, at any scene scale and any knob setting, with
+				// no second number to tune. A traversal that trips this walks the whole tree and builds a fresh block for
+				// the ones after it - visible in the log as reuse_n dropping to 0 for one traversal.
+				cam_pos_ws_.getDist(block->anchor_pos_ws) <= reuse_split_dist_ * reuse_max_drift_fraction)
+			{
+				far_cut_is_frozen = true;
+				reuse_prev_anchor_ws = block->anchor_pos_ws; // The FROZEN anchor, not the predecessor's - that is the whole point.
+				inherited_far_block = prev_frontier->far_block;
+			}
+			else
+				reuse_prev_anchor_ws = cam_pos_ws_; // Building a block: the cut is frozen at where the camera is right now.
 		}
 	}
+
+	// SESSION080 §4.3: fill one frontier's SoA from a compacted index list. Both segments of a split frontier are built
+	// with this - the near one into the published frontier, the far one into the block it references - so there is a
+	// single copy of the gather rather than two that can drift apart.
+	//
+	// A pure map: element i reads positions[src[i]]/cull_radii[src[i]] and writes only slot i, so the chunks need nothing
+	// from each other and the result is bit-identical to the serial loop. Chunked like the occluder gather, and for the
+	// same reason: the cost is DRAM miss latency on the scattered reads into the 30M-entry geometry arrays, not
+	// arithmetic, so what threads buy is outstanding misses.
+	void buildFrontierSoA(GaussianSplatUnculledFrontier& out, const uint32* src, const float* src_coarse, size_t count,
+		const js::Vector<Vec3f, 16>& positions, const js::Vector<float, 16>& cull_radii)
+	{
+		out.indices.resizeNoCopy(count);
+		out.px.resizeNoCopy(count); out.py.resizeNoCopy(count); out.pz.resizeNoCopy(count);
+		out.radius.resizeNoCopy(count); out.is_coarse.resizeNoCopy(count);
+		if(count == 0)
+			return;
+
+		const size_t concurrency = (task_manager != NULL) ? myMax<size_t>(1, (size_t)task_manager->getConcurrency()) : 1;
+		const size_t num_chunks = myMax<size_t>(1, myMin(concurrency * 4, count / 16384));
+		if(task_manager != NULL && num_chunks > 1)
+		{
+			glare::TaskGroupRef group = new glare::TaskGroup();
+			group->tasks.resize(num_chunks);
+			for(size_t c=0; c<num_chunks; ++c)
+			{
+				Reference<GsFrontierSoATask> t = new GsFrontierSoATask();
+				t->i_begin = (count * c)       / num_chunks;
+				t->i_end   = (count * (c + 1)) / num_chunks;
+				t->output = src; t->coarse_flags = src_coarse;
+				t->positions = positions.data(); t->cull_radii = cull_radii.data();
+				t->out_indices = out.indices.data();
+				t->out_px = out.px.data(); t->out_py = out.py.data(); t->out_pz = out.pz.data();
+				t->out_radius = out.radius.data(); t->out_is_coarse = out.is_coarse.data();
+				group->tasks[c] = t;
+			}
+			task_manager->runTaskGroup(group);
+		}
+		else
+			for(size_t i=0; i<count; ++i)
+			{
+				const uint32 idx = src[i];
+				const Vec3f& p = positions[idx];
+				out.indices[i] = idx;
+				out.px[i] = p.x; out.py[i] = p.y; out.pz[i] = p.z;
+				out.radius[i] = cull_radii[idx];
+				out.is_coarse[i] = src_coarse[i];
+			}
+	}
+
 
 	virtual void run(size_t /*thread_index*/) override
 	{
@@ -1618,131 +1634,63 @@ public:
 				uf = new GaussianSplatUnculledFrontier();
 				const size_t n = output.size();
 
-				// SESSION080 STEP B: size the array for the walked part plus the inherited tail. The tail's length is
-				// only known after counting it, so the count pass runs here, ahead of the allocation; the copy runs
-				// after the walked part is written, into the slots past it. See GsReuseChunk for the pass itself.
+				// SESSION080 §4.3: split the sorted selection into the near part this traversal keeps and the far part that
+				// becomes (or already is) a far block - see GaussianSplatUnculledFrontier::far_block.
 				//
-				// The two ranges are concatenated rather than merged, and that is correct without a re-sort: the walk
-				// only inherits a subtree whose whole sphere is beyond the split distance and only keeps for itself
-				// nodes whose sphere is not, so [walked][inherited] is already ordered front-to-back to within the
-				// camera's movement since the previous anchor - the same tolerance every frame already carries, since
-				// what is on screen is always the selection built for where the camera was one traversal ago.
-				// SESSION080 STEP B DIAGNOSTIC: accumulated across the two reuse passes ONLY. It was originally a single timer
-				// spanning this whole block, which made it identical to soa_ms in every log line - a reading that looks like a
-				// measurement but is really just its neighbour, and so could never answer what the tail copy costs.
+				// The mark rode through the sort in bit 30 of each index (set in expandStack()), so this is a stable partition
+				// of an already-sorted array: both halves come out sorted, which is what lets the two segments be streamed one
+				// after the other without a merge. far_n is 0 in every mode except the one that builds a block.
 				double reuse_ms_accum = 0.0;
-				js::Vector<GsReuseChunk, 16> reuse_chunks;
-				size_t reuse_n = 0;
-				if(reuse_enabled)
-				{
-					Timer reuse_count_timer;
-					const size_t prev_n = prev_frontier->indices.size();
-
-					// Scanned in full, deliberately. It is tempting to binary-search for the first node past the split
-					// distance and skip the near half, since the predicate cannot hold nearer than that - but the
-					// previous frontier is NOT sorted by distance from its own anchor. It is itself [walked][inherited],
-					// and its inherited tail is ordered by an OLDER anchor still, so distance along the array is not
-					// monotone and a search would cut in the wrong place. Cutting it short would silently drop nodes the
-					// walk has already stopped above, which is a hole rather than a slightly wrong detail level. The
-					// scan is sequential over six flat arrays and splits across the pool, so the saving was small and
-					// the risk is not.
-					const size_t scan_n = prev_n;
-					const size_t reuse_concurrency = (task_manager != NULL) ? myMax<size_t>(1, (size_t)task_manager->getConcurrency()) : 1;
-					const size_t num_reuse_chunks = myMax<size_t>(1, myMin(reuse_concurrency * 4, scan_n / 16384));
-					reuse_chunks.resize(num_reuse_chunks);
-					glare::TaskGroupRef count_group = new glare::TaskGroup();
-					for(size_t c=0; c<num_reuse_chunks; ++c)
-					{
-						reuse_chunks[c].i_begin = (scan_n * c)       / num_reuse_chunks;
-						reuse_chunks[c].i_end   = (scan_n * (c + 1)) / num_reuse_chunks;
-						reuse_chunks[c].count = 0;
-						reuse_chunks[c].out_begin = 0;
-
-						Reference<GsReuseCountTask> t = new GsReuseCountTask();
-						t->in_px = prev_frontier->px.data(); t->in_py = prev_frontier->py.data(); t->in_pz = prev_frontier->pz.data();
-						t->in_radius = prev_frontier->radius.data();
-						t->prev_anchor_ws = reuse_prev_anchor_ws; t->split_dist = reuse_split_dist;
-						t->chunk = &reuse_chunks[c];
-						if(task_manager != NULL) count_group->tasks.push_back(t); else t->run(0);
-					}
-					if(task_manager != NULL) task_manager->runTaskGroup(count_group);
-
-					for(size_t c=0; c<num_reuse_chunks; ++c) // Prefix sum: each chunk's slice of the tail, in order, so the copy keeps the previous frontier's ordering.
-					{
-						reuse_chunks[c].out_begin = n + reuse_n;
-						reuse_n += reuse_chunks[c].count;
-					}
-					reuse_ms_accum += reuse_count_timer.elapsed() * 1.0e3;
-				}
-
-				uf->indices.resizeNoCopy(n + reuse_n);
-				uf->px.resizeNoCopy(n + reuse_n); uf->py.resizeNoCopy(n + reuse_n); uf->pz.resizeNoCopy(n + reuse_n); uf->radius.resizeNoCopy(n + reuse_n);
-				uf->is_coarse.resizeNoCopy(n + reuse_n);
-				// SESSION080: split across the pool. Measured at ~218ms on the owner's interior - the largest single phase
-				// of the whole async pipeline, and the last serial one, having gone untimed until soa_ms was added.
-				//
-				// It is a pure map: iteration i reads positions[idx]/cull_radius[idx] for its own idx and writes only its
-				// own slot in five pre-sized arrays. No filtering (unlike the occluder gather below, which has to compact),
-				// no ordering, no shared accumulator - so the chunks need nothing from each other and the result is
-				// bit-identical to the serial loop. Chunked exactly like that gather, for the same reason: the cost here is
-				// DRAM miss latency on the scattered reads into the 30M-entry geometry arrays, not arithmetic, so what
-				// threads buy is outstanding misses.
-				const size_t soa_concurrency = (task_manager != NULL) ? myMax<size_t>(1, (size_t)task_manager->getConcurrency()) : 1;
-				const size_t num_soa_chunks = myMax<size_t>(1, myMin(soa_concurrency * 4, n / 16384));
-				if(task_manager != NULL && num_soa_chunks > 1)
-				{
-					glare::TaskGroupRef soa_group = new glare::TaskGroup();
-					soa_group->tasks.resize(num_soa_chunks);
-					for(size_t c=0; c<num_soa_chunks; ++c)
-					{
-						Reference<GsFrontierSoATask> t = new GsFrontierSoATask();
-						t->i_begin = (n * c)       / num_soa_chunks;
-						t->i_end   = (n * (c + 1)) / num_soa_chunks;
-						t->output = output.data(); t->coarse_flags = coarse_flags.data();
-						t->positions = positions.data(); t->cull_radii = cull_radii.data();
-						t->out_indices = uf->indices.data();
-						t->out_px = uf->px.data(); t->out_py = uf->py.data(); t->out_pz = uf->pz.data();
-						t->out_radius = uf->radius.data(); t->out_is_coarse = uf->is_coarse.data();
-						soa_group->tasks[c] = t;
-					}
-					task_manager->runTaskGroup(soa_group);
-				}
-				else
+				Timer partition_timer;
+				size_t far_n = 0;
+				// Only the traversal that BUILDS a block ever sets the mark: with reuse off nothing sets it, and with the
+				// cut frozen the walk stops at the cut instead of descending past it. Skipping the count in those two
+				// cases is not an optimisation of the common path so much as the removal of a pure waste - measured at
+				// 15.9ms scanning 13.2M indices for a bit that is never set.
+				if(reuse_enabled && !far_cut_is_frozen)
 				{
 					for(size_t i=0; i<n; ++i)
-					{
-						const uint32 idx = output[i];
-						const Vec3f& p = positions[idx];
-						uf->indices[i] = idx;
-						uf->px[i] = p.x; uf->py[i] = p.y; uf->pz[i] = p.z;
-						uf->radius[i] = cull_radii[idx];
-						uf->is_coarse[i] = coarse_flags[i];
-					}
+						if(output[i] & 0x40000000u)
+							++far_n;
 				}
-				// SESSION080 STEP B: the inherited tail, written into the slots past the walked part. Pure copy - no
-				// geometry lookup, no distance, no sort. See the count pass above and GsReuseCopyTask.
-				if(reuse_n > 0)
+				const size_t near_n = n - far_n;
+
+				if(far_n > 0) // Building a block: compact the two halves into [near][far], stripping the mark.
 				{
-					Timer reuse_copy_timer;
-					glare::TaskGroupRef copy_group = new glare::TaskGroup();
-					for(size_t c=0; c<reuse_chunks.size(); ++c)
+					scratch->partition_near.resizeNoCopy(near_n); scratch->partition_near_coarse.resizeNoCopy(near_n);
+					scratch->partition_far.resizeNoCopy(far_n);   scratch->partition_far_coarse.resizeNoCopy(far_n);
+					size_t wn = 0, wf = 0;
+					for(size_t i=0; i<n; ++i)
 					{
-						if(reuse_chunks[c].count == 0)
-							continue;
-						Reference<GsReuseCopyTask> t = new GsReuseCopyTask();
-						t->in_indices = prev_frontier->indices.data();
-						t->in_px = prev_frontier->px.data(); t->in_py = prev_frontier->py.data(); t->in_pz = prev_frontier->pz.data();
-						t->in_radius = prev_frontier->radius.data(); t->in_is_coarse = prev_frontier->is_coarse.data();
-						t->out_indices = uf->indices.data();
-						t->out_px = uf->px.data(); t->out_py = uf->py.data(); t->out_pz = uf->pz.data();
-						t->out_radius = uf->radius.data(); t->out_is_coarse = uf->is_coarse.data();
-						t->prev_anchor_ws = reuse_prev_anchor_ws; t->split_dist = reuse_split_dist;
-						t->chunk = &reuse_chunks[c];
-						if(task_manager != NULL) copy_group->tasks.push_back(t); else t->run(0);
+						if(output[i] & 0x40000000u) { scratch->partition_far[wf] = output[i] & ~0x40000000u; scratch->partition_far_coarse[wf] = coarse_flags[i]; ++wf; }
+						else                        { scratch->partition_near[wn] = output[i];                scratch->partition_near_coarse[wn] = coarse_flags[i]; ++wn; }
 					}
-					if(task_manager != NULL) task_manager->runTaskGroup(copy_group);
-					reuse_ms_accum += reuse_copy_timer.elapsed() * 1.0e3;
+					assert(wn == near_n && wf == far_n);
 				}
+				reuse_ms_accum += partition_timer.elapsed() * 1.0e3;
+
+				// The near segment - this frontier's own arrays. When no block is being built this is the whole selection and
+				// `output` is used directly, so the common path allocates and copies nothing extra.
+				const uint32* const near_src       = (far_n > 0) ? scratch->partition_near.data()        : output.data();
+				const float*  const near_src_coarse = (far_n > 0) ? scratch->partition_near_coarse.data() : coarse_flags.data();
+				buildFrontierSoA(*uf, near_src, near_src_coarse, near_n, positions, cull_radii);
+
+				if(far_n > 0)
+				{
+					// The far segment, materialised ONCE here and then referenced by every traversal of this generation.
+					Timer far_soa_timer;
+					Reference<GaussianSplatUnculledFrontier> block = new GaussianSplatUnculledFrontier();
+					buildFrontierSoA(*block, scratch->partition_far.data(), scratch->partition_far_coarse.data(), far_n, positions, cull_radii);
+					// The frozen pair the cut was made at, which every later traversal re-evaluates its predicate against, and
+					// which the drift trigger measures from. reuse_prev_anchor_ws is cam_pos_ws in this mode - see the ctor.
+					block->anchor_pos_ws = reuse_prev_anchor_ws;
+					block->reuse_split_dist_used = reuse_split_dist;
+					block->topology_generation = topology_generation;
+					uf->far_block = block;
+					reuse_ms_accum += far_soa_timer.elapsed() * 1.0e3;
+				}
+				else
+					uf->far_block = inherited_far_block; // Null when reuse is off; the existing block when its cut is frozen.
 
 				uf->topology_generation = topology_generation;
 				uf->anchor_pos_ws = cam_pos_ws;
@@ -1763,15 +1711,14 @@ public:
 				uf->expand_splice_reserve_ms = expand_splice_reserve_ms; // SESSION080 DIAGNOSTIC (plan2 §4.1)
 				uf->expand_splice_copy_ms = expand_splice_copy_ms;
 				uf->sort_alloc_ms = sort_alloc_ms;
-				uf->soa_ms = soa_timer.elapsed() * 1.0e3; // SESSION080 DIAGNOSTIC - the loop just above, which nothing timed before. Includes the reuse passes; reuse_ms below is their own share of it.
-				uf->reuse_roots = diag_reuse_roots; // SESSION080 STEP B DIAGNOSTIC
-				uf->reuse_n = reuse_n;
-				uf->reuse_ms = reuse_ms_accum; // The two reuse passes only - the walked part's SoA build sits between them and is NOT included, which is the whole point. See the accumulator's comment.
+				uf->soa_ms = soa_timer.elapsed() * 1.0e3; // SESSION080 DIAGNOSTIC - the whole segment build, partition included.
+				uf->reuse_roots = diag_reuse_roots; // SESSION080 §4.3 DIAGNOSTIC: subtrees the walk stopped at, or marked as the block's.
+				uf->reuse_n = uf->far_block.nonNull() ? uf->far_block->indices.size() : 0;
+				uf->reuse_ms = reuse_ms_accum; // Partition + the far SoA build, i.e. what BUILDING a block costs. 0 when one was inherited - which is the whole point of §4.3.
 				uf->reuse_split_dist_used = reuse_enabled ? reuse_split_dist : 0.f;
-				// SESSION080 STEP B: carry the oldest contributing anchor forward - see the field. Nothing inherited means
-				// everything here was walked at THIS anchor, which resets the drift the next traversal will measure.
-				uf->reuse_base_anchor_ws = (reuse_n > 0) ? prev_frontier->reuse_base_anchor_ws : cam_pos_ws;
-				uf->hit_budget_cap = hit_budget_cap; // SESSION080 STEP B - see the field. Whether THIS walk was truncated, which decides if the next one may inherit from it.
+				// SESSION080 §4.3: the frozen anchor the far block's cut was made at, carried so the next traversal can measure
+				// drift against it in one subtraction. Equal to cam_pos_ws on a self-contained frontier.
+				uf->reuse_base_anchor_ws = uf->far_block.nonNull() ? uf->far_block->anchor_pos_ws : cam_pos_ws;
 				for(int k=0; k<5; ++k) uf->dist_pctile[k] = dist_pctile[k]; // SESSION080 DIAGNOSTIC
 
 				msg->unculled_frontier = uf;
@@ -2030,7 +1977,6 @@ public:
 					uf2->reuse_ms = uf->reuse_ms;
 					uf2->reuse_split_dist_used = uf->reuse_split_dist_used;
 					uf2->reuse_base_anchor_ws = uf->reuse_base_anchor_ws;
-					uf2->hit_budget_cap = uf->hit_budget_cap;
 
 					uf2->sat_num_occluders = occl_px.size();
 					uf2->sat_grid_res = gsSatGridResForFocal(focal_px, coarse_pixel_scale, sat_grid_subdiv); // SESSION076 CALIBRATION
@@ -2218,12 +2164,11 @@ private:
 		uint32 depth; // 0 for a tree root, parent's depth + 1 for each expansion - see max_tree_depth's use in run().
 		bool coarse_captured; // SESSION063 K4: true once some ancestor on this branch was recorded into the coarse floor, so it's captured once per branch (the first node fine enough at the coarse pixel_scale). Set false at the root by makeHeapItem, propagated to children in run().
 
-		// SESSION080 STEP B: true once some STRICT ancestor on this branch would have been a stop for the PREVIOUS
-		// traversal - i.e. we are below the old cut, so this node's subtree contains none of the old frontier's nodes
-		// and there is nothing here to inherit. Propagated exactly like coarse_captured above, and derived the same way
-		// the old walk derived its own stops (see oldWalkStopsHere()), so it needs no lookup into the old frontier at
-		// all - which is what keeps the whole scheme free of a per-node membership structure over the pool.
-		bool passed_old_cut;
+		// SESSION080 §4.3: true once this node or an ancestor satisfied the frozen far-cut predicate, i.e. this node
+		// belongs to the far block rather than to the walked near part. Propagated exactly like coarse_captured above.
+		// Only ever set while a block is being BUILT: in frozen mode the walk stops at the cut instead of descending
+		// past it, so nothing below it is ever reached. See the classification block in expandStack().
+		bool below_far_cut;
 	};
 
 	HeapItem makeHeapItem(uint32 member_idx, uint32 tree_local_idx, size_t member_offset, uint32 depth, const js::Vector<Vec3f, 16>& positions, const js::Vector<float, 16>& feature_sizes) const
@@ -2240,22 +2185,8 @@ private:
 		item.tree_local_idx = tree_local_idx;
 		item.depth = depth;
 		item.coarse_captured = false; // SESSION063 K4: set by the caller for children; false at the root.
-		item.passed_old_cut = false; // SESSION080 STEP B: as above - a root is never below the old cut.
+		item.below_far_cut = false; // SESSION080 §4.3: a root is never below the cut - see the field.
 		return item;
-	}
-
-	// SESSION080 STEP B: would the PREVIOUS traversal's walk have stopped at this node rather than descending past it?
-	// Re-derives that walk's own stop rules at the old anchor, which is exact because reuse_enabled (see its comment)
-	// already guarantees the previous frontier was built with these very parameters. Budget cap is deliberately not
-	// among them: it is order-dependent, so it cannot be re-derived out of context - and it has measured false in every
-	// capture (see [gsr-traversal]'s budget_cap), while a wrong answer here can only make us conclude "the old cut is
-	// deeper than it is", which declines a reuse rather than inventing one.
-	inline bool oldWalkStopsHere(const GaussianSplatLodNode& node, float old_pixel_scale, uint32 depth) const
-	{
-		return (old_pixel_scale <= pixel_scale_limit) ||
-			(node.child_count == 0) ||
-			(max_layer_density > 0.f && node.layer_density > max_layer_density) ||
-			(max_tree_depth > 0 && depth >= (uint32)max_tree_depth);
 	}
 
 	// SESSION080: the DFS itself, lifted out of run() unchanged so that the serial path and each parallel task run
@@ -2357,54 +2288,56 @@ private:
 				}
 			}
 
-			// SESSION080 STEP B: frontier reuse. Three-way classification of this node against the PREVIOUS traversal's
-			// anchor - see GaussianSplatRenderer::getFrontierReuseSplitDist() for the idea, and the plan doc's section 5
-			// for the full argument. Everything here is O(1) and needs no membership structure over the pool.
+			// SESSION080 §4.3: the far-block cut. One O(1) predicate, evaluated against a FROZEN anchor and split
+			// distance - see GaussianSplatUnculledFrontier::far_block for why freezing them is the whole trick.
 			//
-			// The reused set is defined by a predicate on the OLD frontier's own nodes: node A is inherited iff
-			// dist(old_anchor, A) - cull_radius(A) >= split_dist. The far pass at the end of run() applies exactly that
-			// predicate, over the old frontier's SoA, to produce the inherited part. The test below is the SAME
-			// predicate applied to the node this walk is standing on, which is what makes the two sides agree:
+			//   P(node) = dist(frozen_anchor, centre) - cull_radius >= frozen_split
 			//
-			//   - PASS (whole subtree beyond the split, in the old metric): every old frontier node beneath this one
-			//     also passes, because its bounding sphere is contained in this one's. So the far pass emits a complete
-			//     cut of this subtree and we must emit nothing, or the paths would be covered twice.
-			//   - STRADDLE (sphere spans the split): some descendants may be inherited and some not, so this walk may
-			//     not stop here - stopping would cover paths the far pass also covers. Forced to descend until each
-			//     branch resolves one way or the other. A leaf cannot descend, but a leaf that straddles fails the
-			//     predicate itself, so it is not inherited and emitting it is correct.
-			//   - INSIDE (sphere entirely within the split): nothing beneath can be inherited, so the normal rules
-			//     apply untouched.
+			// cull_radius is the subtree's enclosing sphere (NOT feature_size - see GaussianSplatLodNode::
+			// bounding_radius_os), so P is inherited downwards: if P holds for a node it holds for every descendant,
+			// whose sphere is contained in this one's. That is what makes the cut a clean antichain.
 			//
-			// passed_old_cut is the fourth case and the one that would otherwise put a hole in the picture: below the
-			// old cut there are no old frontier nodes left to inherit, so a PASS there would emit nothing and the far
-			// pass would supply nothing either. Note the walk can never get below an INHERITED node - the PASS branch
-			// stops it at or above one - so this only ever means "the old walk stopped shallower than we are", i.e. the
-			// camera has come closer, which is exactly the case that must be rebuilt anyway.
+			// Two modes, and they must agree node-for-node or the picture gets a hole or a double-draw:
+			//
+			//   far_cut_is_frozen (a later traversal in the generation): P true -> STOP and emit nothing. The far block
+			//     already holds this subtree's selection, made when the block was built. Descending would cover the same
+			//     paths twice.
+			//   building the block (the generation's first traversal): P true -> mark the subtree FAR and carry on under
+			//     the normal rules. Whatever this walk emits down there is what the block will hold, and the partition
+			//     after the sort splits it off by that mark.
+			//
+			// Because P depends only on the frozen pair and the node's own geometry, the first node satisfying it on any
+			// root->leaf path is the SAME node in both modes. So the block holds exactly one selected node per path below
+			// the cut, and later walks stop at exactly the boundary that produced it. Coverage is exact, not approximate.
+			//
+			// STRADDLE (sphere spans the split: P false, but dist + radius >= split) is the one case that needs care in
+			// the frozen mode. Some descendants satisfy P and some do not, so stopping here would cover paths the block
+			// also covers - the walk is forced past its normal stop rules until every branch resolves one way or the
+			// other. A leaf cannot descend, but a straddling leaf fails P itself, so emitting it is correct.
 			bool force_descend = false;
-			bool child_passed_old_cut = false; // Meaningful only when reuse_enabled; propagated to this node's children below.
-			if(reuse_enabled && !top.passed_old_cut)
+			bool child_below_far_cut = top.below_far_cut; // Once below the cut, the whole branch is - see the field.
+			if(reuse_enabled && !top.below_far_cut)
 			{
 				const Vec3f& p = positions[cloud_idx_u32];
-				const float dist_old = reuse_prev_anchor_ws.getDist(Vec4f(p.x, p.y, p.z, 1.f));
-				const float radius = cull_radii[cloud_idx_u32]; // Subtree enclosing sphere, NOT feature_size - see GaussianSplatLodNode::bounding_radius_os.
+				const float dist_frozen = reuse_prev_anchor_ws.getDist(Vec4f(p.x, p.y, p.z, 1.f));
+				const float radius = cull_radii[cloud_idx_u32];
 
-				if(dist_old - radius >= reuse_split_dist)
+				if(dist_frozen - radius >= reuse_split_dist) // P holds.
 				{
 					++diag_reuse_roots;
-					continue; // Inherited whole - see PASS above.
+					if(far_cut_is_frozen)
+						continue; // The block covers this subtree - see above.
+					child_below_far_cut = true; // Building the block: descend, but everything from here down is its.
 				}
-				force_descend = (dist_old + radius >= reuse_split_dist);
-
-				// Propagate "we are below the old cut" to the children, re-deriving the old walk's own stop decision at
-				// this node. dist_old is clamped away from zero exactly as makeHeapItem() does, so a node sitting on the
-				// old anchor cannot produce an infinite pixel scale and read as "the old walk descended past it".
-				const float old_pixel_scale = (feature_sizes[cloud_idx_u32] / myMax(dist_old, 1.0e-6f)) * focal_px;
-				if(oldWalkStopsHere(node, old_pixel_scale, top.depth))
-					child_passed_old_cut = true;
+				else
+					force_descend = far_cut_is_frozen && (dist_frozen + radius >= reuse_split_dist); // STRADDLE, frozen mode only.
 			}
-			else if(reuse_enabled)
-				child_passed_old_cut = true; // Already below the old cut; stays true for the whole branch.
+
+			// SESSION080 §4.3: which segment a node emitted at THIS point belongs to, packed into bit 30 of idx so it
+			// survives the sort the way the coarse flag survives it in bit 31 (cloud indices are far below 2^30). Only
+			// ever set while building a block; in frozen mode the walk emits nothing below the cut, so it stays 0 and
+			// the partition after the sort is a no-op. Unpacked, and the bit cleared, in run()'s partition pass.
+			const uint32 far_bit = child_below_far_cut ? 0x40000000u : 0u;
 
 			// SESSION063 K4: complete coarse-floor cut. A node becomes its branch's single coarse representative if no
 			// ancestor already took the role AND it is either coarse enough (pixel_scale <= coarse_pixel_scale) or terminal
@@ -2430,7 +2363,7 @@ private:
 				// pixel_scale below which a node is provably useless to the grid.
 				if(by_threshold || terminal)
 				{
-					DistIdx cd; cd.dist_sq = top.dist_sq; cd.idx = cloud_idx_u32 | 0x80000000u; // Bit 31 marks a coarse-floor node.
+					DistIdx cd; cd.dist_sq = top.dist_sq; cd.idx = cloud_idx_u32 | 0x80000000u | far_bit; // Bit 31 marks a coarse-floor node; bit 30 the far segment - see far_bit.
 					decorated.push_back(cd);
 					captured_here = true;
 
@@ -2451,7 +2384,7 @@ private:
 			// fails the inheritance predicate itself, so emitting it covers its path exactly once.
 			if(top.pixel_scale <= pixel_scale_limit && !force_descend)
 			{
-				DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32;
+				DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32 | far_bit; // SESSION080 §4.3: bit 30 - see far_bit.
 				decorated.push_back(d);
 				recordFrontierNode(cloud_idx_u32, top.member_idx, top.tree_local_idx, top.depth, FrontierStop_Converged);
 				continue;
@@ -2460,7 +2393,7 @@ private:
 			if(node.child_count == 0)
 			{
 				// A leaf can't be expanded regardless of pixel_scale - it's already the finest detail this tree has.
-				DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32;
+				DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32 | far_bit; // SESSION080 §4.3: bit 30 - see far_bit.
 				decorated.push_back(d);
 				recordFrontierNode(cloud_idx_u32, top.member_idx, top.tree_local_idx, top.depth, FrontierStop_Leaf);
 				continue;
@@ -2473,7 +2406,7 @@ private:
 			if(max_layer_density > 0.f && node.layer_density > max_layer_density && !force_descend)
 			{
 				hit_density_cap = true;
-				DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32;
+				DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32 | far_bit; // SESSION080 §4.3: bit 30 - see far_bit.
 				decorated.push_back(d);
 				recordFrontierNode(cloud_idx_u32, top.member_idx, top.tree_local_idx, top.depth, FrontierStop_DensityCap);
 				continue;
@@ -2484,7 +2417,7 @@ private:
 			if(max_tree_depth > 0 && top.depth >= (uint32)max_tree_depth && !force_descend)
 			{
 				hit_depth_cap = true;
-				DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32;
+				DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32 | far_bit; // SESSION080 §4.3: bit 30 - see far_bit.
 				decorated.push_back(d);
 				recordFrontierNode(cloud_idx_u32, top.member_idx, top.tree_local_idx, top.depth, FrontierStop_DepthCap);
 				continue;
@@ -2499,7 +2432,7 @@ private:
 			if(enforce_budget && (decorated.size() + stack.size() + node.child_count > max_splats_budget) && !force_descend)
 			{
 				hit_budget_cap = true;
-				DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32;
+				DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32 | far_bit; // SESSION080 §4.3: bit 30 - see far_bit.
 				decorated.push_back(d);
 				recordFrontierNode(cloud_idx_u32, top.member_idx, top.tree_local_idx, top.depth, FrontierStop_BudgetCap);
 				continue;
@@ -2509,7 +2442,7 @@ private:
 			{
 				HeapItem child = makeHeapItem(top.member_idx, c, m.offset, top.depth + 1, positions, feature_sizes);
 				child.coarse_captured = child_coarse_captured; // SESSION063 K4: propagate the once-per-branch capture flag.
-				child.passed_old_cut = child_passed_old_cut;   // SESSION080 STEP B: likewise, once-per-branch - see the field.
+				child.below_far_cut = child_below_far_cut;     // SESSION080 §4.3: likewise, once-per-branch - see the field.
 				stack.push_back(child);
 			}
 		}
@@ -2727,33 +2660,42 @@ private:
 	Reference<GaussianSplatUnculledFrontier> prev_frontier;
 	bool sort_staleness_diag_enabled;
 
-	// SESSION080 STEP B - see GaussianSplatRenderer::getFrontierReuseSplitDist() for the idea and the plan doc's
-	// section 5 for the geometry. reuse_enabled folds the knob together with every precondition the scheme needs, so
-	// the hot loop tests one bool; reuse_prev_anchor_ws/reuse_split_dist are the two quantities its test needs.
+	// SESSION080 §4.3 - see GaussianSplatUnculledFrontier::far_block for the idea and the geometry. reuse_enabled folds
+	// the knob together with every precondition the scheme needs, so the hot loop tests one bool.
 	//
-	// Preconditions, each of which would otherwise break the cut invariant or the reused nodes' meaning:
-	//   - a previous frontier exists, and was built for the SAME selection (the key set the frontier documents), so its
-	//     nodes are the ones this walk's own stop rules would have chosen;
-	//   - frustum cull is off (it is, in split-filter mode): a culled traversal's frontier is not a complete cut, so
-	//     inheriting a piece of it could inherit a hole;
+	// Preconditions, each of which would otherwise break the cut invariant or the block's meaning:
+	//   - frustum cull is off (it is, in split-filter mode): a culled traversal's frontier is not a complete cut, so a
+	//     block split out of one could hold a hole;
 	//   - the distance clamp is off, for the same reason - it prunes whole subtrees out of the cut;
 	//   - the coarse floor is off. Not a correctness problem but a scope one: the coarse layer is captured once per
-	//     branch on the way down, and a reused subtree's branch is never walked, so the two capture rules would have to
-	//     be reconciled. The owner runs coarse off; revisit if that changes.
+	//     branch on the way down, and a branch that stops at the cut is never walked below it, so the two capture rules
+	//     would have to be reconciled. The owner runs coarse off; revisit if that changes.
 	bool reuse_enabled;
-	Vec4f reuse_prev_anchor_ws; // Camera position the reused frontier was built from. The reuse test is evaluated against THIS, not cam_pos_ws - see expandStack().
+
+	// SESSION080 §4.3: false = this traversal BUILDS a block (walks everything, marking the far part); true = a block
+	// already exists and this traversal stops at its frozen cut and references it. See the classification in
+	// expandStack(), which is the only place the distinction is acted on.
+	bool far_cut_is_frozen;
+
+	// The FROZEN anchor the cut predicate is evaluated against - the block's own anchor when inheriting one, and this
+	// traversal's camera position when building one. Deliberately NOT cam_pos_ws in the frozen case: holding it still is
+	// what makes every traversal in a generation stop at the same nodes. See expandStack().
+	Vec4f reuse_prev_anchor_ws;
 	float reuse_split_dist;
 
-	// How far the camera may drift from the oldest inherited data's anchor before a traversal gives up on inheritance
-	// and walks the whole tree - see the clause that uses it in the constructor, and
-	// GaussianSplatUnculledFrontier::reuse_base_anchor_ws for what it protects against. A fraction of the split distance,
-	// not an absolute: 1/4 keeps the accumulated ordering error inside the inherited region well under the range at which
-	// that region sits, which is the ratio that decides whether it can be seen.
+	// The block being inherited, held so run() can hand it to the frontier it publishes. Null while building one.
+	Reference<GaussianSplatUnculledFrontier> inherited_far_block;
+
+	// How far the camera may drift from a block's frozen anchor before a traversal gives up on it and walks the whole
+	// tree - see the clause that uses it in the constructor, and GaussianSplatUnculledFrontier::reuse_base_anchor_ws for
+	// what it protects against. A fraction of the split distance, not an absolute: 1/4 keeps the accumulated ordering
+	// error inside the far region well under the range at which that region sits, which is the ratio that decides
+	// whether it can be seen.
 	static const float reuse_max_drift_fraction;
 };
 
 
-const float GaussianSplatLodTraversalTask::reuse_max_drift_fraction = 0.25f; // SESSION080 STEP B - see the declaration.
+const float GaussianSplatLodTraversalTask::reuse_max_drift_fraction = 0.25f; // SESSION080 §4.3 - see the declaration.
 
 
 } // end anonymous namespace
@@ -3565,20 +3507,22 @@ static inline bool pointInFrustum(const Planef* frustum_clip_planes, int num_fru
 // coarse are one globally sorted list, survivors come out globally front-to-back (a near coarse node correctly occludes a
 // far fine one - the fix for the green bleed of the old draw-coarse-last approach). coarse_only_debug keeps only coarse
 // nodes, for the isolation view. Writes survivor indices in input order (no re-sort); shrinks out_indices to the count.
-static size_t filterUnculledFrontier(const GaussianSplatUnculledFrontier& uf, const Planef* planes, int num_planes,
+// SESSION080 §4.3: a frontier is now two segments - its own arrays followed by its far block's - so the streaming pass
+// below runs once per segment, appending into the same output. Split out of filterUnculledFrontier(), which became the
+// two-call wrapper; the body is unchanged from the single-segment version it replaces.
+static size_t filterFrontierSegment(const GaussianSplatUnculledFrontier& uf, const Planef* planes, int num_planes,
 	const Vec4f& cam_pos_ws, float rate_fine_baseline, float rate_coarse_baseline,
 	const Vec4f& rotation_axis, float swept_fine, float swept_coarse, // SESSION072: unit rotation axis + the angle swept during each layer's latency window - see above.
 	const float* trans_dilation, bool coarse_only_debug,
 	bool draw_coarse_layer, // SESSION075: whether coarse-floor nodes may survive at all - see kickOffFilters()'s call site. Independent of whether U(P) captured them (see kickOffTraversals()'s coarse_capture_needed): captured-but-not-drawn is now a valid state, for saturation-only measurement.
-	js::Vector<uint32, 16>& out_indices,
-	size_t* out_num_coarse = NULL) // SESSION072 DIAGNOSTIC: if non-null, receives how many of the survivors were coarse-floor nodes - see [gsr-filter-drain].
+	uint32* const out, // SESSION080 §4.3: caller-owned, pre-sized for both segments - see filterUnculledFrontier().
+	size_t* out_num_coarse) // SESSION072 DIAGNOSTIC: accumulates how many of the survivors were coarse-floor nodes - see [gsr-filter-drain].
 {
 	// SESSION074: no saturation work happens here any more. The verdict is orientation-independent, so it is applied
 	// once when the frontier is built and this function simply streams whatever survived - see
 	// GaussianSplatUnculledFrontier::sat_num_occluders's block comment for why that move mattered.
 	size_t num_coarse_out = 0;
 	const size_t n = uf.indices.size();
-	out_indices.resizeNoCopy(n); // Worst case every node survives.
 	const int npl = myMin(num_planes, 6);
 
 	__m128 pl_nx[6], pl_ny[6], pl_nz[6], pl_d[6], pl_d_raw[6];
@@ -3608,7 +3552,6 @@ static size_t filterUnculledFrontier(const GaussianSplatUnculledFrontier& uf, co
 	const float* const rad = uf.radius.data();
 	const float* const isc = uf.is_coarse.data();
 	const uint32* const idx = uf.indices.data();
-	uint32* const out = out_indices.data();
 	size_t num_out = 0;
 
 	const size_t n4 = n & ~size_t(3);
@@ -3684,9 +3627,42 @@ static size_t filterUnculledFrontier(const GaussianSplatUnculledFrontier& uf, co
 		out[num_out++] = idx[i];
 		if(is_coarse) ++num_coarse_out; // SESSION072 DIAGNOSTIC counting - see out_num_coarse.
 	}
-	out_indices.resize(num_out); // Shrink to survivor count (keeps prefix, no realloc) so .size() is authoritative.
 	if(out_num_coarse)
-		*out_num_coarse = num_coarse_out;
+		*out_num_coarse += num_coarse_out; // Accumulates: the caller runs this once per segment.
+	return num_out;
+}
+
+
+// SESSION080 §4.3: filter a whole frontier - its own arrays, then its far block's, appending both into one draw list.
+//
+// The two segments are streamed back to back rather than merged, and that needs no re-sort: each is sorted, and the cut
+// that separates them put the far one beyond a split distance from the near one's nodes, so the concatenation is
+// front-to-back to within the same one-traversal tolerance everything on screen already carries (the selection being
+// drawn was always built for where the camera was a traversal ago). Same property the single-array frontier relied on
+// when its far tail was a copy rather than a reference; only the storage changed.
+static size_t filterUnculledFrontier(const GaussianSplatUnculledFrontier& uf, const Planef* planes, int num_planes,
+	const Vec4f& cam_pos_ws, float rate_fine_baseline, float rate_coarse_baseline,
+	const Vec4f& rotation_axis, float swept_fine, float swept_coarse,
+	const float* trans_dilation, bool coarse_only_debug, bool draw_coarse_layer,
+	js::Vector<uint32, 16>& out_indices,
+	size_t* out_num_coarse = NULL)
+{
+	const GaussianSplatUnculledFrontier* const far_seg = uf.far_block.ptr(); // Not `far`: that is still a macro in the Windows headers.
+	const size_t total_in = uf.indices.size() + (far_seg ? far_seg->indices.size() : 0);
+	out_indices.resizeNoCopy(total_in); // Worst case every node survives.
+	if(out_num_coarse)
+		*out_num_coarse = 0;
+
+	size_t num_out = filterFrontierSegment(uf, planes, num_planes, cam_pos_ws, rate_fine_baseline, rate_coarse_baseline,
+		rotation_axis, swept_fine, swept_coarse, trans_dilation, coarse_only_debug, draw_coarse_layer,
+		out_indices.data(), out_num_coarse);
+
+	if(far_seg)
+		num_out += filterFrontierSegment(*far_seg, planes, num_planes, cam_pos_ws, rate_fine_baseline, rate_coarse_baseline,
+			rotation_axis, swept_fine, swept_coarse, trans_dilation, coarse_only_debug, draw_coarse_layer,
+			out_indices.data() + num_out, out_num_coarse);
+
+	out_indices.resize(num_out); // Shrink to survivor count (keeps prefix, no realloc) so .size() is authoritative.
 	return num_out;
 }
 
@@ -7474,7 +7450,7 @@ void GaussianSplatRenderer::drainTraversalResults()
 						" reuse_split=" + doubleToStringNDecimalPlaces(uf.reuse_split_dist_used, 2) +
 						" reuse_roots=" + uInt64ToStringCommaSeparated(uf.reuse_roots) +
 						" reuse_n=" + uInt64ToStringCommaSeparated(uf.reuse_n) +
-						" (" + doubleToStringNDecimalPlaces(uf.traversal_output_n + uf.reuse_n > 0 ? (100.0 * (double)uf.reuse_n / (double)(uf.traversal_output_n + uf.reuse_n)) : 0.0, 1) + "%)" +
+						" (" + doubleToStringNDecimalPlaces(uf.indices.size() + uf.reuse_n > 0 ? (100.0 * (double)uf.reuse_n / (double)(uf.indices.size() + uf.reuse_n)) : 0.0, 1) + "%)" + // SESSION080 §4.3: indices.size() is this frontier's NEAR segment; the far block is reuse_n. traversal_output_n counts the whole walk, which double-counts on the traversal that builds a block.
 						" reuse_ms=" + doubleToStringNDecimalPlaces(uf.reuse_ms, 2) +
 						// How far this frontier's OLDEST inherited data's anchor is from where the camera is now - the quantity
 						// the full-rebuild safety trigger watches. Rising towards split*0.25 and then reuse_n dropping to 0 for
@@ -7720,7 +7696,9 @@ void GaussianSplatRenderer::drainFilterResults()
 			conPrint("[gsr-filter-drain] t" + doubleToStringNDecimalPlaces(now_s_diag * 1000.0, 0) + "ms surv=" + uInt64ToStringCommaSeparated(survivors.size()) +
 				" coarse=" + uInt64ToStringCommaSeparated(msg->num_coarse_survivors) + // SESSION072 DIAGNOSTIC
 				" fine=" + uInt64ToStringCommaSeparated(survivors.size() - msg->num_coarse_survivors) +
-				" pool=" + uInt64ToStringCommaSeparated(msg->frontier->indices.size()) +
+				" pool=" + uInt64ToStringCommaSeparated(msg->frontier->indices.size() +
+					(msg->frontier->far_block.nonNull() ? msg->frontier->far_block->indices.size() : 0)) + // SESSION080 §4.3: both segments - indices.size() alone is just the near one, which read as pool < surv.
+
 				" compute=" + doubleToStringNDecimalPlaces(msg->filter_compute_ms, 2) + "ms" + // SESSION072 DIAGNOSTIC: pure filterUnculledFrontier() cost, no scheduling.
 				// SESSION073 DIAGNOSTIC - see the block above.
 				" age=" + doubleToStringNDecimalPlaces((now_s_diag - cloud->diag_filter_kick_time_s) * 1000.0, 1) + "ms" +

@@ -277,9 +277,39 @@ public:
 	// shape as, and over the same indices as, the occluder gather that follows it.
 	double soa_ms;
 
+	// SESSION080 DIAGNOSTIC: camera-distance at the 10/25/50/75/90th percentile of this frontier, in metres. Read
+	// straight out of the sorted selection, so it costs five indexings and five sqrts.
+	//
+	// This is the sizing question for any "reuse the far frontier, re-expand only the near shell" scheme: the owner's
+	// hypothesis is about VISUAL importance (the nearest splats dominate what a re-sort must get right), but expand's
+	// COST is distributed the other way - the tree unfolds deepest close to the camera. If most of the pool already
+	// lies near, reusing the far tail saves little, and the scheme is not worth its complexity. These five numbers say
+	// which regime the scene is in before anything is built.
+	float dist_pctile[5];
+
 	size_t traversal_output_n; // SESSION080 DIAGNOSTIC: decorated.size() at the point expand_ms/sort_ms were measured -
 	// i.e. what the DFS actually walked/sorted, BEFORE the saturation prune. indices.size() is NOT this on the pruned
 	// replacement (uf2): it shrinks to pool_after, which would misattribute expand_ms/sort_ms's cost to the wrong N.
+
+	// SESSION080 DIAGNOSTIC (plan doc session080-plan.md STEP A): how much this frontier's front-to-back order has
+	// moved since sort_staleness_prev_frontier - the cloud's cached_ufrontier at kick time, i.e. whatever was
+	// actually being drawn just before this traversal started. Matches nodes by identity (cloud_idx = member
+	// offset + tree_local_idx), NOT by array position - see the computation site in run() for why. Zero/default
+	// when there was no previous frontier (first kick for this cloud) or its topology_generation didn't match
+	// (a structural change makes cloud_idx comparisons meaningless).
+	//
+	// Answers the plan doc's open question: under NORMAL WALKING (not a teleport - teleport tests read zero here
+	// by construction, see the doc's §8) does the sort order drift enough between kicks to justify a depth-bucketed
+	// segment scheme (plan §7.2), or does the existing ~1% resort_threshold_dist_fraction re-kick policy already
+	// keep it close enough that none of that complexity is worth building.
+	double sort_staleness_delta_ws;  // Camera displacement (m) since the previous frontier's anchor_pos_ws.
+	size_t sort_staleness_prev_n;    // Size of the previous frontier compared against.
+	size_t sort_staleness_common_n;  // Nodes present (same cloud_idx) in both frontiers - the denominator below.
+	size_t sort_staleness_max_disp;  // Largest |new rank - old rank| among common nodes.
+	double sort_staleness_mean_disp; // Mean |new rank - old rank| among common nodes.
+	size_t sort_staleness_gt1k;      // Common nodes displaced more than 1000 positions.
+	size_t sort_staleness_gt10k;     // Common nodes displaced more than 10000 positions.
+	double sort_staleness_ms;        // Cost of computing the above, so this diagnostic's own overhead is visible.
 
 	GaussianSplatUnculledFrontier() // SESSION074: defaults are "stage never ran" - only kickOffTraversals() passing the stage-enabled flag sets sat_grid_res non-zero.
 	:	sat_grid_res(0), sat_num_occluders(0), sat_num_tested(0), sat_num_dropped(0), sat_num_dropped_aggr(0),
@@ -291,10 +321,13 @@ public:
 		sat_prefilter_threshold_used(0.f), sat_grid_subdiv_used(0.f), sat_region_radius_used(0.f), // SESSION080
 		expand_ms(0.0), sort_ms(0.0), // SESSION080
 		expand_seeds(0), expand_num_tasks(0), expand_prologue_ms(0.0), expand_task_max_ms(0.0), expand_task_sum_ms(0.0), soa_ms(0.0), // SESSION080
-		traversal_output_n(0) // SESSION080
+		traversal_output_n(0), // SESSION080
+		sort_staleness_delta_ws(0.0), sort_staleness_prev_n(0), sort_staleness_common_n(0), sort_staleness_max_disp(0), // SESSION080
+		sort_staleness_mean_disp(0.0), sort_staleness_gt1k(0), sort_staleness_gt10k(0), sort_staleness_ms(0.0) // SESSION080
 	{
 		for(int i=0; i<3; ++i) sat_diag_tile_stats[i] = 0;
 		for(int i=0; i<3; ++i) sat_erode_stats[i] = 0; // SESSION080
+		for(int i=0; i<5; ++i) dist_pctile[i] = 0.f; // SESSION080
 	}
 };
 
@@ -398,6 +431,17 @@ public:
 	// drainTraversalResults() from a cull-off traversal; a rotation re-filters this instead of re-traversing. Null until
 	// the first split-mode traversal for this cloud lands. See GaussianSplatUnculledFrontier.
 	Reference<GaussianSplatUnculledFrontier> cached_ufrontier;
+
+	// SESSION080 DIAGNOSTIC (plan doc STEP A), debug-only: the last UNPRUNED frontier this cloud received - i.e. what
+	// message 1 carried, before the saturation follow-up replaced cached_ufrontier with its pruned copy.
+	//
+	// cached_ufrontier itself cannot serve as the "previous frontier" for the sort-staleness comparison, and this is the
+	// whole reason this field exists: most of the time it holds the PRUNED frontier (message 2's uf2), whose ranks are
+	// compacted by whatever saturation dropped - 55-80% of the pool at R=0. Ranking the new unpruned frontier against
+	// that would measure the prune's compaction, not the camera's motion, and would swamp the signal being looked for.
+	// Held only while filter_debug_log is on (drainTraversalResults() nulls it otherwise), because retaining it keeps a
+	// whole extra frontier alive - see the assignment site.
+	Reference<GaussianSplatUnculledFrontier> last_unpruned_ufrontier;
 
 	// SESSION076 §9 / SESSION077: debug-only visualisation of cached_ufrontier's saturation grid, rebuilt by
 	// drainTraversalResults() alongside cached_ufrontier whenever getSatDiagLog() is on. Null whenever the diag
@@ -1139,7 +1183,9 @@ public:
 		float sat_region_radius_ = 0.f, // SESSION078: region pruning - see GaussianSplatRenderer::getSatRegionRadius(). 0 = the point-anchored behaviour.
 		bool sat_overlay_requested_ = false, // SESSION078: driven by "Show debug" + its mode dropdown (getSatDebugOverlayMode() != Off), NOT sat_diag_log_ - see that getter's comment. Forces the grid to build even with the saturation filter off, and fills sat_accum_t/sat_amp_sum, exactly what sat_diag_log_ used to gate before the overlay was split out of it.
 		float alpha_gain_ = 1.f, float alpha_gamma_ = 1.f, // SESSION078: see GaussianSplatRenderer::getAlphaGain(). Applied to occluder alphas before they feed the saturation grid, matching what the draw path applies - 1/1 (the defaults here) is the identity, i.e. the pre-session078 behaviour.
-		glare::TaskManager* task_manager_ = NULL) // SESSION079: the pool this task is itself running on, so the saturation build can spread across it - see gsBuildSaturationGridParallel(). NULL keeps the build serial.
+		glare::TaskManager* task_manager_ = NULL, // SESSION079: the pool this task is itself running on, so the saturation build can spread across it - see gsBuildSaturationGridParallel(). NULL keeps the build serial.
+		const Reference<GaussianSplatUnculledFrontier>& sort_staleness_prev_frontier_ = Reference<GaussianSplatUnculledFrontier>(), // SESSION080 DIAGNOSTIC (plan doc STEP A) - see the field's comment.
+		bool sort_staleness_diag_enabled_ = false)
 	:	cloud_id(cloud_id_), topology_generation(topology_generation_), scratch(scratch_), cam_pos_ws(cam_pos_ws_),
 		pixel_scale_limit(pixel_scale_limit_), max_splats_budget(max_splats_budget_), max_layer_density(max_layer_density_), max_tree_depth(max_tree_depth_), focal_px(focal_px_),
 		num_frustum_clip_planes(num_frustum_clip_planes_), frustum_cull_enabled(frustum_cull_enabled_),
@@ -1156,7 +1202,8 @@ public:
 		sat_overlay_requested(sat_overlay_requested_), // SESSION078
 		alpha_gain(alpha_gain_), alpha_gamma(alpha_gamma_), // SESSION078
 		task_manager(task_manager_), // SESSION079
-		expand_seeds(0), expand_num_tasks(0), expand_prologue_ms(0.0), expand_task_max_ms(0.0), expand_task_sum_ms(0.0) // SESSION080 DIAGNOSTIC
+		expand_seeds(0), expand_num_tasks(0), expand_prologue_ms(0.0), expand_task_max_ms(0.0), expand_task_sum_ms(0.0), // SESSION080 DIAGNOSTIC
+		sort_staleness_prev_frontier(sort_staleness_prev_frontier_), sort_staleness_diag_enabled(sort_staleness_diag_enabled_) // SESSION080 DIAGNOSTIC
 	{
 		if(num_frustum_clip_planes < 0)
 			num_frustum_clip_planes = 0;
@@ -1294,6 +1341,17 @@ public:
 		}
 		const double sort_ms = sort_timer.elapsed() * 1.0e3; // SESSION080 DIAGNOSTIC - includes the unpack loop above, not just the sort call.
 
+		// SESSION080 DIAGNOSTIC: where this frontier's nodes actually sit, in metres - see GaussianSplatUnculledFrontier::
+		// dist_pctile. `decorated` is already ascending by dist_sq, so this is five lookups; deliberately not gated on a
+		// debug flag for that reason. Sizes the "reuse the far tail" question before any of it is built.
+		float dist_pctile[5] = { 0.f, 0.f, 0.f, 0.f, 0.f };
+		if(!decorated.empty())
+		{
+			const int pct[5] = { 10, 25, 50, 75, 90 };
+			for(int k=0; k<5; ++k)
+				dist_pctile[k] = std::sqrt(decorated[myMin(decorated.size() - 1, (decorated.size() * pct[k]) / 100)].dist_sq);
+		}
+
 		scratch->hit_budget_cap = hit_budget_cap;
 		scratch->hit_density_cap = hit_density_cap;
 		scratch->hit_depth_cap = hit_depth_cap;
@@ -1381,6 +1439,7 @@ public:
 				uf->expand_task_max_ms = expand_task_max_ms;
 				uf->expand_task_sum_ms = expand_task_sum_ms;
 				uf->soa_ms = soa_timer.elapsed() * 1.0e3; // SESSION080 DIAGNOSTIC - the loop just above, which nothing timed before.
+				for(int k=0; k<5; ++k) uf->dist_pctile[k] = dist_pctile[k]; // SESSION080 DIAGNOSTIC
 
 				msg->unculled_frontier = uf;
 			}
@@ -1394,6 +1453,89 @@ public:
 			// superset of the pruned one - the intermediate state costs extra splats for a few hundred ms, never missing
 			// ones. That is exactly the state the owner already runs (and calls smooth) with the stage switched off.
 			result_queue->enqueue(msg);
+
+			// SESSION080 DIAGNOSTIC (plan doc STEP A): how far this frontier's front-to-back order has moved since the
+			// previous traversal's - see GaussianSplatUnculledFrontier::sort_staleness_* for what question it answers.
+			//
+			// Placed HERE, immediately after the enqueue above and before the saturation stage, on purpose:
+			//  - after the enqueue, because this is pure diagnostic work and anything ahead of that line delays the
+			//    picture by its own duration (§2.8 of the plan doc - the trap the soa/gather merge idea fell into);
+			//  - before the saturation stage rather than inside it, because the numbers describe the TRAVERSAL, and
+			//    nesting them in the uf2 block would silently tie them to the saturation stage being switched on.
+			//
+			// Both sides are UNPRUNED frontiers: sort_staleness_prev_frontier is fed from SplatCloud::
+			// last_unpruned_ufrontier, not cached_ufrontier - ranking against a saturation-pruned list would measure
+			// that prune's compaction (55-80% of the pool at R=0) rather than the camera's motion.
+			//
+			// Matching is by identity, not by array position: cloud_idx (= member offset + tree_local_idx) names a
+			// specific LoD-tree node - see HeapItem's comment - so it is stable across traversals whenever the same node
+			// was selected both times. Nodes selected only once are not "displaced", they are LoD churn, and are counted
+			// out of common_n rather than into the displacement. The lookup is a flat rank array indexed by cloud_idx
+			// (bound: positions.size(), the geometry snapshot this task already pins) rather than a hash map, which at
+			// ~13M entries would cost more to build than the walk it serves.
+			double staleness_delta_ws = 0.0, staleness_mean_disp = 0.0, staleness_ms = 0.0;
+			size_t staleness_prev_n = 0, staleness_common_n = 0, staleness_max_disp = 0, staleness_gt1k = 0, staleness_gt10k = 0;
+			if(uf.nonNull() && sort_staleness_diag_enabled && sort_staleness_prev_frontier.nonNull() &&
+				// The previous frontier has to have been built for the same SELECTION, or the differences are the
+				// settings change rather than the motion. This is the key set GaussianSplatUnculledFrontier documents
+				// and that drainTraversalResults() checks for the same reason; checked here rather than by clearing
+				// last_unpruned_ufrontier at each setter, so a setter added later cannot silently skip it.
+				sort_staleness_prev_frontier->topology_generation == topology_generation &&
+				sort_staleness_prev_frontier->pixel_scale_limit == pixel_scale_limit &&
+				sort_staleness_prev_frontier->max_splats_budget == max_splats_budget &&
+				sort_staleness_prev_frontier->max_layer_density == max_layer_density &&
+				sort_staleness_prev_frontier->max_tree_depth == max_tree_depth &&
+				sort_staleness_prev_frontier->focal_px == focal_px)
+			{
+				Timer staleness_timer;
+				const GaussianSplatUnculledFrontier& prev_uf = *sort_staleness_prev_frontier; // Not `prev` - that name shadows glare::Task::prev, the intrusive task-list link.
+				staleness_prev_n = prev_uf.indices.size();
+
+				// Coarse-floor nodes are excluded from BOTH sides. A coarse node re-uses the cloud_idx of the fine node
+				// it stands for whenever its branch is terminal (see the capture block in expandStack()), so including
+				// them would make cloud_idx ambiguous as a key; and excluding them also makes this measurement
+				// independent of the "coarse" checkbox, which changes the captured set but never the fine selection.
+				js::Vector<uint32, 16> old_rank;
+				old_rank.resizeNoCopy(positions.size());
+				std::memset(old_rank.data(), 0xFF, old_rank.size() * sizeof(uint32)); // 0xFFFFFFFF = "not in the previous frontier".
+				uint32 prev_fine_rank = 0;
+				for(size_t i=0; i<staleness_prev_n; ++i)
+				{
+					if(prev_uf.is_coarse[i] != 0.f)
+						continue;
+					const uint32 idx = prev_uf.indices[i];
+					if(idx < old_rank.size()) // Defensive only - the topology_generation match above already means the two frontiers index the same cloud.
+						old_rank[idx] = prev_fine_rank;
+					++prev_fine_rank; // Rank within the FINE subsequence, so both sides are numbered on the same scale.
+				}
+
+				const size_t new_n = uf->indices.size();
+				double disp_sum = 0.0;
+				uint32 new_fine_rank = 0;
+				for(size_t i=0; i<new_n; ++i)
+				{
+					if(uf->is_coarse[i] != 0.f)
+						continue;
+					const uint32 idx = uf->indices[i];
+					const uint32 rank = new_fine_rank++;
+					if(idx >= old_rank.size())
+						continue;
+					const uint32 old_r = old_rank[idx];
+					if(old_r == 0xFFFFFFFFu)
+						continue; // Selected this time but not last - LoD churn, not displacement.
+					const size_t disp = (rank > old_r) ? (rank - old_r) : (old_r - rank);
+					++staleness_common_n;
+					disp_sum += (double)disp;
+					if(disp > staleness_max_disp) staleness_max_disp = disp;
+					if(disp > 1000) ++staleness_gt1k;
+					if(disp > 10000) ++staleness_gt10k;
+				}
+
+				staleness_delta_ws = cam_pos_ws.getDist(prev_uf.anchor_pos_ws);
+				staleness_prev_n = prev_fine_rank; // Report the fine count, the same population the comparison ran over.
+				staleness_mean_disp = staleness_common_n > 0 ? (disp_sum / (double)staleness_common_n) : 0.0;
+				staleness_ms = staleness_timer.elapsed() * 1.0e3;
+			}
 
 			// SESSION076: saturation as a SECOND message on the same frontier - see GaussianSplatLodTraversalResultMsg::
 			// derived_from. Everything below reads `uf` (published, immutable) and the pinned geom snapshot; it must not
@@ -1531,6 +1673,15 @@ public:
 					uf2->expand_task_max_ms = uf->expand_task_max_ms;
 					uf2->expand_task_sum_ms = uf->expand_task_sum_ms;
 					uf2->soa_ms = uf->soa_ms;
+					for(int k=0; k<5; ++k) uf2->dist_pctile[k] = uf->dist_pctile[k];
+					uf2->sort_staleness_delta_ws = staleness_delta_ws; // SESSION080 DIAGNOSTIC - computed above, right after the enqueue.
+					uf2->sort_staleness_prev_n = staleness_prev_n;
+					uf2->sort_staleness_common_n = staleness_common_n;
+					uf2->sort_staleness_max_disp = staleness_max_disp;
+					uf2->sort_staleness_mean_disp = staleness_mean_disp;
+					uf2->sort_staleness_gt1k = staleness_gt1k;
+					uf2->sort_staleness_gt10k = staleness_gt10k;
+					uf2->sort_staleness_ms = staleness_ms;
 
 					uf2->sat_num_occluders = occl_px.size();
 					uf2->sat_grid_res = gsSatGridResForFocal(focal_px, coarse_pixel_scale, sat_grid_subdiv); // SESSION076 CALIBRATION
@@ -2099,6 +2250,14 @@ private:
 	// GaussianSplatUnculledFrontier's matching fields for what the numbers are for. All stay zero on the serial path.
 	size_t expand_seeds, expand_num_tasks;
 	double expand_prologue_ms, expand_task_max_ms, expand_task_sum_ms;
+
+	// SESSION080 DIAGNOSTIC (plan doc STEP A): the cloud's cached_ufrontier at kick time, captured by
+	// kickOffTraversals() before this task was created - i.e. whatever was actually being drawn just before this
+	// traversal started. NULL on a cloud's first kick. See GaussianSplatUnculledFrontier::sort_staleness_* for what
+	// the comparison computes; sort_staleness_diag_enabled gates the cost (an O(positions.size()) rank array plus
+	// an O(N) pass), off by default since it's meaningful only during the dedicated walking test - see the plan doc.
+	Reference<GaussianSplatUnculledFrontier> sort_staleness_prev_frontier;
+	bool sort_staleness_diag_enabled;
 };
 
 
@@ -6622,7 +6781,26 @@ void GaussianSplatRenderer::drainTraversalResults()
 						" task_max_ms=" + doubleToStringNDecimalPlaces(uf.expand_task_max_ms, 2) +
 						" task_sum_ms=" + doubleToStringNDecimalPlaces(uf.expand_task_sum_ms, 2) +
 						" soa_ms=" + doubleToStringNDecimalPlaces(uf.soa_ms, 2) + // SESSION080: was untimed before - see the field.
-						" par=" + doubleToStringNDecimalPlaces(uf.expand_task_max_ms > 0.0 ? (uf.expand_task_sum_ms / uf.expand_task_max_ms) : 0.0, 2));
+						// SESSION080: node distance distribution, metres - sizes the far-tail-reuse question. See the field.
+						" d10=" + doubleToStringNDecimalPlaces(uf.dist_pctile[0], 1) +
+						" d25=" + doubleToStringNDecimalPlaces(uf.dist_pctile[1], 1) +
+						" d50=" + doubleToStringNDecimalPlaces(uf.dist_pctile[2], 1) +
+						" d75=" + doubleToStringNDecimalPlaces(uf.dist_pctile[3], 1) +
+						" d90=" + doubleToStringNDecimalPlaces(uf.dist_pctile[4], 1) +
+						" par=" + doubleToStringNDecimalPlaces(uf.expand_task_max_ms > 0.0 ? (uf.expand_task_sum_ms / uf.expand_task_max_ms) : 0.0, 2) +
+						// SESSION080 DIAGNOSTIC (plan doc STEP A): sort staleness vs. whatever this cloud was drawing off
+						// just before this kick - see GaussianSplatUnculledFrontier::sort_staleness_*. All zero when
+						// sort_staleness_diag_enabled was off, there was no previous frontier, or topology changed.
+						" delta_ws=" + doubleToStringNDecimalPlaces(uf.sort_staleness_delta_ws, 3) +
+						" stale_common=" + uInt64ToStringCommaSeparated(uf.sort_staleness_common_n) +
+						"/" + uInt64ToStringCommaSeparated(uf.sort_staleness_prev_n) +
+						" stale_max=" + uInt64ToStringCommaSeparated(uf.sort_staleness_max_disp) +
+						" stale_mean=" + doubleToStringNDecimalPlaces(uf.sort_staleness_mean_disp, 1) +
+						" stale_gt1k=" + uInt64ToStringCommaSeparated(uf.sort_staleness_gt1k) +
+						" (" + doubleToStringNDecimalPlaces(uf.sort_staleness_common_n > 0 ? (100.0 * (double)uf.sort_staleness_gt1k / (double)uf.sort_staleness_common_n) : 0.0, 2) + "%)" +
+						" stale_gt10k=" + uInt64ToStringCommaSeparated(uf.sort_staleness_gt10k) +
+						" (" + doubleToStringNDecimalPlaces(uf.sort_staleness_common_n > 0 ? (100.0 * (double)uf.sort_staleness_gt10k / (double)uf.sort_staleness_common_n) : 0.0, 2) + "%)" +
+						" stale_ms=" + doubleToStringNDecimalPlaces(uf.sort_staleness_ms, 2));
 
 				if(filter_debug_log && uf.sat_grid_res > 0)
 				{
@@ -6726,6 +6904,13 @@ void GaussianSplatRenderer::drainTraversalResults()
 		{
 			cloud->cached_ufrontier = msg->unculled_frontier;
 			cloud->ufrontier_needs_filter = true; // Produce the first S(P,R) for this fresh U(P) even with no rotation.
+
+			// SESSION080 DIAGNOSTIC (plan doc STEP A): this branch is the only place the UNPRUNED frontier is ever seen -
+			// the saturation follow-up overwrites cached_ufrontier with its pruned copy - so it is the only place the
+			// sort-staleness comparison's "previous frontier" can be captured. See the field's comment for why the pruned
+			// one will not do. Assigned NULL when the trace is off so the extra frontier is released rather than pinned.
+			cloud->last_unpruned_ufrontier = filter_debug_log ? msg->unculled_frontier : Reference<GaussianSplatUnculledFrontier>();
+
 			cloud->last_traversal_hit_budget_cap = msg->scratch->hit_budget_cap;
 			cloud->last_traversal_hit_density_cap = msg->scratch->hit_density_cap;
 			cloud->last_traversal_hit_depth_cap = msg->scratch->hit_depth_cap;
@@ -7247,7 +7432,9 @@ void GaussianSplatRenderer::kickOffTraversals()
 			/*sat_region_radius=*/sat_region_radius, // SESSION078
 			/*sat_overlay_requested=*/sat_debug_overlay_mode != GaussianSplatSatDebugOverlayMode_Off, // SESSION078
 			/*alpha_gain=*/splat_alpha_gain, /*alpha_gamma=*/splat_alpha_gamma, // SESSION078
-			/*task_manager=*/task_manager)); // SESSION079: lets the saturation build spread across the same pool - safe, see gsBuildSaturationGridParallel().
+			/*task_manager=*/task_manager, // SESSION079: lets the saturation build spread across the same pool - safe, see gsBuildSaturationGridParallel().
+			/*sort_staleness_prev_frontier=*/best_cloud->last_unpruned_ufrontier, // SESSION080 DIAGNOSTIC (plan doc STEP A): the previous traversal's UNPRUNED output - NOT cached_ufrontier, see that field's comment.
+			/*sort_staleness_diag_enabled=*/filter_debug_log)); // Same toggle as [gsr-traversal]/[gsr-sat] - this diagnostic's cost is only meaningful while that trace is being read.
 	}
 
 	// SESSION055 diag: after the while-loop, detect *unmet* rotation demand - a cloud whose forward has shifted past the

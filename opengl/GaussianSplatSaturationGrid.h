@@ -353,12 +353,18 @@ float gsSatGridTileAngle(int res);
 // regime this file's calibration note (session078, R=0.01-0.03) already lives in, where R is small next to every
 // occluder's own distance - it is not a general fix for camera motion, and does not by itself bound how stale a prune
 // can be. See the session080 snapshot for the reproduction log ([gsr-sat-apply]/[gsr-sat] thr=/sub=/R=).
+// SESSION081: closing_radius_tiles - see gsSatApplyClosing() in the .cpp for the full derivation. A morphological
+// closing pass (fixed tile-space radius, NOT derived from region_radius) that runs immediately before the region
+// erosion above, filling any +inf tile whose neighbourhood within this radius is otherwise entirely saturated -
+// pinhole noise from the saturation threshold, not a real silhouette. 0 reproduces the pre-session081 behaviour
+// bit-for-bit (the pass does not run). Only has any effect when region_radius > 0 - at R = 0 the erosion this
+// pass feeds never runs either.
 void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, const float* radius, const float* alpha, size_t n,
-	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius,
+	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius, int closing_radius_tiles,
 	js::Vector<float, 16>& sat_depth_out, size_t* out_writers = NULL, size_t* out_tile_writes = NULL,
 	js::Vector<float, 16>* out_accum_t = NULL, js::Vector<float, 16>* out_amp_sum = NULL,
 	size_t* out_tile_stats = NULL, // SESSION079 DIAGNOSTIC: 3-element array - [0] total per-tile loop iterations, [1] of those, rejected off the Gaussian's tail, [2] skipped because the tile's barrier was already set. Against out_tile_writes, which counts only the iterations that reached the accumulator.
-	size_t* out_erode_stats = NULL); // SESSION080 DIAGNOSTIC: 3-element array - [0] tiles the region erosion killed by the R/sat_depth ceiling, [1] tiles it killed by finding an unsaturated tile in the window, [2] the largest erosion radius, in tiles, actually used on a saturated tile. All zero when region_radius is 0 (the pass does not run at all). See [gsr-sat]'s er_ceil=/er_win=/er_radmax=.
+	size_t* out_erode_stats = NULL); // SESSION080/081 DIAGNOSTIC: 4-element array - [0] tiles the region erosion killed by the R/sat_depth ceiling, [1] tiles it killed by finding an unsaturated tile in the window, [2] the largest erosion radius, in tiles, actually used on a saturated tile, [3] SESSION081: tiles the closing pass filled (pinholes removed before erosion ever saw them). All zero when region_radius is 0 (neither pass runs). See [gsr-sat]'s er_ceil=/er_win=/er_radmax=/cl=.
 
 
 // SESSION079: the same build, split across the task manager by horizontal strips of grid rows. Bit-identical to
@@ -373,11 +379,11 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 // NOTE on out_writers: it counts nodes that reached the tile loop, so a node straddling a strip boundary is counted once
 // per strip. The per-tile counters (out_tile_writes, out_tile_stats) are exact.
 void gsBuildSaturationGridParallel(const float* px, const float* py, const float* pz, const float* radius, const float* alpha, size_t n,
-	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius,
+	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius, int closing_radius_tiles, // SESSION081 - see the serial entry point's comment.
 	js::Vector<float, 16>& sat_depth_out, glare::TaskManager& task_manager,
 	size_t* out_writers = NULL, size_t* out_tile_writes = NULL, size_t* out_tile_stats = NULL,
 	js::Vector<GsSatOccluderRec, 16>* scratch_recs = NULL, // Optional caller-owned scratch for the phase-1 records, to keep the allocation out of the per-build cost.
-	size_t* out_erode_stats = NULL); // SESSION080 DIAGNOSTIC - see the serial entry point's.
+	size_t* out_erode_stats = NULL); // SESSION080/081 DIAGNOSTIC - see the serial entry point's.
 
 
 // SESSION074: pass 2's per-node read - true if this fine node is unambiguously behind saturated coarse geometry, so

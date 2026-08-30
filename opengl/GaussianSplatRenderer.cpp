@@ -254,13 +254,14 @@ public:
 	// self-describing - answers exactly the "what was R set to during this measurement" question that came up trying
 	// to reconcile the region-pruning math against an observed hole at R=2.
 	float sat_prefilter_threshold_used, sat_grid_subdiv_used, sat_region_radius_used;
+	int sat_region_closing_tiles_used; // SESSION081 - see the other _used fields' comment; same reasoning.
 
 	// SESSION080 DIAGNOSTIC: what the region erosion did to this grid - see gsSatApplyRegionErosion(). 3 elements:
 	// [0] killed by the R/sat_depth ceiling, [1] killed by an unsaturated tile inside the window, [2] the largest erosion
 	// radius in tiles actually used. This is the visible price of the ball guarantee, and the split is what says which
 	// regime a view is in: near zero means the occluders in view are an enclosing shell (a room, an interior inside a
 	// larger scene) and a large R costs nothing; a large [1] means silhouettes - or a pinholed mask - dominate.
-	size_t sat_erode_stats[3];
+	size_t sat_erode_stats[4]; // SESSION080: [0] er_ceil, [1] er_win, [2] er_radmax. SESSION081: [3] tiles the closing pass filled - see gsSatApplyClosing().
 
 	// SESSION080 DIAGNOSTIC: splits the traversal task's own cost (everything above the saturation stage) into the tree
 	// walk/selection (the while(!stack.empty()) loop in run()) versus the front-to-back radix sort of its output - see
@@ -293,8 +294,13 @@ public:
 	// Split in two because the two halves want opposite fixes and the aggregate cannot tell them apart:
 	//   reserve_ms - growing `decorated` to the final size. It is a local in run(), so this is a FRESH allocation every
 	//     traversal, and at 13.2M nodes x 8 bytes it is a ~106MB one whose first-touch page faults are paid here. If
-	//     this dominates, the fix is to pool the buffer on GaussianSplatLodTraversalScratch - exactly what session079
-	//     did for sat_occluder_recs, and for exactly this reason (see that field's comment).
+	//     this dominates, the fix is to pool the buffer on GaussianSplatLodTraversalScratch - what session079 did for
+	//     sat_occluder_recs, EXCEPT that pooling was reverted in session081: it is only safe for a buffer fully
+	//     consumed before result_queue->enqueue() publishes the frontier (like `decorated` here). sat_occluder_recs
+	//     and sat_keep_mask are read by the LATER saturation phase, which runs after that enqueue - once scratch is
+	//     back in the free pool a faster/second traversal can resize the same buffer out from under the first one's
+	//     still-running saturation phase. See selected_indices/sort_scratch's own comment on the same struct for the
+	//     line that still correctly distinguishes the two cases, and the sat_phase_scope comment at this bug's fix site.
 	//   copy_ms - the element-by-element push_back loop itself. If THIS dominates, the fix is a memcpy per task block
 	//     (offsets are known from the same prefix pass that computes `total`), optionally dispatched across the pool.
 	double expand_splice_reserve_ms;
@@ -385,7 +391,7 @@ public:
 		sat_diag_coarse_a(0), sat_diag_coarse_b(0), sat_diag_writers(0), sat_diag_tile_writes(0), // SESSION076
 		sat_diag_aniso_n(0), sat_diag_aniso_mean(0.0), sat_diag_aniso_max(0.f), sat_diag_aniso_gt5(0), sat_diag_aniso_gt10(0), // SESSION077
 		built_time_real_s(0.0), // SESSION080
-		sat_prefilter_threshold_used(0.f), sat_grid_subdiv_used(0.f), sat_region_radius_used(0.f), // SESSION080
+		sat_prefilter_threshold_used(0.f), sat_grid_subdiv_used(0.f), sat_region_radius_used(0.f), sat_region_closing_tiles_used(0), // SESSION080/081
 		expand_ms(0.0), sort_ms(0.0), // SESSION080
 		expand_seeds(0), expand_num_tasks(0), expand_prologue_ms(0.0), expand_task_max_ms(0.0), expand_task_sum_ms(0.0), // SESSION080
 		expand_splice_reserve_ms(0.0), expand_splice_copy_ms(0.0), sort_alloc_ms(0.0), soa_ms(0.0), // SESSION080 (plan2 §4.1)
@@ -395,7 +401,7 @@ public:
 		reuse_roots(0), reuse_n(0), reuse_ms(0.0), reuse_split_dist_used(0.f), reuse_base_anchor_ws(0.f) // SESSION080 §4.3
 	{
 		for(int i=0; i<3; ++i) sat_diag_tile_stats[i] = 0;
-		for(int i=0; i<3; ++i) sat_erode_stats[i] = 0; // SESSION080
+		for(int i=0; i<4; ++i) sat_erode_stats[i] = 0; // SESSION080/081
 		for(int i=0; i<5; ++i) dist_pctile[i] = 0.f; // SESSION080
 	}
 };
@@ -517,8 +523,9 @@ public:
 	// checkbox is off, the frontier has no grid (sat_grid_res == 0), or none has landed yet - see
 	// getSatGridDebugInfo(), which skips a cloud with a null binary tex. Two textures, one per overlay mode - see
 	// GaussianSplatUnculledFrontier::sat_accum_t / sat_amp_sum for why one field can't serve both.
-	Reference<OpenGLTexture> sat_grid_debug_tex;      // Binary view source: transmittance.
-	Reference<OpenGLTexture> sat_grid_debug_ramp_tex; // Ramp view source: unbounded contribution sum.
+	Reference<OpenGLTexture> sat_grid_debug_tex;         // Binary view source: transmittance (pre closing/erosion).
+	Reference<OpenGLTexture> sat_grid_debug_ramp_tex;    // Ramp view source: unbounded contribution sum.
+	Reference<OpenGLTexture> sat_grid_debug_maskfix_tex; // SESSION081: "mask_fix" view source - see updateSatGridDebugTexture().
 	Vec4f sat_grid_debug_anchor_ws;
 
 	bool filter_in_flight;                 // True from a filter kick until its result is applied/dropped - see kickOffFilters().
@@ -664,17 +671,20 @@ public:
 	bool hit_density_cap; // True if getMaxLayerDensity() stopped at least one node's expansion this traversal - see GaussianSplatLodNode::layer_density.
 	bool hit_depth_cap; // True if getMaxTreeDepth() stopped at least one node's expansion this traversal.
 
-	// SESSION079: scratch for the parallel saturation build's phase-1 records. Lives here, on the reused per-kick
-	// scratch, rather than inside the build: at ~2.98M occluders it is a 71MB buffer, and paying its allocation and
-	// first-touch page faults on every build would be a large fraction of the build's own 35ms.
-	js::Vector<GsSatOccluderRec, 16> sat_occluder_recs;
+	// SESSION079: scratch for the parallel saturation build's phase-1 records and the parallel read pass's keep mask
+	// USED TO live here, pooled on the reused per-kick scratch for the same first-touch-cost reason as the fields
+	// below. SESSION081 BUGFIX: moved back to locals in run() - both are read by the saturation phase, which runs
+	// AFTER this scratch is handed back to the free pool (see the frontier's publish-then-saturate comment at the
+	// enqueue site), so a second, faster traversal could resize either buffer while the first traversal's saturation
+	// phase was still writing through a pointer into it. Reproduced as an access violation: saturation on, frontier
+	// reuse > 0 (traversal fast enough to overlap), diag on (widens the race window further). Not pooled here any
+	// more - see the local declarations at the saturation phase's own comment for the full account.
 
-	// SESSION079: scratch for the parallel read pass's keep mask - one byte per frontier node. Kept here for the same
-	// reason as the records above, though it is small by comparison (~3.5MB where they are 32).
-	js::Vector<uint8, 16> sat_keep_mask;
-
-	// SESSION080 (plan2 §4.1): the traversal's selection and the sort's working space. Pooled here for the same reason
-	// as sat_occluder_recs above: both are sized to the frontier - ~106MB each at 13.2M nodes - and as locals in run()
+	// SESSION080 (plan2 §4.1): the traversal's selection and the sort's working space. Pooled here because BOTH are
+	// fully consumed before result_queue->enqueue() publishes the frontier - unlike sat_occluder_recs/sat_keep_mask
+	// above, this is the safe case: nothing outside run() can touch this scratch while these are still live, so there
+	// is no equivalent of the bug the comment above describes. Sized to the frontier - ~106MB each at 13.2M nodes -
+	// and as locals in run()
 	// they were allocated, first-touched and freed on EVERY traversal. The allocation itself measured free
 	// (splice_res_ms/sort_alloc_ms, 0.01-0.05ms: js::Vector::reserve does not touch the pages), so the cost that
 	// pooling removes is the first-touch faulting spread through the copy that follows. run() clear()s them - which
@@ -1328,6 +1338,7 @@ public:
 		bool coarse_layer_drawn_ = true, // SESSION076: whether anything will actually DRAW the captured coarse layer (the "coarse" checkbox). False means it was captured solely to feed the saturation grid, which lets this task both skip capturing nodes the grid cannot use and evict the rest once the grid is built - see the capture block and the compaction loop in run(). Defaults true, i.e. the pre-session076 behaviour, so callers that don't care are unaffected.
 		float sat_grid_subdiv_ = 1.f, // SESSION076 CALIBRATION - see GaussianSplatRenderer::getSatGridSubdiv().
 		float sat_region_radius_ = 0.f, // SESSION078: region pruning - see GaussianSplatRenderer::getSatRegionRadius(). 0 = the point-anchored behaviour.
+		int sat_region_closing_tiles_ = 0, // SESSION081: hole closing before the region erosion - see GaussianSplatRenderer::getSatRegionClosingTiles(). 0 = off.
 		bool sat_overlay_requested_ = false, // SESSION078: driven by "Show debug" + its mode dropdown (getSatDebugOverlayMode() != Off), NOT sat_diag_log_ - see that getter's comment. Forces the grid to build even with the saturation filter off, and fills sat_accum_t/sat_amp_sum, exactly what sat_diag_log_ used to gate before the overlay was split out of it.
 		float alpha_gain_ = 1.f, float alpha_gamma_ = 1.f, // SESSION078: see GaussianSplatRenderer::getAlphaGain(). Applied to occluder alphas before they feed the saturation grid, matching what the draw path applies - 1/1 (the defaults here) is the identity, i.e. the pre-session078 behaviour.
 		glare::TaskManager* task_manager_ = NULL, // SESSION079: the pool this task is itself running on, so the saturation build can spread across it - see gsBuildSaturationGridParallel(). NULL keeps the build serial.
@@ -1347,6 +1358,7 @@ public:
 		sat_diag_log(sat_diag_log_), coarse_layer_drawn(coarse_layer_drawn_),
 		sat_grid_subdiv(sat_grid_subdiv_), // SESSION076
 		sat_region_radius(sat_region_radius_), // SESSION078
+		sat_region_closing_tiles(sat_region_closing_tiles_), // SESSION081
 		sat_overlay_requested(sat_overlay_requested_), // SESSION078
 		alpha_gain(alpha_gain_), alpha_gamma(alpha_gamma_), // SESSION078
 		task_manager(task_manager_), // SESSION079
@@ -1845,6 +1857,18 @@ public:
 				// reading. See gs_sat_phases_running for what the number is for.
 				GsSatPhaseScope sat_phase_scope;
 
+				// SESSION081 BUGFIX: local, NOT scratch->sat_occluder_recs / scratch->sat_keep_mask as session079/080
+				// pooled them. This whole block runs AFTER the enqueue above, and the comment two lines below it is the
+				// invariant that pooling violated: `scratch` may already be back in the free pool - and reused by a
+				// fresh traversal that resizeNoCopy()s these very same buffers - well before a slower saturation phase
+				// (diag-on staleness measurement ahead of it, or a reuse-shortened traversal racing past it) gets here.
+				// Reproduced as a crash (0xc0000005, same fault offset every time): Saturation + reuse>0 + diag on, one
+				// step of camera movement. Costs one alloc + first-touch per traversal instead of a pooled reuse -
+				// unavoidable now that these can no longer safely outlive the enqueue; see the fields' own comments on
+				// GaussianSplatLodTraversalScratch for the pooling rationale this gives up.
+				js::Vector<GsSatOccluderRec, 16> sat_occluder_recs_local;
+				js::Vector<uint8, 16> sat_keep_mask_local;
+
 				// SESSION076: the grid is accumulated from the FINE frontier, not from the coarse floor it was originally
 				// written against. The coarse source was measured to a dead end - at the only setting that preserved
 				// visible geometry it dropped 1.0% against a 10.8% ceiling, and no tuning moved that - because a coarse
@@ -1983,6 +2007,7 @@ public:
 					uf2->sat_prefilter_threshold_used = sat_saturation_threshold; // SESSION080: the task's OWN knobs, not the renderer's live settings - see the fields' comment.
 					uf2->sat_grid_subdiv_used = sat_grid_subdiv;
 					uf2->sat_region_radius_used = sat_region_radius;
+					uf2->sat_region_closing_tiles_used = sat_region_closing_tiles; // SESSION081
 					uf2->pixel_scale_limit = uf->pixel_scale_limit;
 					uf2->max_splats_budget = uf->max_splats_budget;
 					uf2->max_layer_density = uf->max_layer_density;
@@ -2027,14 +2052,14 @@ public:
 					if(task_manager != NULL && !sat_overlay_requested)
 					{
 						gsBuildSaturationGridParallel(occl_px.data(), occl_py.data(), occl_pz.data(), occl_radius.data(), occl_alpha.data(), occl_px.size(),
-							cam_pos_ws, uf2->sat_grid_res, sat_saturation_threshold, sat_region_radius, uf2->sat_depth, *task_manager,
+							cam_pos_ws, uf2->sat_grid_res, sat_saturation_threshold, sat_region_radius, sat_region_closing_tiles, uf2->sat_depth, *task_manager,
 							sat_diag_log ? &uf2->sat_diag_writers : NULL, sat_diag_log ? &uf2->sat_diag_tile_writes : NULL,
-							sat_diag_log ? uf2->sat_diag_tile_stats : NULL, &scratch->sat_occluder_recs,
+							sat_diag_log ? uf2->sat_diag_tile_stats : NULL, &sat_occluder_recs_local, // SESSION081 BUGFIX: local, not scratch - see the declaration above.
 							uf2->sat_erode_stats); // SESSION080: unconditional - three counters, and they are what explains an unexpected dropped%.
 					}
 					else
 					gsBuildSaturationGrid(occl_px.data(), occl_py.data(), occl_pz.data(), occl_radius.data(), occl_alpha.data(), occl_px.size(),
-						cam_pos_ws, uf2->sat_grid_res, sat_saturation_threshold, sat_region_radius, uf2->sat_depth, // SESSION078: sat_region_radius = 0 reproduces the point-anchored behaviour exactly.
+						cam_pos_ws, uf2->sat_grid_res, sat_saturation_threshold, sat_region_radius, sat_region_closing_tiles, uf2->sat_depth, // SESSION078: sat_region_radius = 0 reproduces the point-anchored behaviour exactly. SESSION081: sat_region_closing_tiles = 0 likewise.
 						sat_diag_log ? &uf2->sat_diag_writers : NULL, sat_diag_log ? &uf2->sat_diag_tile_writes : NULL, // SESSION076 DIAGNOSTIC - null (no counting) unless the sat diag checkbox is on.
 					sat_overlay_requested ? &uf2->sat_accum_t : NULL, sat_overlay_requested ? &uf2->sat_amp_sum : NULL, // SESSION077/078 - the two overlay fields, gated on the overlay request, not the sat diag checkbox.
 						sat_diag_log ? uf2->sat_diag_tile_stats : NULL, // SESSION079
@@ -2106,7 +2131,7 @@ public:
 							}
 						}
 
-						js::Vector<uint8, 16>& keep_mask = scratch->sat_keep_mask;
+						js::Vector<uint8, 16>& keep_mask = sat_keep_mask_local; // SESSION081 BUGFIX: local, not scratch - see the declaration above.
 						keep_mask.resizeNoCopy(n);
 
 						// ---- Phase 1: the verdict, per node. ----
@@ -2693,6 +2718,7 @@ private:
 	bool coarse_layer_drawn;         // SESSION076: see the ctor param.
 	float sat_grid_subdiv; // SESSION076 CALIBRATION: see the ctor param.
 	float sat_region_radius; // SESSION078: see the ctor param.
+	int sat_region_closing_tiles; // SESSION081: see the ctor param.
 	bool sat_overlay_requested; // SESSION078: see the ctor param.
 	float alpha_gain, alpha_gamma;
 	glare::TaskManager* task_manager; // SESSION079: may be NULL - see the ctor param. // SESSION078: see the ctor param.
@@ -2778,7 +2804,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	filter_debug_log(false), kick_debug_log(false), cpu_prof_log(false), // SESSION072: default off - see getFilterDebugLog()'s comment.
 	sat_prefilter_mode(GaussianSplatSatPrefilterMode_Off), filter_frustum_planes_enabled(true), // SESSION074: stage off by default, frustum planes on (i.e. unchanged pipeline) - see getSatPrefilterMode()/getFilterFrustumPlanesEnabled().
 	sat_prefilter_threshold(0.98f), // SESSION079 - see getSatPrefilterThreshold().
-	sat_diag_log(false), sat_debug_overlay_mode(GaussianSplatSatDebugOverlayMode_Off), sat_grid_subdiv(0.3f), sat_region_radius(0.f), // SESSION076/078: diagnostics off by default - see getSatDiagLog()/getSatDebugOverlayMode(). Calibration defaults are the values reasoned to on paper, not yet confirmed on a scene.
+	sat_diag_log(false), sat_debug_overlay_mode(GaussianSplatSatDebugOverlayMode_Off), sat_grid_subdiv(0.3f), sat_region_radius(0.f), sat_region_closing_tiles(0), // SESSION076/078/081: diagnostics off by default - see getSatDiagLog()/getSatDebugOverlayMode(). Calibration defaults are the values reasoned to on paper, not yet confirmed on a scene.
 	frontier_reuse_split_dist(0.f), // SESSION080 STEP B: off by default - 0 is the pre-session080 walk-everything behaviour, bit-for-bit. See getFrontierReuseSplitDist().
 	splat_point_size_px(1.f),
 	splat_merge_spread_widen(3.0f), // SESSION071: analytic minimum is sqrt(3) (see widenedMergedScale()); owner default set higher for extra margin.
@@ -6123,6 +6149,7 @@ void GaussianSplatRenderer::setSatDebugOverlayMode(GaussianSplatSatDebugOverlayM
 		clouds[i]->have_last_traversal_cam_pos = false;
 		clouds[i]->sat_grid_debug_tex = NULL; // SESSION076 §9: stale overlay texture from before the toggle - not drawn either way (gated at the call site), but no reason to keep the GPU memory.
 		clouds[i]->sat_grid_debug_ramp_tex = NULL; // SESSION077: its ramp-view companion.
+		clouds[i]->sat_grid_debug_maskfix_tex = NULL; // SESSION081: its mask_fix-view companion.
 	}
 }
 
@@ -6185,6 +6212,22 @@ void GaussianSplatRenderer::setSatRegionRadius(float v)
 	if(v == sat_region_radius)
 		return;
 	sat_region_radius = v;
+
+	for(size_t i=0; i<clouds.size(); ++i)
+	{
+		clouds[i]->cached_ufrontier = NULL;
+		clouds[i]->have_last_traversal_cam_pos = false;
+	}
+}
+
+
+// SESSION081: same reasoning as setSatRegionRadius() above - changes sat_depth, so cached frontiers built under the
+// old value are not valid under the new one.
+void GaussianSplatRenderer::setSatRegionClosingTiles(int v)
+{
+	if(v == sat_region_closing_tiles)
+		return;
+	sat_region_closing_tiles = v;
 
 	for(size_t i=0; i<clouds.size(); ++i)
 	{
@@ -7182,6 +7225,7 @@ void GaussianSplatRenderer::updateSatGridDebugTexture(SplatCloud& cloud, const G
 	{
 		cloud.sat_grid_debug_tex = NULL;
 		cloud.sat_grid_debug_ramp_tex = NULL;
+		cloud.sat_grid_debug_maskfix_tex = NULL;
 		return;
 	}
 
@@ -7199,6 +7243,27 @@ void GaussianSplatRenderer::updateSatGridDebugTexture(SplatCloud& cloud, const G
 		OpenGLTexture::Wrapping_Clamp,
 		/*has_mipmaps=*/false);
 
+	// SESSION081: "mask_fix" - the FINAL sat_depth, i.e. uf.sat_depth itself, already post closing+erosion (both run
+	// inside gsBuildSaturationGrid[Parallel]() before the frontier is handed back - see gsSatApplyRegionErosion()).
+	// No new capture needed, unlike accum_t/amp_sum above: sat_depth is always populated whenever the grid is built at
+	// all, overlay or not. Encoded as a plain 0/1 mask (finite = saturated = 1) rather than reusing sat_depth's raw
+	// distances, so the shader can test it the same simple way as the Mask view - see the frag shader's mode 2.
+	if(uf.sat_depth.size() == res * res)
+	{
+		js::Vector<float, 16> mask_fix(res * res);
+		for(size_t i=0; i<res * res; ++i)
+			mask_fix[i] = std::isfinite(uf.sat_depth[i]) ? 1.f : 0.f;
+
+		cloud.sat_grid_debug_maskfix_tex = new OpenGLTexture(res, res, opengl_engine,
+			ArrayRef<uint8>((const uint8*)mask_fix.data(), mask_fix.size() * sizeof(float)),
+			OpenGLTextureFormat::Format_Greyscale_Float,
+			OpenGLTexture::Filtering_Nearest,
+			OpenGLTexture::Wrapping_Clamp,
+			/*has_mipmaps=*/false);
+	}
+	else
+		cloud.sat_grid_debug_maskfix_tex = NULL;
+
 	cloud.sat_grid_debug_anchor_ws = uf.anchor_pos_ws;
 }
 
@@ -7207,11 +7272,12 @@ void GaussianSplatRenderer::getSatGridDebugInfo(std::vector<SatGridDebugInfo>& o
 {
 	out.clear();
 	for(size_t i=0; i<clouds.size(); ++i)
-		if(clouds[i]->sat_grid_debug_tex.nonNull() && clouds[i]->sat_grid_debug_ramp_tex.nonNull())
+		if(clouds[i]->sat_grid_debug_tex.nonNull() && clouds[i]->sat_grid_debug_ramp_tex.nonNull() && clouds[i]->sat_grid_debug_maskfix_tex.nonNull())
 		{
 			SatGridDebugInfo info;
 			info.tex = clouds[i]->sat_grid_debug_tex;
 			info.ramp_tex = clouds[i]->sat_grid_debug_ramp_tex;
+			info.maskfix_tex = clouds[i]->sat_grid_debug_maskfix_tex;
 			info.anchor_ws = clouds[i]->sat_grid_debug_anchor_ws;
 			out.push_back(info);
 		}
@@ -7288,6 +7354,7 @@ void GaussianSplatRenderer::drainTraversalResults()
 				{
 					cloud->sat_grid_debug_tex = NULL; // Overlay off, or this frontier has no grid: nothing to show.
 					cloud->sat_grid_debug_ramp_tex = NULL;
+					cloud->sat_grid_debug_maskfix_tex = NULL;
 				}
 
 				// SESSION074/076 DIAGNOSTIC: the saturation stage's own numbers, printed at the cadence they change - once
@@ -7314,12 +7381,14 @@ void GaussianSplatRenderer::drainTraversalResults()
 						"thr=" + doubleToStringNDecimalPlaces(uf.sat_prefilter_threshold_used, 3) + // SESSION080: the knobs THIS grid was built with - see the fields' comment. Self-describes the log capture instead of relying on remembering what the UI said.
 						" sub=" + doubleToStringNDecimalPlaces(uf.sat_grid_subdiv_used, 3) +
 						" R=" + doubleToStringNDecimalPlaces(uf.sat_region_radius_used, 3) +
+						" close=" + toString(uf.sat_region_closing_tiles_used) + // SESSION081
 						" occl=" + uInt64ToStringCommaSeparated(uf.sat_num_occluders) +
 						" tiles=" + uInt64ToStringCommaSeparated(num_tiles) +
 						" sat_tiles=" + doubleToStringNDecimalPlaces(num_tiles > 0 ? (100.0 * (double)sat_tiles / (double)num_tiles) : 0.0, 1) + "%" +
 						// SESSION080: what the ball guarantee cost this build - see the field's comment. sat_tiles above is
 						// AFTER this, so eroded tiles are already excluded from it; add er_ceil+er_win back to recover the
 						// pre-erosion mask. The two kill mechanisms are printed apart on purpose - see GsSatErodeStats.
+						" cl=" + uInt64ToStringCommaSeparated(uf.sat_erode_stats[3]) + // SESSION081: pinholes the closing pass filled BEFORE the erosion below ran - see gsSatApplyClosing().
 						" er_ceil=" + uInt64ToStringCommaSeparated(uf.sat_erode_stats[0]) +
 						" er_win=" + uInt64ToStringCommaSeparated(uf.sat_erode_stats[1]) +
 						" (" + doubleToStringNDecimalPlaces(num_tiles > 0 ? (100.0 * (double)(uf.sat_erode_stats[0] + uf.sat_erode_stats[1]) / (double)num_tiles) : 0.0, 1) + "%)" +
@@ -8024,6 +8093,7 @@ void GaussianSplatRenderer::kickOffTraversals()
 			/*coarse_layer_drawn=*/split_coarse_floor_enabled, // SESSION076: lets the task skip/evict coarse nodes when the layer is captured only to feed the saturation grid - see its ctor param.
 			/*sat_grid_subdiv=*/sat_grid_subdiv,
 			/*sat_region_radius=*/sat_region_radius, // SESSION078
+			/*sat_region_closing_tiles=*/sat_region_closing_tiles, // SESSION081
 			/*sat_overlay_requested=*/sat_debug_overlay_mode != GaussianSplatSatDebugOverlayMode_Off, // SESSION078
 			/*alpha_gain=*/splat_alpha_gain, /*alpha_gamma=*/splat_alpha_gamma, // SESSION078
 			/*task_manager=*/task_manager, // SESSION079: lets the saturation build spread across the same pool - safe, see gsBuildSaturationGridParallel().

@@ -123,7 +123,8 @@ enum GaussianSplatSatDebugOverlayMode
 {
 	GaussianSplatSatDebugOverlayMode_Off = 0,
 	GaussianSplatSatDebugOverlayMode_Mask = 1,
-	GaussianSplatSatDebugOverlayMode_Ramp = 2
+	GaussianSplatSatDebugOverlayMode_Ramp = 2,
+	GaussianSplatSatDebugOverlayMode_MaskFix = 3 // SESSION081: "Saturation mask_fix" - same binary view as Mask, but of the FINAL sat_depth (after the closing pass and the region erosion), not the raw pre-erosion accumulator Mask shows. Lets the two be compared directly: any tile blue in Mask but not in MaskFix was removed either as a closed pinhole or by the erosion window.
 };
 
 
@@ -427,8 +428,9 @@ public:
 	// overlay is off or no cloud has a grid yet.
 	struct SatGridDebugInfo
 	{
-		Reference<OpenGLTexture> tex;      // Binary view source: transmittance.
-		Reference<OpenGLTexture> ramp_tex; // Ramp view source: unbounded contribution sum - see sat_amp_sum.
+		Reference<OpenGLTexture> tex;         // Binary view source: transmittance (pre closing/erosion).
+		Reference<OpenGLTexture> ramp_tex;    // Ramp view source: unbounded contribution sum - see sat_amp_sum.
+		Reference<OpenGLTexture> maskfix_tex; // SESSION081: "mask_fix" view source - the FINAL sat_depth, post closing+erosion.
 		Vec4f anchor_ws;
 	};
 	void getSatGridDebugInfo(std::vector<SatGridDebugInfo>& out) const;
@@ -483,6 +485,18 @@ public:
 	// Changes what a traversal PRODUCES, so the setter drops cached frontiers, as setSatGridSubdiv() does.
 	float getSatRegionRadius() const { return sat_region_radius; }
 	void setSatRegionRadius(float v);
+
+
+	// SESSION081: HOLE CLOSING. Radius, in GRID TILES (not world units - unlike every other sat_* knob, this one is
+	// purely about discretisation noise, not physical distance), of a morphological closing pass that runs immediately
+	// before the region erosion above. Fixes an interaction the erosion's own doc comment predicted: a single tile
+	// that missed the saturation threshold by noise, not by a real silhouette, otherwise spreads its "unusable"
+	// verdict across the erosion's whole window (up to gs_sat_region_max_erosion_tiles tiles wide). Measured
+	// (session081, owner's interior, R=0.9): this alone erased 62.0% of an otherwise 65.1%-saturated mask, collapsing
+	// dropped= from an 86.6% R=0 baseline to 7.9%. 0 = off, bit-for-bit the pre-session081 behaviour. Only matters when
+	// sat_region_radius > 0 - see [gsr-sat]'s cl= for tiles actually filled.
+	int getSatRegionClosingTiles() const { return sat_region_closing_tiles; }
+	void setSatRegionClosingTiles(int v);
 
 
 	// SESSION080 STEP B: FRONTIER REUSE. Distance, in world units, beyond which a traversal stops re-walking the tree and
@@ -1592,6 +1606,7 @@ private:
 	GaussianSplatSatDebugOverlayMode sat_debug_overlay_mode; // SESSION078 - see getSatDebugOverlayMode().
 	float sat_grid_subdiv;                           // SESSION076 CALIBRATION - see getSatGridSubdiv().
 	float sat_region_radius;                         // SESSION078 - see getSatRegionRadius().
+	int sat_region_closing_tiles;                    // SESSION081 - see getSatRegionClosingTiles().
 	float frontier_reuse_split_dist;                 // SESSION080 STEP B - see getFrontierReuseSplitDist(). 0 = disabled.
 
 	// SESSION055: camera-motion tracker for anisotropic frustum-cull dilation. think() diffs the current cam pose against

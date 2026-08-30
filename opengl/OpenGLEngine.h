@@ -1707,6 +1707,7 @@ private:
 	int sat_grid_debug_sphere_pos_radius_location;
 	int sat_grid_debug_tex_location;
 	int sat_grid_debug_ramp_tex_location; // SESSION077
+	int sat_grid_debug_maskfix_tex_location; // SESSION081
 	int sat_grid_debug_remaining_threshold_location; // SESSION077
 	int sat_grid_debug_mode_location;                // SESSION077
 	int sat_grid_debug_ramp_range_min_location;      // SESSION077

@@ -8,11 +8,12 @@ in vec3 dir_os;
 
 // Both R32F, res x res, one texel per saturation-grid tile - see GaussianSplatUnculledFrontier's sat_accum_t /
 // sat_amp_sum for what each holds and why the ramp view needs a different quantity from the binary one.
-uniform sampler2D sat_grid_tex;      // TRANSMITTANCE: 1 = nothing occludes this direction, 0 = fully blocked. Binary view only - exactly what the prune's threshold test acts on.
-uniform sampler2D sat_grid_ramp_tex; // Unbounded SUM of every touching occluder's contribution. Ramp view only - has no ceiling, so it does not visually clamp towards one colour the way a threshold-normalised quantity would.
+uniform sampler2D sat_grid_tex;         // TRANSMITTANCE: 1 = nothing occludes this direction, 0 = fully blocked. Binary view only - exactly what the prune's threshold test acts on, BEFORE the closing pass and region erosion run.
+uniform sampler2D sat_grid_ramp_tex;    // Unbounded SUM of every touching occluder's contribution. Ramp view only - has no ceiling, so it does not visually clamp towards one colour the way a threshold-normalised quantity would.
+uniform sampler2D sat_grid_maskfix_tex; // SESSION081: already a plain 0/1 mask (1 = saturated) of the FINAL sat_depth, i.e. AFTER the closing pass and region erosion - see GaussianSplatRenderer::updateSatGridDebugTexture(). MaskFix view only.
 
-uniform float sat_grid_remaining_threshold; // 1 - saturation threshold. A tile counts as saturated at or below this - the same test gsBuildSaturationGrid() makes.
-uniform int sat_grid_debug_mode;            // 0 = binary (saturated tiles only), 1 = continuous ramp over saturation degree.
+uniform float sat_grid_remaining_threshold; // 1 - saturation threshold. A tile counts as saturated at or below this - the same test gsBuildSaturationGrid() makes. Not used by the MaskFix view - see below.
+uniform int sat_grid_debug_mode;            // 0 = binary Mask (pre closing/erosion), 1 = continuous Ramp, 2 = SESSION081 binary MaskFix (post closing/erosion).
 
 // SESSION077: the ramp's blue/red endpoints, reusing the existing overdraw view's own range controls
 // (splat_overdraw_range_min/max, "Show overdraw" row) rather than a new pair of spinboxes - same idea (map a
@@ -24,9 +25,14 @@ uniform float sat_grid_ramp_range_max;
 layout(location = 0) out vec4 colour_out;
 
 
-// Bondi Blue, for the binary view.
+// Bondi Blue, for the binary Mask view.
 const vec3 SAT_GRID_DEBUG_COLOUR = vec3(0.0, 0.584, 0.714);
 const float SAT_GRID_DEBUG_ALPHA = 0.35;
+
+// SESSION081: a visibly different colour for MaskFix, deliberately - the two binary views are meant to be A/B'd
+// against each other (same geometry, same camera position), so they must never be mistaken for one another even in a
+// single screenshot. Amber.
+const vec3 SAT_GRID_DEBUG_MASKFIX_COLOUR = vec3(0.90, 0.55, 0.0);
 
 
 void main()
@@ -38,12 +44,23 @@ void main()
 
 	if(sat_grid_debug_mode == 0)
 	{
-		// Binary: exactly what the prune acts on.
+		// Binary: exactly what the prune acts on, BEFORE closing/erosion run.
 		float transmittance = texture(sat_grid_tex, oct_uv).r;
 		if(transmittance <= sat_grid_remaining_threshold)
 			colour_out = vec4(SAT_GRID_DEBUG_COLOUR, SAT_GRID_DEBUG_ALPHA);
 		else
 			colour_out = vec4(0.0); // Not saturated: fully transparent, real scene shows through unchanged.
+		return;
+	}
+
+	if(sat_grid_debug_mode == 2)
+	{
+		// SESSION081: MaskFix - the FINAL verdict, AFTER closing/erosion. Already a plain 0/1 mask, no threshold needed.
+		float saturated = texture(sat_grid_maskfix_tex, oct_uv).r;
+		if(saturated >= 0.5)
+			colour_out = vec4(SAT_GRID_DEBUG_MASKFIX_COLOUR, SAT_GRID_DEBUG_ALPHA);
+		else
+			colour_out = vec4(0.0);
 		return;
 	}
 

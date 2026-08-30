@@ -674,6 +674,183 @@ static void gsSatErodeRegionRows(const float* const src, float* const dst, int r
 }
 
 
+// SESSION081 - HOLE CLOSING. Runs BEFORE the region erosion above, to fix an interaction the erosion's own doc comment
+// already flagged as a risk ("how a noisy, pinholed mask destroys itself once max_radius reaches 1"): the erosion is a
+// pure MAX-window (grayscale dilation) over the finished mask, so a single tile that missed the saturation threshold
+// by noise - not a real silhouette - spreads its "unusable" (+inf) verdict across the WHOLE erosion window around it,
+// up to gs_sat_region_max_erosion_tiles wide. Measured (owner's interior, R=0.9): er_win alone erased 62.0% of an
+// otherwise 65.1%-saturated mask, collapsing dropped% from an 86.6% R=0 baseline to 7.9%, with er_ceil=0 in every
+// capture - the honest "R is too large for this occluder" refusal was never the cause.
+//
+// Closing removes exactly this class of defect: a hole narrower than 2*rc+1 tiles is filled solid before the erosion
+// ever sees it, while a hole at least that wide - a real doorway, a wall's corner, the edge of the geometry - passes
+// through unchanged, because no window inside it is ever fully surrounded by finite neighbours. Same "erode the
+// aggregate, not the atoms" principle the build side already uses (gsSatBuildStrip()'s SESSION078 CORRECTION),
+// applied one level up: here it is the erosion's OWN silhouette detector being protected from individual atoms
+// (single noisy tiles), not the occluders.
+//
+// Two full-grid passes, values only - no separate binary mask is kept, because +inf already IS this domain's
+// "background" and behaves correctly as the identity element for min:
+//  1. tmp[t] = MIN over a (2*rc+1)^2 window of src (t included). This is binary dilation of the "saturated" indicator,
+//     expressed on real values: tmp[t] comes out finite iff at least one tile in the window is finite, and the value
+//     picked (the nearest local barrier) is provisional scratch for step 2, not a final answer.
+//  2. For a tile whose ORIGINAL value was +inf: dst[t] = MAX over the same window of tmp. This is binary erosion of
+//     the now-dilated indicator - finite only if EVERY tile in the window was filled by step 1, i.e. the hole is
+//     fully surrounded within rc tiles on every side. MAX also picks the FURTHEST of the locally-available barriers,
+//     the same "never drop more than necessary" direction the R-erosion below and the build side's +region_radius
+//     already commit to.
+// A tile whose original value was already finite is never touched (dst[t] = src[t] verbatim) - closing only ever ADDS
+// conservatism to a hole, it never revises a real measurement.
+//
+// closing_radius_tiles <= 0 reproduces the pre-session081 behaviour bit-for-bit (this whole pass is skipped).
+struct GsSatCloseStats
+{
+	GsSatCloseStats() : closed(0) {}
+	size_t closed; // Tiles that were +inf in the input and came out finite - i.e. pinholes actually filled.
+};
+
+
+static void gsSatCloseMinRows(const float* const src, float* const tmp_min, int res, int rc, int v_begin, int v_end)
+{
+	const float inf = std::numeric_limits<float>::infinity();
+	for(int v=v_begin; v<v_end; ++v)
+	{
+		const int v0 = myMax(v - rc, 0), v1 = myMin(v + rc, res - 1);
+		for(int u=0; u<res; ++u)
+		{
+			const int u0 = myMax(u - rc, 0), u1 = myMin(u + rc, res - 1);
+			float m = inf;
+			for(int vv=v0; vv<=v1; ++vv)
+			{
+				const float* const row = src + (size_t)vv * (size_t)res;
+				for(int uu=u0; uu<=u1; ++uu)
+					if(row[uu] < m)
+						m = row[uu];
+			}
+			tmp_min[(size_t)v * (size_t)res + (size_t)u] = m;
+		}
+	}
+}
+
+
+static void gsSatCloseFinishRows(const float* const src, const float* const tmp_min, float* const dst, int res, int rc,
+	int v_begin, int v_end, GsSatCloseStats* out_stats)
+{
+	const float inf = std::numeric_limits<float>::infinity();
+	GsSatCloseStats st;
+	for(int v=v_begin; v<v_end; ++v)
+	{
+		const int v0 = myMax(v - rc, 0), v1 = myMin(v + rc, res - 1);
+		for(int u=0; u<res; ++u)
+		{
+			const size_t idx = (size_t)v * (size_t)res + (size_t)u;
+			if(src[idx] != inf) { dst[idx] = src[idx]; continue; } // Real measurement - closing never revises it.
+
+			const int u0 = myMax(u - rc, 0), u1 = myMin(u + rc, res - 1);
+			float worst = -inf;
+			bool all_finite = true;
+			for(int vv=v0; vv<=v1 && all_finite; ++vv)
+			{
+				const float* const row = tmp_min + (size_t)vv * (size_t)res;
+				for(int uu=u0; uu<=u1; ++uu)
+					if(row[uu] == inf) { all_finite = false; break; }
+					else if(row[uu] > worst) worst = row[uu];
+			}
+			dst[idx] = all_finite ? worst : inf;
+			if(all_finite) ++st.closed;
+		}
+	}
+	if(out_stats) *out_stats = st;
+}
+
+
+// SESSION081: row-parallel workers for the two passes above - same disjoint-write/full-read shape as GsSatErodeTask
+// below. Two SEPARATE task classes (and, in gsSatApplyClosing(), two separate task groups) because pass 2 reads
+// tmp_min across the WHOLE grid - a window can straddle any strip boundary - so every strip's pass 1 must finish
+// before any strip starts pass 2.
+class GsSatCloseMinTask : public glare::Task
+{
+public:
+	virtual void run(size_t /*thread_index*/) { gsSatCloseMinRows(src, tmp_min, res, rc, v_begin, v_end); }
+	const float* src; float* tmp_min; int res, rc, v_begin, v_end;
+};
+class GsSatCloseFinishTask : public glare::Task
+{
+public:
+	virtual void run(size_t /*thread_index*/) { gsSatCloseFinishRows(src, tmp_min, dst, res, rc, v_begin, v_end, &stats); }
+	const float* src; const float* tmp_min; float* dst; int res, rc, v_begin, v_end;
+	GsSatCloseStats stats;
+};
+
+
+// SESSION081: safety ceiling on the closing radius. Cost is O((2*rc+1)^2) per tile for two full-grid passes - the same
+// shape as the erosion window below, but in practice far smaller (a handful of tiles fixes pinhole noise; nothing
+// about closing needs anywhere near gs_sat_region_max_erosion_tiles). This ceiling exists only to stop a mistyped
+// huge value from being expensive, not because larger values would be unsound.
+static const int gs_sat_closing_max_radius_tiles = 8;
+
+
+// SESSION081: applies closing in place into `sat_depth` (swaps a scratch buffer into it, same pattern
+// gsSatApplyRegionErosion below uses for its own result). No-op when closing_radius_tiles <= 0.
+static void gsSatApplyClosing(js::Vector<float, 16>& sat_depth, int res, int closing_radius_tiles,
+	glare::TaskManager* task_manager, size_t* out_closed)
+{
+	if(out_closed) *out_closed = 0;
+	if(closing_radius_tiles <= 0 || res == 0)
+		return;
+	const int rc = myMin(closing_radius_tiles, gs_sat_closing_max_radius_tiles);
+
+	js::Vector<float, 16> tmp_min(sat_depth.size());
+	js::Vector<float, 16> closed(sat_depth.size());
+
+	const int concurrency = task_manager ? myMax(1, (int)task_manager->getConcurrency()) : 1;
+	const int num_strips = myClamp(res / gs_sat_min_strip_rows, 1, concurrency);
+
+	GsSatCloseStats total;
+	if(num_strips <= 1)
+	{
+		gsSatCloseMinRows(sat_depth.data(), tmp_min.data(), res, rc, 0, res);
+		gsSatCloseFinishRows(sat_depth.data(), tmp_min.data(), closed.data(), res, rc, 0, res, &total);
+	}
+	else
+	{
+		{
+			glare::TaskGroupRef group = new glare::TaskGroup();
+			js::Vector<Reference<GsSatCloseMinTask>, 16> tasks(num_strips);
+			for(int t=0; t<num_strips; ++t)
+			{
+				Reference<GsSatCloseMinTask> task = new GsSatCloseMinTask();
+				task->src = sat_depth.data(); task->tmp_min = tmp_min.data(); task->res = res; task->rc = rc;
+				task->v_begin = (int)(((int64)res * t)       / num_strips);
+				task->v_end   = (int)(((int64)res * (t + 1)) / num_strips);
+				tasks[t] = task;
+				group->tasks.push_back(task);
+			}
+			task_manager->runTaskGroup(group);
+		}
+		{
+			glare::TaskGroupRef group = new glare::TaskGroup();
+			js::Vector<Reference<GsSatCloseFinishTask>, 16> tasks(num_strips);
+			for(int t=0; t<num_strips; ++t)
+			{
+				Reference<GsSatCloseFinishTask> task = new GsSatCloseFinishTask();
+				task->src = sat_depth.data(); task->tmp_min = tmp_min.data(); task->dst = closed.data(); task->res = res; task->rc = rc;
+				task->v_begin = (int)(((int64)res * t)       / num_strips);
+				task->v_end   = (int)(((int64)res * (t + 1)) / num_strips);
+				tasks[t] = task;
+				group->tasks.push_back(task);
+			}
+			task_manager->runTaskGroup(group);
+			for(int t=0; t<num_strips; ++t)
+				total.closed += tasks[t]->stats.closed;
+		}
+	}
+
+	if(out_closed) *out_closed = total.closed;
+	sat_depth = closed;
+}
+
+
 // SESSION080: the erosion split over the task manager by rows. Read-only source, disjoint destination rows - nothing to
 // synchronise, same shape as the build's strips.
 class GsSatErodeTask : public glare::Task
@@ -695,12 +872,18 @@ public:
 // SESSION080: shared tail of both builds - allocate the destination, run the erosion (parallel where a pool was handed
 // in), swap it into place. No-op when region_radius is 0, which keeps the R = 0 path bit-identical to before.
 static void gsSatApplyRegionErosion(js::Vector<float, 16>& sat_depth, int res,
-	float region_radius, glare::TaskManager* task_manager, size_t* out_erode_stats)
+	float region_radius, int closing_radius_tiles, glare::TaskManager* task_manager, size_t* out_erode_stats)
 {
 	if(out_erode_stats)
-		out_erode_stats[0] = out_erode_stats[1] = out_erode_stats[2] = 0;
+		out_erode_stats[0] = out_erode_stats[1] = out_erode_stats[2] = out_erode_stats[3] = 0;
 	if(!(region_radius > 0.f) || res == 0)
 		return;
+
+	// SESSION081: closing runs first, in place, so the erosion below sees a mask with pinhole noise already removed -
+	// see gsSatApplyClosing()'s doc comment for why order matters here.
+	size_t closed_count = 0;
+	gsSatApplyClosing(sat_depth, res, closing_radius_tiles, task_manager, &closed_count);
+	if(out_erode_stats) out_erode_stats[3] = closed_count;
 
 	js::Vector<float, 16> eroded(sat_depth.size());
 
@@ -749,7 +932,7 @@ static void gsSatApplyRegionErosion(js::Vector<float, 16>& sat_depth, int res,
 
 
 void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, const float* radius, const float* alpha, size_t n,
-	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius,
+	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius, int closing_radius_tiles,
 	js::Vector<float, 16>& sat_depth_out, size_t* out_writers, size_t* out_tile_writes,
 	js::Vector<float, 16>* out_accum_t, js::Vector<float, 16>* out_amp_sum, size_t* out_tile_stats,
 	size_t* out_erode_stats)
@@ -781,7 +964,7 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 
 	// SESSION080: the erosion runs LAST, on the finished mask - see gsSatApplyRegionErosion(). Serial entry point, so no
 	// pool: this path is the overlay/no-TaskManager one, where a few ms more is not what anyone is measuring.
-	gsSatApplyRegionErosion(sat_depth_out, res, region_radius, NULL, out_erode_stats);
+	gsSatApplyRegionErosion(sat_depth_out, res, region_radius, closing_radius_tiles, NULL, out_erode_stats);
 
 	// SESSION077 DIAGNOSTIC: hand the accumulator fields out for the debug overlay - see the header.
 	if(out_accum_t)
@@ -886,7 +1069,7 @@ public:
 
 
 void gsBuildSaturationGridParallel(const float* px, const float* py, const float* pz, const float* radius, const float* alpha, size_t n,
-	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius,
+	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius, int closing_radius_tiles,
 	js::Vector<float, 16>& sat_depth_out, glare::TaskManager& task_manager,
 	size_t* out_writers, size_t* out_tile_writes, size_t* out_tile_stats,
 	js::Vector<GsSatOccluderRec, 16>* scratch_recs, size_t* out_erode_stats)
@@ -1005,7 +1188,7 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 
 	// SESSION080: after every block has deposited, never per block - the mask has to be complete before it is eroded,
 	// or a silhouette would be measured against a half-built neighbourhood.
-	gsSatApplyRegionErosion(sat_depth_out, res, region_radius, &task_manager, out_erode_stats);
+	gsSatApplyRegionErosion(sat_depth_out, res, region_radius, closing_radius_tiles, &task_manager, out_erode_stats);
 }
 
 

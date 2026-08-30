@@ -208,7 +208,8 @@ enum TextureUnitIndices
 	SPLAT_COVERAGE_MASK_TEXTURE_UNIT_INDEX, // The splat program's third texture - see GaussianSplatRenderer::getCoverageShrinkStrength().
 	SPLAT_HIDE_COUNT_TEXTURE_UNIT_INDEX, // SESSION066 - the "Clip" diagnostic's own overdraw-count texture - see drawSplatClouds().
 	SAT_GRID_DEBUG_TEXTURE_UNIT_INDEX, // SESSION076 §9 - see drawSatGridDebugSphere().
-	SAT_GRID_DEBUG_RAMP_TEXTURE_UNIT_INDEX // SESSION077 - the ramp view's own unbounded-sum texture, same function.
+	SAT_GRID_DEBUG_RAMP_TEXTURE_UNIT_INDEX, // SESSION077 - the ramp view's own unbounded-sum texture, same function.
+	SAT_GRID_DEBUG_MASKFIX_TEXTURE_UNIT_INDEX // SESSION081 - "Saturation mask_fix": the FINAL sat_depth (post closing+erosion), same function.
 };
 
 
@@ -7049,6 +7050,7 @@ OpenGLProgramRef OpenGLEngine::buildSatGridDebugProg()
 	sat_grid_debug_sphere_pos_radius_location   = prog->getUniformLocation("sat_grid_sphere_pos_radius");
 	sat_grid_debug_tex_location                 = prog->getUniformLocation("sat_grid_tex");
 	sat_grid_debug_ramp_tex_location            = prog->getUniformLocation("sat_grid_ramp_tex");
+	sat_grid_debug_maskfix_tex_location         = prog->getUniformLocation("sat_grid_maskfix_tex"); // SESSION081
 	sat_grid_debug_remaining_threshold_location = prog->getUniformLocation("sat_grid_remaining_threshold");
 	sat_grid_debug_mode_location                = prog->getUniformLocation("sat_grid_debug_mode");
 	sat_grid_debug_ramp_range_min_location      = prog->getUniformLocation("sat_grid_ramp_range_min");
@@ -7089,7 +7091,12 @@ void OpenGLEngine::drawSatGridDebugSphere(const Matrix4f& view_matrix, const Mat
 	// SESSION077: the same threshold test the grid build makes, so the binary view is the prune's own verdict rather
 	// than a re-derivation of it - see gsBuildSaturationGrid()'s remaining_threshold.
 	glUniform1f(sat_grid_debug_remaining_threshold_location, myClamp(1.f - splat_renderer->getSaturationThreshold(), 0.f, 1.f));
-	glUniform1i(sat_grid_debug_mode_location, splat_renderer->getSatDebugOverlayMode() == GaussianSplatSatDebugOverlayMode_Ramp ? 1 : 0); // SESSION078
+	// SESSION081: was a 2-way ternary (Mask/Ramp); now 3-way. 0 = Mask, 1 = Ramp, 2 = MaskFix - matches the frag shader's
+	// sat_grid_debug_mode branches.
+	const GaussianSplatSatDebugOverlayMode sat_overlay_mode = splat_renderer->getSatDebugOverlayMode();
+	glUniform1i(sat_grid_debug_mode_location,
+		sat_overlay_mode == GaussianSplatSatDebugOverlayMode_Ramp ? 1 :
+		(sat_overlay_mode == GaussianSplatSatDebugOverlayMode_MaskFix ? 2 : 0));
 	glUniform1f(sat_grid_debug_ramp_range_min_location, splat_renderer->getOverdrawRangeMin()); // SESSION077: shared with the overdraw view's own range controls - see the shader's comment.
 	glUniform1f(sat_grid_debug_ramp_range_max_location, splat_renderer->getOverdrawRangeMax());
 
@@ -7108,8 +7115,9 @@ void OpenGLEngine::drawSatGridDebugSphere(const Matrix4f& view_matrix, const Mat
 
 	for(size_t i=0; i<spheres.size(); ++i)
 	{
-		bindTextureUnitToSampler(*spheres[i].tex,      SAT_GRID_DEBUG_TEXTURE_UNIT_INDEX,      sat_grid_debug_tex_location);
-		bindTextureUnitToSampler(*spheres[i].ramp_tex, SAT_GRID_DEBUG_RAMP_TEXTURE_UNIT_INDEX, sat_grid_debug_ramp_tex_location);
+		bindTextureUnitToSampler(*spheres[i].tex,         SAT_GRID_DEBUG_TEXTURE_UNIT_INDEX,         sat_grid_debug_tex_location);
+		bindTextureUnitToSampler(*spheres[i].ramp_tex,    SAT_GRID_DEBUG_RAMP_TEXTURE_UNIT_INDEX,    sat_grid_debug_ramp_tex_location);
+		bindTextureUnitToSampler(*spheres[i].maskfix_tex, SAT_GRID_DEBUG_MASKFIX_TEXTURE_UNIT_INDEX, sat_grid_debug_maskfix_tex_location); // SESSION081
 
 		glUniform4f(sat_grid_debug_sphere_pos_radius_location, spheres[i].anchor_ws[0], spheres[i].anchor_ws[1], spheres[i].anchor_ws[2], radius);
 

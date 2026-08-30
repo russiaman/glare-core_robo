@@ -10,6 +10,7 @@ Copyright Glare Technologies Limited 2026 -
 #include "../maths/vec3.h" // SESSION077: per-axis splat scales - see gsSatProjectedRadius().
 #include "../maths/Vec4f.h"
 #include "../utils/Vector.h"
+#include <limits> // SESSION081: gsSatRegionErosionTiles() returns +inf for a direction whose occluder sits inside the ball.
 
 namespace glare { class TaskManager; } // SESSION079: gsBuildSaturationGridParallel().
 
@@ -139,10 +140,12 @@ static const float gs_sat_occluder_sigmas = 3.f;
 //  - Cost. The pass is a max-filter with a per-tile radius, so its work is quadratic in this: at 40 the window is 81x81
 //    over a 101x101 grid, ~67M tile reads, which parallelises to a few ms. Much past that and the pass stops being
 //    free next to the ~40ms build it follows.
-//  - Honesty. R/sat_depth exceeding this means the ball reaches a substantial fraction of the way around the occluding
+//  - Honesty. The angle exceeding this means the ball reaches a substantial fraction of the way around the occluding
 //    mass - i.e. R is no longer small next to the occluder's own distance, and the whole "the barrier still holds
 //    anywhere in the ball" premise has failed for that direction. Rather than silently under-eroding (which would
 //    quietly hand back an unsound barrier, the exact bug session078 shipped), such a tile is marked unusable outright.
+//    SESSION081: this is R/(sat_depth - R), the occluder's own distance - NOT R/sat_depth, which is what it used to be
+//    and which quietly disarmed this whole test as R grew, since sat_depth contains R. See gsSatRegionErosionTiles().
 //
 // A tile that needs more erosion than this is therefore set to +inf: nothing behind it may be pruned. That is what
 // makes "stand 0.5m from a wall with R=2" come out as "no pruning behind that wall" rather than as a hole - the
@@ -163,21 +166,39 @@ static const int gs_sat_region_max_erosion_tiles = 40;
 // dragged the radius from 1 tile to 12 across the grid, which then bloomed every pinhole in a 13%-saturated mask and
 // collapsed dropped% from 42.3% to 4.2% in a single wheel click - pruning visibly switching off.
 //
-// sat_depth is the right distance and needs no extra tracking at all. Occluders are accumulated strictly front-to-back,
-// so the one that crosses the threshold is the FURTHEST of the set that mattered, and everything nearer was by
-// construction insufficient on its own. Its far edge is the barrier. Using the barrier therefore says "how far away is
-// the mass this tile's claim rests on", which is exactly the quantity whose parallax matters - and it is
+// sat_depth is the right occluder to measure and needs no extra tracking at all. Occluders are accumulated strictly
+// front-to-back, so the one that crosses the threshold is the FURTHEST of the set that mattered, and everything nearer
+// was by construction insufficient on its own. Its far edge is the barrier. Using the barrier therefore says "how far
+// away is the mass this tile's claim rests on", which is exactly the quantity whose parallax matters - and it is
 // self-consistent: the barrier and its own reliability radius come from the same occluder.
 //
-// Converting radians to tiles needs a tile angle, and the octahedral map's varies over the sphere (see
-// gsSatGridInvLocalTileAngle()). The SMALLEST it gets is 2/res, which yields the LARGEST tile count for a given angle -
-// so this over-covers in every direction, the safe side. Same s=1 bound the build's early amp reject and its strip test
-// already rest on, kept identical on purpose.
+// SESSION081 FIX - but the barrier is not that distance, and using it raw was a real defect. sat_depth is
+// dist + r + region_radius (see the write loop's far_edge), so it carries region_radius INSIDE it. Dividing by it
+// therefore shrinks the angle by exactly the quantity being tested for, and the error grows with R - so the mechanism
+// went blind precisely as R got large, which is the opposite of what both this radius and the ceiling above are for.
+//
+// Reproduced (owner, session081): standing ~0.5m from a wall with R=1.5, a 1m teleport showed a large hole behind it.
+// The ball plainly engulfs a wall that close - R/d = 3.0 rad, 172 deg - and the ceiling should have refused those
+// directions outright. It did not: sat_depth came to 0.5 + r + 1.5 = 2.02, giving (1.5/2.02)*50.5 = 37.5 tiles,
+// just under the 40-tile ceiling, so the tile survived and pruned geometry that a camera 1m away could plainly see.
+// Against the occluder's own distance it is (1.5/0.5)*50.5 = 151 tiles, over the ceiling four times over.
+//
+// Subtracting region_radius recovers the occluder's far edge, dist + r. That is still not exactly dist, but it is over
+// by the splat's own radius only (1-2cm on this scene's near field, where the LoD holds nodes at a fixed screen size),
+// which errs towards a smaller angle - the same safe direction every other bound in this file takes. Clamped below,
+// because a barrier at or inside the ball's own radius means the ball reaches the occluding mass and past it: there is
+// no valid angle there at all, and the caller's ceiling must reject the direction rather than receive a finite number.
 static inline float gsSatRegionErosionTiles(float region_radius, float barrier_dist, int res)
 {
 	if(!(barrier_dist > 0.f)) // +inf (this direction never saturated) or a degenerate zero - nothing to erode either way.
 		return 0.f;
-	const float ang = region_radius / barrier_dist; // Radians, small-angle; the exact asin is larger, but only where this is already past the ceiling above.
+
+	// SESSION081: the occluding mass, not the barrier - see above.
+	const float occluder_dist = barrier_dist - region_radius;
+	if(!(occluder_dist > 0.f))
+		return std::numeric_limits<float>::infinity(); // Ball reaches the occluder itself: no sound barrier in this direction, always past the ceiling.
+
+	const float ang = region_radius / occluder_dist; // Radians, small-angle; the exact asin is larger, but only where this is already past the ceiling above.
 	return ang * ((float)res * 0.5f);
 }
 

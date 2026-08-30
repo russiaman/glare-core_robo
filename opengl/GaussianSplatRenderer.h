@@ -31,10 +31,12 @@ class OpenGLTexture; // SESSION076 §9: for SatGridDebugInfo::tex - see Gaussian
 struct GLObject; // Only ever passed through by pointer here - see visibleFractionToDrawIndex().  Declared the same way MeshPrimitiveBuilding.h and TransformGizmo.h do it.
 namespace glare { class TaskManager; }
 class SplatCloud; // Defined in GaussianSplatRenderer.cpp - one drawable cloud, holding one or more splat objects.
+class GaussianSplatCachedGeom; // Defined in GaussianSplatRenderer.cpp - a cloud's shared, topology-generation-scoped snapshot of positions/scales/rotations/alpha.
 struct CloudMember; // Defined in GaussianSplatRenderer.cpp - one registered splat object within a cloud.
 class GaussianSplatSortScratch; // Defined in GaussianSplatRenderer.cpp - the reusable working buffers a background depth-sort uses.
 class GaussianSplatLodTraversalScratch; // Defined in GaussianSplatRenderer.cpp - the reusable working buffers a background LoD traversal uses.
 class GaussianSplatUnculledFrontier; // Defined in GaussianSplatRenderer.cpp - the split-filter architecture's U(P), see drainTraversalResults().
+class GaussianSplatSaturationBarrier; // SESSION081: defined in GaussianSplatRenderer.cpp - see drainSaturationBuildResults().
 
 
 /*=====================================================================
@@ -421,11 +423,12 @@ public:
 	void setSatDiagLog(bool v);
 
 	// SESSION076 §9 / SESSION077 / SESSION078: one entry per cloud currently holding saturation-grid debug textures
-	// (built by drainTraversalResults() only while getSatDebugOverlayMode() is not Off - see there). Both are R32F,
+	// (built by drainSaturationBuildResults() only while getSatDebugOverlayMode() is not Off - see there). All R32F,
 	// res x res, sampled by sat_grid_debug_frag_shader.glsl via the octahedral direction mapping - see the struct
-	// fields for what each holds. anchor_ws is the world position the grid's directions are anchored to
-	// (GaussianSplatUnculledFrontier::anchor_pos_ws as of the traversal the textures were built from). Empty when the
-	// overlay is off or no cloud has a grid yet.
+	// fields for what each holds. anchor_ws is the world position the grid's directions are anchored to - SESSION081:
+	// the BARRIER's own anchor (GaussianSplatSaturationBarrier::anchor_pos_ws), not necessarily where the camera is
+	// now or where the current traversal ran - see that class for why the two can differ. Empty when the overlay is
+	// off or no cloud has a barrier yet.
 	struct SatGridDebugInfo
 	{
 		Reference<OpenGLTexture> tex;         // Binary view source: transmittance (pre closing/erosion).
@@ -497,6 +500,43 @@ public:
 	// sat_region_radius > 0 - see [gsr-sat]'s cl= for tiles actually filled.
 	int getSatRegionClosingTiles() const { return sat_region_closing_tiles; }
 	void setSatRegionClosingTiles(int v);
+
+
+	// SESSION081 DIAGNOSTIC, TEMPORARY - "bypass grid" test. Skips gather+build+closing+erosion (pipeline stage 3)
+	// entirely and marks every direction saturated at one flat distance, taken from getDistClampMax() (the "Distance
+	// slice max" spinbox - reused rather than adding a new control) - see the "bypass grid" branch in
+	// GaussianSplatSaturationBuildTask::run() for the full rationale. Everything else - the R-ball re-kick cadence in
+	// kickOffSaturationBuilds(), the apply/test stage, the async frustum filter, draw_unpruned - is untouched, so
+	// this isolates whether THAT machinery is acceptable once stage 3's own cost and correctness are taken out of the
+	// picture. A live, owner-driven diagnostic switch meant to be removed once the experiment concludes, not a
+	// permanent feature - see the ctor field's own comment on GaussianSplatSaturationBuildTask for the full removal
+	// list. Changes what a build PRODUCES, so the setter drops every cloud's cached barrier to force an immediate
+	// rebuild under the new mode - same reasoning as setSatRegionRadius() etc, but scoped to just the barrier (a
+	// bypass toggle doesn't change what a TRAVERSAL produces, so cached_ufrontier is left alone).
+	bool getSatDebugBypassGrid() const { return sat_debug_bypass_grid; }
+	void setSatDebugBypassGrid(bool v);
+
+
+	// SESSION081: whether a traversal's UNPRUNED frontier is drawn while its saturation prune is still being computed.
+	//
+	// On (the session076 behaviour): the traversal publishes its frontier the moment the tree walk is done, so a new
+	// viewpoint reaches the screen at traversal latency (~170ms) instead of traversal + saturation (~570ms), and the
+	// prune lands afterwards as a refinement. The cost is that the ~13.2M-node unpruned set is what gets DRAWN for the
+	// saturation phase's whole duration - and since a moving camera re-kicks faster than the phase completes, the draw
+	// load spends much of any walk at the unpruned figure rather than the pruned ~2.8M.
+	//
+	// Off: message 1 is still sent (it owns the scratch, the in-flight slot, the reuse source and the traversal's own
+	// diagnostics) but is not installed for drawing; the PREVIOUS pruned frontier keeps drawing until this traversal's
+	// own pruned result arrives. The draw load stays flat at the pruned figure.
+	//
+	// What makes this safe to turn off is sat_region_radius (R) above, and only it: the previous pruned frontier is an
+	// assertion about where the camera WAS, so holding it while the camera moves is exactly the stale-prune hole this
+	// pipeline's split was built to avoid - unless the barrier is valid over a ball of radius R around that anchor, in
+	// which case it stays correct for as long as the camera is inside the ball. The honest limit is that R only buys
+	// R metres of travel: past that, and before the new prune lands, holes are possible again. That trade is the point
+	// of the knob - see the session081 snapshot.
+	bool getDrawUnprunedFrontier() const { return draw_unpruned_frontier; }
+	void setDrawUnprunedFrontier(bool v);
 
 
 	// SESSION080 STEP B: FRONTIER REUSE. Distance, in world units, beyond which a traversal stops re-walking the tree and
@@ -1487,10 +1527,23 @@ private:
 
 	void writePlaceholderSelection(SplatCloud& cloud); // Synchronous stand-in frontier (root-only per member with a tree, everything for a member without one), written after any structural change, until the next background traversal's result supersedes it.
 	void drainTraversalResults();
-	void updateSatGridDebugTexture(SplatCloud& cloud, const GaussianSplatUnculledFrontier& uf); // SESSION076 §9 - see drainTraversalResults()'s use of this.
+	void updateSatGridDebugTexture(SplatCloud& cloud, const GaussianSplatSaturationBarrier& barrier); // SESSION076 §9, SESSION081: see drainSaturationBuildResults()'s use of this.
 	void kickOffTraversals();
 	void kickOffFilters();      // SESSION063: split architecture - see the .cpp.
 	void drainFilterResults();  // SESSION063
+
+	// SESSION081: the saturation barrier, decoupled from the traversal pipeline - see GaussianSplatSaturationBarrier
+	// and the session081 snapshot. Own kick/drain pair, same shape as the traversal/sort/filter pipelines above but
+	// with no scratch pool (the build's working buffers are locals - see GaussianSplatSaturationBuildTask, and the
+	// session081 bugfix comment on why pooling them was unsafe).
+	void kickOffSaturationBuilds();
+	void drainSaturationBuildResults();
+
+	// SESSION081: the saturation APPLY, decoupled from the traversal pipeline AND from the build above - see
+	// GaussianSplatSaturationApplyTask. Throttled to at most one in flight per cloud, kicked only when there is
+	// something new to test (a fresher source frontier or a fresher barrier than the last attempt) - see the .cpp.
+	void kickOffSaturationApplies();
+	void drainSaturationApplyResults();
 
 	// SESSION069 - Per-frame TAA bookkeeping.  Called from think(), before the per-cloud loop writes the jitter uniform.
 	// See the .cpp for the exact reset condition list.
@@ -1499,6 +1552,7 @@ private:
 	void noteDrawOrderForSlicing(SplatCloud& cloud, const uint32* draw_indices, size_t count); // Refreshes the sample of a cloud's draw order the frustum-aware slicing works from - see getVisibleSlicingEnabled().  Called from every place that writes the instance index VBO.
 	void buildVisibleSliceCDFs(); // Per-frame, from think(): re-tests each cloud's sample against the current frustum.  The one part of the draw order that depends on where the camera is looking rather than where it is.
 	void fillTraversalScratch(SplatCloud& cloud, GaussianSplatLodTraversalScratch& scratch) const; // Freezes a cloud's world-space node data and member layout into a scratch, ready for a traversal to read without touching the live arrays. SESSION058: non-const - may cache the snapshot on the cloud (see SplatCloud::cached_traversal_geom) so repeated kicks against an unchanged cloud reuse it instead of re-copying.
+	Reference<GaussianSplatCachedGeom> getOrBuildCachedGeom(SplatCloud& cloud) const; // SESSION081: the geom-snapshot cache-hit/miss logic fillTraversalScratch() used to do inline, extracted so kickOffSaturationBuilds() can share it - a saturation build needs the same positions/scales/rotations/alpha snapshot a traversal does, without needing a whole GaussianSplatLodTraversalScratch to hold it.
 
 	Reference<OpenGLProgram> shader_prog; // Shared by every cloud.  Null until the first addObject().
 	Reference<OpenGLProgram> resolve_prog; // Resolves the splat accumulation buffer onto the main colour buffer.  Built alongside shader_prog.
@@ -1547,6 +1601,20 @@ private:
 	static const int max_concurrent_filters = 2; // A filter is ~13ms; a couple in flight covers multi-cloud scenes without oversubscribing the worker pool.
 	ThreadSafeQueue<Reference<ThreadMessage> > filter_result_queue;
 	js::Vector<Reference<ThreadMessage>, 16> completed_filter_msgs;
+
+	// SESSION081: the saturation barrier build pipeline - independent of the traversal pipeline above (see
+	// GaussianSplatSaturationBarrier). No scratch pool and no concurrency cap: a build is stateless apart from its
+	// input frontier/geom (both held via Reference) and its own working buffers are locals, and at most one is ever in
+	// flight per cloud (SplatCloud::sat_build_in_flight), which already bounds it the way max_concurrent_traversals
+	// bounds the pooled traversal scratch.
+	ThreadSafeQueue<Reference<ThreadMessage> > sat_build_result_queue;
+	js::Vector<Reference<ThreadMessage>, 16> completed_sat_build_msgs;
+
+	// SESSION081: the saturation APPLY pipeline - see GaussianSplatSaturationApplyTask and
+	// kickOffSaturationApplies()/drainSaturationApplyResults(). Same shape as the build pipeline above, same reasoning
+	// (no pool, capped at one in flight per cloud via SplatCloud::sat_apply_in_flight).
+	ThreadSafeQueue<Reference<ThreadMessage> > sat_apply_result_queue;
+	js::Vector<Reference<ThreadMessage>, 16> completed_sat_apply_msgs;
 
 	// Live-tunable via GaussianSplatSettingsWidget (Qt only); hardcoded defaults if that panel's saved settings are never
 	// applied (e.g. no UI). pixel_scale_limit is roughly "stop refining once a node projects to about this many pixels";
@@ -1607,6 +1675,8 @@ private:
 	float sat_grid_subdiv;                           // SESSION076 CALIBRATION - see getSatGridSubdiv().
 	float sat_region_radius;                         // SESSION078 - see getSatRegionRadius().
 	int sat_region_closing_tiles;                    // SESSION081 - see getSatRegionClosingTiles().
+	bool draw_unpruned_frontier;                     // SESSION081 - see getDrawUnprunedFrontier().
+	bool sat_debug_bypass_grid;                      // SESSION081 DIAGNOSTIC, TEMPORARY - see getSatDebugBypassGrid().
 	float frontier_reuse_split_dist;                 // SESSION080 STEP B - see getFrontierReuseSplitDist(). 0 = disabled.
 
 	// SESSION055: camera-motion tracker for anisotropic frustum-cull dilation. think() diffs the current cam pose against

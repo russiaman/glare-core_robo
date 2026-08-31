@@ -1290,6 +1290,20 @@ public:
 };
 
 
+// SESSION081 STAGE 4B: how far ahead GsSatGatherTask prefetches the packed occluder record. Swept, not assumed -
+// ns per occluder on the owner's reference scene, 5-7 barrier builds each, teleporting between viewpoints:
+//
+//   none 7.05 (6.62-7.91) | 8: 5.66 (5.49-11.62) | 16: 5.67 (5.31-11.76) | 32: 5.34 (5.14-5.46) | 64: 5.72 (5.38-6.31)
+//
+// 32 wins on the median, but what actually decides it is the SPREAD. The saturation build shares a pool with the
+// traversal (session081 decoupling), and at 8 and 16 a build that overlaps a full ~13M-node traversal blows out to
+// 7.5-11.6 ns - while every one of 32's samples was taken under exactly that contention and stayed inside 5.14-5.46.
+// Issuing the prefetch further ahead leaves slack for the core to be pulled away and the line still to arrive in time.
+// 64 is worse again, as expected: ~64 prefetches in flight against ~10-12 line-fill buffers per core, so lines are
+// evicted before use. Both neighbours being worse is what makes this a measured optimum rather than a stopping point.
+static const size_t gs_sat_gather_prefetch_dist = 32;
+
+
 // SESSION079: one slice of the occluder gather - see GsSatGatherTask.
 struct GsSatGatherChunk
 {
@@ -1329,6 +1343,13 @@ public:
 		size_t c = 0;
 		for(size_t i=chunk->i_begin; i<chunk->i_end; ++i)
 		{
+			// SESSION081 STAGE 4B: the hardware prefetcher cannot follow occl[indices[i]] - the stride is whatever the index
+			// list says - but WE can: indices is sequential, so the address wanted N iterations from now is already
+			// readable. Without this a thread stalls on its single outstanding miss (measured 7.05ns per node against a
+			// 3.32ns floor with the read removed entirely), so the loop ran at a memory-level parallelism of roughly 1.
+			if(i + gs_sat_gather_prefetch_dist < chunk->i_end)
+				_mm_prefetch((const char*)&occl[indices[i + gs_sat_gather_prefetch_dist]], _MM_HINT_T0);
+
 			if(is_coarse[i] != 0.f) // Coarse nodes are a second, redundant description of the same surfaces - see the call site.
 				continue;
 

@@ -203,11 +203,81 @@ static const float gs_sat_tile_half_diag = 0.70710678f;
 static const float gs_sat_min_occluder_amp = 0.002f;
 
 
-// SESSION079: floor on how thin a strip gsBuildSaturationGridParallel() will cut. Every strip walks the WHOLE occluder
-// array - that is the price of not reordering anything - so thinner strips buy less tile work each while paying the same
-// walk. 8 rows keeps a strip's two accumulators (8*res*4 bytes each) comfortably inside L1 at any res this stage
-// produces, which is the property the split exists for.
+// SESSION079: floor on how thin a strip the row-parallel FILTER passes (closing, erosion) will cut. Each of those reads
+// a window around every row it writes, so a strip's halo is redundant work shared with its neighbours, and thinner
+// strips mean proportionally more of it. 8 rows also keeps a strip's accumulators (8*res*4 bytes) inside L1 at any res
+// this stage produces.
+//
+// SESSION081: the deposit no longer uses this - see gs_sat_deposit_strip_rows. It shared the constant while both passes
+// had the same "every strip pays a fixed per-strip cost" shape; the deposit does not any more, and the filter passes
+// were never measured at any other value, so they keep the 8 they were calibrated with.
 static const int gs_sat_min_strip_rows = 8;
+
+
+// SESSION081: absolute floor on how thin a strip the phase-2 DEPOSIT will cut - split from gs_sat_min_strip_rows above.
+// This is a hard limit on strip THICKNESS; the strip COUNT is derived from the thread count, not from this - see
+// gsSatDepositStripCount().
+//
+// The deposit's original reason for 8 was that "every strip walks the WHOLE occluder array - that is the price of not
+// reordering anything - so thinner strips buy less tile work each while paying the same walk". That walk is gone: each
+// strip now gets a list of exactly the records reaching its rows (see GsSatBinTask), so a thinner strip pays strictly
+// less work, and the argument for a floor of 8 went with it. The L1 half of the argument points the other way - 4 rows
+// is half the working set of 8 - so it was never what set the number.
+//
+// What thinning DOES cost is list duplication: a record straddling a strip boundary is deposited by both strips, and
+// thinner strips mean more boundaries. At 8 rows / 12 strips the measured writers/num_recs was 1.110 - the average
+// record already reaches 1.11 strips. That ratio is the thing to watch when moving this; it is printed as
+// writers/num_recs in [gsr-sat-build-diag] and is a direct per-record multiplier on phase 2's real work.
+//
+// SWEPT, not assumed (owner's reference scene, R=0.1 sub=0.3, ~9 builds each, teleporting between viewpoints):
+//
+//   rows  strips  dep_ms+bin_ms (mean/median)  dep_par   writers/rec   tile_iters/rec
+//     8     12          37.8                     6.40       1.110          4.31
+//     4     25          34.3 / 32.4             10.64       1.243          4.34
+//     2     50          32.5 / 32.8             12.28       1.468          4.08
+//
+// 25 strips wins. 50 buys no more time - mean -1.8ms, median +0.4ms, against a +-5.1ms standard error on the
+// difference, i.e. nothing - while writers/rec climbs to 1.468, so nearly half of all records get deposited twice. The
+// duplication cost grows linearly with the number of boundaries while the parallelism gain has flattened (10.64 ->
+// 12.28 of 17), and the knee sits between these two rows.
+//
+// This value is only the FLOOR on thickness, not the operating point: 2 rows is where duplication starts to run away,
+// so nothing thinner is ever cut. What actually sets the strip count is the thread count - see gsSatDepositStripCount().
+//
+// Read tile_iters/rec, not dep_busy, when judging a change here: dep_busy is each strip task's WALL time, so with more
+// strips than threads it inflates with contention even when the work is identical - it rose 48% between the first two
+// rows while the actual per-record tile work did not move at all. That mistake was made once already; the counters
+// above are the honest ones.
+static const int gs_sat_deposit_min_strip_rows = 2;
+
+
+// SESSION081: how many strips phase 2 cuts, derived from the thread count rather than fixed.
+//
+// The sweep above found 25 strips optimal - but that was measured on the owner's 17-thread desktop, and a number tuned
+// there is the wrong shape of answer for this project. The web client is the product, and its pool is not the desktop's:
+// SDLClient.cpp clamps main_task_manager to 8 threads under EMSCRIPTEN (against 512 native), and the worker threads are
+// preallocated by -sPTHREAD_POOL_SIZE=30, so a phone typically runs this stage with 4-8. Fixing the strip count at 25
+// there would pay the full duplication cost - every strip boundary is a record deposited twice - to feed threads that
+// do not exist.
+//
+// So the count targets ~1.5 strips per thread. The 0.5 is deliberate oversubscription: strips carry unequal work (the
+// deposit is heaviest across the middle rows of the octahedral grid, lightest at the poles), and a spare half-strip per
+// thread lets runTaskGroup()'s pool steal the tail instead of idling behind the heaviest one. Above that the extra
+// parallelism flattens while duplication keeps climbing, which is exactly what the 50-strip row measured.
+//
+// It reproduces the measured optimum where it was measured - 17 threads -> 25 strips - and degrades correctly
+// elsewhere: 8 threads -> 12, a phone's 4 -> 6, single-core -> 1 (which takes the no-binning path in GsSatStripTask).
+//
+// Two things still bound it: the grid cannot give strips thinner than the floor above, and the count cannot exceed 255
+// because GsSatBinTask packs a record's first and last strip into one uint16, a byte each. 255 is unreachable from a
+// realistic thread count, but it is enforced rather than assumed - silent list corruption is not an acceptable failure
+// mode on hardware we do not own.
+static inline int gsSatDepositStripCount(int res, int concurrency)
+{
+	const int strips_for_threads = myMax(1, (concurrency * 3) / 2);
+	const int strips_for_res     = myMax(1, res / gs_sat_deposit_min_strip_rows);
+	return myClamp(myMin(strips_for_res, strips_for_threads), 1, 255);
+}
 
 
 // SESSION079: memory ceiling on the parallel build's record scratch. The block size is derived from this rather than
@@ -1022,6 +1092,7 @@ class GsSatRecordTask : public glare::Task
 public:
 	virtual void run(size_t /*thread_index*/)
 	{
+		start_ms = clock->elapsed() * 1.0e3; // SESSION081 SCHEDULING PROBE, TEMPORARY DIAGNOSTIC - see the field.
 		Timer task_timer; // SESSION081 PLAN, REC-BALANCE PROBE, TEMPORARY DIAGNOSTIC - see task_ms. Nodes are FRONT-TO-BACK and the cheap/expensive split correlates with distance, so an equal-COUNT chunking may not be an equal-WORK chunking; this measures whether that is actually true before anything is rebalanced.
 		const float amp_reject_k = 3.14159265f * (float)res * (float)res / 18.f;
 		size_t w = 0;
@@ -1067,16 +1138,136 @@ public:
 		count = w;
 		gate1_survivors = g1; // SESSION081 PLAN, PRE-REJECT PROBE, TEMPORARY DIAGNOSTIC.
 		task_ms = task_timer.elapsed() * 1.0e3; // SESSION081 PLAN, REC-BALANCE PROBE, TEMPORARY DIAGNOSTIC.
+		end_ms = clock->elapsed() * 1.0e3;      // SESSION081 SCHEDULING PROBE - see start_ms.
 	}
 
 	const float *px, *py, *pz, *radius, *alpha;
 	size_t i_begin, i_end, count;
 	size_t gate1_survivors; // SESSION081 PLAN, PRE-REJECT PROBE, TEMPORARY DIAGNOSTIC - see run(). gate1_survivors - count is how many paid for sqrt+oct+tile-angle only to be rejected by the exact amp test - the ceiling on a tighter second-tier reject, measured BEFORE writing one.
+	// SESSION081 SCHEDULING PROBE, TEMPORARY DIAGNOSTIC. The rec-balance probe above measures how long a chunk RUNS; it
+	// cannot say when the chunk ran, and that turned out to be the question. Measured 2026-09-01 over 9 builds: the sum
+	// of chunk run-times is near-constant (269-333ms, 1.23x spread) while rec_ms swings 31-116ms (3.74x), and in the
+	// slowest build the group took four times its own slowest chunk. That rules out load imbalance, but it does NOT
+	// distinguish the two remaining stories - chunks QUEUED behind other pool work and starting late, versus chunks
+	// starting on time and being preempted mid-run (which inflates task_ms itself, since it is wall time).
+	//
+	// These two timestamps separate them. Both are read from ONE clock shared by every chunk in the group (see
+	// GsSatRecordTask::clock) rather than each chunk timing itself - separate zero points would make the starts
+	// incomparable, which is the whole measurement. If start_ms is spread across most of rec_ms, the chunks were
+	// queued; if every chunk starts near zero and rec_ms is still long, they were preempted while running.
+	double start_ms, end_ms; // Chunk start/end, ms after the group's clock was reset - see run().
+	const Timer* clock;      // Shared group clock, owned by the caller. Timer::elapsed() is const, so concurrent reads are safe.
 	double task_ms; // SESSION081 PLAN, REC-BALANCE PROBE, TEMPORARY DIAGNOSTIC - this chunk's own wall time. Chunks split the input range by equal COUNT; if the cheap/expensive split correlates with distance (front-to-back order), the near chunk can do far more real work than the far one while both wait on the same runTaskGroup() - this is what would explain rec_ms exceeding the DRAM-bandwidth-bound + arithmetic estimate.
 	Vec4f anchor_pos_ws;
 	int res;
 	float region_radius;
 	GsSatOccluderRec* out;
+};
+
+
+// SESSION081: one chunk's share of the phase-1 compaction.
+//
+// Phase 1's chunks write into slices sized to their INPUT range, so the surviving records sit in num_chunks dense runs
+// separated by gaps. Closing those gaps used to be a serial memmove loop on the calling thread, and the scheduling
+// probe caught what that cost: 12.8-25.1ms per build, mean 18.2 - THIRTY PERCENT of rec_ms, with the other sixteen
+// threads idle through all of it. It had never been timed apart from rec_ms, so every rec_ms figure this session
+// quoted had it folded in.
+//
+// Splitting it is safe, and the reason is worth writing down because it is not obvious:
+//
+//   - A chunk's records only ever move DOWN. out[c] = sum of counts below c, and every count[j] is at most its own
+//     slice's length, so out[c] <= slice_begin[c] for every c.
+//   - Chunk c therefore writes [out[c], out[c+1]), and any later chunk c' reads from slice_begin[c'] >= out[c'] >=
+//     out[c+1]. So one chunk's destination lies strictly BELOW every other chunk's source, in both directions.
+//
+// No task can read a region another task is writing, so no ordering between them is needed and the result is
+// bit-identical to the serial loop. Overlap of a chunk's own source and destination is real, and is exactly what
+// memmove is for.
+//
+// Expect bandwidth, not thread count, to set the ceiling here: this is ~57MB of pure copy on the reference scene, and
+// a handful of threads already saturate a desktop's memcpy bandwidth. The win is real but it will not be 12x.
+class GsSatCompactTask : public glare::Task
+{
+public:
+	virtual void run(size_t /*thread_index*/)
+	{
+		std::memmove(dst, src, count * sizeof(GsSatOccluderRec));
+	}
+
+	GsSatOccluderRec* dst;
+	const GsSatOccluderRec* src;
+	size_t count;
+};
+
+
+// SESSION081 PHASE 1c: which strips each record reaches, and the per-strip index lists phase 2 walks instead of
+// re-scanning the whole record array once per strip.
+//
+// The measurement that motivated this, from the 2026-09-01 sub sweep (three grid resolutions, which is what finally
+// broke the collinearity between scan count and tile count and let the two be separated):
+//
+//   sub    strips  scan_iters  ->  scan     tile_iters -> tile      sum     measured dep_busy
+//   0.30     12      27.0M        173ms       9.70M      167ms      340.6      340
+//   0.25     10      17.9M        115ms       7.22M      124ms      239.5      241
+//   0.20      8      10.0M         64ms       4.68M       81ms      145.1      144
+//
+// The strip scan is HALF of phase 2's work, at 6.4ns per iteration. Note what that number means: the scan is bound by
+// its iteration count, not by the bytes it touches. That is the post-mortem on this session's rejected 8-byte
+// strip-key experiment, which cut the scan's traffic from 57MB to 19MB and bought nothing measurable - it was the
+// right target reached by the wrong mechanism.
+//
+// Cutting the count instead: 12 * num_recs iterations become one binning pass over num_recs plus each strip walking
+// only its own ~9% of the records.
+//
+// Why this does NOT repeat the plan's stage 5 (slabs), which died because reordering destroyed the front-to-back
+// order the deposit's saturation early-out depends on: nothing is reordered here. A strip's list is built in ascending
+// record order, so within a strip the occluders arrive in exactly the sequence they did before, and the barrier is
+// still each tile's first crossing. Bit-identical.
+//
+// The strip set is EXACT, not conservative. gsSatDepositRec() restricts a record to rows [max(v0_grid, v_lo),
+// min(v1_grid, v_hi-1)] and returns when that is empty, so a record deposits into strip t precisely when
+// [v0_grid, v1_grid] meets t's rows - i.e. for t in [strip_of_row[v0_grid], strip_of_row[v1_grid]], nothing wider and
+// nothing narrower. v0_grid/v1_grid are computed here with the same two expressions the deposit uses, so the two agree
+// by construction rather than by a second derivation that could drift from it.
+struct GsSatBinTask : public glare::Task
+{
+	// Pass A counts, pass B (after the caller's prefix sum) scatters. The strip range is computed in A and kept in
+	// rec_range so B does not recompute it - two bytes per record, against recomputing a clamp and two ceils.
+	virtual void run(size_t /*thread_index*/)
+	{
+		if(counting)
+		{
+			for(int t=0; t<num_strips; ++t) counts[t] = 0;
+			for(size_t i=i_begin; i<i_end; ++i)
+			{
+				const GsSatOccluderRec& rec = recs[i];
+				const int v0 = myClamp(gsSatCeilToInt(rec.cv - rec.span - 0.5f), 0, res - 1); // Same two expressions as gsSatDepositRec().
+				const int v1 = myClamp((int)         (rec.cv + rec.span - 0.5f), 0, res - 1);
+				const int s0 = strip_of_row[v0], s1 = strip_of_row[v1];
+				rec_range[i] = (uint16)(s0 | (s1 << 8));
+				for(int t=s0; t<=s1; ++t) ++counts[t];
+			}
+		}
+		else
+		{
+			for(size_t i=i_begin; i<i_end; ++i)
+			{
+				const uint16 r = rec_range[i];
+				const int s0 = r & 0xFF, s1 = r >> 8;
+				for(int t=s0; t<=s1; ++t) lists[offsets[t]++] = (uint32)i;
+			}
+		}
+	}
+
+	const GsSatOccluderRec* recs;
+	const int* strip_of_row;
+	uint16* rec_range;
+	uint32* counts;  // Pass A output: this chunk's per-strip count. num_strips entries.
+	uint32* offsets; // Pass B input/cursor: where this chunk's entries for each strip start. num_strips entries.
+	uint32* lists;
+	size_t i_begin, i_end;
+	int res, num_strips;
+	bool counting;
 };
 
 
@@ -1091,17 +1282,39 @@ class GsSatStripTask : public glare::Task
 public:
 	virtual void run(size_t /*thread_index*/)
 	{
-		const float lo = (float)v_lo, hi = (float)v_hi;
-		for(size_t i=0; i<num_recs; ++i)
+		start_ms = clock->elapsed() * 1.0e3; // SESSION081 SCHEDULING PROBE - see GsSatRecordTask's start_ms for what this answers.
+		if(list)
 		{
-			const GsSatOccluderRec& rec = recs[i];
-			if(rec.cv + rec.span < lo || rec.cv - rec.span >= hi)
-				continue; // Footprint cannot reach this strip. Exact, not a bound - span is the real one.
-			gsSatDepositRec(rec, res, remaining_threshold, sat_depth, accum, NULL, false, v_lo, v_hi, &stats);
+			// SESSION081 PHASE 1c: no scan and no reject - every entry here is a record that reaches these rows, in
+			// front-to-back order. See GsSatBinTask.
+			for(size_t j=0; j<list_len; ++j)
+				gsSatDepositRec(recs[list[j]], res, remaining_threshold, sat_depth, accum, NULL, false, v_lo, v_hi, &stats);
 		}
+		else
+		{
+			// Single strip: the list would hold every record, so the binning is pure overhead and this walks the array.
+			const float lo = (float)v_lo, hi = (float)v_hi;
+			for(size_t i=0; i<num_recs; ++i)
+			{
+				const GsSatOccluderRec& rec = recs[i];
+				if(rec.cv + rec.span < lo || rec.cv - rec.span >= hi)
+					continue; // Footprint cannot reach this strip. Exact, not a bound - span is the real one.
+				gsSatDepositRec(rec, res, remaining_threshold, sat_depth, accum, NULL, false, v_lo, v_hi, &stats);
+			}
+		}
+		end_ms = clock->elapsed() * 1.0e3;
 	}
 
+	// SESSION081 SCHEDULING PROBE, TEMPORARY DIAGNOSTIC. Phase 2 is measured alongside phase 1 because the suspected
+	// cause - this build sharing a task pool with the traversal that spawned it - would hit both, and telling "the whole
+	// stage is starved" apart from "phase 1 specifically is" costs nothing extra here but a whole measurement round if
+	// asked later. Same shared clock, same reasoning: see GsSatRecordTask's copy of these fields.
+	double start_ms, end_ms;
+	const Timer* clock;
+
 	const GsSatOccluderRec* recs;
+	const uint32* list; // SESSION081 PHASE 1c: this strip's records, ascending. NULL for the single-strip case - see run().
+	size_t list_len;
 	size_t num_recs;
 	int res;
 	float remaining_threshold;
@@ -1119,7 +1332,8 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 	double* out_close_ms, double* out_erode_ms, double* out_rec_ms, double* out_dep_ms,
 	size_t* out_num_recs, int* out_num_strips, size_t* out_num_blocks,
 	size_t* out_gate1_survivors, // SESSION081 PLAN, PRE-REJECT PROBE, TEMPORARY DIAGNOSTIC.
-	double* out_rec_task_ms_min, double* out_rec_task_ms_max, double* out_rec_task_ms_mean) // SESSION081 PLAN, REC-BALANCE PROBE, TEMPORARY DIAGNOSTIC.
+	double* out_rec_task_ms_min, double* out_rec_task_ms_max, double* out_rec_task_ms_mean, // SESSION081 PLAN, REC-BALANCE PROBE, TEMPORARY DIAGNOSTIC.
+	double* out_sched_stats) // SESSION081 SCHEDULING PROBE, TEMPORARY DIAGNOSTIC - 9 doubles, layout documented in the header.
 {
 	const size_t num_tiles = (size_t)res * (size_t)res;
 	sat_depth_out.resizeNoCopy(num_tiles);
@@ -1129,9 +1343,18 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 	const int concurrency = myMax(1, (int)task_manager.getConcurrency());
 	const float remaining_threshold = myClamp(1.f - saturation_threshold, 0.f, 1.f);
 
-	const int num_strips = myClamp(res / gs_sat_min_strip_rows, 1, concurrency);
+	// SESSION081: was clamp(res/8, 1, concurrency) - one strip per thread, and a thickness the per-strip scan (now gone,
+	// see GsSatBinTask) used to justify. Both halves are now derived from the thread count instead - see
+	// gsSatDepositStripCount() for the sweep behind it and for why a number tuned on this desktop is the wrong shape of
+	// answer for a client that also runs on phones.
+	const int num_strips = gsSatDepositStripCount(res, concurrency);
 	if(out_num_strips) *out_num_strips = num_strips;
 	double rec_ms_total = 0.0, dep_ms_total = 0.0;
+
+	// SESSION081 SCHEDULING PROBE, TEMPORARY DIAGNOSTIC - see GsSatRecordTask::start_ms for the question these answer.
+	double rec_start_max_total = 0.0, rec_start_sum_total = 0.0, rec_busy_sum_total = 0.0, rec_group_wall_total = 0.0;
+	double dep_start_max_total = 0.0, dep_busy_sum_total = 0.0, move_ms_total = 0.0, bin_ms_total = 0.0;
+	size_t rec_chunk_n_total = 0, dep_strip_n_total = 0;
 	size_t num_recs_total = 0;
 	size_t num_blocks_total = 0; // SESSION081 PLAN, ETAP 0 follow-up DIAGNOSTIC: how many blocks (and therefore task-group launch pairs) this build actually ran - see gs_sat_rec_scratch_bytes's ceiling-measurement comment.
 	size_t gate1_survivors_total = 0; // SESSION081 PLAN, PRE-REJECT PROBE, TEMPORARY DIAGNOSTIC - see GsSatRecordTask::gate1_survivors.
@@ -1148,6 +1371,20 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 	js::Vector<GsSatOccluderRec, 16> local_recs;
 	js::Vector<GsSatOccluderRec, 16>& recs = scratch_recs ? *scratch_recs : local_recs;
 	recs.resizeNoCopy(block_n);
+
+	// SESSION081 PHASE 1c: scratch for the per-strip record lists - see GsSatBinTask. Declared outside the block loop so
+	// a multi-block build reuses the allocations. strip_of_row is the strip that owns each grid row, which is what makes
+	// a record's strip range two array lookups instead of a search.
+	js::Vector<int, 16>    strip_of_row(res);
+	js::Vector<uint16, 16> rec_range;
+	js::Vector<uint32, 16> bin_counts, strip_lists, strip_list_begin;
+	for(int t=0; t<num_strips; ++t)
+	{
+		const int v_lo = (int)(((int64)res * t)       / num_strips);
+		const int v_hi = (int)(((int64)res * (t + 1)) / num_strips);
+		for(int v=v_lo; v<v_hi; ++v)
+			strip_of_row[v] = t;
+	}
 
 	js::Vector<float, 16> accum(num_tiles, 1.f);
 
@@ -1169,11 +1406,14 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 		// gather next door already uses, for the same reason.
 		const int num_chunks = (int)myMin((size_t)concurrency * 4, block_len);
 		js::Vector<Reference<GsSatRecordTask>, 16> rec_tasks(num_chunks);
+		Timer rec_group_clock; // SESSION081 SCHEDULING PROBE: ONE clock every chunk reads - see GsSatRecordTask::start_ms. Reset immediately before the launch below so its zero point is the launch, not the task allocation loop.
 		{
 			glare::TaskGroupRef group = new glare::TaskGroup();
 			for(int c=0; c<num_chunks; ++c)
 			{
 				Reference<GsSatRecordTask> t = new GsSatRecordTask();
+				t->clock = &rec_group_clock; // SESSION081 SCHEDULING PROBE.
+				t->start_ms = t->end_ms = 0.0;
 				t->px = px; t->py = py; t->pz = pz; t->radius = radius; t->alpha = alpha;
 				t->i_begin = block_begin + (block_len * (size_t)c)       / (size_t)num_chunks;
 				t->i_end   = block_begin + (block_len * (size_t)(c + 1)) / (size_t)num_chunks;
@@ -1185,32 +1425,122 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 				rec_tasks[c] = t;
 				group->tasks.push_back(t);
 			}
+			rec_group_clock.reset(); // SESSION081 SCHEDULING PROBE: zero the shared clock at the launch itself.
 			task_manager.runTaskGroup(group);
+			rec_group_wall_total += rec_group_clock.elapsed() * 1.0e3;
 		}
 
-		// Close the gaps the chunks left, in ascending chunk order so the records stay front-to-back. Each chunk's block
-		// only ever moves to a LOWER offset, so the copies never overlap forwards.
+		// Close the gaps the chunks left. Destinations are assigned in ascending chunk order, so the records stay
+		// front-to-back exactly as the serial version left them; the moves themselves are mutually independent and run
+		// in parallel - see GsSatCompactTask for the proof and for what the serial loop was costing.
+		glare::TaskGroupRef move_group = new glare::TaskGroup();
 		size_t num_recs = 0;
 		for(int c=0; c<num_chunks; ++c)
 		{
 			const GsSatRecordTask& t = *rec_tasks[c];
 			const size_t slice_begin = t.i_begin - block_begin;
 			if(t.count > 0 && num_recs != slice_begin)
-				std::memmove(recs.data() + num_recs, recs.data() + slice_begin, t.count * sizeof(GsSatOccluderRec));
+			{
+				Reference<GsSatCompactTask> mt = new GsSatCompactTask();
+				mt->dst = recs.data() + num_recs;
+				mt->src = recs.data() + slice_begin;
+				mt->count = t.count;
+				move_group->tasks.push_back(mt);
+			}
 			num_recs += t.count;
+			rec_start_max_total = myMax(rec_start_max_total, t.start_ms); // SESSION081 SCHEDULING PROBE.
+			rec_start_sum_total += t.start_ms;
+			rec_busy_sum_total  += t.end_ms - t.start_ms;
+			++rec_chunk_n_total;
 			gate1_survivors_total += t.gate1_survivors; // SESSION081 PLAN, PRE-REJECT PROBE, TEMPORARY DIAGNOSTIC.
 			rec_task_ms_min_total = myMin(rec_task_ms_min_total, t.task_ms); // SESSION081 PLAN, REC-BALANCE PROBE, TEMPORARY DIAGNOSTIC.
 			rec_task_ms_max_total = myMax(rec_task_ms_max_total, t.task_ms);
 			rec_task_ms_sum_total += t.task_ms;
 			++rec_task_n_total;
 		}
+		Timer move_timer; // SESSION081: times the compaction alone, as the probe's serial version did, so the before/after is like for like.
+		if(move_group->tasks.size() > 0)
+			task_manager.runTaskGroup(move_group);
+		move_ms_total += move_timer.elapsed() * 1.0e3;
 		rec_ms_total += rec_timer.elapsed() * 1.0e3;
 		num_recs_total += num_recs;
 		if(num_recs == 0)
 			continue;
 
+		// ---- Phase 1c: bin the records by strip, so phase 2 walks lists instead of re-scanning. See GsSatBinTask. ----
+		Timer bin_timer;
+		const bool want_bins = num_strips > 1;
+		if(want_bins)
+		{
+			rec_range.resizeNoCopy(num_recs);
+			const int num_bin_chunks = (int)myMin((size_t)concurrency * 4, num_recs);
+			bin_counts.resizeNoCopy((size_t)num_bin_chunks * (size_t)num_strips);
+
+			// A Task carries its own queue links and a pointer to the group it belongs to, so the two passes get
+			// SEPARATE task objects rather than the same ones pushed into a second group. 2*num_bin_chunks small
+			// allocations against a pass over millions of records is not worth reasoning about task reuse for.
+			glare::TaskGroupRef count_group = new glare::TaskGroup();
+			for(int c=0; c<num_bin_chunks; ++c)
+			{
+				Reference<GsSatBinTask> t = new GsSatBinTask();
+				t->recs = recs.data();
+				t->strip_of_row = strip_of_row.data();
+				t->rec_range = rec_range.data();
+				t->counts = bin_counts.data() + (size_t)c * (size_t)num_strips;
+				t->offsets = t->counts; // Rewritten into absolute cursors by the prefix sum below, then consumed by pass B.
+				t->lists = NULL;
+				t->i_begin = (num_recs * (size_t)c)       / (size_t)num_bin_chunks;
+				t->i_end   = (num_recs * (size_t)(c + 1)) / (size_t)num_bin_chunks;
+				t->res = res;
+				t->num_strips = num_strips;
+				t->counting = true;
+				count_group->tasks.push_back(t);
+			}
+			task_manager.runTaskGroup(count_group);
+
+			// Prefix sum, strip-major then chunk-major: strip t's entries are contiguous, and within them the chunks
+			// appear in ascending order - which is what keeps each list front-to-back. Serial, but it is only
+			// num_bin_chunks*num_strips entries (~816).
+			strip_list_begin.resizeNoCopy((size_t)num_strips + 1);
+			size_t running = 0;
+			for(int t=0; t<num_strips; ++t)
+			{
+				strip_list_begin[t] = (uint32)running;
+				for(int c=0; c<num_bin_chunks; ++c)
+				{
+					const size_t idx = (size_t)c * (size_t)num_strips + (size_t)t;
+					const uint32 cnt = bin_counts[idx];
+					bin_counts[idx] = (uint32)running; // Becomes this chunk's write cursor for strip t.
+					running += cnt;
+				}
+			}
+			strip_list_begin[num_strips] = (uint32)running;
+
+			strip_lists.resizeNoCopy(running);
+			glare::TaskGroupRef scatter_group = new glare::TaskGroup();
+			for(int c=0; c<num_bin_chunks; ++c)
+			{
+				Reference<GsSatBinTask> t = new GsSatBinTask();
+				t->recs = recs.data();
+				t->strip_of_row = strip_of_row.data();
+				t->rec_range = rec_range.data();
+				t->counts = NULL;
+				t->offsets = bin_counts.data() + (size_t)c * (size_t)num_strips; // Now this chunk's write cursors.
+				t->lists = strip_lists.data();
+				t->i_begin = (num_recs * (size_t)c)       / (size_t)num_bin_chunks;
+				t->i_end   = (num_recs * (size_t)(c + 1)) / (size_t)num_bin_chunks;
+				t->res = res;
+				t->num_strips = num_strips;
+				t->counting = false;
+				scatter_group->tasks.push_back(t);
+			}
+			task_manager.runTaskGroup(scatter_group);
+		}
+		bin_ms_total += bin_timer.elapsed() * 1.0e3;
+
 		// ---- Phase 2: deposit, in parallel over strips. ----
 		Timer dep_timer; // SESSION081 PLAN ETAP 0.
+		Timer dep_group_clock; // SESSION081 SCHEDULING PROBE: phase 2's shared clock - see GsSatStripTask::clock.
 		glare::TaskGroupRef group = new glare::TaskGroup();
 		js::Vector<Reference<GsSatStripTask>, 16> strip_tasks(num_strips);
 		for(int t=0; t<num_strips; ++t)
@@ -1219,7 +1549,11 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 			const int v_hi = (int)(((int64)res * (t + 1)) / num_strips);
 
 			Reference<GsSatStripTask> task = new GsSatStripTask();
+			task->clock = &dep_group_clock; // SESSION081 SCHEDULING PROBE.
+			task->start_ms = task->end_ms = 0.0;
 			task->recs = recs.data();
+			task->list     = want_bins ? (strip_lists.data() + strip_list_begin[t]) : NULL; // SESSION081 PHASE 1c.
+			task->list_len = want_bins ? (size_t)(strip_list_begin[t + 1] - strip_list_begin[t]) : 0;
 			task->num_recs = num_recs;
 			task->res = res;
 			task->remaining_threshold = remaining_threshold;
@@ -1235,11 +1569,15 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 		// the pool has not picked up. That is what makes this safe to call from inside the traversal task, which is itself
 		// running on this same TaskManager - there is no configuration in which it waits on a thread that never arrives.
 		// It is also why a build degrades gracefully to serial where there are no worker threads, with no separate path.
+		dep_group_clock.reset(); // SESSION081 SCHEDULING PROBE: zero at the launch itself, as phase 1 does.
 		task_manager.runTaskGroup(group);
 		dep_ms_total += dep_timer.elapsed() * 1.0e3;
 
 		for(int t=0; t<num_strips; ++t)
 		{
+			dep_start_max_total = myMax(dep_start_max_total, strip_tasks[t]->start_ms); // SESSION081 SCHEDULING PROBE.
+			dep_busy_sum_total += strip_tasks[t]->end_ms - strip_tasks[t]->start_ms;
+			++dep_strip_n_total;
 			total.writers     += strip_tasks[t]->stats.writers;
 			total.tile_writes += strip_tasks[t]->stats.tile_writes;
 			total.tile_iters  += strip_tasks[t]->stats.tile_iters;
@@ -1251,6 +1589,18 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 
 	if(out_rec_ms) *out_rec_ms = rec_ms_total;
 	if(out_dep_ms) *out_dep_ms = dep_ms_total;
+	if(out_sched_stats) // SESSION081 SCHEDULING PROBE - layout documented in the header.
+	{
+		out_sched_stats[0] = rec_start_max_total;
+		out_sched_stats[1] = rec_chunk_n_total > 0 ? (rec_start_sum_total / (double)rec_chunk_n_total) : 0.0;
+		out_sched_stats[2] = rec_busy_sum_total;
+		out_sched_stats[3] = rec_group_wall_total;
+		out_sched_stats[4] = move_ms_total;
+		out_sched_stats[5] = dep_start_max_total;
+		out_sched_stats[6] = dep_busy_sum_total;
+		out_sched_stats[7] = (double)concurrency;
+		out_sched_stats[8] = bin_ms_total; // SESSION081 PHASE 1c - what the binning ADDS, against the scan it removes.
+	}
 	if(out_num_recs) *out_num_recs = num_recs_total;
 	if(out_num_blocks) *out_num_blocks = num_blocks_total;
 	if(out_gate1_survivors) *out_gate1_survivors = gate1_survivors_total; // SESSION081 PLAN, PRE-REJECT PROBE, TEMPORARY DIAGNOSTIC.

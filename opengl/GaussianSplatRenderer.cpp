@@ -470,6 +470,7 @@ public:
 	size_t num_blocks;    // SESSION081 PLAN, ETAP 0 follow-up DIAGNOSTIC: how many gs_sat_rec_scratch_bytes-bounded blocks this build ran - see that constant's comment on the sync-barrier cost of blocking.
 	size_t gate1_survivors; // SESSION081 PLAN, PRE-REJECT PROBE, TEMPORARY DIAGNOSTIC - see gsBuildSaturationGridParallel()'s out param of the same name.
 	double rec_task_ms_min, rec_task_ms_max, rec_task_ms_mean; // SESSION081 PLAN, REC-BALANCE PROBE, TEMPORARY DIAGNOSTIC - see gsBuildSaturationGridParallel()'s out params of the same name.
+	double sched_stats[9]; // SESSION081 SCHEDULING PROBE, TEMPORARY DIAGNOSTIC - layout in gsBuildSaturationGridParallel()'s out_sched_stats.
 	size_t diag_writers, diag_tile_writes;
 	size_t diag_tile_stats[3]; // [0] total per-tile iterations, [1] rejected off the Gaussian's tail, [2] skipped as already saturated - see gsSatDepositRec().
 	size_t erode_stats[4];     // [0] er_ceil, [1] er_win, [2] er_radmax, [3] cl (closed) - see gsSatApplyRegionErosion()/gsSatApplyClosing().
@@ -495,6 +496,7 @@ public:
 		diag_writers(0), diag_tile_writes(0),
 		bypass_used(false), bypass_distance_used(0.f)
 	{
+		for(int i=0; i<9; ++i) sched_stats[i] = 0.0; // SESSION081 SCHEDULING PROBE.
 		for(int i=0; i<3; ++i) diag_tile_stats[i] = 0;
 		for(int i=0; i<4; ++i) erode_stats[i] = 0;
 	}
@@ -1631,7 +1633,8 @@ public:
 					diag_log ? &barrier->num_recs : NULL, diag_log ? &barrier->num_strips : NULL,
 					diag_log ? &barrier->num_blocks : NULL,
 					diag_log ? &barrier->gate1_survivors : NULL, // SESSION081 PLAN, PRE-REJECT PROBE, TEMPORARY.
-					diag_log ? &barrier->rec_task_ms_min : NULL, diag_log ? &barrier->rec_task_ms_max : NULL, diag_log ? &barrier->rec_task_ms_mean : NULL); // SESSION081 PLAN, REC-BALANCE PROBE, TEMPORARY.
+					diag_log ? &barrier->rec_task_ms_min : NULL, diag_log ? &barrier->rec_task_ms_max : NULL, diag_log ? &barrier->rec_task_ms_mean : NULL, // SESSION081 PLAN, REC-BALANCE PROBE, TEMPORARY.
+					diag_log ? barrier->sched_stats : NULL); // SESSION081 SCHEDULING PROBE, TEMPORARY.
 			}
 			else
 				gsBuildSaturationGrid(occl_px.data(), occl_py.data(), occl_pz.data(), occl_radius.data(), occl_alpha.data(), occl_px.size(),
@@ -7578,6 +7581,26 @@ void GaussianSplatRenderer::drainSaturationBuildResults()
 						" concurrency=" + toString(b.concurrency_used) +
 						" strip_reads=" + uInt64ToStringCommaSeparated((uint64)b.num_strips * (uint64)b.num_recs) +
 						" num_blocks=" + uInt64ToStringCommaSeparated(b.num_blocks)); // SESSION081 PLAN, ETAP 0 follow-up DIAGNOSTIC.
+
+					// SESSION081 SCHEDULING PROBE, TEMPORARY DIAGNOSTIC. rec_par/dep_par are busy-sum over group wall -
+					// the thread count each phase ACTUALLY got, against the concurrency it was promised. rec_start_max
+					// is the discriminator: near zero with a long wall means the chunks ran but were preempted; a large
+					// fraction of the wall means they sat queued behind other pool work. move_ms is the serial
+					// compaction that has been hiding inside rec_ms all session.
+					const double rec_wall = b.sched_stats[3], dep_wall = b.dep_ms;
+					conPrint("[gsr-sat-sched] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms " +
+						"conc=" + doubleToStringNDecimalPlaces(b.sched_stats[7], 0) +
+						" | rec wall=" + doubleToStringNDecimalPlaces(rec_wall, 2) +
+						" busy=" + doubleToStringNDecimalPlaces(b.sched_stats[2], 1) +
+						" par=" + doubleToStringNDecimalPlaces(rec_wall > 0.0 ? (b.sched_stats[2] / rec_wall) : 0.0, 2) +
+						" start_max=" + doubleToStringNDecimalPlaces(b.sched_stats[0], 2) +
+						" start_mean=" + doubleToStringNDecimalPlaces(b.sched_stats[1], 2) +
+						" | move_ms=" + doubleToStringNDecimalPlaces(b.sched_stats[4], 2) +
+						" bin_ms=" + doubleToStringNDecimalPlaces(b.sched_stats[8], 2) + // SESSION081 PHASE 1c.
+						" | dep wall=" + doubleToStringNDecimalPlaces(dep_wall, 2) +
+						" busy=" + doubleToStringNDecimalPlaces(b.sched_stats[6], 1) +
+						" par=" + doubleToStringNDecimalPlaces(dep_wall > 0.0 ? (b.sched_stats[6] / dep_wall) : 0.0, 2) +
+						" start_max=" + doubleToStringNDecimalPlaces(b.sched_stats[5], 2));
 				}
 
 				if(sat_diag_log)

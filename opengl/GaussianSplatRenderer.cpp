@@ -357,6 +357,16 @@ public:
 	// build it no longer does.
 	size_t num_occluders;
 	double gather_ms, grid_build_ms;
+	// SESSION081 PLAN ETAP 0 DIAGNOSTIC: grid_build_ms broken into its sub-phases - see gsBuildSaturationGridParallel()'s
+	// new out-params. Previously only the whole grid_build_ms was known, with no way to tell how much of it was the
+	// occluder-record pass, the strip deposit, closing, or erosion. misc_ms is not stored - the caller computes
+	// grid_build_ms - (rec_ms+dep_ms+close_ms+erode_ms) at print time as the "did we measure everything" check.
+	double rec_ms, dep_ms, close_ms, erode_ms;
+	size_t frontier_n; // SESSION081 PLAN ETAP 0 DIAGNOSTIC: size of the source frontier handed to gather (near+far segments), BEFORE the is_coarse filter gather itself applies - distinct from num_occluders (occl=), which is gather's OUTPUT.
+	size_t num_recs;   // Records that survived the amp reject and reached phase 2 - what every strip re-reads (see num_strips).
+	int num_strips;    // The strip count phase 2 actually ran with - num_strips*num_recs is the phase-2 re-read volume the plan's stage 5 targets.
+	int concurrency_used; // task_manager->getConcurrency() at build time - num_strips is clamp(res/8, 1, this), so this says whether num_strips was capped by resolution or by thread count.
+	size_t num_blocks;    // SESSION081 PLAN, ETAP 0 follow-up DIAGNOSTIC: how many gs_sat_rec_scratch_bytes-bounded blocks this build ran - see that constant's comment on the sync-barrier cost of blocking.
 	size_t diag_writers, diag_tile_writes;
 	size_t diag_tile_stats[3]; // [0] total per-tile iterations, [1] rejected off the Gaussian's tail, [2] skipped as already saturated - see gsSatDepositRec().
 	size_t erode_stats[4];     // [0] er_ceil, [1] er_win, [2] er_radmax, [3] cl (closed) - see gsSatApplyRegionErosion()/gsSatApplyClosing().
@@ -378,6 +388,7 @@ public:
 	:	sat_grid_res(0), anchor_pos_ws(0.f), built_time_real_s(0.0),
 		threshold_used(0.f), subdiv_used(0.f), region_radius_used(0.f), closing_tiles_used(0),
 		num_occluders(0), gather_ms(0.0), grid_build_ms(0.0),
+		frontier_n(0), rec_ms(0.0), dep_ms(0.0), close_ms(0.0), erode_ms(0.0), num_recs(0), num_strips(0), concurrency_used(0), num_blocks(0),
 		diag_writers(0), diag_tile_writes(0),
 		diag_aniso_n(0), diag_aniso_mean(0.0), diag_aniso_max(0.f), diag_aniso_gt5(0), diag_aniso_gt10(0),
 		bypass_used(false), bypass_distance_used(0.f)
@@ -1177,6 +1188,47 @@ public:
 };
 
 
+// SESSION081 PLAN ETAP 4, P4.1 - TEMPORARY DIAGNOSTIC SWITCH. 1 = build the deliberately-wrong, scatter-free
+// gather described in GsSatGatherTask::run(), to measure the ceiling on what removing the scattered
+// scales/rotations/alpha reads could buy. The picture is WRONG in this mode (see that comment) - it exists purely
+// to bound the prize before the real 8-byte packed occlusion record is designed. MUST be 0 for any build the owner
+// looks at for anything other than this one gather_ms measurement. Remove the macro and its branch once stage 4
+// concludes either way.
+// MEASURED 2026-08-31 (owner, clean 4+-teleport protocol, R=1): gather_ms 169.8ms (baseline, 3 scattered reads)
+// -> 43.8ms with them gone, a 74% cut, spread only +-4% across 7 captures. So the scattered reads were
+// essentially the WHOLE cost of gather, not merely most of it, and stage 4's prize is ~126ms per barrier build
+// (~47% of the whole build, which was gather 170 + grid 106). Ceiling established; switch back off.
+#define GS_SAT_GATHER_SCATTER_CEILING_TEST 0
+
+
+// SESSION081 PLAN ETAP 4, P4.2 - TEMPORARY DIAGNOSTIC. 1 = alongside the exact gsSatProjectedRadius(), also compute
+// the PACKED DISC MODEL's radius and histogram the ratio between them, so the quality cost of stage 4's storage
+// format is known from the real occluder population BEFORE the format is committed to. Read-only: the value the
+// grid is actually built from is untouched, so the picture is correct in this mode (unlike the ceiling test above)
+// - it only costs a little arithmetic per node. Remove once P4.2 concludes.
+//
+// The model under test: a 3DGS splat's exact equal-area occlusion radius (see gsSatProjectedRadius()) is
+//   r = sqrt( s0*s1*s2 * sqrt( sum_k (d.axis_k)^2 / s_k^2 ) )
+// which needs all three scales AND the full rotation - 28 bytes, 3 scattered reads. Approximating the splat as a
+// DISC (two equal large axes a, one small axis b along normal n) collapses that to
+//   r_disc = sqrt( a^2*b * sqrt( (1-c^2)/a^2 + c^2/b^2 ) ),  c = |d.n|
+// which needs only (n, a, b) = 8 bytes: oct16 normal (4B) + a (half) + b (half). Sanity checks, both exact:
+// face-on (c=1) gives a; edge-on (c=0) gives sqrt(a*b) - matching gsSatProjectedRadius()'s own two checks.
+// a = sqrt(s_mid*s_max) preserves the true face-on area (which goes as s_mid*s_max), b = s_min, n = s_min's axis.
+// The model is EXACT when s_mid == s_max and degrades as the splat becomes needle-like - hence midmax_bins.
+#define GS_SAT_GATHER_DISC_MODEL_PROBE 1
+
+// SESSION081 ETAP 4: build the grid from the disc model's radius (the approximation the 8-byte packed occlusion
+// record commits to) rather than the exact gsSatProjectedRadius().
+//
+// Accepted approximation: over-estimates the radius on 2.24% of (node, viewpoint) pairs, which can prune visible
+// geometry. Owner-validated 2026-08-31: small silhouette artefacts at R = 0, none at R > 0 (R > 0 covers it with
+// the ball guarantee's own conservatism - it masks the error, does not fix it, so this depends on R staying > 0).
+// If it ever bites: bake a per-splat conservative divisor at pack time, or fall back to the exact 12-byte format.
+// Full numbers, derivation and both fallbacks: session081 plan doc, ETAP 4.
+#define GS_SAT_GATHER_DISC_MODEL_VISUAL_TEST 1
+
+
 // SESSION079: one slice of the occluder gather - see GsSatGatherTask.
 struct GsSatGatherChunk
 {
@@ -1189,6 +1241,15 @@ struct GsSatGatherChunk
 	double aniso_sum;    // Diagnostic, accumulated per chunk so the threads never share a counter.
 	float aniso_max;
 	size_t aniso_gt5, aniso_gt10, aniso_n;
+
+	// SESSION081 PLAN ETAP 4, P4.2 TEMPORARY - the quality cost of the packed 8-byte disc model, measured against the
+	// exact gsSatProjectedRadius() on the real occluder population before anything is built on it. Per chunk, like
+	// aniso above, so threads never share a counter. Only filled when GS_SAT_GATHER_DISC_MODEL_PROBE is on.
+	size_t disc_bins[7];    // r_disc/r_exact: [0]<0.5 [1]0.5-0.8 [2]0.8-0.9 [3]0.9-1.1 [4]1.1-1.25 [5]1.25-2.0 [6]>2.0
+	size_t midmax_bins[4];  // s_mid/s_max: [0]<0.25 [1]0.25-0.5 [2]0.5-0.8 [3]>0.8 - the disc model is EXACT at s_mid==s_max, so this says how much of the population is even disc-shaped.
+	double disc_ratio_sum;
+	float disc_ratio_min, disc_ratio_max;
+	size_t disc_n;
 };
 
 
@@ -1214,6 +1275,11 @@ public:
 	{
 		size_t c = 0;
 		double a_sum = 0.0; float a_max = 0.f; size_t a_gt5 = 0, a_gt10 = 0, a_n = 0;
+#if GS_SAT_GATHER_DISC_MODEL_PROBE
+		size_t d_bins[7] = { 0, 0, 0, 0, 0, 0, 0 }; // SESSION081 PLAN ETAP 4, P4.2 TEMPORARY - see GsSatGatherChunk.
+		size_t d_midmax[4] = { 0, 0, 0, 0 };
+		double d_ratio_sum = 0.0; float d_ratio_min = std::numeric_limits<float>::infinity(), d_ratio_max = 0.f; size_t d_n = 0;
+#endif
 		for(size_t i=chunk->i_begin; i<chunk->i_end; ++i)
 		{
 			if(is_coarse[i] != 0.f) // Coarse nodes are a second, redundant description of the same surfaces - see the call site.
@@ -1221,6 +1287,25 @@ public:
 			const uint32 idx = indices[i];
 
 			out_px[c] = px[i]; out_py[c] = py[i]; out_pz[c] = pz[i];
+
+#if GS_SAT_GATHER_SCATTER_CEILING_TEST
+			// SESSION081 PLAN ETAP 4, P4.1 - DELIBERATELY WRONG, TEMPORARY. Establishes the CEILING on what stage 4 can
+			// buy BEFORE the real thing is built (the plan's "measure the ceiling first" rule). scales[idx] (12B),
+			// rotations[idx] (16B) and alphas[idx] (4B) are the ONLY scattered reads in this loop - a node's cloud
+			// index into arrays of ~30M entries (~960MB), i.e. 3 cache misses per node with no locality at all,
+			// ~2.5GB of DRAM line traffic per build on the owner's reference scene. Here they are replaced by one
+			// SEQUENTIAL read of the frontier's own radius array (gathered in traversal order by GsFrontierSoATask,
+			// right beside px/py/pz) plus a constant, leaving this loop with no scattered access whatsoever.
+			//
+			// THE PICTURE IS WRONG while this is enabled - cull_radius is a bounding radius, not an occlusion
+			// cross-section, and the alpha is fake, so the barrier prunes wrongly. That is intended: this measures
+			// COST, not quality. gather_ms against the baseline bounds the whole of stage 4's prize; the aniso
+			// diagnostic is skipped too, since it reads scales[idx] and would put a scattered read straight back.
+			out_radius[c] = radius_seq[i];
+			out_alpha[c] = 0.5f;
+			++c;
+			continue;
+#endif
 
 			const float ddx = px[i] - cam_pos_ws.x[0];
 			const float ddy = py[i] - cam_pos_ws.x[1];
@@ -1231,6 +1316,87 @@ public:
 
 			out_radius[c] = gs_sat_occluder_sigmas * gsSatProjectedRadius(scales[idx], rotations[idx], unit_dir);
 			out_alpha[c] = adjustSplatAlpha(alphas[idx], alpha_gain, alpha_gamma); // The DRAWN opacity, not the stored one - see GaussianSplatRenderer::getAlphaGain().
+
+#if GS_SAT_GATHER_DISC_MODEL_PROBE
+			// SESSION081 PLAN ETAP 4, P4.2 TEMPORARY - see the macro's comment for the model and its derivation.
+			// scales[idx]/rotations[idx] are already hot from the exact call above, so this adds arithmetic only.
+			{
+				const Vec3f& sc = scales[idx];
+				// Sort the three axes so we know which is which, keeping track of WHICH axis is the thin one - the
+				// disc's normal is that axis, not an arbitrary one.
+				int min_axis = 0;
+				if(sc[1] < sc[min_axis]) min_axis = 1;
+				if(sc[2] < sc[min_axis]) min_axis = 2;
+				const float s_min = myMax(sc[min_axis], 1.0e-8f); // Same degenerate-axis floor gsSatProjectedRadius() uses.
+				float s_a = 0.f, s_b = 0.f; // The two non-thin axes.
+				bool first = true;
+				for(int k=0; k<3; ++k)
+					if(k != min_axis)
+					{
+						if(first) { s_a = myMax(sc[k], 1.0e-8f); first = false; }
+						else        s_b = myMax(sc[k], 1.0e-8f);
+					}
+				const float s_max_ax = myMax(s_a, s_b), s_mid_ax = myMin(s_a, s_b);
+				const float a_disc = std::sqrt(s_mid_ax * s_max_ax); // Preserves the true face-on area (proportional to s_mid*s_max).
+
+				// The thin axis in world space = the min_axis'th column of the rotation matrix, built from the same
+				// quaternion convention gsSatProjectedRadius() uses (x, y, z, w).
+				const Vec4f& q = rotations[idx];
+				const float qx = q[0], qy = q[1], qz = q[2], qw = q[3];
+				const float qxx = qx*qx, qyy = qy*qy, qzz = qz*qz;
+				const float qxy = qx*qy, qxz = qx*qz, qyz = qy*qz, qwx = qw*qx, qwy = qw*qy, qwz = qw*qz;
+				float nx, ny, nz;
+				if(min_axis == 0)      { nx = 1.f - 2.f*(qyy + qzz); ny = 2.f*(qxy + qwz);       nz = 2.f*(qxz - qwy); }
+				else if(min_axis == 1) { nx = 2.f*(qxy - qwz);       ny = 1.f - 2.f*(qxx + qzz); nz = 2.f*(qyz + qwx); }
+				else                   { nx = 2.f*(qxz + qwy);       ny = 2.f*(qyz - qwx);       nz = 1.f - 2.f*(qxx + qyy); }
+
+				// NB: deliberately NOT called 'c' - that name is the output write cursor in the enclosing loop, and
+				// shadowing it made out_radius[c] below index by a float (caught at compile time, C2108).
+				const float cos_n = myClamp(std::fabs(unit_dir[0]*nx + unit_dir[1]*ny + unit_dir[2]*nz), 0.f, 1.f);
+				const float c_sq = cos_n * cos_n;
+				const float q_disc = (1.f - c_sq) / (a_disc * a_disc) + c_sq / (s_min * s_min);
+				const float r_disc = std::sqrt(a_disc * a_disc * s_min * std::sqrt(q_disc));
+
+				// out_radius[c] is gs_sat_occluder_sigmas * gsSatProjectedRadius(...), so divide that common factor
+				// back out to compare like with like. The ratio is what matters, so the factor would cancel anyway -
+				// dividing keeps the min/max readable as true radii ratios rather than something scaled by 3.
+				const float r_exact = out_radius[c] * (1.f / gs_sat_occluder_sigmas);
+				if(r_exact > 1.0e-9f)
+				{
+					const float ratio = r_disc / r_exact;
+					int bin;
+					if     (ratio < 0.5f)  bin = 0;
+					else if(ratio < 0.8f)  bin = 1;
+					else if(ratio < 0.9f)  bin = 2;
+					else if(ratio < 1.1f)  bin = 3;
+					else if(ratio < 1.25f) bin = 4;
+					else if(ratio < 2.0f)  bin = 5;
+					else                   bin = 6;
+					++d_bins[bin];
+
+					const float midmax = s_mid_ax / s_max_ax; // 1 = a true disc (model exact), small = needle-like.
+					int mm;
+					if     (midmax < 0.25f) mm = 0;
+					else if(midmax < 0.5f)  mm = 1;
+					else if(midmax < 0.8f)  mm = 2;
+					else                    mm = 3;
+					++d_midmax[mm];
+
+					d_ratio_sum += ratio;
+					d_ratio_min = myMin(d_ratio_min, ratio);
+					d_ratio_max = myMax(d_ratio_max, ratio);
+					++d_n;
+				}
+
+#if GS_SAT_GATHER_DISC_MODEL_VISUAL_TEST
+				// SESSION081 PLAN ETAP 4 TEMPORARY: overwrite the exact radius with the packed disc model's, AFTER the
+				// stats above have already captured r_exact - so [gsr-sat-disc-probe] keeps reporting the true ratio
+				// even while the grid is being built from r_disc. This is what "visually validate the 8-byte format"
+				// actually means: the barrier this build produces is now the one the light format would really give.
+				out_radius[c] = gs_sat_occluder_sigmas * r_disc;
+#endif
+			}
+#endif
 
 			if(want_aniso) // SESSION077 DIAGNOSTIC - scales[idx] is already hot from the line above, so this costs a max/min, not a miss.
 			{
@@ -1249,9 +1415,17 @@ public:
 		chunk->count = c;
 		chunk->aniso_sum = a_sum; chunk->aniso_max = a_max;
 		chunk->aniso_gt5 = a_gt5; chunk->aniso_gt10 = a_gt10; chunk->aniso_n = a_n;
+#if GS_SAT_GATHER_DISC_MODEL_PROBE
+		for(int k=0; k<7; ++k) chunk->disc_bins[k] = d_bins[k]; // SESSION081 PLAN ETAP 4, P4.2 TEMPORARY.
+		for(int k=0; k<4; ++k) chunk->midmax_bins[k] = d_midmax[k];
+		chunk->disc_ratio_sum = d_ratio_sum;
+		chunk->disc_ratio_min = d_ratio_min; chunk->disc_ratio_max = d_ratio_max;
+		chunk->disc_n = d_n;
+#endif
 	}
 
 	const uint32* indices; const float* px; const float* py; const float* pz; const float* is_coarse;
+	const float* radius_seq; // SESSION081 PLAN ETAP 4, P4.1 TEMPORARY: the frontier's own per-node cull_radius, sequential - only read by the ceiling-test branch in run(). Always wired up (costs nothing when the test is off) so enabling the macro needs no call-site change.
 	const Vec3f* scales; const Vec4f* rotations; const float* alphas;
 	float* out_px; float* out_py; float* out_pz; float* out_radius; float* out_alpha;
 	Vec4f cam_pos_ws;
@@ -1377,6 +1551,7 @@ public:
 		const size_t n = uf.indices.size() + (uf.far_block.nonNull() ? uf.far_block->indices.size() : 0);
 
 		Reference<GaussianSplatSaturationBarrier> barrier = new GaussianSplatSaturationBarrier();
+		barrier->frontier_n = n; // SESSION081 PLAN ETAP 0 DIAGNOSTIC - see the field's comment.
 		barrier->anchor_pos_ws = anchor_pos_ws;
 		barrier->built_time_real_s = Clock::getCurTimeRealSec();
 		barrier->threshold_used = saturation_threshold;
@@ -1435,11 +1610,19 @@ public:
 					ch.count = 0;
 					ch.aniso_sum = 0.0; ch.aniso_max = 0.f;
 					ch.aniso_gt5 = ch.aniso_gt10 = ch.aniso_n = 0;
+					for(int k=0; k<7; ++k) ch.disc_bins[k] = 0; // SESSION081 PLAN ETAP 4, P4.2 TEMPORARY.
+					for(int k=0; k<4; ++k) ch.midmax_bins[k] = 0;
+					ch.disc_ratio_sum = 0.0; ch.disc_ratio_min = 0.f; ch.disc_ratio_max = 0.f; ch.disc_n = 0;
 					chunks.push_back(ch);
 				}
 			}
 
 			double aniso_sum = 0.0; float aniso_max = 0.f; size_t aniso_gt5 = 0, aniso_gt10 = 0, aniso_n = 0;
+#if GS_SAT_GATHER_DISC_MODEL_PROBE
+			size_t disc_bins_tot[7] = { 0, 0, 0, 0, 0, 0, 0 }; // SESSION081 PLAN ETAP 4, P4.2 TEMPORARY.
+			size_t midmax_tot[4] = { 0, 0, 0, 0 };
+			double disc_ratio_sum_tot = 0.0; float disc_ratio_min_tot = std::numeric_limits<float>::infinity(), disc_ratio_max_tot = 0.f; size_t disc_n_tot = 0;
+#endif
 			glare::TaskGroupRef group = new glare::TaskGroup();
 			{
 				size_t c = 0;
@@ -1452,6 +1635,7 @@ public:
 						Reference<GsSatGatherTask> t = new GsSatGatherTask();
 						t->indices = seg.indices.data(); t->px = seg.px.data(); t->py = seg.py.data(); t->pz = seg.pz.data();
 						t->is_coarse = seg.is_coarse.data();
+						t->radius_seq = seg.radius.data(); // SESSION081 PLAN ETAP 4, P4.1 TEMPORARY - see GsSatGatherTask::radius_seq.
 						t->scales = geom->scales.data(); t->rotations = geom->rotations.data(); t->alphas = geom->alpha.data();
 						t->out_px = occl_px.data() + chunks[c].out_base; t->out_py = occl_py.data() + chunks[c].out_base;
 						t->out_pz = occl_pz.data() + chunks[c].out_base; t->out_radius = occl_radius.data() + chunks[c].out_base;
@@ -1481,9 +1665,45 @@ public:
 				kept += cnt;
 				aniso_sum += chunks[c].aniso_sum; aniso_max = myMax(aniso_max, chunks[c].aniso_max);
 				aniso_gt5 += chunks[c].aniso_gt5; aniso_gt10 += chunks[c].aniso_gt10; aniso_n += chunks[c].aniso_n;
+#if GS_SAT_GATHER_DISC_MODEL_PROBE
+				for(int k=0; k<7; ++k) disc_bins_tot[k] += chunks[c].disc_bins[k]; // SESSION081 PLAN ETAP 4, P4.2 TEMPORARY.
+				for(int k=0; k<4; ++k) midmax_tot[k] += chunks[c].midmax_bins[k];
+				disc_ratio_sum_tot += chunks[c].disc_ratio_sum;
+				if(chunks[c].disc_n > 0)
+				{
+					disc_ratio_min_tot = myMin(disc_ratio_min_tot, chunks[c].disc_ratio_min);
+					disc_ratio_max_tot = myMax(disc_ratio_max_tot, chunks[c].disc_ratio_max);
+				}
+				disc_n_tot += chunks[c].disc_n;
+#endif
 			}
 			occl_px.resize(kept); occl_py.resize(kept); occl_pz.resize(kept);
 			occl_radius.resize(kept); occl_alpha.resize(kept);
+
+#if GS_SAT_GATHER_DISC_MODEL_PROBE
+			// SESSION081 PLAN ETAP 4, P4.2 TEMPORARY - printed straight from the build task rather than carried on the
+			// barrier, since this whole probe is a one-off measurement and not something the barrier should grow a
+			// field for. Gated on diag_log so it costs nothing (and prints nothing) in normal operation.
+			if(diag_log && disc_n_tot > 0)
+			{
+				const double dn = (double)disc_n_tot;
+				conPrint("[gsr-sat-disc-probe] n=" + uInt64ToStringCommaSeparated(disc_n_tot) +
+					" mean=" + doubleToStringNDecimalPlaces(disc_ratio_sum_tot / dn, 4) +
+					" min=" + doubleToStringNDecimalPlaces(disc_ratio_min_tot, 4) +
+					" max=" + doubleToStringNDecimalPlaces(disc_ratio_max_tot, 2) +
+					" | ratio r_disc/r_exact: <0.5=" + doubleToStringNDecimalPlaces(100.0 * (double)disc_bins_tot[0] / dn, 2) + "%" +
+					" 0.5-0.8=" + doubleToStringNDecimalPlaces(100.0 * (double)disc_bins_tot[1] / dn, 2) + "%" +
+					" 0.8-0.9=" + doubleToStringNDecimalPlaces(100.0 * (double)disc_bins_tot[2] / dn, 2) + "%" +
+					" 0.9-1.1=" + doubleToStringNDecimalPlaces(100.0 * (double)disc_bins_tot[3] / dn, 2) + "%" +
+					" 1.1-1.25=" + doubleToStringNDecimalPlaces(100.0 * (double)disc_bins_tot[4] / dn, 2) + "%" +
+					" 1.25-2=" + doubleToStringNDecimalPlaces(100.0 * (double)disc_bins_tot[5] / dn, 2) + "%" +
+					" >2=" + doubleToStringNDecimalPlaces(100.0 * (double)disc_bins_tot[6] / dn, 2) + "%" +
+					" | s_mid/s_max: <0.25=" + doubleToStringNDecimalPlaces(100.0 * (double)midmax_tot[0] / dn, 1) + "%" +
+					" 0.25-0.5=" + doubleToStringNDecimalPlaces(100.0 * (double)midmax_tot[1] / dn, 1) + "%" +
+					" 0.5-0.8=" + doubleToStringNDecimalPlaces(100.0 * (double)midmax_tot[2] / dn, 1) + "%" +
+					" >0.8=" + doubleToStringNDecimalPlaces(100.0 * (double)midmax_tot[3] / dn, 1) + "%");
+			}
+#endif
 
 			barrier->diag_aniso_n = aniso_n;
 			barrier->diag_aniso_mean = aniso_n > 0 ? (aniso_sum / (double)aniso_n) : 0.0;
@@ -1505,11 +1725,16 @@ public:
 
 			if(task_manager != NULL && !overlay_requested)
 			{
+				if(diag_log) barrier->concurrency_used = (int)task_manager->getConcurrency(); // SESSION081 PLAN ETAP 0
 				gsBuildSaturationGridParallel(occl_px.data(), occl_py.data(), occl_pz.data(), occl_radius.data(), occl_alpha.data(), occl_px.size(),
 					anchor_pos_ws, barrier->sat_grid_res, saturation_threshold, region_radius, closing_tiles, barrier->sat_depth, *task_manager,
 					diag_log ? &barrier->diag_writers : NULL, diag_log ? &barrier->diag_tile_writes : NULL,
 					diag_log ? barrier->diag_tile_stats : NULL, NULL, // No scratch pool for the records - see the session081 bugfix this task's whole existence traces back to.
-					barrier->erode_stats);
+					barrier->erode_stats,
+					diag_log ? &barrier->close_ms : NULL, diag_log ? &barrier->erode_ms : NULL, // SESSION081 PLAN ETAP 0
+					diag_log ? &barrier->rec_ms : NULL, diag_log ? &barrier->dep_ms : NULL,
+					diag_log ? &barrier->num_recs : NULL, diag_log ? &barrier->num_strips : NULL,
+					diag_log ? &barrier->num_blocks : NULL);
 			}
 			else
 				gsBuildSaturationGrid(occl_px.data(), occl_py.data(), occl_pz.data(), occl_radius.data(), occl_alpha.data(), occl_px.size(),
@@ -1517,7 +1742,8 @@ public:
 					diag_log ? &barrier->diag_writers : NULL, diag_log ? &barrier->diag_tile_writes : NULL,
 					overlay_requested ? &barrier->sat_accum_t : NULL, overlay_requested ? &barrier->sat_amp_sum : NULL,
 					diag_log ? barrier->diag_tile_stats : NULL,
-					barrier->erode_stats);
+					barrier->erode_stats,
+					diag_log ? &barrier->close_ms : NULL, diag_log ? &barrier->erode_ms : NULL); // SESSION081 PLAN ETAP 0 - no rec_ms/dep_ms here, this path has no record/strip split.
 
 			barrier->grid_build_ms = sat_grid_timer.elapsed() * 1.0e3;
 		}
@@ -7402,6 +7628,27 @@ void GaussianSplatRenderer::drainSaturationBuildResults()
 					" er_radmax=" + uInt64ToStringCommaSeparated(b.erode_stats[2]) +
 					" gather_ms=" + doubleToStringNDecimalPlaces(b.gather_ms, 2) +
 					" grid_ms=" + doubleToStringNDecimalPlaces(b.grid_build_ms, 2));
+
+				// SESSION081 PLAN ETAP 0 DIAGNOSTIC: grid_ms broken into its measured sub-phases, plus the "sum of parts
+				// vs whole" check (misc_ms) - see [[reconcile_parts_with_the_whole]]. A significant misc_ms means a
+				// phase inside grid_ms is still unaccounted for.
+				if(sat_diag_log)
+				{
+					const double misc_ms = b.grid_build_ms - (b.rec_ms + b.dep_ms + b.close_ms + b.erode_ms);
+					conPrint("[gsr-sat-build-phases] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms " +
+						"n=" + uInt64ToStringCommaSeparated(b.frontier_n) +
+						" rec_ms=" + doubleToStringNDecimalPlaces(b.rec_ms, 2) +
+						" dep_ms=" + doubleToStringNDecimalPlaces(b.dep_ms, 2) +
+						" close_ms=" + doubleToStringNDecimalPlaces(b.close_ms, 2) +
+						" erode_ms=" + doubleToStringNDecimalPlaces(b.erode_ms, 2) +
+						" misc_ms=" + doubleToStringNDecimalPlaces(misc_ms, 2) +
+						" (" + doubleToStringNDecimalPlaces(b.grid_build_ms > 0.0 ? (100.0 * misc_ms / b.grid_build_ms) : 0.0, 1) + "% of grid_ms)" +
+						" num_recs=" + uInt64ToStringCommaSeparated(b.num_recs) +
+						" num_strips=" + toString(b.num_strips) +
+						" concurrency=" + toString(b.concurrency_used) +
+						" strip_reads=" + uInt64ToStringCommaSeparated((uint64)b.num_strips * (uint64)b.num_recs) +
+						" num_blocks=" + uInt64ToStringCommaSeparated(b.num_blocks)); // SESSION081 PLAN, ETAP 0 follow-up DIAGNOSTIC.
+				}
 
 				if(sat_diag_log)
 				{

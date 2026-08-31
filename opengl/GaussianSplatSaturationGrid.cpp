@@ -9,6 +9,7 @@ Copyright Glare Technologies Limited 2026 -
 #include "../maths/mathstypes.h"
 #include "../utils/TaskManager.h" // SESSION079: gsBuildSaturationGridParallel().
 #include "../utils/Reference.h"
+#include "../utils/Timer.h" // SESSION081 PLAN ETAP 0: per-phase diagnostic timers - see gsSatApplyRegionErosion() and gsBuildSaturationGridParallel().
 #include <cstring> // SESSION079: memmove() in gsBuildSaturationGridParallel().
 #include <cmath>
 #include <limits>
@@ -351,6 +352,14 @@ static inline void gsSatDepositRec(const GsSatOccluderRec& rec, int res, float r
 		float* const sum_row = amp_sum ? (amp_sum + (size_t)(v - v_lo) * (size_t)res) : NULL;
 		const float dv = ((float)v + 0.5f) - cv;
 		const float dv_sq = dv * dv;
+
+		// SESSION081 PLAN ETAP 1: TEMPORARILY REVERTED to plain scalar for an apples-to-apples A/B measurement - the
+		// SSE4.1 version (same shape as this loop, 4 tiles/iteration) measured SLOWER on a clean 4-teleport dep_ms
+		// average (145.4ms) than the single old scalar sample it was first compared against (78.3ms). Before
+		// concluding anything, need the OLD code's dep_ms averaged over the SAME clean protocol, not one sample
+		// against four - see the session081 plan doc. Nothing here was ever committed, so the vectorised version
+		// is not in git history - it is saved verbatim in tmp/session081_etap1_simd_deposit_backup.cpp pending the
+		// fair comparison, in case it needs to come back.
 		for(int u=u0; u<=u1; ++u)
 		{
 			if(stats) ++stats->tile_iters; // SESSION079 DIAGNOSTIC.
@@ -871,20 +880,29 @@ public:
 
 // SESSION080: shared tail of both builds - allocate the destination, run the erosion (parallel where a pool was handed
 // in), swap it into place. No-op when region_radius is 0, which keeps the R = 0 path bit-identical to before.
+// SESSION081 PLAN ETAP 0: out_close_ms/out_erode_ms, when non-null, receive the wall time of each sub-pass separately -
+// both used to be folded into the caller's one grid_ms timer with no way to tell how much either cost (the plan's
+// "sum the parts against the whole" check). Left NULL (no Timer calls at all) when the caller does not ask.
 static void gsSatApplyRegionErosion(js::Vector<float, 16>& sat_depth, int res,
-	float region_radius, int closing_radius_tiles, glare::TaskManager* task_manager, size_t* out_erode_stats)
+	float region_radius, int closing_radius_tiles, glare::TaskManager* task_manager, size_t* out_erode_stats,
+	double* out_close_ms, double* out_erode_ms)
 {
 	if(out_erode_stats)
 		out_erode_stats[0] = out_erode_stats[1] = out_erode_stats[2] = out_erode_stats[3] = 0;
+	if(out_close_ms) *out_close_ms = 0.0;
+	if(out_erode_ms) *out_erode_ms = 0.0;
 	if(!(region_radius > 0.f) || res == 0)
 		return;
 
 	// SESSION081: closing runs first, in place, so the erosion below sees a mask with pinhole noise already removed -
 	// see gsSatApplyClosing()'s doc comment for why order matters here.
+	Timer close_timer;
 	size_t closed_count = 0;
 	gsSatApplyClosing(sat_depth, res, closing_radius_tiles, task_manager, &closed_count);
 	if(out_erode_stats) out_erode_stats[3] = closed_count;
+	if(out_close_ms) *out_close_ms = close_timer.elapsed() * 1.0e3;
 
+	Timer erode_timer;
 	js::Vector<float, 16> eroded(sat_depth.size());
 
 	const int concurrency = task_manager ? myMax(1, (int)task_manager->getConcurrency()) : 1;
@@ -926,6 +944,7 @@ static void gsSatApplyRegionErosion(js::Vector<float, 16>& sat_depth, int res,
 		out_erode_stats[1] = total.by_window;
 		out_erode_stats[2] = total.max_radius;
 	}
+	if(out_erode_ms) *out_erode_ms = erode_timer.elapsed() * 1.0e3;
 
 	sat_depth = eroded;
 }
@@ -935,7 +954,7 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius, int closing_radius_tiles,
 	js::Vector<float, 16>& sat_depth_out, size_t* out_writers, size_t* out_tile_writes,
 	js::Vector<float, 16>* out_accum_t, js::Vector<float, 16>* out_amp_sum, size_t* out_tile_stats,
-	size_t* out_erode_stats)
+	size_t* out_erode_stats, double* out_close_ms, double* out_erode_ms)
 {
 	const size_t num_tiles = (size_t)res * (size_t)res;
 	sat_depth_out.resizeNoCopy(num_tiles);
@@ -964,7 +983,7 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 
 	// SESSION080: the erosion runs LAST, on the finished mask - see gsSatApplyRegionErosion(). Serial entry point, so no
 	// pool: this path is the overlay/no-TaskManager one, where a few ms more is not what anyone is measuring.
-	gsSatApplyRegionErosion(sat_depth_out, res, region_radius, closing_radius_tiles, NULL, out_erode_stats);
+	gsSatApplyRegionErosion(sat_depth_out, res, region_radius, closing_radius_tiles, NULL, out_erode_stats, out_close_ms, out_erode_ms);
 
 	// SESSION077 DIAGNOSTIC: hand the accumulator fields out for the debug overlay - see the header.
 	if(out_accum_t)
@@ -1072,7 +1091,9 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius, int closing_radius_tiles,
 	js::Vector<float, 16>& sat_depth_out, glare::TaskManager& task_manager,
 	size_t* out_writers, size_t* out_tile_writes, size_t* out_tile_stats,
-	js::Vector<GsSatOccluderRec, 16>* scratch_recs, size_t* out_erode_stats)
+	js::Vector<GsSatOccluderRec, 16>* scratch_recs, size_t* out_erode_stats,
+	double* out_close_ms, double* out_erode_ms, double* out_rec_ms, double* out_dep_ms,
+	size_t* out_num_recs, int* out_num_strips, size_t* out_num_blocks)
 {
 	const size_t num_tiles = (size_t)res * (size_t)res;
 	sat_depth_out.resizeNoCopy(num_tiles);
@@ -1083,6 +1104,10 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 	const float remaining_threshold = myClamp(1.f - saturation_threshold, 0.f, 1.f);
 
 	const int num_strips = myClamp(res / gs_sat_min_strip_rows, 1, concurrency);
+	if(out_num_strips) *out_num_strips = num_strips;
+	double rec_ms_total = 0.0, dep_ms_total = 0.0;
+	size_t num_recs_total = 0;
+	size_t num_blocks_total = 0; // SESSION081 PLAN, ETAP 0 follow-up DIAGNOSTIC: how many blocks (and therefore task-group launch pairs) this build actually ran - see gs_sat_rec_scratch_bytes's ceiling-measurement comment.
 
 	// The occluders are processed in BLOCKS rather than all at once, to bound the record scratch - see
 	// gs_sat_rec_scratch_bytes for the trade-off and the numbers behind the budget.
@@ -1101,10 +1126,12 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 
 	for(size_t block_begin=0; block_begin<n; block_begin += block_n)
 	{
+		++num_blocks_total; // SESSION081 PLAN, ETAP 0 follow-up DIAGNOSTIC.
 		const size_t block_end = myMin(block_begin + block_n, n);
 		const size_t block_len = block_end - block_begin;
 
 		// ---- Phase 1: geometry, once, in parallel over node ranges within this block. ----
+		Timer rec_timer; // SESSION081 PLAN ETAP 0: covers the task group AND the compaction memmove below - both are phase 1's cost, not phase 2's.
 		const int num_chunks = (int)myMin((size_t)concurrency, block_len);
 		js::Vector<Reference<GsSatRecordTask>, 16> rec_tasks(num_chunks);
 		{
@@ -1137,10 +1164,13 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 				std::memmove(recs.data() + num_recs, recs.data() + slice_begin, t.count * sizeof(GsSatOccluderRec));
 			num_recs += t.count;
 		}
+		rec_ms_total += rec_timer.elapsed() * 1.0e3;
+		num_recs_total += num_recs;
 		if(num_recs == 0)
 			continue;
 
 		// ---- Phase 2: deposit, in parallel over strips. ----
+		Timer dep_timer; // SESSION081 PLAN ETAP 0.
 		glare::TaskGroupRef group = new glare::TaskGroup();
 		js::Vector<Reference<GsSatStripTask>, 16> strip_tasks(num_strips);
 		for(int t=0; t<num_strips; ++t)
@@ -1166,6 +1196,7 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 		// running on this same TaskManager - there is no configuration in which it waits on a thread that never arrives.
 		// It is also why a build degrades gracefully to serial where there are no worker threads, with no separate path.
 		task_manager.runTaskGroup(group);
+		dep_ms_total += dep_timer.elapsed() * 1.0e3;
 
 		for(int t=0; t<num_strips; ++t)
 		{
@@ -1178,6 +1209,11 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 
 	}
 
+	if(out_rec_ms) *out_rec_ms = rec_ms_total;
+	if(out_dep_ms) *out_dep_ms = dep_ms_total;
+	if(out_num_recs) *out_num_recs = num_recs_total;
+	if(out_num_blocks) *out_num_blocks = num_blocks_total;
+
 	// NOTE: `writers` counts records that reached the tile loop, so one straddling a strip boundary is counted once per
 	// strip it touches - the parallel total is the serial one plus the boundary crossings. The per-TILE counters
 	// (tile_writes, tile_iters, tail_rej, sat_skip) are exact, and tile_writes is the one to check against the serial
@@ -1188,7 +1224,7 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 
 	// SESSION080: after every block has deposited, never per block - the mask has to be complete before it is eroded,
 	// or a silhouette would be measured against a half-built neighbourhood.
-	gsSatApplyRegionErosion(sat_depth_out, res, region_radius, closing_radius_tiles, &task_manager, out_erode_stats);
+	gsSatApplyRegionErosion(sat_depth_out, res, region_radius, closing_radius_tiles, &task_manager, out_erode_stats, out_close_ms, out_erode_ms);
 }
 
 

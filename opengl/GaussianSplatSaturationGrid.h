@@ -385,7 +385,8 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 	js::Vector<float, 16>& sat_depth_out, size_t* out_writers = NULL, size_t* out_tile_writes = NULL,
 	js::Vector<float, 16>* out_accum_t = NULL, js::Vector<float, 16>* out_amp_sum = NULL,
 	size_t* out_tile_stats = NULL, // SESSION079 DIAGNOSTIC: 3-element array - [0] total per-tile loop iterations, [1] of those, rejected off the Gaussian's tail, [2] skipped because the tile's barrier was already set. Against out_tile_writes, which counts only the iterations that reached the accumulator.
-	size_t* out_erode_stats = NULL); // SESSION080/081 DIAGNOSTIC: 4-element array - [0] tiles the region erosion killed by the R/sat_depth ceiling, [1] tiles it killed by finding an unsaturated tile in the window, [2] the largest erosion radius, in tiles, actually used on a saturated tile, [3] SESSION081: tiles the closing pass filled (pinholes removed before erosion ever saw them). All zero when region_radius is 0 (neither pass runs). See [gsr-sat]'s er_ceil=/er_win=/er_radmax=/cl=.
+	size_t* out_erode_stats = NULL, // SESSION080/081 DIAGNOSTIC: 4-element array - [0] tiles the region erosion killed by the R/sat_depth ceiling, [1] tiles it killed by finding an unsaturated tile in the window, [2] the largest erosion radius, in tiles, actually used on a saturated tile, [3] SESSION081: tiles the closing pass filled (pinholes removed before erosion ever saw them). All zero when region_radius is 0 (neither pass runs). See [gsr-sat]'s er_ceil=/er_win=/er_radmax=/cl=.
+	double* out_close_ms = NULL, double* out_erode_ms = NULL); // SESSION081 PLAN ETAP 0 DIAGNOSTIC: wall time of the closing pass and the erosion pass, separately - both were previously folded into the caller's one grid_ms timer with no way to tell how much either cost. NULL under normal operation (gated by the diag checkbox at the call site).
 
 
 // SESSION079: the same build, split across the task manager by horizontal strips of grid rows. Bit-identical to
@@ -404,7 +405,13 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 	js::Vector<float, 16>& sat_depth_out, glare::TaskManager& task_manager,
 	size_t* out_writers = NULL, size_t* out_tile_writes = NULL, size_t* out_tile_stats = NULL,
 	js::Vector<GsSatOccluderRec, 16>* scratch_recs = NULL, // Optional caller-owned scratch for the phase-1 records, to keep the allocation out of the per-build cost.
-	size_t* out_erode_stats = NULL); // SESSION080/081 DIAGNOSTIC - see the serial entry point's.
+	size_t* out_erode_stats = NULL, // SESSION080/081 DIAGNOSTIC - see the serial entry point's.
+	double* out_close_ms = NULL, double* out_erode_ms = NULL, // SESSION081 PLAN ETAP 0 DIAGNOSTIC - see the serial entry point's.
+	double* out_rec_ms = NULL, // SESSION081 PLAN ETAP 0 DIAGNOSTIC: wall time of phase 1 (GsSatRecordTask - geometry, once per occluder) summed across blocks.
+	double* out_dep_ms = NULL, // SESSION081 PLAN ETAP 0 DIAGNOSTIC: wall time of phase 2 (GsSatStripTask - per-strip deposit) summed across blocks.
+	size_t* out_num_recs = NULL, // SESSION081 PLAN ETAP 0 DIAGNOSTIC: total records that survived the amp reject and reached phase 2, summed across blocks - this is what every strip re-reads.
+	int* out_num_strips = NULL, // SESSION081 PLAN ETAP 0 DIAGNOSTIC: the strip count actually used, so callers can report num_strips * num_recs (the phase-2 re-read volume, see the plan's stage 5) without re-deriving it.
+	size_t* out_num_blocks = NULL); // SESSION081 PLAN, ETAP 0 follow-up DIAGNOSTIC: how many gs_sat_rec_scratch_bytes-bounded blocks this build actually ran - each is a synchronisation barrier (two task-group launches). See that constant's comment.
 
 
 // SESSION074: pass 2's per-node read - true if this fine node is unambiguously behind saturated coarse geometry, so

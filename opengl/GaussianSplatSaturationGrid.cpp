@@ -1022,8 +1022,10 @@ class GsSatRecordTask : public glare::Task
 public:
 	virtual void run(size_t /*thread_index*/)
 	{
+		Timer task_timer; // SESSION081 PLAN, REC-BALANCE PROBE, TEMPORARY DIAGNOSTIC - see task_ms. Nodes are FRONT-TO-BACK and the cheap/expensive split correlates with distance, so an equal-COUNT chunking may not be an equal-WORK chunking; this measures whether that is actually true before anything is rebalanced.
 		const float amp_reject_k = 3.14159265f * (float)res * (float)res / 18.f;
 		size_t w = 0;
+		size_t g1 = 0; // SESSION081 PLAN, PRE-REJECT PROBE, TEMPORARY DIAGNOSTIC - see gate1_survivors.
 		for(size_t i=i_begin; i<i_end; ++i)
 		{
 			const float dx = px[i] - anchor_pos_ws.x[0];
@@ -1037,6 +1039,7 @@ public:
 			const float a = myClamp(alpha[i], 0.f, 1.f);
 			if(a * r * r * amp_reject_k < gs_sat_min_occluder_amp * dist_sq)
 				continue; // Upper bound on amp is already below the cutoff - see the same test in gsSatBuildStrip().
+			++g1; // SESSION081 PLAN, PRE-REJECT PROBE, TEMPORARY - survived the cheap gate; about to pay for sqrt+oct+tile-angle whether or not it becomes a record.
 
 			const float inv_dist = 1.f / std::sqrt(dist_sq);
 			const float ang_radius = r * inv_dist;
@@ -1062,10 +1065,14 @@ public:
 			rec.inv_2var = 0.5f / var;
 		}
 		count = w;
+		gate1_survivors = g1; // SESSION081 PLAN, PRE-REJECT PROBE, TEMPORARY DIAGNOSTIC.
+		task_ms = task_timer.elapsed() * 1.0e3; // SESSION081 PLAN, REC-BALANCE PROBE, TEMPORARY DIAGNOSTIC.
 	}
 
 	const float *px, *py, *pz, *radius, *alpha;
 	size_t i_begin, i_end, count;
+	size_t gate1_survivors; // SESSION081 PLAN, PRE-REJECT PROBE, TEMPORARY DIAGNOSTIC - see run(). gate1_survivors - count is how many paid for sqrt+oct+tile-angle only to be rejected by the exact amp test - the ceiling on a tighter second-tier reject, measured BEFORE writing one.
+	double task_ms; // SESSION081 PLAN, REC-BALANCE PROBE, TEMPORARY DIAGNOSTIC - this chunk's own wall time. Chunks split the input range by equal COUNT; if the cheap/expensive split correlates with distance (front-to-back order), the near chunk can do far more real work than the far one while both wait on the same runTaskGroup() - this is what would explain rec_ms exceeding the DRAM-bandwidth-bound + arithmetic estimate.
 	Vec4f anchor_pos_ws;
 	int res;
 	float region_radius;
@@ -1110,7 +1117,9 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 	size_t* out_writers, size_t* out_tile_writes, size_t* out_tile_stats,
 	js::Vector<GsSatOccluderRec, 16>* scratch_recs, size_t* out_erode_stats,
 	double* out_close_ms, double* out_erode_ms, double* out_rec_ms, double* out_dep_ms,
-	size_t* out_num_recs, int* out_num_strips, size_t* out_num_blocks)
+	size_t* out_num_recs, int* out_num_strips, size_t* out_num_blocks,
+	size_t* out_gate1_survivors, // SESSION081 PLAN, PRE-REJECT PROBE, TEMPORARY DIAGNOSTIC.
+	double* out_rec_task_ms_min, double* out_rec_task_ms_max, double* out_rec_task_ms_mean) // SESSION081 PLAN, REC-BALANCE PROBE, TEMPORARY DIAGNOSTIC.
 {
 	const size_t num_tiles = (size_t)res * (size_t)res;
 	sat_depth_out.resizeNoCopy(num_tiles);
@@ -1125,6 +1134,9 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 	double rec_ms_total = 0.0, dep_ms_total = 0.0;
 	size_t num_recs_total = 0;
 	size_t num_blocks_total = 0; // SESSION081 PLAN, ETAP 0 follow-up DIAGNOSTIC: how many blocks (and therefore task-group launch pairs) this build actually ran - see gs_sat_rec_scratch_bytes's ceiling-measurement comment.
+	size_t gate1_survivors_total = 0; // SESSION081 PLAN, PRE-REJECT PROBE, TEMPORARY DIAGNOSTIC - see GsSatRecordTask::gate1_survivors.
+	double rec_task_ms_min_total = std::numeric_limits<double>::infinity(), rec_task_ms_max_total = 0.0, rec_task_ms_sum_total = 0.0;
+	size_t rec_task_n_total = 0; // SESSION081 PLAN, REC-BALANCE PROBE, TEMPORARY DIAGNOSTIC - see GsSatRecordTask::task_ms.
 
 	// The occluders are processed in BLOCKS rather than all at once, to bound the record scratch - see
 	// gs_sat_rec_scratch_bytes for the trade-off and the numbers behind the budget.
@@ -1149,7 +1161,13 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 
 		// ---- Phase 1: geometry, once, in parallel over node ranges within this block. ----
 		Timer rec_timer; // SESSION081 PLAN ETAP 0: covers the task group AND the compaction memmove below - both are phase 1's cost, not phase 2's.
-		const int num_chunks = (int)myMin((size_t)concurrency, block_len);
+		// SESSION081: 4 chunks per thread, not one. The input is sorted FRONT-TO-BACK and the expensive path (sqrt, oct
+		// unwrap, local tile angle, amplitude) is only taken by occluders that clear the cheap bound - which the near
+		// ones do and the far ones do not. So an equal-COUNT split is not an equal-WORK split: measured 2026-09-01, the
+		// slowest of 17 chunks took 30.3ms against a 16.5ms mean, and runTaskGroup() waits for it while the other 16
+		// idle. Oversubscribing lets the pool work-steal the tail instead. Same shape (and the same *4) the occluder
+		// gather next door already uses, for the same reason.
+		const int num_chunks = (int)myMin((size_t)concurrency * 4, block_len);
 		js::Vector<Reference<GsSatRecordTask>, 16> rec_tasks(num_chunks);
 		{
 			glare::TaskGroupRef group = new glare::TaskGroup();
@@ -1180,6 +1198,11 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 			if(t.count > 0 && num_recs != slice_begin)
 				std::memmove(recs.data() + num_recs, recs.data() + slice_begin, t.count * sizeof(GsSatOccluderRec));
 			num_recs += t.count;
+			gate1_survivors_total += t.gate1_survivors; // SESSION081 PLAN, PRE-REJECT PROBE, TEMPORARY DIAGNOSTIC.
+			rec_task_ms_min_total = myMin(rec_task_ms_min_total, t.task_ms); // SESSION081 PLAN, REC-BALANCE PROBE, TEMPORARY DIAGNOSTIC.
+			rec_task_ms_max_total = myMax(rec_task_ms_max_total, t.task_ms);
+			rec_task_ms_sum_total += t.task_ms;
+			++rec_task_n_total;
 		}
 		rec_ms_total += rec_timer.elapsed() * 1.0e3;
 		num_recs_total += num_recs;
@@ -1230,6 +1253,10 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 	if(out_dep_ms) *out_dep_ms = dep_ms_total;
 	if(out_num_recs) *out_num_recs = num_recs_total;
 	if(out_num_blocks) *out_num_blocks = num_blocks_total;
+	if(out_gate1_survivors) *out_gate1_survivors = gate1_survivors_total; // SESSION081 PLAN, PRE-REJECT PROBE, TEMPORARY DIAGNOSTIC.
+	if(out_rec_task_ms_min) *out_rec_task_ms_min = (rec_task_n_total > 0) ? rec_task_ms_min_total : 0.0; // SESSION081 PLAN, REC-BALANCE PROBE, TEMPORARY DIAGNOSTIC.
+	if(out_rec_task_ms_max) *out_rec_task_ms_max = rec_task_ms_max_total;
+	if(out_rec_task_ms_mean) *out_rec_task_ms_mean = (rec_task_n_total > 0) ? (rec_task_ms_sum_total / (double)rec_task_n_total) : 0.0;
 
 	// NOTE: `writers` counts records that reached the tile loop, so one straddling a strip boundary is counted once per
 	// strip it touches - the parallel total is the serial one plus the boundary crossings. The per-TILE counters

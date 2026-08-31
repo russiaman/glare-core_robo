@@ -468,6 +468,8 @@ public:
 	int num_strips;    // The strip count phase 2 actually ran with - num_strips*num_recs is the phase-2 re-read volume the plan's stage 5 targets.
 	int concurrency_used; // task_manager->getConcurrency() at build time - num_strips is clamp(res/8, 1, this), so this says whether num_strips was capped by resolution or by thread count.
 	size_t num_blocks;    // SESSION081 PLAN, ETAP 0 follow-up DIAGNOSTIC: how many gs_sat_rec_scratch_bytes-bounded blocks this build ran - see that constant's comment on the sync-barrier cost of blocking.
+	size_t gate1_survivors; // SESSION081 PLAN, PRE-REJECT PROBE, TEMPORARY DIAGNOSTIC - see gsBuildSaturationGridParallel()'s out param of the same name.
+	double rec_task_ms_min, rec_task_ms_max, rec_task_ms_mean; // SESSION081 PLAN, REC-BALANCE PROBE, TEMPORARY DIAGNOSTIC - see gsBuildSaturationGridParallel()'s out params of the same name.
 	size_t diag_writers, diag_tile_writes;
 	size_t diag_tile_stats[3]; // [0] total per-tile iterations, [1] rejected off the Gaussian's tail, [2] skipped as already saturated - see gsSatDepositRec().
 	size_t erode_stats[4];     // [0] er_ceil, [1] er_win, [2] er_radmax, [3] cl (closed) - see gsSatApplyRegionErosion()/gsSatApplyClosing().
@@ -488,7 +490,8 @@ public:
 	:	sat_grid_res(0), anchor_pos_ws(0.f), built_time_real_s(0.0),
 		threshold_used(0.f), subdiv_used(0.f), region_radius_used(0.f), closing_tiles_used(0),
 		num_occluders(0), gather_ms(0.0), grid_build_ms(0.0),
-		frontier_n(0), rec_ms(0.0), dep_ms(0.0), close_ms(0.0), erode_ms(0.0), num_recs(0), num_strips(0), concurrency_used(0), num_blocks(0),
+		frontier_n(0), rec_ms(0.0), dep_ms(0.0), close_ms(0.0), erode_ms(0.0), num_recs(0), num_strips(0), concurrency_used(0), num_blocks(0), gate1_survivors(0),
+		rec_task_ms_min(0.0), rec_task_ms_max(0.0), rec_task_ms_mean(0.0),
 		diag_writers(0), diag_tile_writes(0),
 		bypass_used(false), bypass_distance_used(0.f)
 	{
@@ -1605,7 +1608,9 @@ public:
 					diag_log ? &barrier->close_ms : NULL, diag_log ? &barrier->erode_ms : NULL, // SESSION081 PLAN ETAP 0
 					diag_log ? &barrier->rec_ms : NULL, diag_log ? &barrier->dep_ms : NULL,
 					diag_log ? &barrier->num_recs : NULL, diag_log ? &barrier->num_strips : NULL,
-					diag_log ? &barrier->num_blocks : NULL);
+					diag_log ? &barrier->num_blocks : NULL,
+					diag_log ? &barrier->gate1_survivors : NULL, // SESSION081 PLAN, PRE-REJECT PROBE, TEMPORARY.
+					diag_log ? &barrier->rec_task_ms_min : NULL, diag_log ? &barrier->rec_task_ms_max : NULL, diag_log ? &barrier->rec_task_ms_mean : NULL); // SESSION081 PLAN, REC-BALANCE PROBE, TEMPORARY.
 			}
 			else
 				gsBuildSaturationGrid(occl_px.data(), occl_py.data(), occl_pz.data(), occl_radius.data(), occl_alpha.data(), occl_px.size(),
@@ -7542,6 +7547,12 @@ void GaussianSplatRenderer::drainSaturationBuildResults()
 						" misc_ms=" + doubleToStringNDecimalPlaces(misc_ms, 2) +
 						" (" + doubleToStringNDecimalPlaces(b.grid_build_ms > 0.0 ? (100.0 * misc_ms / b.grid_build_ms) : 0.0, 1) + "% of grid_ms)" +
 						" num_recs=" + uInt64ToStringCommaSeparated(b.num_recs) +
+						" gate1=" + uInt64ToStringCommaSeparated(b.gate1_survivors) + // SESSION081 PLAN, PRE-REJECT PROBE, TEMPORARY - see gsBuildSaturationGridParallel()'s out_gate1_survivors.
+						" wasted=" + uInt64ToStringCommaSeparated(b.gate1_survivors - b.num_recs) +
+						" (" + doubleToStringNDecimalPlaces(b.gate1_survivors > 0 ? (100.0 * (double)(b.gate1_survivors - b.num_recs) / (double)b.gate1_survivors) : 0.0, 1) + "% of gate1)" +
+						" rec_task_ms min=" + doubleToStringNDecimalPlaces(b.rec_task_ms_min, 2) + // SESSION081 PLAN, REC-BALANCE PROBE, TEMPORARY - is one chunk (the near, front-of-list one) a straggler the whole task group waits on?
+						" mean=" + doubleToStringNDecimalPlaces(b.rec_task_ms_mean, 2) +
+						" max=" + doubleToStringNDecimalPlaces(b.rec_task_ms_max, 2) +
 						" num_strips=" + toString(b.num_strips) +
 						" concurrency=" + toString(b.concurrency_used) +
 						" strip_reads=" + uInt64ToStringCommaSeparated((uint64)b.num_strips * (uint64)b.num_recs) +

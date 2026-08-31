@@ -73,6 +73,110 @@ static Timer diag_timer;
 // traversal-result VBO upload (session058 snapshot §3).
 
 
+// SESSION081 ETAP 4: a minimal half-float codec for the packed occluder record below. Deliberately restricted: the
+// three quantities it stores are all strictly positive and are clamped into the half's NORMAL range first, so there is
+// no sign case, no denormal case and no inf/nan case, and each direction is one shift and one add. (IlmBase's half
+// would do the job, but its decode is a 128KB table lookup - exactly the wrong shape for a loop whose entire purpose is
+// to touch one cache line and nothing else.)
+static const float gs_sat_half_min = 6.10352e-5f; // 2^-14, the smallest normal half.
+static const float gs_sat_half_max = 65504.f;     // The largest finite half.
+
+// Having no denormals means the representable window is [6.1e-5, 65504], which is not where two of the three stored
+// quantities live, so those two are PRE-SCALED into it. This matters in one direction only: clamping a value UP
+// inflates an occluder and can prune visible geometry, while clamping DOWN merely under-occludes. With these scales
+// both clamps are harmless - the bottom one lands at sub-micron sizes (which occlude nothing either way) and the top
+// one clamps down. Found by the session081 pack verification: without them, a splat with an extreme axis ratio has
+// sqrt(a*b) BELOW 6.1e-5 and was being rounded up to it, a silent over-estimate of exactly the wrong sign.
+static const float gs_sat_half_g_scale = 1024.f;     // Radius window becomes [6.0e-8, 63.9] m.
+static const float gs_sat_half_alpha_scale = 1024.f; // Opacity window becomes [6.0e-8, 63.9], and opacity is <= 1.
+
+static inline uint16 gsSatPackHalf(float v)
+{
+	const float clamped = myClamp(v, gs_sat_half_min, gs_sat_half_max);
+	uint32 bits;
+	std::memcpy(&bits, &clamped, 4);
+	return (uint16)(((bits + 0x1000u) >> 13) - (112u << 10)); // Exponent rebias 127 -> 15, mantissa 23 -> 10 bits, rounded.
+}
+
+static inline float gsSatUnpackHalf(uint16 h)
+{
+	const uint32 bits = ((uint32)h + (112u << 10)) << 13;
+	float v;
+	std::memcpy(&v, &bits, 4);
+	return v;
+}
+
+
+// SESSION081 ETAP 4: everything the saturation gather needs to know about one splat, in 12 bytes fetched as ONE cache
+// line - replacing the three scattered reads (scales 12B, rotations 16B, alpha 4B, in three separate ~30M-entry arrays)
+// that measured as essentially the WHOLE cost of the gather: 169.8ms -> 43.8ms with them removed (plan doc, P4.1). It
+// also shrinks the cached geom rather than growing it - 12B/node against the 32B/node those three arrays cost.
+//
+// The stored model is the disc approximation validated in P4.2 (see the plan doc for its quality cost and the two ways
+// back if it ever bites), written in the form the gather wants:
+//
+//   r = g * (1 + c^2*(inv_t^2 - 1))^(1/4),   c = |d . n|,   g = sqrt(a*b),   inv_t = a/b
+//
+// with a = sqrt(s_mid*s_max), b = s_min and n = the s_min axis. Face-on (c=1) gives a, edge-on (c=0) gives sqrt(a*b) -
+// the same two sanity checks gsSatProjectedRadius() satisfies.
+//
+// Quantisation cost, measured against the unquantised disc model over 400k splats spanning 0.1mm-30m and axis ratios
+// to the measured 63000:1: median 0.02%, p99.99 0.35%, worst 2.2%. The tail is the snorm16 normal, not the halves: a
+// needle seen near edge-on has a genuinely steep dr/dc. It sits an order of magnitude below the disc model's OWN
+// approximation error, which the owner validated visually - so this quantisation is not what would bite first.
+struct GsSatPackedOccluder
+{
+	int16 nx, ny, nz;   // Thin-axis unit normal, snorm16 (n * 32767). Only |d.n| is ever used, so the sign is free.
+	uint16 g_half;      // sqrt(a*b) * gs_sat_half_g_scale. One sigma, world space.
+	uint16 inv_t_half;  // a/b, unscaled - always >= 1 (a = sqrt(s_mid*s_max) >= s_mid >= s_min = b), so it needs no room below 1.
+	uint16 alpha_half;  // The STORED opacity * gs_sat_half_alpha_scale: alpha_gain/alpha_gamma are runtime knobs, so the gather applies them.
+};
+
+static_assert(sizeof(GsSatPackedOccluder) == 12, "GsSatPackedOccluder must stay 12 bytes - the whole point is one cache line per node.");
+
+
+// SESSION081 ETAP 4: builds one record from a splat's world-space scales/rotation/alpha. Runs once per splat per
+// topology change (see getOrBuildCachedGeom()), never per build.
+static inline GsSatPackedOccluder gsSatPackOccluder(const Vec3f& sc, const Vec4f& rot, float alpha)
+{
+	int min_axis = 0;
+	if(sc[1] < sc[min_axis]) min_axis = 1;
+	if(sc[2] < sc[min_axis]) min_axis = 2;
+	const float s_min = myMax(sc[min_axis], 1.0e-8f); // Same degenerate-axis floor gsSatProjectedRadius() uses.
+	float s_p = 0.f, s_q = 0.f; // The two non-thin axes, in whatever order - only their product is wanted.
+	bool first = true;
+	for(int k=0; k<3; ++k)
+		if(k != min_axis)
+		{
+			if(first) { s_p = myMax(sc[k], 1.0e-8f); first = false; }
+			else        s_q = myMax(sc[k], 1.0e-8f);
+		}
+	const float a = std::sqrt(s_p * s_q); // = sqrt(s_mid*s_max): preserves the true face-on area, which goes as s_mid*s_max.
+
+	// The thin axis in world space is the min_axis'th column of the quaternion's rotation matrix - same (x, y, z, w)
+	// convention, and the same three columns, gsSatProjectedRadius() dots against.
+	const float qx = rot[0], qy = rot[1], qz = rot[2], qw = rot[3];
+	const float qxx = qx*qx, qyy = qy*qy, qzz = qz*qz;
+	const float qxy = qx*qy, qxz = qx*qz, qyz = qy*qz, qwx = qw*qx, qwy = qw*qy, qwz = qw*qz;
+	float nx, ny, nz;
+	if(min_axis == 0)      { nx = 1.f - 2.f*(qyy + qzz); ny = 2.f*(qxy + qwz);       nz = 2.f*(qxz - qwy); }
+	else if(min_axis == 1) { nx = 2.f*(qxy - qwz);       ny = 1.f - 2.f*(qxx + qzz); nz = 2.f*(qyz + qwx); }
+	else                   { nx = 2.f*(qxz + qwy);       ny = 2.f*(qyz - qwx);       nz = 1.f - 2.f*(qxx + qyy); }
+
+	const float len_sq = nx*nx + ny*ny + nz*nz; // The stored quaternion is unit only to float precision, and snorm16 assumes a unit vector.
+	const float inv_len = len_sq > 1.0e-12f ? (1.f / std::sqrt(len_sq)) : 0.f;
+
+	GsSatPackedOccluder p;
+	p.nx = (int16)myClamp((int)(nx * inv_len * 32767.f + (nx >= 0.f ? 0.5f : -0.5f)), -32767, 32767);
+	p.ny = (int16)myClamp((int)(ny * inv_len * 32767.f + (ny >= 0.f ? 0.5f : -0.5f)), -32767, 32767);
+	p.nz = (int16)myClamp((int)(nz * inv_len * 32767.f + (nz >= 0.f ? 0.5f : -0.5f)), -32767, 32767);
+	p.g_half = gsSatPackHalf(std::sqrt(a * s_min) * gs_sat_half_g_scale);
+	p.inv_t_half = gsSatPackHalf(a / s_min);
+	p.alpha_half = gsSatPackHalf(alpha * gs_sat_half_alpha_scale);
+	return p;
+}
+
+
 // SESSION058: immutable, cacheable copy of one cloud's world-space node positions + feature_size, shared (via Reference<>)
 // between every traversal kicked off since the cloud's last structural change, instead of each kick paying its own
 // memcpy. Safe to share across the worker and later kicks because nothing ever mutates an instance of this class after
@@ -88,21 +192,18 @@ public:
 	js::Vector<Vec3f, 16> positions;
 	js::Vector<float, 16> feature_size;
 	js::Vector<float, 16> cull_radius; // SESSION059: world-space enclosing-sphere radius per node - see SplatCloud::cull_radius and GaussianSplatLodNode::bounding_radius_os.
-	js::Vector<float, 16> alpha; // SESSION074: colours[i].w, same pattern as cull_radius above - needed by the traversal task's coarse-floor saturation-grid pass (GaussianSplatSaturationGrid.h) to weight each coarse node's contribution; colours itself is never added here, only this one channel, since nothing else on this path needs colour.
 
-	// SESSION077: cloud.scales / cloud.rotations verbatim (world-space), for the saturation grid's occluder footprint -
-	// see the gather loop's gsSatProjectedRadius() call.
+	// SESSION081 ETAP 4: the saturation gather's per-splat input, packed - see GsSatPackedOccluder. Replaces the
+	// separate scales (Vec3f), rotations (Vec4f) and alpha (float) arrays that used to live here; those three existed
+	// only to feed that one loop, and feeding it from three ~30M-entry arrays cost three cache misses per node.
 	//
-	// The grid used to treat every occluder as an ISOTROPIC disc of radius max(scale.xyz). That is the right bound for
-	// CULLING (the splat cannot reach further than that in any direction) but the wrong quantity for OCCLUSION, which
-	// needs the splat's cross-section as seen from the anchor. Measured on the owner's interior: mean
-	// max(scale)/min(scale) = 101, 67% of occluders past 10:1, worst 63000:1 - so the isotropic disc overstated most
-	// splats' footprints by orders of magnitude, and by a factor that varies with viewing angle (a flat splat seen
-	// face-on vs edge-on), which is what made an opaque wall's mask break up by distance-from-normal instead of being
-	// uniform. Both arrays are needed because the cross-section depends on the splat's orientation relative to the view
-	// direction, not just on its extents.
-	js::Vector<Vec3f, 16> scales;
-	js::Vector<Vec4f, 16> rotations; // (x, y, z, w), same convention as SplatCloud::rotations.
+	// SESSION077's point still stands and is what this record encodes: the grid used to treat every occluder as an
+	// ISOTROPIC disc of radius max(scale.xyz). That is the right bound for CULLING (the splat cannot reach further in
+	// any direction) and the wrong quantity for OCCLUSION, which needs the cross-section as seen from the anchor.
+	// Measured on the owner's interior: mean max(scale)/min(scale) = 101, 67% of occluders past 10:1, worst 63000:1 -
+	// so the isotropic disc overstated most footprints by orders of magnitude, by a factor that varies with viewing
+	// angle, which is what made an opaque wall's mask break up by distance-from-normal instead of being uniform.
+	js::Vector<GsSatPackedOccluder, 16> sat_occl;
 };
 
 
@@ -370,7 +471,6 @@ public:
 	size_t diag_writers, diag_tile_writes;
 	size_t diag_tile_stats[3]; // [0] total per-tile iterations, [1] rejected off the Gaussian's tail, [2] skipped as already saturated - see gsSatDepositRec().
 	size_t erode_stats[4];     // [0] er_ceil, [1] er_win, [2] er_radmax, [3] cl (closed) - see gsSatApplyRegionErosion()/gsSatApplyClosing().
-	size_t diag_aniso_n; double diag_aniso_mean; float diag_aniso_max; size_t diag_aniso_gt5, diag_aniso_gt10; // See GaussianSplatUnculledFrontier's old sat_diag_aniso_* comment.
 
 	// SESSION077/078 debug overlay sources - see updateSatGridDebugTexture(). Empty unless the overlay was requested
 	// for this build (same gate sat_overlay_requested used to drive on the traversal task).
@@ -390,7 +490,6 @@ public:
 		num_occluders(0), gather_ms(0.0), grid_build_ms(0.0),
 		frontier_n(0), rec_ms(0.0), dep_ms(0.0), close_ms(0.0), erode_ms(0.0), num_recs(0), num_strips(0), concurrency_used(0), num_blocks(0),
 		diag_writers(0), diag_tile_writes(0),
-		diag_aniso_n(0), diag_aniso_mean(0.0), diag_aniso_max(0.f), diag_aniso_gt5(0), diag_aniso_gt10(0),
 		bypass_used(false), bypass_distance_used(0.f)
 	{
 		for(int i=0; i<3; ++i) diag_tile_stats[i] = 0;
@@ -1188,47 +1287,6 @@ public:
 };
 
 
-// SESSION081 PLAN ETAP 4, P4.1 - TEMPORARY DIAGNOSTIC SWITCH. 1 = build the deliberately-wrong, scatter-free
-// gather described in GsSatGatherTask::run(), to measure the ceiling on what removing the scattered
-// scales/rotations/alpha reads could buy. The picture is WRONG in this mode (see that comment) - it exists purely
-// to bound the prize before the real 8-byte packed occlusion record is designed. MUST be 0 for any build the owner
-// looks at for anything other than this one gather_ms measurement. Remove the macro and its branch once stage 4
-// concludes either way.
-// MEASURED 2026-08-31 (owner, clean 4+-teleport protocol, R=1): gather_ms 169.8ms (baseline, 3 scattered reads)
-// -> 43.8ms with them gone, a 74% cut, spread only +-4% across 7 captures. So the scattered reads were
-// essentially the WHOLE cost of gather, not merely most of it, and stage 4's prize is ~126ms per barrier build
-// (~47% of the whole build, which was gather 170 + grid 106). Ceiling established; switch back off.
-#define GS_SAT_GATHER_SCATTER_CEILING_TEST 0
-
-
-// SESSION081 PLAN ETAP 4, P4.2 - TEMPORARY DIAGNOSTIC. 1 = alongside the exact gsSatProjectedRadius(), also compute
-// the PACKED DISC MODEL's radius and histogram the ratio between them, so the quality cost of stage 4's storage
-// format is known from the real occluder population BEFORE the format is committed to. Read-only: the value the
-// grid is actually built from is untouched, so the picture is correct in this mode (unlike the ceiling test above)
-// - it only costs a little arithmetic per node. Remove once P4.2 concludes.
-//
-// The model under test: a 3DGS splat's exact equal-area occlusion radius (see gsSatProjectedRadius()) is
-//   r = sqrt( s0*s1*s2 * sqrt( sum_k (d.axis_k)^2 / s_k^2 ) )
-// which needs all three scales AND the full rotation - 28 bytes, 3 scattered reads. Approximating the splat as a
-// DISC (two equal large axes a, one small axis b along normal n) collapses that to
-//   r_disc = sqrt( a^2*b * sqrt( (1-c^2)/a^2 + c^2/b^2 ) ),  c = |d.n|
-// which needs only (n, a, b) = 8 bytes: oct16 normal (4B) + a (half) + b (half). Sanity checks, both exact:
-// face-on (c=1) gives a; edge-on (c=0) gives sqrt(a*b) - matching gsSatProjectedRadius()'s own two checks.
-// a = sqrt(s_mid*s_max) preserves the true face-on area (which goes as s_mid*s_max), b = s_min, n = s_min's axis.
-// The model is EXACT when s_mid == s_max and degrades as the splat becomes needle-like - hence midmax_bins.
-#define GS_SAT_GATHER_DISC_MODEL_PROBE 1
-
-// SESSION081 ETAP 4: build the grid from the disc model's radius (the approximation the 8-byte packed occlusion
-// record commits to) rather than the exact gsSatProjectedRadius().
-//
-// Accepted approximation: over-estimates the radius on 2.24% of (node, viewpoint) pairs, which can prune visible
-// geometry. Owner-validated 2026-08-31: small silhouette artefacts at R = 0, none at R > 0 (R > 0 covers it with
-// the ball guarantee's own conservatism - it masks the error, does not fix it, so this depends on R staying > 0).
-// If it ever bites: bake a per-splat conservative divisor at pack time, or fall back to the exact 12-byte format.
-// Full numbers, derivation and both fallbacks: session081 plan doc, ETAP 4.
-#define GS_SAT_GATHER_DISC_MODEL_VISUAL_TEST 1
-
-
 // SESSION079: one slice of the occluder gather - see GsSatGatherTask.
 struct GsSatGatherChunk
 {
@@ -1238,32 +1296,24 @@ struct GsSatGatherChunk
 	// when a frontier was one flat array.
 	size_t out_base;
 	size_t count;        // Survivors this chunk wrote into its own slice.
-	double aniso_sum;    // Diagnostic, accumulated per chunk so the threads never share a counter.
-	float aniso_max;
-	size_t aniso_gt5, aniso_gt10, aniso_n;
-
-	// SESSION081 PLAN ETAP 4, P4.2 TEMPORARY - the quality cost of the packed 8-byte disc model, measured against the
-	// exact gsSatProjectedRadius() on the real occluder population before anything is built on it. Per chunk, like
-	// aniso above, so threads never share a counter. Only filled when GS_SAT_GATHER_DISC_MODEL_PROBE is on.
-	size_t disc_bins[7];    // r_disc/r_exact: [0]<0.5 [1]0.5-0.8 [2]0.8-0.9 [3]0.9-1.1 [4]1.1-1.25 [5]1.25-2.0 [6]>2.0
-	size_t midmax_bins[4];  // s_mid/s_max: [0]<0.25 [1]0.25-0.5 [2]0.5-0.8 [3]>0.8 - the disc model is EXACT at s_mid==s_max, so this says how much of the population is even disc-shaped.
-	double disc_ratio_sum;
-	float disc_ratio_min, disc_ratio_max;
-	size_t disc_n;
 };
 
 
 // SESSION079: builds the occluder SoA the saturation grid is fed from, split across the pool.
 //
 // This turned out to be the largest single cost in the whole stage and had never been timed: ~845ms of a ~1010ms
-// stage on the owner's full scene (11.49M nodes), against 96ms for the grid build and 73ms for the read. Of that,
-// ~512ms is the two scattered reads below - scales[idx] and rotations[idx] land wherever the node's cloud index
-// points, in arrays of 30M entries (~840MB), so this is ~45ns per node of pure DRAM miss latency and almost no
-// arithmetic.
+// stage on the owner's full scene (11.49M nodes), against 96ms for the grid build and 73ms for the read. Most of that
+// was scattered reads - a node's cloud index lands wherever it points in arrays of ~30M entries, so it is pure DRAM
+// miss latency and almost no arithmetic.
 //
 // That is exactly the shape that gains MOST from threading: the limit is outstanding misses, not issue width, so
 // N threads give close to N times the memory-level parallelism. (The other ~228ms was the five outputs growing
 // from empty by push_back; they are sized up front now, which is what let each chunk own a slice.)
+//
+// SESSION081 ETAP 4: there used to be THREE scattered reads per node - scales, rotations and alpha, in three separate
+// arrays - and P4.1 measured them as essentially the whole remaining cost of this loop: 169.8ms of gather became
+// 43.8ms with them removed. There is now exactly ONE, into the 12-byte packed record; see GsSatPackedOccluder for the
+// format, the disc model it encodes, and that model's measured quality cost.
 //
 // Each chunk writes into its own slice of full-size arrays and reports how many it kept; the caller closes the
 // gaps afterwards. Same shape as the grid build's phase 1, deliberately - and where the coarse floor is off
@@ -1274,163 +1324,41 @@ public:
 	virtual void run(size_t /*thread_index*/)
 	{
 		size_t c = 0;
-		double a_sum = 0.0; float a_max = 0.f; size_t a_gt5 = 0, a_gt10 = 0, a_n = 0;
-#if GS_SAT_GATHER_DISC_MODEL_PROBE
-		size_t d_bins[7] = { 0, 0, 0, 0, 0, 0, 0 }; // SESSION081 PLAN ETAP 4, P4.2 TEMPORARY - see GsSatGatherChunk.
-		size_t d_midmax[4] = { 0, 0, 0, 0 };
-		double d_ratio_sum = 0.0; float d_ratio_min = std::numeric_limits<float>::infinity(), d_ratio_max = 0.f; size_t d_n = 0;
-#endif
 		for(size_t i=chunk->i_begin; i<chunk->i_end; ++i)
 		{
 			if(is_coarse[i] != 0.f) // Coarse nodes are a second, redundant description of the same surfaces - see the call site.
 				continue;
-			const uint32 idx = indices[i];
 
 			out_px[c] = px[i]; out_py[c] = py[i]; out_pz[c] = pz[i];
 
-#if GS_SAT_GATHER_SCATTER_CEILING_TEST
-			// SESSION081 PLAN ETAP 4, P4.1 - DELIBERATELY WRONG, TEMPORARY. Establishes the CEILING on what stage 4 can
-			// buy BEFORE the real thing is built (the plan's "measure the ceiling first" rule). scales[idx] (12B),
-			// rotations[idx] (16B) and alphas[idx] (4B) are the ONLY scattered reads in this loop - a node's cloud
-			// index into arrays of ~30M entries (~960MB), i.e. 3 cache misses per node with no locality at all,
-			// ~2.5GB of DRAM line traffic per build on the owner's reference scene. Here they are replaced by one
-			// SEQUENTIAL read of the frontier's own radius array (gathered in traversal order by GsFrontierSoATask,
-			// right beside px/py/pz) plus a constant, leaving this loop with no scattered access whatsoever.
-			//
-			// THE PICTURE IS WRONG while this is enabled - cull_radius is a bounding radius, not an occlusion
-			// cross-section, and the alpha is fake, so the barrier prunes wrongly. That is intended: this measures
-			// COST, not quality. gather_ms against the baseline bounds the whole of stage 4's prize; the aniso
-			// diagnostic is skipped too, since it reads scales[idx] and would put a scattered read straight back.
-			out_radius[c] = radius_seq[i];
-			out_alpha[c] = 0.5f;
-			++c;
-			continue;
-#endif
+			const GsSatPackedOccluder p = occl[indices[i]]; // The one scattered read left in this loop - see GsSatPackedOccluder.
 
 			const float ddx = px[i] - cam_pos_ws.x[0];
 			const float ddy = py[i] - cam_pos_ws.x[1];
 			const float ddz = pz[i] - cam_pos_ws.x[2];
 			const float d_len = std::sqrt(ddx*ddx + ddy*ddy + ddz*ddz);
 			const float inv_d = d_len > 1.0e-6f ? (1.f / d_len) : 0.f; // Degenerate (node at the anchor) - the grid build skips such nodes anyway.
-			const Vec4f unit_dir(ddx * inv_d, ddy * inv_d, ddz * inv_d, 0.f);
 
-			out_radius[c] = gs_sat_occluder_sigmas * gsSatProjectedRadius(scales[idx], rotations[idx], unit_dir);
-			out_alpha[c] = adjustSplatAlpha(alphas[idx], alpha_gain, alpha_gamma); // The DRAWN opacity, not the stored one - see GaussianSplatRenderer::getAlphaGain().
+			// r = g * (1 + c^2*(inv_t^2 - 1))^(1/4). cos_n is clamped because the snorm16 normal is unit only to ~3e-5,
+			// and a value a hair over 1 would push the fourth root past the true face-on radius.
+			const float nx = (float)p.nx * (1.f / 32767.f), ny = (float)p.ny * (1.f / 32767.f), nz = (float)p.nz * (1.f / 32767.f);
+			const float cos_n = myMin(std::fabs(ddx*nx + ddy*ny + ddz*nz) * inv_d, 1.f);
+			const float inv_t = gsSatUnpackHalf(p.inv_t_half);
+			const float w = 1.f + cos_n*cos_n * (inv_t*inv_t - 1.f);
 
-#if GS_SAT_GATHER_DISC_MODEL_PROBE
-			// SESSION081 PLAN ETAP 4, P4.2 TEMPORARY - see the macro's comment for the model and its derivation.
-			// scales[idx]/rotations[idx] are already hot from the exact call above, so this adds arithmetic only.
-			{
-				const Vec3f& sc = scales[idx];
-				// Sort the three axes so we know which is which, keeping track of WHICH axis is the thin one - the
-				// disc's normal is that axis, not an arbitrary one.
-				int min_axis = 0;
-				if(sc[1] < sc[min_axis]) min_axis = 1;
-				if(sc[2] < sc[min_axis]) min_axis = 2;
-				const float s_min = myMax(sc[min_axis], 1.0e-8f); // Same degenerate-axis floor gsSatProjectedRadius() uses.
-				float s_a = 0.f, s_b = 0.f; // The two non-thin axes.
-				bool first = true;
-				for(int k=0; k<3; ++k)
-					if(k != min_axis)
-					{
-						if(first) { s_a = myMax(sc[k], 1.0e-8f); first = false; }
-						else        s_b = myMax(sc[k], 1.0e-8f);
-					}
-				const float s_max_ax = myMax(s_a, s_b), s_mid_ax = myMin(s_a, s_b);
-				const float a_disc = std::sqrt(s_mid_ax * s_max_ax); // Preserves the true face-on area (proportional to s_mid*s_max).
-
-				// The thin axis in world space = the min_axis'th column of the rotation matrix, built from the same
-				// quaternion convention gsSatProjectedRadius() uses (x, y, z, w).
-				const Vec4f& q = rotations[idx];
-				const float qx = q[0], qy = q[1], qz = q[2], qw = q[3];
-				const float qxx = qx*qx, qyy = qy*qy, qzz = qz*qz;
-				const float qxy = qx*qy, qxz = qx*qz, qyz = qy*qz, qwx = qw*qx, qwy = qw*qy, qwz = qw*qz;
-				float nx, ny, nz;
-				if(min_axis == 0)      { nx = 1.f - 2.f*(qyy + qzz); ny = 2.f*(qxy + qwz);       nz = 2.f*(qxz - qwy); }
-				else if(min_axis == 1) { nx = 2.f*(qxy - qwz);       ny = 1.f - 2.f*(qxx + qzz); nz = 2.f*(qyz + qwx); }
-				else                   { nx = 2.f*(qxz + qwy);       ny = 2.f*(qyz - qwx);       nz = 1.f - 2.f*(qxx + qyy); }
-
-				// NB: deliberately NOT called 'c' - that name is the output write cursor in the enclosing loop, and
-				// shadowing it made out_radius[c] below index by a float (caught at compile time, C2108).
-				const float cos_n = myClamp(std::fabs(unit_dir[0]*nx + unit_dir[1]*ny + unit_dir[2]*nz), 0.f, 1.f);
-				const float c_sq = cos_n * cos_n;
-				const float q_disc = (1.f - c_sq) / (a_disc * a_disc) + c_sq / (s_min * s_min);
-				const float r_disc = std::sqrt(a_disc * a_disc * s_min * std::sqrt(q_disc));
-
-				// out_radius[c] is gs_sat_occluder_sigmas * gsSatProjectedRadius(...), so divide that common factor
-				// back out to compare like with like. The ratio is what matters, so the factor would cancel anyway -
-				// dividing keeps the min/max readable as true radii ratios rather than something scaled by 3.
-				const float r_exact = out_radius[c] * (1.f / gs_sat_occluder_sigmas);
-				if(r_exact > 1.0e-9f)
-				{
-					const float ratio = r_disc / r_exact;
-					int bin;
-					if     (ratio < 0.5f)  bin = 0;
-					else if(ratio < 0.8f)  bin = 1;
-					else if(ratio < 0.9f)  bin = 2;
-					else if(ratio < 1.1f)  bin = 3;
-					else if(ratio < 1.25f) bin = 4;
-					else if(ratio < 2.0f)  bin = 5;
-					else                   bin = 6;
-					++d_bins[bin];
-
-					const float midmax = s_mid_ax / s_max_ax; // 1 = a true disc (model exact), small = needle-like.
-					int mm;
-					if     (midmax < 0.25f) mm = 0;
-					else if(midmax < 0.5f)  mm = 1;
-					else if(midmax < 0.8f)  mm = 2;
-					else                    mm = 3;
-					++d_midmax[mm];
-
-					d_ratio_sum += ratio;
-					d_ratio_min = myMin(d_ratio_min, ratio);
-					d_ratio_max = myMax(d_ratio_max, ratio);
-					++d_n;
-				}
-
-#if GS_SAT_GATHER_DISC_MODEL_VISUAL_TEST
-				// SESSION081 PLAN ETAP 4 TEMPORARY: overwrite the exact radius with the packed disc model's, AFTER the
-				// stats above have already captured r_exact - so [gsr-sat-disc-probe] keeps reporting the true ratio
-				// even while the grid is being built from r_disc. This is what "visually validate the 8-byte format"
-				// actually means: the barrier this build produces is now the one the light format would really give.
-				out_radius[c] = gs_sat_occluder_sigmas * r_disc;
-#endif
-			}
-#endif
-
-			if(want_aniso) // SESSION077 DIAGNOSTIC - scales[idx] is already hot from the line above, so this costs a max/min, not a miss.
-			{
-				const Vec3f& sc = scales[idx];
-				const float max_s = myMax(sc.x, myMax(sc.y, sc.z));
-				const float min_s = myMax(myMin(sc.x, myMin(sc.y, sc.z)), 1.0e-6f); // Floor avoids a divide-by-zero on a degenerate/near-planar splat.
-				const float ratio = max_s / min_s;
-				a_sum += ratio;
-				a_max = myMax(a_max, ratio);
-				if(ratio > 5.f) ++a_gt5;
-				if(ratio > 10.f) ++a_gt10;
-				++a_n;
-			}
+			// The two pack scales divide back out here; folded into constants, so they cost nothing at runtime.
+			out_radius[c] = (gs_sat_occluder_sigmas / gs_sat_half_g_scale) * gsSatUnpackHalf(p.g_half) * std::sqrt(std::sqrt(w));
+			out_alpha[c] = adjustSplatAlpha(gsSatUnpackHalf(p.alpha_half) * (1.f / gs_sat_half_alpha_scale), alpha_gain, alpha_gamma); // The DRAWN opacity, not the stored one - see GaussianSplatRenderer::getAlphaGain().
 			++c;
 		}
 		chunk->count = c;
-		chunk->aniso_sum = a_sum; chunk->aniso_max = a_max;
-		chunk->aniso_gt5 = a_gt5; chunk->aniso_gt10 = a_gt10; chunk->aniso_n = a_n;
-#if GS_SAT_GATHER_DISC_MODEL_PROBE
-		for(int k=0; k<7; ++k) chunk->disc_bins[k] = d_bins[k]; // SESSION081 PLAN ETAP 4, P4.2 TEMPORARY.
-		for(int k=0; k<4; ++k) chunk->midmax_bins[k] = d_midmax[k];
-		chunk->disc_ratio_sum = d_ratio_sum;
-		chunk->disc_ratio_min = d_ratio_min; chunk->disc_ratio_max = d_ratio_max;
-		chunk->disc_n = d_n;
-#endif
 	}
 
 	const uint32* indices; const float* px; const float* py; const float* pz; const float* is_coarse;
-	const float* radius_seq; // SESSION081 PLAN ETAP 4, P4.1 TEMPORARY: the frontier's own per-node cull_radius, sequential - only read by the ceiling-test branch in run(). Always wired up (costs nothing when the test is off) so enabling the macro needs no call-site change.
-	const Vec3f* scales; const Vec4f* rotations; const float* alphas;
+	const GsSatPackedOccluder* occl; // SESSION081 ETAP 4: indexed by indices[i] - the only scattered access in run().
 	float* out_px; float* out_py; float* out_pz; float* out_radius; float* out_alpha;
 	Vec4f cam_pos_ws;
 	float alpha_gain, alpha_gamma;
-	bool want_aniso;
 	GsSatGatherChunk* chunk;
 };
 
@@ -1608,21 +1536,10 @@ public:
 					ch.i_end   = (seg_n * (c + 1)) / seg_chunks;
 					ch.out_base = seg_base[sg] + ch.i_begin;
 					ch.count = 0;
-					ch.aniso_sum = 0.0; ch.aniso_max = 0.f;
-					ch.aniso_gt5 = ch.aniso_gt10 = ch.aniso_n = 0;
-					for(int k=0; k<7; ++k) ch.disc_bins[k] = 0; // SESSION081 PLAN ETAP 4, P4.2 TEMPORARY.
-					for(int k=0; k<4; ++k) ch.midmax_bins[k] = 0;
-					ch.disc_ratio_sum = 0.0; ch.disc_ratio_min = 0.f; ch.disc_ratio_max = 0.f; ch.disc_n = 0;
 					chunks.push_back(ch);
 				}
 			}
 
-			double aniso_sum = 0.0; float aniso_max = 0.f; size_t aniso_gt5 = 0, aniso_gt10 = 0, aniso_n = 0;
-#if GS_SAT_GATHER_DISC_MODEL_PROBE
-			size_t disc_bins_tot[7] = { 0, 0, 0, 0, 0, 0, 0 }; // SESSION081 PLAN ETAP 4, P4.2 TEMPORARY.
-			size_t midmax_tot[4] = { 0, 0, 0, 0 };
-			double disc_ratio_sum_tot = 0.0; float disc_ratio_min_tot = std::numeric_limits<float>::infinity(), disc_ratio_max_tot = 0.f; size_t disc_n_tot = 0;
-#endif
 			glare::TaskGroupRef group = new glare::TaskGroup();
 			{
 				size_t c = 0;
@@ -1635,14 +1552,12 @@ public:
 						Reference<GsSatGatherTask> t = new GsSatGatherTask();
 						t->indices = seg.indices.data(); t->px = seg.px.data(); t->py = seg.py.data(); t->pz = seg.pz.data();
 						t->is_coarse = seg.is_coarse.data();
-						t->radius_seq = seg.radius.data(); // SESSION081 PLAN ETAP 4, P4.1 TEMPORARY - see GsSatGatherTask::radius_seq.
-						t->scales = geom->scales.data(); t->rotations = geom->rotations.data(); t->alphas = geom->alpha.data();
+						t->occl = geom->sat_occl.data(); // SESSION081 ETAP 4 - see GsSatPackedOccluder.
 						t->out_px = occl_px.data() + chunks[c].out_base; t->out_py = occl_py.data() + chunks[c].out_base;
 						t->out_pz = occl_pz.data() + chunks[c].out_base; t->out_radius = occl_radius.data() + chunks[c].out_base;
 						t->out_alpha = occl_alpha.data() + chunks[c].out_base;
 						t->cam_pos_ws = anchor_pos_ws;
 						t->alpha_gain = alpha_gain; t->alpha_gamma = alpha_gamma;
-						t->want_aniso = diag_log;
 						t->chunk = &chunks[c];
 						if(task_manager != NULL) group->tasks.push_back(t); else t->run(0);
 					}
@@ -1663,53 +1578,9 @@ public:
 					std::memmove(occl_alpha.data() + kept, occl_alpha.data() + slice_begin, cnt * sizeof(float));
 				}
 				kept += cnt;
-				aniso_sum += chunks[c].aniso_sum; aniso_max = myMax(aniso_max, chunks[c].aniso_max);
-				aniso_gt5 += chunks[c].aniso_gt5; aniso_gt10 += chunks[c].aniso_gt10; aniso_n += chunks[c].aniso_n;
-#if GS_SAT_GATHER_DISC_MODEL_PROBE
-				for(int k=0; k<7; ++k) disc_bins_tot[k] += chunks[c].disc_bins[k]; // SESSION081 PLAN ETAP 4, P4.2 TEMPORARY.
-				for(int k=0; k<4; ++k) midmax_tot[k] += chunks[c].midmax_bins[k];
-				disc_ratio_sum_tot += chunks[c].disc_ratio_sum;
-				if(chunks[c].disc_n > 0)
-				{
-					disc_ratio_min_tot = myMin(disc_ratio_min_tot, chunks[c].disc_ratio_min);
-					disc_ratio_max_tot = myMax(disc_ratio_max_tot, chunks[c].disc_ratio_max);
-				}
-				disc_n_tot += chunks[c].disc_n;
-#endif
 			}
 			occl_px.resize(kept); occl_py.resize(kept); occl_pz.resize(kept);
 			occl_radius.resize(kept); occl_alpha.resize(kept);
-
-#if GS_SAT_GATHER_DISC_MODEL_PROBE
-			// SESSION081 PLAN ETAP 4, P4.2 TEMPORARY - printed straight from the build task rather than carried on the
-			// barrier, since this whole probe is a one-off measurement and not something the barrier should grow a
-			// field for. Gated on diag_log so it costs nothing (and prints nothing) in normal operation.
-			if(diag_log && disc_n_tot > 0)
-			{
-				const double dn = (double)disc_n_tot;
-				conPrint("[gsr-sat-disc-probe] n=" + uInt64ToStringCommaSeparated(disc_n_tot) +
-					" mean=" + doubleToStringNDecimalPlaces(disc_ratio_sum_tot / dn, 4) +
-					" min=" + doubleToStringNDecimalPlaces(disc_ratio_min_tot, 4) +
-					" max=" + doubleToStringNDecimalPlaces(disc_ratio_max_tot, 2) +
-					" | ratio r_disc/r_exact: <0.5=" + doubleToStringNDecimalPlaces(100.0 * (double)disc_bins_tot[0] / dn, 2) + "%" +
-					" 0.5-0.8=" + doubleToStringNDecimalPlaces(100.0 * (double)disc_bins_tot[1] / dn, 2) + "%" +
-					" 0.8-0.9=" + doubleToStringNDecimalPlaces(100.0 * (double)disc_bins_tot[2] / dn, 2) + "%" +
-					" 0.9-1.1=" + doubleToStringNDecimalPlaces(100.0 * (double)disc_bins_tot[3] / dn, 2) + "%" +
-					" 1.1-1.25=" + doubleToStringNDecimalPlaces(100.0 * (double)disc_bins_tot[4] / dn, 2) + "%" +
-					" 1.25-2=" + doubleToStringNDecimalPlaces(100.0 * (double)disc_bins_tot[5] / dn, 2) + "%" +
-					" >2=" + doubleToStringNDecimalPlaces(100.0 * (double)disc_bins_tot[6] / dn, 2) + "%" +
-					" | s_mid/s_max: <0.25=" + doubleToStringNDecimalPlaces(100.0 * (double)midmax_tot[0] / dn, 1) + "%" +
-					" 0.25-0.5=" + doubleToStringNDecimalPlaces(100.0 * (double)midmax_tot[1] / dn, 1) + "%" +
-					" 0.5-0.8=" + doubleToStringNDecimalPlaces(100.0 * (double)midmax_tot[2] / dn, 1) + "%" +
-					" >0.8=" + doubleToStringNDecimalPlaces(100.0 * (double)midmax_tot[3] / dn, 1) + "%");
-			}
-#endif
-
-			barrier->diag_aniso_n = aniso_n;
-			barrier->diag_aniso_mean = aniso_n > 0 ? (aniso_sum / (double)aniso_n) : 0.0;
-			barrier->diag_aniso_max = aniso_max;
-			barrier->diag_aniso_gt5 = aniso_gt5;
-			barrier->diag_aniso_gt10 = aniso_gt10;
 		}
 		barrier->gather_ms = sat_gather_timer.elapsed() * 1.0e3;
 		barrier->num_occluders = occl_px.size();
@@ -4504,6 +4375,22 @@ static const char* const stop_reason_labels[FrontierStop_NumReasons] =
 // kickOffSaturationBuilds() can obtain the same snapshot without needing a whole GaussianSplatLodTraversalScratch to
 // hold it - a saturation build reads positions/scales/rotations/alpha exactly like a traversal does, just without the
 // rest of the scratch (selected_indices, members_snapshot, the caps). Behaviour unchanged from before the extraction.
+// SESSION081 ETAP 4: one slice of the packed-occluder build - see getOrBuildCachedGeom() and GsSatPackedOccluder.
+class GsSatPackTask : public glare::Task
+{
+public:
+	virtual void run(size_t /*thread_index*/)
+	{
+		for(size_t i=i_begin; i<i_end; ++i)
+			out[i] = gsSatPackOccluder(scales[i], rotations[i], colours[i][3]);
+	}
+
+	const Vec3f* scales; const Vec4f* rotations; const Vec4f* colours;
+	GsSatPackedOccluder* out;
+	size_t i_begin, i_end;
+};
+
+
 Reference<GaussianSplatCachedGeom> GaussianSplatRenderer::getOrBuildCachedGeom(SplatCloud& cloud) const
 {
 	// SESSION058: reuse the cached snapshot if the cloud hasn't structurally changed since it was built - see
@@ -4530,18 +4417,29 @@ Reference<GaussianSplatCachedGeom> GaussianSplatRenderer::getOrBuildCachedGeom(S
 	geom->cull_radius.resizeNoCopy(cloud.total_splats);
 	std::memcpy(geom->cull_radius.data(), cloud.cull_radius.data(), cloud.total_splats * sizeof(float));
 
-	// SESSION074: unlike positions/feature_size/cull_radius, there is no pre-maintained flat alpha array on the
-	// cloud to memcpy - colours is Vec4f (rgb+alpha interleaved), so this is a per-node extract, not a raw copy.
-	// Only runs on a cache miss (topology change), same as the blocks above.
-	geom->alpha.resizeNoCopy(cloud.total_splats);
-	for(size_t i=0; i<cloud.total_splats; ++i)
-		geom->alpha[i] = cloud.colours[i][3];
-
-	// SESSION077: see GaussianSplatCachedGeom::scales. Raw memcpys, same pattern as feature_size/cull_radius.
-	geom->scales.resizeNoCopy(cloud.total_splats);
-	std::memcpy(geom->scales.data(), cloud.scales.data(), cloud.total_splats * sizeof(Vec3f));
-	geom->rotations.resizeNoCopy(cloud.total_splats);
-	std::memcpy(geom->rotations.data(), cloud.rotations.data(), cloud.total_splats * sizeof(Vec4f));
+	// SESSION081 ETAP 4: pack the saturation gather's inputs - see GsSatPackedOccluder. This replaces the scales and
+	// rotations memcpys and the alpha extract loop that used to be here, and it MOVES LESS MEMORY than they did (12B
+	// written per node against 32B), so the arithmetic it adds is paid for out of the bandwidth it saves. Split across
+	// the pool because this is the one place in the pipeline that touches every splat in the cloud, and it runs on the
+	// main thread; serial fallback when there is no pool (the same shape every other split loop here uses).
+	geom->sat_occl.resizeNoCopy(cloud.total_splats);
+	{
+		glare::TaskManager* const pack_task_manager = opengl_engine->getMainTaskManager();
+		const size_t n = cloud.total_splats;
+		const size_t num_chunks = (pack_task_manager != NULL) ?
+			myMax<size_t>(1, myMin((size_t)myMax(1, (int)pack_task_manager->getConcurrency()) * 4, n / 16384)) : 1;
+		glare::TaskGroupRef group = new glare::TaskGroup();
+		for(size_t c=0; c<num_chunks; ++c)
+		{
+			Reference<GsSatPackTask> t = new GsSatPackTask();
+			t->scales = cloud.scales.data(); t->rotations = cloud.rotations.data(); t->colours = cloud.colours.data();
+			t->out = geom->sat_occl.data();
+			t->i_begin = (n * c) / num_chunks;
+			t->i_end   = (n * (c + 1)) / num_chunks;
+			if(pack_task_manager != NULL) group->tasks.push_back(t); else t->run(0);
+		}
+		if(pack_task_manager != NULL) pack_task_manager->runTaskGroup(group);
+	}
 
 	cloud.cached_traversal_geom = geom;
 	cloud.cached_traversal_geom_generation = cloud.topology_generation;
@@ -7662,14 +7560,10 @@ void GaussianSplatRenderer::drainSaturationBuildResults()
 						" tail_rej=" + uInt64ToStringCommaSeparated(b.diag_tile_stats[1]) +
 						" sat_skip=" + uInt64ToStringCommaSeparated(b.diag_tile_stats[2]) +
 						" per_writer_iters=" + doubleToStringNDecimalPlaces(b.diag_writers > 0 ? ((double)b.diag_tile_stats[0] / (double)b.diag_writers) : 0.0, 1));
-
-					conPrint("[gsr-sat-aniso] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms n=" + uInt64ToStringCommaSeparated(b.diag_aniso_n) +
-						" mean=" + doubleToStringNDecimalPlaces(b.diag_aniso_mean, 2) +
-						" max=" + doubleToStringNDecimalPlaces(b.diag_aniso_max, 1) +
-						" >5x=" + uInt64ToStringCommaSeparated(b.diag_aniso_gt5) +
-						" (" + doubleToStringNDecimalPlaces(b.diag_aniso_n > 0 ? (100.0 * (double)b.diag_aniso_gt5 / (double)b.diag_aniso_n) : 0.0, 1) + "%)" +
-						" >10x=" + uInt64ToStringCommaSeparated(b.diag_aniso_gt10) +
-						" (" + doubleToStringNDecimalPlaces(b.diag_aniso_n > 0 ? (100.0 * (double)b.diag_aniso_gt10 / (double)b.diag_aniso_n) : 0.0, 1) + "%)");
+					// SESSION081 ETAP 4: [gsr-sat-aniso] is gone. It reported max(scale)/min(scale) over the occluder
+					// population, read straight from geom->scales in the gather; that array no longer exists (see
+					// GsSatPackedOccluder), and the packed record cannot reconstruct the ratio. The measurement it
+					// existed to make was session077's and is recorded there.
 				}
 			}
 			else

@@ -222,7 +222,24 @@ static const int gs_sat_min_strip_rows = 8;
 // gets both: on a large desktop scene it yields two or three blocks, where the barrier cost is negligible, and on a
 // smaller scene - a phone's, where the LoD budget produces far fewer occluders in the first place - it yields one block,
 // i.e. no blocking at all.
-static const size_t gs_sat_rec_scratch_bytes = 32 * 1024 * 1024;
+// SESSION081: the 32MB this carried since session079 was calibrated against a ~3M-occluder scene ("two or three
+// blocks", above). The owner's reference scene is now ~13.2M occluders, which the same 32MB/24B math turns into
+// 10 blocks / 20 task-group launches per build. Measured cost of that (owner, 4-teleport averages, R=1): forcing
+// one block cut rec_ms 115.2->46.1ms and dep_ms 124.2->39.6ms. Both phases moved, not just the deposit, so the
+// cost is less "N sync barriers" than N cold restarts of the scratch buffer plus N task-group launch pairs
+// contending with traversal/apply/filter on the shared pool.
+//
+// Split by platform rather than picking one flat number, because the two ends are not really in tension: the
+// scratch is sized to min(n, budget/24B) (see block_n below), so raising the ceiling costs nothing on any scene
+// whose n already sits under it. Mobile scenes produce far fewer occluders (the same LoD-budget difference the
+// comment above already relied on), so the desktop number moving does not affect them; and a scene large enough
+// to exceed this budget would already be dominated by the occluder SoA gather that runs before this stage, not
+// by this buffer. EMSCRIPTEN is the project's existing platform gate - see maths/SSE.h.
+#if defined(EMSCRIPTEN)
+static const size_t gs_sat_rec_scratch_bytes = 32 * 1024 * 1024; // Web/mobile: unchanged from session079.
+#else
+static const size_t gs_sat_rec_scratch_bytes = 512 * 1024 * 1024; // Desktop: one block for the reference scene (13.2M*24B ~= 317MB), with headroom.
+#endif
 
 
 // SESSION076: exp(-x) over x in [0, gs_sat_exp_lut_max), sampled at bin centres. The write loop below evaluates one

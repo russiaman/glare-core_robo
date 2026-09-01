@@ -130,6 +130,30 @@ enum GaussianSplatSatDebugOverlayMode
 };
 
 
+// SESSION082: which set of nodes the saturation barrier is BUILT from. The tested population is unaffected - this
+// chooses the occluders only. See GaussianSplatRenderer::getSatOccluderSource().
+enum GaussianSplatOccluderSource
+{
+	// The frontier's fine nodes: every node the render traversal selected. The behaviour up to session082, and the
+	// largest possible input (13.5M nodes on the owner's interior).
+	GaussianSplatOccluderSource_Fine = 0,
+
+	// The frontier's coarse floor (session063 K4: one node per branch), which the gather normally discards as a
+	// redundant second description of the same surfaces. ~4.8x smaller than fine, and measured session082 to produce a
+	// barrier no worse than fine on the owner's interior - but still a by-product of the RENDER traversal, selected by
+	// pixel_scale, i.e. by a quality target rather than by anything to do with occlusion.
+	GaussianSplatOccluderSource_CoarseFloor = 1,
+
+	// SESSION082: a tree walk of its own, run inside the saturation build and anchored at the BUILD's anchor rather
+	// than at whatever camera position the source frontier happens to have been traversed from. It descends while a
+	// node is still bigger than one grid tile and stops there, so the occluder set is sized by the barrier's own
+	// resolution instead of by the render's. Measured 618k/843k nodes against the coarse floor's 2.80M/3.61M on two
+	// structurally different scenes - a 4.3-4.5x reduction that held across both, since it follows from the criterion
+	// rather than from the scene.
+	GaussianSplatOccluderSource_TreeWalk = 2
+};
+
+
 class GaussianSplatRenderer
 {
 public:
@@ -515,6 +539,22 @@ public:
 	// bypass toggle doesn't change what a TRAVERSAL produces, so cached_ufrontier is left alone).
 	bool getSatDebugBypassGrid() const { return sat_debug_bypass_grid; }
 	void setSatDebugBypassGrid(bool v);
+
+
+	// SESSION082, TEMPORARY - which node set the barrier is built from. See GaussianSplatOccluderSource for what each
+	// option means and what each one measured.
+	//
+	// This exists as one selector rather than as a switch per experiment because the options are mutually exclusive by
+	// construction - a build reads exactly one occluder set - and because the question they answer is a single one: how
+	// small and how coarse an occluder input the barrier can be built from before its verdict degrades. Nothing else
+	// changes under any of them; the render frontier, the traversal and the tested population are untouched, which is
+	// what makes the three directly comparable.
+	//
+	// Changes what a build PRODUCES, so the setter drops every cloud's cached barrier to force an immediate rebuild -
+	// same scoping as setSatDebugBypassGrid() above, and for the same reason (a traversal produces the same frontier
+	// whichever of these is selected).
+	GaussianSplatOccluderSource getSatOccluderSource() const { return sat_occluder_source; }
+	void setSatOccluderSource(GaussianSplatOccluderSource v);
 
 
 	// SESSION081: whether a traversal's UNPRUNED frontier is drawn while its saturation prune is still being computed.
@@ -1677,6 +1717,7 @@ private:
 	int sat_region_closing_tiles;                    // SESSION081 - see getSatRegionClosingTiles().
 	bool draw_unpruned_frontier;                     // SESSION081 - see getDrawUnprunedFrontier().
 	bool sat_debug_bypass_grid;                      // SESSION081 DIAGNOSTIC, TEMPORARY - see getSatDebugBypassGrid().
+	GaussianSplatOccluderSource sat_occluder_source; // SESSION082, TEMPORARY - see getSatOccluderSource().
 	float frontier_reuse_split_dist;                 // SESSION080 STEP B - see getFrontierReuseSplitDist(). 0 = disabled.
 
 	// SESSION055: camera-motion tracker for anisotropic frustum-cull dilation. think() diffs the current cam pose against

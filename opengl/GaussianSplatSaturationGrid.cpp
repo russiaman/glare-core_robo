@@ -1373,6 +1373,7 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 	size_t* out_num_recs, int* out_num_strips, size_t* out_num_blocks,
 	size_t* out_gate1_survivors, // SESSION081 PLAN, PRE-REJECT PROBE, TEMPORARY DIAGNOSTIC.
 	double* out_rec_task_ms_min, double* out_rec_task_ms_max, double* out_rec_task_ms_mean, // SESSION081 PLAN, REC-BALANCE PROBE, TEMPORARY DIAGNOSTIC.
+	size_t* out_inf_hist, // SESSION082 PLAN §1.1, TEMPORARY DIAGNOSTIC - 5 counters, layout documented in the header.
 	double* out_sched_stats) // SESSION081 SCHEDULING PROBE, TEMPORARY DIAGNOSTIC - 9 doubles, layout documented in the header.
 {
 	const size_t num_tiles = (size_t)res * (size_t)res;
@@ -1681,6 +1682,32 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 	if(out_writers)     *out_writers     = total.writers;
 	if(out_tile_writes) *out_tile_writes = total.tile_writes;
 	if(out_tile_stats) { out_tile_stats[0] = total.tile_iters; out_tile_stats[1] = total.tail_rej; out_tile_stats[2] = total.sat_skip; }
+
+	// SESSION082 PLAN §1.1, TEMPORARY DIAGNOSTIC: what the unsaturated (+inf) tiles are MADE OF - see out_inf_hist's
+	// header comment for the question. Placed here, after every block has deposited but before closing/erosion, because
+	// both of those rewrite +inf tiles: this has to see the tiles as the deposit actually left them.
+	//
+	// accum is the right source and needs no extra bookkeeping: the deposit stops updating a tile once it saturates
+	// (keep_accumulating_past_saturation is false on this path), but every tile counted here never saturated, so its
+	// accum is the complete accumulation of everything that reached it. accum == 1 exactly means no occluder ever
+	// deposited into the tile at all - float equality is the intended test, not a tolerance: the value is the untouched
+	// initialiser, not the result of arithmetic that might land near it.
+	if(out_inf_hist)
+	{
+		for(int i=0; i<5; ++i) out_inf_hist[i] = 0;
+		const float inf = std::numeric_limits<float>::infinity();
+		const float sat_thresh = 1.f - remaining_threshold; // The live saturation_threshold, after the same clamp the deposit used.
+		for(size_t t=0; t<num_tiles; ++t)
+		{
+			if(sat_depth_out[t] != inf)
+				continue;
+			const float a = accum[t];
+			if(a >= 1.f) { ++out_inf_hist[0]; continue; } // Nothing was ever deposited here.
+			const float progress = (sat_thresh > 0.f) ? ((1.f - a) / sat_thresh) : 0.f;
+			const int bin = myClamp(1 + (int)(progress * 4.f), 1, 4); // Four equal quarters of the way to the threshold; clamped because progress is in [0, 1) only up to float rounding.
+			++out_inf_hist[bin];
+		}
+	}
 
 	// SESSION080: after every block has deposited, never per block - the mask has to be complete before it is eroded,
 	// or a silhouette would be measured against a half-built neighbourhood.

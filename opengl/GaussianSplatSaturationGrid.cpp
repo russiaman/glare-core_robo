@@ -7,6 +7,7 @@ Copyright Glare Technologies Limited 2026 -
 
 
 #include "../maths/mathstypes.h"
+#include "../maths/SSE.h" // SESSION081 PHASE 2 PREFETCH: _mm_prefetch. Routed through sse2neon on ARM by this header, so the hint is real on mobile too, not silently desktop-only.
 #include "../utils/TaskManager.h" // SESSION079: gsBuildSaturationGridParallel().
 #include "../utils/Reference.h"
 #include "../utils/Timer.h" // SESSION081 PLAN ETAP 0: per-phase diagnostic timers - see gsSatApplyRegionErosion() and gsBuildSaturationGridParallel().
@@ -1280,6 +1281,21 @@ struct GsSatBinTask : public glare::Task
 };
 
 
+// SESSION081 PHASE 2 PREFETCH: how far ahead GsSatStripTask reads the next record. Same mechanism as stage 4B's
+// gs_sat_gather_prefetch_dist, and the same warning applies: this wants to be SWEPT on the target, not reasoned to.
+//
+// The starting value is derived rather than guessed, so the sweep has somewhere sensible to start. In the gather each
+// iteration is ~5-7ns and 32 was measured best; here an iteration is far heavier (a whole footprint, ~3.4 tile
+// iterations), so once the miss is covered an iteration should land near ~10ns, and a DRAM latency of ~80ns needs only
+// ~8 iterations of lead. 16 doubles that for slack, because 4B's sweep showed the wide end wins for a reason that
+// applies here too: this build shares a pool with the traversal, and the deciding factor there was not the median but
+// the SPREAD - a distance that only just covers the latency falls apart when the core is pulled away mid-loop.
+//
+// Too far is a real failure mode, not a free margin: ~10-12 line-fill buffers per core means prefetches issued too
+// early are evicted before use, which is what made 64 worse than 32 in the gather.
+static const size_t gs_sat_deposit_prefetch_dist = 16;
+
+
 // SESSION079 phase 2: deposit every record that reaches this strip's rows.
 //
 // Strips own disjoint tiles, so no two of these touch the same accumulator entry - no locks, no atomics. Each strip
@@ -1296,8 +1312,23 @@ public:
 		{
 			// SESSION081 PHASE 1c: no scan and no reject - every entry here is a record that reaches these rows, in
 			// front-to-back order. See GsSatBinTask.
+			//
+			// SESSION081 PHASE 2 PREFETCH: recs[list[j]] is a scattered read the hardware prefetcher cannot follow -
+			// the stride is whatever the list says - but the list itself is sequential, so the address wanted a few
+			// iterations from now is already readable. Exactly the shape stage 4B fixed in the gather, and the
+			// arithmetic says it is where this phase's time actually goes: on the reference build, 2.76M record visits
+			// at a DRAM latency each is ~221ms against 9.39M tile iterations at ~2ns = ~19ms, summing to ~240ms against
+			// a measured dep busy of 234ms. That is ~94% of phase 2 spent waiting for records rather than depositing
+			// them, and it is why the strip lists do not shrink the cost by holding smaller records: consecutive
+			// entries are ~20 records apart, which is 7.6 cache lines at 24B and still 3.8 at 12B, so the LINE COUNT
+			// is unchanged either way. Latency, not bytes - so a prefetch, not a repack.
 			for(size_t j=0; j<list_len; ++j)
+			{
+				if(j + gs_sat_deposit_prefetch_dist < list_len)
+					_mm_prefetch((const char*)&recs[list[j + gs_sat_deposit_prefetch_dist]], _MM_HINT_T0);
+
 				gsSatDepositRec(recs[list[j]], res, remaining_threshold, sat_depth, accum, NULL, false, v_lo, v_hi, &stats);
+			}
 		}
 		else
 		{

@@ -1173,16 +1173,25 @@ public:
 // threads idle through all of it. It had never been timed apart from rec_ms, so every rec_ms figure this session
 // quoted had it folded in.
 //
-// Splitting it is safe, and the reason is worth writing down because it is not obvious:
+// SESSION081 BUGFIX - the first parallel cut of this compacted IN PLACE, and was wrong. Its argument ran: a chunk's
+// records only ever move down (out[c] <= slice_begin[c]), and chunk c's destination [out[c], out[c+1]) lies below
+// slice_begin[c'] for every LATER chunk c' - then asserted "in both directions" without checking the other one. The
+// other one does not hold. A late chunk's destination lands inside an EARLY chunk's source, because the destinations
+// contract towards zero by the survival rate while the sources do not: at the measured 16.7% survival (num_recs 2.25M
+// out of 13.5M occluders) chunk 6 writes [1.00L, 1.17L) while chunk 1 is still reading [1.00L, 1.17L), L being a
+// slice's length. Whichever ran first decided the contents.
 //
-//   - A chunk's records only ever move DOWN. out[c] = sum of counts below c, and every count[j] is at most its own
-//     slice's length, so out[c] <= slice_begin[c] for every c.
-//   - Chunk c therefore writes [out[c], out[c+1]), and any later chunk c' reads from slice_begin[c'] >= out[c'] >=
-//     out[c+1]. So one chunk's destination lies strictly BELOW every other chunk's source, in both directions.
+// The damage was not a crash or a lost record - counts are unaffected, which is why the writers/num_recs checks that
+// commit leaned on did not catch it. It was silent corruption of record CONTENT, which breaks the one thing the whole
+// grid rests on: strict front-to-back order. A tile then latches its barrier off whichever occluder happened to be
+// sitting in that slot, so the grid stops being a function of its input. Caught by the etap-2 prefix probe's
+// determinism check (2026-09-01): three builds from an identical 13,473,650-occluder array produced sat_tiles of
+// 82.8% / 94.4% / 82.8%, and 2,029 tiles that all three agreed were saturated carried different barrier distances.
 //
-// No task can read a region another task is writing, so no ordering between them is needed and the result is
-// bit-identical to the serial loop. Overlap of a chunk's own source and destination is real, and is exactly what
-// memmove is for.
+// Fixed by giving the compaction a separate destination array. Sources are then in 'recs' and destinations in
+// 'packed' - two distinct allocations - so no task can write a region another task reads, whatever the survival rate,
+// and no argument about index arithmetic is needed to see it. Costs one extra num_recs-sized buffer (~54MB on the
+// reference scene, against the 512MB record scratch already held) and turns the memmove into a memcpy.
 //
 // Expect bandwidth, not thread count, to set the ceiling here: this is ~57MB of pure copy on the reference scene, and
 // a handful of threads already saturate a desktop's memcpy bandwidth. The win is real but it will not be 12x.
@@ -1191,7 +1200,7 @@ class GsSatCompactTask : public glare::Task
 public:
 	virtual void run(size_t /*thread_index*/)
 	{
-		std::memmove(dst, src, count * sizeof(GsSatOccluderRec));
+		std::memcpy(dst, src, count * sizeof(GsSatOccluderRec)); // Disjoint arrays - see the note above.
 	}
 
 	GsSatOccluderRec* dst;
@@ -1372,6 +1381,12 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 	js::Vector<GsSatOccluderRec, 16>& recs = scratch_recs ? *scratch_recs : local_recs;
 	recs.resizeNoCopy(block_n);
 
+	// SESSION081 BUGFIX: the compaction's destination, deliberately a DIFFERENT array from the one phase 1 writes -
+	// see GsSatCompactTask for the in-place version's write-before-read hazard and how it showed up. Everything
+	// downstream of the compaction (binning, deposit) reads this one, never 'recs'. Declared outside the block loop so
+	// a multi-block build reuses the allocation; it only ever grows.
+	js::Vector<GsSatOccluderRec, 16> packed;
+
 	// SESSION081 PHASE 1c: scratch for the per-strip record lists - see GsSatBinTask. Declared outside the block loop so
 	// a multi-block build reuses the allocations. strip_of_row is the strip that owns each grid row, which is what makes
 	// a record's strip range two array lookups instead of a search.
@@ -1430,24 +1445,33 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 			rec_group_wall_total += rec_group_clock.elapsed() * 1.0e3;
 		}
 
-		// Close the gaps the chunks left. Destinations are assigned in ascending chunk order, so the records stay
-		// front-to-back exactly as the serial version left them; the moves themselves are mutually independent and run
-		// in parallel - see GsSatCompactTask for the proof and for what the serial loop was costing.
-		glare::TaskGroupRef move_group = new glare::TaskGroup();
+		// Close the gaps the chunks left, copying into 'packed'. Destinations are assigned in ascending chunk order, so
+		// the records come out front-to-back exactly as the serial version left them; the copies are mutually
+		// independent because source and destination are separate arrays - see GsSatCompactTask, including what the
+		// in-place version of this got wrong.
+		//
+		// Counting has to finish before any copy starts (a chunk's destination is the sum of every earlier chunk's
+		// count), so the task-building loop below runs to completion first and the group is launched after it.
 		size_t num_recs = 0;
+		for(int c=0; c<num_chunks; ++c)
+			num_recs += rec_tasks[c]->count;
+		packed.resizeNoCopy(num_recs);
+
+		glare::TaskGroupRef move_group = new glare::TaskGroup();
+		size_t packed_pos = 0;
 		for(int c=0; c<num_chunks; ++c)
 		{
 			const GsSatRecordTask& t = *rec_tasks[c];
 			const size_t slice_begin = t.i_begin - block_begin;
-			if(t.count > 0 && num_recs != slice_begin)
+			if(t.count > 0)
 			{
 				Reference<GsSatCompactTask> mt = new GsSatCompactTask();
-				mt->dst = recs.data() + num_recs;
+				mt->dst = packed.data() + packed_pos;
 				mt->src = recs.data() + slice_begin;
 				mt->count = t.count;
 				move_group->tasks.push_back(mt);
 			}
-			num_recs += t.count;
+			packed_pos += t.count;
 			rec_start_max_total = myMax(rec_start_max_total, t.start_ms); // SESSION081 SCHEDULING PROBE.
 			rec_start_sum_total += t.start_ms;
 			rec_busy_sum_total  += t.end_ms - t.start_ms;
@@ -1483,7 +1507,7 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 			for(int c=0; c<num_bin_chunks; ++c)
 			{
 				Reference<GsSatBinTask> t = new GsSatBinTask();
-				t->recs = recs.data();
+				t->recs = packed.data(); // SESSION081 BUGFIX: the compaction OUTPUT - see GsSatCompactTask.
 				t->strip_of_row = strip_of_row.data();
 				t->rec_range = rec_range.data();
 				t->counts = bin_counts.data() + (size_t)c * (size_t)num_strips;
@@ -1521,7 +1545,7 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 			for(int c=0; c<num_bin_chunks; ++c)
 			{
 				Reference<GsSatBinTask> t = new GsSatBinTask();
-				t->recs = recs.data();
+				t->recs = packed.data(); // SESSION081 BUGFIX: the compaction OUTPUT - see GsSatCompactTask.
 				t->strip_of_row = strip_of_row.data();
 				t->rec_range = rec_range.data();
 				t->counts = NULL;
@@ -1551,7 +1575,7 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 			Reference<GsSatStripTask> task = new GsSatStripTask();
 			task->clock = &dep_group_clock; // SESSION081 SCHEDULING PROBE.
 			task->start_ms = task->end_ms = 0.0;
-			task->recs = recs.data();
+			task->recs = packed.data(); // SESSION081 BUGFIX: the compaction OUTPUT - see GsSatCompactTask.
 			task->list     = want_bins ? (strip_lists.data() + strip_list_begin[t]) : NULL; // SESSION081 PHASE 1c.
 			task->list_len = want_bins ? (size_t)(strip_list_begin[t + 1] - strip_list_begin[t]) : 0;
 			task->num_recs = num_recs;

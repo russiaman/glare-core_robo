@@ -1337,7 +1337,7 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius, int closing_radius_tiles,
 	js::Vector<float, 16>& sat_depth_out, glare::TaskManager& task_manager,
 	size_t* out_writers, size_t* out_tile_writes, size_t* out_tile_stats,
-	js::Vector<GsSatOccluderRec, 16>* scratch_recs, size_t* out_erode_stats,
+	GsSatBuildScratch* scratch, size_t* out_erode_stats,
 	double* out_close_ms, double* out_erode_ms, double* out_rec_ms, double* out_dep_ms,
 	size_t* out_num_recs, int* out_num_strips, size_t* out_num_blocks,
 	size_t* out_gate1_survivors, // SESSION081 PLAN, PRE-REJECT PROBE, TEMPORARY DIAGNOSTIC.
@@ -1377,22 +1377,28 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 	// each tile still sees its occluders front-to-back.
 	const size_t block_n = myMin(n, myMax((size_t)65536, gs_sat_rec_scratch_bytes / sizeof(GsSatOccluderRec)));
 
-	js::Vector<GsSatOccluderRec, 16> local_recs;
-	js::Vector<GsSatOccluderRec, 16>& recs = scratch_recs ? *scratch_recs : local_recs;
+	// SESSION081: the working buffers, from the caller when it supplied a scratch and freshly allocated when it did not
+	// - see GsSatBuildScratch for why supplying one matters (the fresh path re-faults ~54MB of demand-zero pages on
+	// every build, inside rec_ms, where it reads as work). Behaviour is identical either way; only the allocation is.
+	GsSatBuildScratch local_scratch;
+	GsSatBuildScratch& s = scratch ? *scratch : local_scratch;
+
+	js::Vector<GsSatOccluderRec, 16>& recs = s.recs;
 	recs.resizeNoCopy(block_n);
 
 	// SESSION081 BUGFIX: the compaction's destination, deliberately a DIFFERENT array from the one phase 1 writes -
 	// see GsSatCompactTask for the in-place version's write-before-read hazard and how it showed up. Everything
-	// downstream of the compaction (binning, deposit) reads this one, never 'recs'. Declared outside the block loop so
-	// a multi-block build reuses the allocation; it only ever grows.
-	js::Vector<GsSatOccluderRec, 16> packed;
+	// downstream of the compaction (binning, deposit) reads this one, never 'recs'.
+	js::Vector<GsSatOccluderRec, 16>& packed = s.packed;
 
-	// SESSION081 PHASE 1c: scratch for the per-strip record lists - see GsSatBinTask. Declared outside the block loop so
-	// a multi-block build reuses the allocations. strip_of_row is the strip that owns each grid row, which is what makes
-	// a record's strip range two array lookups instead of a search.
-	js::Vector<int, 16>    strip_of_row(res);
-	js::Vector<uint16, 16> rec_range;
-	js::Vector<uint32, 16> bin_counts, strip_lists, strip_list_begin;
+	// SESSION081 PHASE 1c: scratch for the per-strip record lists - see GsSatBinTask. strip_of_row is the strip that
+	// owns each grid row, which is what makes a record's strip range two array lookups instead of a search.
+	js::Vector<int, 16>&    strip_of_row = s.strip_of_row;
+	js::Vector<uint16, 16>& rec_range    = s.rec_range;
+	js::Vector<uint32, 16>& bin_counts   = s.bin_counts;
+	js::Vector<uint32, 16>& strip_lists  = s.strip_lists;
+	js::Vector<uint32, 16>& strip_list_begin = s.strip_list_begin;
+	strip_of_row.resizeNoCopy(res); // Was a sized construction; now a resize, since a reused buffer may already hold a previous build's rows.
 	for(int t=0; t<num_strips; ++t)
 	{
 		const int v_lo = (int)(((int64)res * t)       / num_strips);
@@ -1401,7 +1407,12 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 			strip_of_row[v] = t;
 	}
 
-	js::Vector<float, 16> accum(num_tiles, 1.f);
+	// SESSION081: from the scratch too, so it is not reallocated per build. A reused buffer holds the previous build's
+	// values, so the fill is explicit rather than a side effect of construction - it was never optional, only implicit.
+	js::Vector<float, 16>& accum = s.accum;
+	accum.resizeNoCopy(num_tiles);
+	for(size_t i=0; i<num_tiles; ++i)
+		accum[i] = 1.f;
 
 	GsSatStripStats total;
 

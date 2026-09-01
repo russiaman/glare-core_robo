@@ -10,6 +10,7 @@ Copyright Glare Technologies Limited 2026 -
 #include "../maths/vec3.h" // SESSION077: per-axis splat scales - see gsSatProjectedRadius().
 #include "../maths/Vec4f.h"
 #include "../utils/Vector.h"
+#include "../utils/Platform.h" // SESSION081: uint16/uint32 in GsSatBuildScratch.
 #include <limits> // SESSION081: gsSatRegionErosionTiles() returns +inf for a direction whose occluder sits inside the ball.
 
 namespace glare { class TaskManager; } // SESSION079: gsBuildSaturationGridParallel().
@@ -24,6 +25,41 @@ struct GsSatOccluderRec
 	float amp;      // Peak per-tile contribution.
 	float far_edge; // Barrier distance to record if this occluder saturates a tile.
 	float inv_2var; // 0.5/var, the Gaussian falloff's coefficient.
+};
+
+
+// SESSION081: every working buffer gsBuildSaturationGridParallel() needs, so a caller that builds repeatedly can hand
+// the same one back and stop paying for the allocation each time. Contents are meaningless between calls - this is
+// scratch, not state; nothing outside the build looks inside it.
+//
+// Why it exists. The build's buffers were function locals, so each build allocated them fresh, and the big one is
+// large: 'recs' is sized to the whole block (13.2M records = 317MB on the reference scene at the desktop budget - see
+// gs_sat_rec_scratch_bytes), with ~54MB of it actually touched, scattered across the full extent because each phase-1
+// chunk writes into a slice sized to its own INPUT range. Fresh pages are demand-zeroed by the OS on first touch, so
+// that cost was paid again on every single build, inside rec_ms where it looked like work.
+//
+// It was measured before it was fixed, and it was already visible in the logs as the plan's own
+// "sum of the parts against the whole" check failing: misc_ms = 24.66ms, 24.8% of grid_ms, against the plan's own 10%
+// threshold for "there is an unmeasured phase in here". Of that, bin_ms accounted for 7.99ms, leaving ~16.7ms of pure
+// per-build allocation and first-touch. An earlier reconciliation had attributed a similar residual to task dispatch,
+// which never held up arithmetically - 11ms over 68 tasks is 160us per dispatch.
+//
+// Reuse works because js::Vector::resizeNoCopy() only reallocates when the request exceeds capacity, and capacity only
+// grows: the first build allocates, every later one finds the buffers already big enough and already faulted in. The
+// cost is that the memory stays resident between builds instead of being returned - which on a walking camera, where
+// builds run about once a second, it effectively was anyway.
+//
+// Ownership note for callers: a build runs on a worker thread and can outlive whatever kicked it off, so a caller must
+// keep this alive for the duration of the build, and must not share one instance between two builds that can run at
+// the same time (one per cloud, not one per renderer).
+struct GsSatBuildScratch
+{
+	js::Vector<GsSatOccluderRec, 16> recs;   // Phase 1's output, in per-chunk slices sized to each chunk's input range.
+	js::Vector<GsSatOccluderRec, 16> packed; // The compaction's destination - deliberately a separate array from recs, see GsSatCompactTask.
+	js::Vector<int, 16> strip_of_row;        // Phase 1c: grid row -> owning strip.
+	js::Vector<uint16, 16> rec_range;        // Phase 1c: each record's first/last strip, a byte each.
+	js::Vector<uint32, 16> bin_counts, strip_lists, strip_list_begin; // Phase 1c: the per-strip record lists and their offsets.
+	js::Vector<float, 16> accum;             // The running per-tile transmittance.
 };
 
 
@@ -404,7 +440,7 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 	const Vec4f& anchor_pos_ws, int res, float saturation_threshold, float region_radius, int closing_radius_tiles, // SESSION081 - see the serial entry point's comment.
 	js::Vector<float, 16>& sat_depth_out, glare::TaskManager& task_manager,
 	size_t* out_writers = NULL, size_t* out_tile_writes = NULL, size_t* out_tile_stats = NULL,
-	js::Vector<GsSatOccluderRec, 16>* scratch_recs = NULL, // Optional caller-owned scratch for the phase-1 records, to keep the allocation out of the per-build cost.
+	GsSatBuildScratch* scratch = NULL, // Optional caller-owned working buffers - see GsSatBuildScratch for what reusing them is worth. NULL allocates a fresh set for this one call, which is correct but pays the allocation every time.
 	size_t* out_erode_stats = NULL, // SESSION080/081 DIAGNOSTIC - see the serial entry point's.
 	double* out_close_ms = NULL, double* out_erode_ms = NULL, // SESSION081 PLAN ETAP 0 DIAGNOSTIC - see the serial entry point's.
 	double* out_rec_ms = NULL, // SESSION081 PLAN ETAP 0 DIAGNOSTIC: wall time of phase 1 (GsSatRecordTask - geometry, once per occluder) summed across blocks.

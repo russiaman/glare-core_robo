@@ -425,6 +425,17 @@ public:
 };
 
 
+// SESSION081: a ref-counted holder for the barrier build's working buffers, so the cloud that owns them and the task
+// that is writing into them can both keep them alive - see SplatCloud::sat_build_scratch and GsSatBuildScratch. The
+// refcount is the whole point of the wrapper: a cloud can be removed while its build is still running, and the running
+// task must not be left writing into freed memory.
+class GaussianSplatSaturationBuildScratch : public ThreadSafeRefCounted
+{
+public:
+	GsSatBuildScratch scratch;
+};
+
+
 // SESSION081 - THE SATURATION BARRIER, decoupled from any one traversal's frontier. See the session081 snapshot's
 // "Variant 2" for the motivation: sat_region_radius (R) already makes the grid a statement about a BALL of camera
 // positions, not the single point it was built from, so once built it does not need rebuilding on every traversal -
@@ -621,6 +632,14 @@ public:
 	// the moment a build is kicked until its result is drained (mirrors traversal_in_flight/filter_in_flight above).
 	Reference<GaussianSplatSaturationBarrier> cached_sat_barrier;
 	bool sat_build_in_flight;
+
+	// SESSION081: the barrier build's working buffers, kept alive between builds instead of being reallocated by each
+	// one - see GsSatBuildScratch for the measurement that motivated this. Per CLOUD, not per renderer: two clouds can
+	// have builds running at the same time (sat_build_in_flight only serialises builds within one cloud), and two
+	// concurrent builds sharing one scratch would write over each other. Ref-counted and also held by the task, because
+	// a build outlives its cloud if the cloud is removed mid-build - drainSaturationBuildResults() already handles that
+	// case for the result, and this keeps the buffers the running task is still writing into alive to match.
+	Reference<GaussianSplatSaturationBuildScratch> sat_build_scratch;
 
 	// SESSION081: the saturation APPLY pipeline's own in-flight/throttle state - see GaussianSplatSaturationApplyTask
 	// and kickOffSaturationApplies()/drainSaturationApplyResults(). sat_apply_in_flight mirrors sat_build_in_flight
@@ -1626,7 +1645,8 @@ public:
 				gsBuildSaturationGridParallel(occl_px.data(), occl_py.data(), occl_pz.data(), occl_radius.data(), occl_alpha.data(), occl_px.size(),
 					anchor_pos_ws, barrier->sat_grid_res, saturation_threshold, region_radius, closing_tiles, barrier->sat_depth, *task_manager,
 					diag_log ? &barrier->diag_writers : NULL, diag_log ? &barrier->diag_tile_writes : NULL,
-					diag_log ? barrier->diag_tile_stats : NULL, NULL, // No scratch pool for the records - see the session081 bugfix this task's whole existence traces back to.
+					diag_log ? barrier->diag_tile_stats : NULL,
+					build_scratch.nonNull() ? &build_scratch->scratch : NULL, // SESSION081: caller-owned working buffers, so the build stops reallocating ~370MB per call - see GsSatBuildScratch.
 					barrier->erode_stats,
 					diag_log ? &barrier->close_ms : NULL, diag_log ? &barrier->erode_ms : NULL, // SESSION081 PLAN ETAP 0
 					diag_log ? &barrier->rec_ms : NULL, diag_log ? &barrier->dep_ms : NULL,
@@ -1658,6 +1678,7 @@ public:
 	uint64 cloud_id, topology_generation;
 	Reference<GaussianSplatUnculledFrontier> source_frontier; // Its own arrays + far_block - see the segment enumeration above.
 	Reference<GaussianSplatCachedGeom> geom;
+	Reference<GaussianSplatSaturationBuildScratch> build_scratch; // SESSION081 - see GsSatBuildScratch. Held by reference so it survives its cloud being removed mid-build.
 	Vec4f anchor_pos_ws;
 	float saturation_threshold, grid_subdiv, region_radius;
 	int closing_tiles;
@@ -8239,6 +8260,10 @@ void GaussianSplatRenderer::kickOffSaturationBuilds()
 		t->topology_generation = cloud.topology_generation;
 		t->source_frontier = cloud.last_unpruned_ufrontier;
 		t->geom = getOrBuildCachedGeom(cloud);
+		// SESSION081: allocated once per cloud, on its first build, then reused by every later one - see GsSatBuildScratch.
+		if(cloud.sat_build_scratch.isNull())
+			cloud.sat_build_scratch = new GaussianSplatSaturationBuildScratch();
+		t->build_scratch = cloud.sat_build_scratch;
 		t->anchor_pos_ws = cam_pos_ws;
 		t->saturation_threshold = sat_prefilter_threshold;
 		t->grid_subdiv = sat_grid_subdiv;

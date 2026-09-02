@@ -351,7 +351,27 @@ void main()
 
 	// Project the 3D covariance to a 2D screen-space covariance via the projection's Jacobian, evaluated at this splat's
 	// view-space position.  Standard z-forward perspective projection: screen = focal * (x, y) / depth.
-	float vx = pos_vs.x, vy = pos_vs.y;
+	//
+	// SESSION084: the Jacobian is only a first-order (affine) approximation of the perspective divide, taken about the
+	// single point it is evaluated at, and its off-diagonal focal * v / depth^2 term grows with how far off the view axis
+	// that point is - by the frame edge it dominates and the projected covariance inflates without bound.  The frustum
+	// side-plane cull above (splat_ewa_fix_enabled) removes splats whose whole 3-sigma sphere is outside the view, and the
+	// near_fade above removes ones the camera is inside of, but neither helps a splat whose CENTRE sits at a wide angle
+	// while some of its extent is still on screen - e.g. a large coarse/merged splat near the frame edge - and the
+	// max_radius_px bound further below only shortens the resulting quad; it is isotropic on a covariance that is by then
+	// already wrongly shaped and wrongly oriented, which reads as a wrong-coloured smear rather than a clean cutoff.
+	//
+	// The fix, following the reference 3D Gaussian Splatting implementation (Kerbl et al. 2023, computeCov2D): clamp the
+	// (x/depth, y/depth) ratio the Jacobian is evaluated at - the LINEARISATION POINT, not the splat's real position or
+	// its drawn location - to a frustum expanded 1.3x past the actual view volume. That keeps the point the derivative is
+	// taken at close enough to the actual geometry for the affine approximation to stay valid, without moving or resizing
+	// anything already handled correctly near the view axis (there the clamp is inert). 1.3x is the reference
+	// implementation's own margin, wide enough that a splat's real footprint - which extends beyond its centre - is still
+	// covered by a linearisation point taken slightly inside the frame.
+	vec2 tan_half_fov = viewport_dims_px / (2.0 * focal_len_px);
+	vec2 lim = 1.3 * tan_half_fov;
+	vec2 txy_over_z = clamp(pos_vs.xy / depth, -lim, lim);
+	float vx = txy_over_z.x * depth, vy = txy_over_z.y * depth;
 	vec3 j_row0 = vec3(focal_len_px.x / depth, 0.0, focal_len_px.x * vx / (depth*depth));
 	vec3 j_row1 = vec3(0.0, focal_len_px.y / depth, focal_len_px.y * vy / (depth*depth));
 

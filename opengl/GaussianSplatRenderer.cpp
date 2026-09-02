@@ -4619,7 +4619,14 @@ static SplatFootprint splatFootprint(const Vec3f& pos_ws, const Vec3f& scale, co
 	}
 	const Mat3Cols cov_vs = mat3Mul(mat3Mul(W, cov_os), mat3Transpose(W));
 
-	const float vx = pos_vs[0], vy = pos_vs[1];
+	// SESSION084: clamp the linearisation point the Jacobian is evaluated at - mirrors gaussian_splat_vert_shader.glsl's
+	// tan-clamp, see that comment for the reasoning. Does not move or resize anything; only bounds the affine
+	// approximation's error for splats whose centre sits at a wide angle off the view axis.
+	const float tan_half_fov_x = (float)viewport_dims.x / (2.f * focal_len_px.x);
+	const float tan_half_fov_y = (float)viewport_dims.y / (2.f * focal_len_px.y);
+	const float lim_x = 1.3f * tan_half_fov_x, lim_y = 1.3f * tan_half_fov_y;
+	const float vx = myClamp(pos_vs[0] / depth, -lim_x, lim_x) * depth;
+	const float vy = myClamp(pos_vs[1] / depth, -lim_y, lim_y) * depth;
 	const Vec4f j_row0(focal_len_px.x / depth, 0.f, focal_len_px.x * vx / (depth*depth), 0.f);
 	const Vec4f j_row1(0.f, focal_len_px.y / depth, focal_len_px.y * vy / (depth*depth), 0.f);
 

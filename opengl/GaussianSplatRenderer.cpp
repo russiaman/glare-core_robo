@@ -2968,10 +2968,36 @@ private:
 			// root->leaf path is the SAME node in both modes. So the block holds exactly one selected node per path below
 			// the cut, and later walks stop at exactly the boundary that produced it. Coverage is exact, not approximate.
 			//
-			// STRADDLE (sphere spans the split: P false, but dist + radius >= split) is the one case that needs care in
-			// the frozen mode. Some descendants satisfy P and some do not, so stopping here would cover paths the block
-			// also covers - the walk is forced past its normal stop rules until every branch resolves one way or the
-			// other. A leaf cannot descend, but a straddling leaf fails P itself, so emitting it is correct.
+			// STRADDLE (sphere spans the split: P false, but dist + radius >= split) is the case that needs care. Some
+			// descendants satisfy P and some do not, so emitting here would cover paths the block also covers - the walk
+			// is forced past its normal stop rules until every branch resolves one way or the other.
+			//
+			// SESSION083: two corrections here, both about a straddling node whose own radius is large.
+			//
+			// (a) A straddling LEAF now resolves to FAR, not near. It cannot descend, and it fails P, so the old rule
+			//     emitted it into the NEAR segment keyed on its centre distance. But P fails for it only because its own
+			//     radius is subtracted: a leaf with a 700m 3-sigma radius fails P at any centre distance below split+700m,
+			//     while its centre may sit hundreds of metres away. Near and far are concatenated, not merged, so such a
+			//     leaf lands at the END of near - i.e. still ahead of the whole far segment, which starts at `split`. Under
+			//     the front-to-back T *= (1-a) compositor that is not a small ordering error that blends away: a huge,
+			//     hundreds-of-metres-distant splat eats the transmittance of everything the far segment was about to draw
+			//     just past the split. That is the "cracks" artifact - visible even at zero drift, i.e. exactly at the
+			//     anchor, which is why it never looked like the drift-shell error the split's own error budget accounts
+			//     for. Resolving it to far puts it back among nodes of its own range, sorted with them, at no cost.
+			//
+			//     Only a leaf needs this. Any straddling INTERNAL node is descended past, so it never reaches an emit
+			//     point in the first place, and every node that does emit below it has resolved to one side or the other.
+			//
+			// (b) force_descend now applies while BUILDING the block too, not only in the frozen mode. It has to, for (a)
+			//     to be safe: the block is what a later frozen walk defers to, so any node a frozen walk skips must have
+			//     been reached and emitted when the block was built. A straddling leaf is reachable only through
+			//     straddling ancestors (a node with dist + radius < split contains only descendants with the same
+			//     property, so a fully-near ancestor can never hold a straddling leaf). If a straddling ancestor is
+			//     allowed to stop on its own rules at build time - pixel_scale there is measured from the anchor, and a
+			//     later walk measures it from somewhere else - the build never reaches the leaf, the block never receives
+			//     it, and the frozen walk's skip turns into a hole. Descending in both modes makes the cut resolve at
+			//     the same nodes in both, which is the property the paragraph above claims and previously only assumed.
+			//     The extra descent is confined to the straddle shell and is work the frozen walks already did.
 			bool force_descend = false;
 			bool child_below_far_cut = top.below_far_cut; // Once below the cut, the whole branch is - see the field.
 			if(reuse_enabled && !top.below_far_cut)
@@ -2980,7 +3006,10 @@ private:
 				const float dist_frozen = reuse_prev_anchor_ws.getDist(Vec4f(p.x, p.y, p.z, 1.f));
 				const float radius = cull_radii[cloud_idx_u32];
 
-				if(dist_frozen - radius >= reuse_split_dist) // P holds.
+				// P holds, or the node straddles and is a leaf that cannot be resolved by descending - see (a) above.
+				// Both resolve to FAR, and both do it identically in the two modes, so coverage stays exactly once.
+				if((dist_frozen - radius >= reuse_split_dist) ||
+					(node.child_count == 0 && dist_frozen + radius >= reuse_split_dist))
 				{
 					++diag_reuse_roots;
 					if(far_cut_is_frozen)
@@ -2988,7 +3017,7 @@ private:
 					child_below_far_cut = true; // Building the block: descend, but everything from here down is its.
 				}
 				else
-					force_descend = far_cut_is_frozen && (dist_frozen + radius >= reuse_split_dist); // STRADDLE, frozen mode only.
+					force_descend = dist_frozen + radius >= reuse_split_dist; // STRADDLE, both modes - see (b) above.
 			}
 
 			// SESSION080 §4.3: which segment a node emitted at THIS point belongs to, packed into bit 30 of idx so it
@@ -3038,8 +3067,9 @@ private:
 
 			// Converged - already fine enough, no need to expand further.
 			// SESSION080 STEP B: force_descend suppresses this and the two caps below - see the STRADDLE case above. The
-			// leaf branch is deliberately NOT suppressed: a leaf has nothing to descend into, and a straddling leaf
-			// fails the inheritance predicate itself, so emitting it covers its path exactly once.
+			// leaf branch is deliberately NOT suppressed, and no longer needs to be: force_descend is now only ever set
+			// on a node with children (SESSION083 (a) resolves a straddling leaf to far before we get here), so a leaf
+			// reaching this point has already been classified and emitting it covers its path exactly once.
 			if(top.pixel_scale <= pixel_scale_limit && !force_descend)
 			{
 				DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32 | far_bit; // SESSION080 §4.3: bit 30 - see far_bit.
@@ -4619,7 +4649,7 @@ static SplatFootprint splatFootprint(const Vec3f& pos_ws, const Vec3f& scale, co
 	}
 	const Mat3Cols cov_vs = mat3Mul(mat3Mul(W, cov_os), mat3Transpose(W));
 
-	// SESSION084: clamp the linearisation point the Jacobian is evaluated at - mirrors gaussian_splat_vert_shader.glsl's
+	// SESSION083: clamp the linearisation point the Jacobian is evaluated at - mirrors gaussian_splat_vert_shader.glsl's
 	// tan-clamp, see that comment for the reasoning. Does not move or resize anything; only bounds the affine
 	// approximation's error for splats whose centre sits at a wide angle off the view axis.
 	const float tan_half_fov_x = (float)viewport_dims.x / (2.f * focal_len_px.x);

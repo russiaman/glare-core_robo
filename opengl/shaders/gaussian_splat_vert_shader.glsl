@@ -352,7 +352,7 @@ void main()
 	// Project the 3D covariance to a 2D screen-space covariance via the projection's Jacobian, evaluated at this splat's
 	// view-space position.  Standard z-forward perspective projection: screen = focal * (x, y) / depth.
 	//
-	// SESSION084: the Jacobian is only a first-order (affine) approximation of the perspective divide, taken about the
+	// SESSION083: the Jacobian is only a first-order (affine) approximation of the perspective divide, taken about the
 	// single point it is evaluated at, and its off-diagonal focal * v / depth^2 term grows with how far off the view axis
 	// that point is - by the frame edge it dominates and the projected covariance inflates without bound.  The frustum
 	// side-plane cull above (splat_ewa_fix_enabled) removes splats whose whole 3-sigma sphere is outside the view, and the

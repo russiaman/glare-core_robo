@@ -582,6 +582,49 @@ public:
 	void setSatMinRatio(float v);
 
 
+	// SESSION085 ETAP 3 - THE SATURATION LoD BIAS: the ceiling on how far it may push a node's pixel_scale_limit.
+	// 1 = off, and off is bit-for-bit the pre-etap-3 behaviour.
+	//
+	// What it does. Instead of DROPPING a node that sits behind saturated geometry, the traversal stops walking there
+	// and emits the node's own merged stand-in, giving up the subtree rather than the geometry. The multiplier is the
+	// linear depth ratio from the barrier (etap 2's graded read), capped here - so a node the barrier says is 5x behind
+	// gets its limit multiplied by 5, and one just past the barrier is barely touched.
+	//
+	// Why a ceiling is the only knob. feature_size roughly halves per tree level, so the multiplier reads directly as
+	// levels: 2 is about one level coarser, 3 about 1.5, 5 about 2.3. The SHAPE is fixed in code (the ratio itself) -
+	// this only bounds it, which keeps the mechanism automatic rather than per-scene (project rule).
+	//
+	// Why this is not the prune knob in disguise. Both read the same sat_depth and act on the same population, but the
+	// failure modes differ completely: a wrong prune is a hole, a wrong bias is slightly coarser geometry in a region
+	// that is mostly occluded anyway. Session085's minR experiment showed the binary prune cannot be tuned out of its
+	// holes - in an open view the margin that removes them also removes the pruning - which is the whole reason this
+	// exists. See snapshots/2026-09-03-session085-progressiveSaturation_PLAN.md.
+	//
+	// DO NOT RUN THIS WITH THE PRUNE ON. They are alternatives, not layers, and the reason is not cost - it is that the
+	// prune UNDOES the bias. The bias stops the walk at an ancestor because that ancestor is deeply behind the barrier;
+	// the apply stage then tests that same ancestor against that same barrier and drops it. What reaches the screen is:
+	//
+	//   prune only : fine descendants, the deep ones dropped        -> hole
+	//   bias only  : the coarse ancestor, drawn                     -> no hole, coarser geometry
+	//   both       : the ancestor produced, then dropped            -> hole
+	//
+	// So "both" is visually the prune with a cheaper walk, and anyone measuring the bias that way will see holes and
+	// conclude the mechanism does not work, when what happened is that the prune removed its output. To judge the bias,
+	// turn the saturation filter OFF and set this above 1; the apply stage then does not run at all, which is also where
+	// the latency win lives (session085 etap 0 measured that stage at 87-560ms, ~30% of end-to-end).
+	//
+	// An earlier draft of the plan suggested composing them, to let the prune clean up coarse stand-ins that protrude
+	// through a surface (see GaussianSplatLodTree.h:52-61 on merged bounding radii). That reasoning does not hold: a
+	// stand-in poking through a wall is partly IN FRONT of the barrier, which is exactly the case the prune leaves
+	// alone, while the honest stand-ins behind it are the ones it removes. It is the wrong tool for that artifact.
+	//
+	// Changes what a TRAVERSAL produces, so the setter drops cached frontiers. Above 1 it also makes this renderer a
+	// consumer of the saturation barrier in its own right - see kickOffSaturationBuilds(), which must build one even
+	// with the prune off.
+	float getSatBiasCeiling() const { return sat_bias_ceiling; }
+	void setSatBiasCeiling(float v);
+
+
 	// SESSION085: the session081 "bypass grid" diagnostic (skip stage 3, mark every direction saturated at one flat
 	// distance) is removed - it was always labelled temporary, and the question it was built to answer (whether the
 	// machinery AROUND the grid was the source of holes/slow updates, rather than the grid itself) was settled by
@@ -1749,6 +1792,7 @@ private:
 	float sat_region_radius;                         // SESSION078 - see getSatRegionRadius().
 	int sat_region_closing_tiles;                    // SESSION081 - see getSatRegionClosingTiles().
 	float sat_min_ratio;                             // SESSION085 - see getSatMinRatio().
+	float sat_bias_ceiling;                          // SESSION085 ETAP 3 - see getSatBiasCeiling().
 	bool draw_unpruned_frontier;                     // SESSION081 - see getDrawUnprunedFrontier().
 	float frontier_reuse_split_dist;                 // SESSION080 STEP B - see getFrontierReuseSplitDist(). 0 = disabled.
 

@@ -284,6 +284,18 @@ public:
 	float max_layer_density;
 	int max_tree_depth;
 	float focal_px;
+	// SESSION085 ETAP 3: which barrier's LoD bias shaped this selection, identified by the barrier's own build timestamp,
+	// or 0.0 when the bias was OFF and therefore had no influence.
+	//
+	// This belongs to the key set above and is the reason it had to be extended. Frontier reuse (session080 STEP B)
+	// inherits a far segment from a previous traversal and accepts it if the previous traversal answered to the same
+	// selection rules. pixel_scale_limit alone used to say that; with the bias the EFFECTIVE limit is per-node and comes
+	// from the barrier, so two traversals can agree on every scalar here and still have made different cuts. Inheriting
+	// across that would splice a segment shaped by one barrier into a frontier shaped by another - rare, silent, and
+	// visible only as artifacts in the far field.
+	//
+	// 0.0 when the bias is off means a bias-off session's reuse behaves exactly as it did before this field existed.
+	double sat_bias_barrier_time;
 
 	// SESSION080 DIAGNOSTIC: Clock::getCurTimeRealSec() at the moment this frontier was built on the worker thread (set
 	// alongside anchor_pos_ws below) - answers "how stale is the prune drainTraversalResults() is about to apply", which
@@ -440,7 +452,7 @@ public:
 		expand_seeds(0), expand_num_tasks(0), expand_prologue_ms(0.0), expand_task_max_ms(0.0), expand_task_sum_ms(0.0), // SESSION080
 		expand_splice_reserve_ms(0.0), expand_splice_copy_ms(0.0), sort_alloc_ms(0.0), soa_ms(0.0), // SESSION080 (plan2 §4.1)
 		traversal_output_n(0), // SESSION080
-		pre_sat_n(0), // SESSION085
+		pre_sat_n(0), sat_bias_barrier_time(0.0), // SESSION085
 		sort_staleness_delta_ws(0.0), sort_staleness_prev_n(0), sort_staleness_common_n(0), sort_staleness_max_disp(0), // SESSION080
 		sort_staleness_mean_disp(0.0), sort_staleness_gt1k(0), sort_staleness_gt10k(0), sort_staleness_ms(0.0), // SESSION080
 		reuse_roots(0), reuse_n(0), reuse_ms(0.0), reuse_split_dist_used(0.f), reuse_base_anchor_ws(0.f) // SESSION080 §4.3
@@ -580,7 +592,7 @@ public:
 		importance_layout_fingerprint(0), slice_sample_draw_count(0),
 		have_last_sort_cam_pos(false), last_sort_cam_pos_ws(0.f), aabb_ws(js::AABBox::emptyAABBox()), added_to_engine(false),
 		topology_generation(0), traversal_in_flight(false), have_last_traversal_cam_pos(false), last_traversal_cam_pos_ws(0.f), last_traversal_cam_forward_ws(0.f), last_traversal_kick_time_s(0.0),
-		last_traversal_kicked_topology_generation(0), last_traversal_hit_budget_cap(false), last_traversal_hit_density_cap(false), last_traversal_hit_depth_cap(false), last_traversal_dilation_elevated(false),
+		last_traversal_kicked_topology_generation(0), last_traversal_hit_budget_cap(false), last_traversal_hit_density_cap(false), last_traversal_hit_depth_cap(false), last_traversal_sat_bias_stops(0), last_traversal_sat_bias_tested(0), last_traversal_dilation_elevated(false),
 		cached_traversal_geom_generation(0), importance_num_views(0),
 		sat_grid_debug_anchor_ws(0.f), // SESSION076 §9
 		filter_in_flight(false), ufrontier_needs_filter(false), have_last_filter_cam_forward(false), last_filter_cam_forward_ws(0.f), // SESSION063
@@ -636,6 +648,7 @@ public:
 	bool last_traversal_hit_budget_cap; // Copied from the most recently applied traversal result's GaussianSplatLodTraversalScratch::hit_budget_cap (which itself doesn't persist - the scratch goes back to the pool) - surfaced in getDiagnostics() as a "detail is being truncated by the budget" warning.
 	bool last_traversal_hit_density_cap; // As above, for GaussianSplatLodTraversalScratch::hit_density_cap.
 	bool last_traversal_hit_depth_cap; // As above, for GaussianSplatLodTraversalScratch::hit_depth_cap.
+	size_t last_traversal_sat_bias_stops, last_traversal_sat_bias_tested; // SESSION085 ETAP 3: as above, for the scratch's counters of the same name.
 
 	// SESSION063: the cached unculled frontier U(P) for the split filter architecture, when split_filter_enabled. Set by
 	// drainTraversalResults() from a cull-off traversal; a rotation re-filters this instead of re-traversing. Null until
@@ -848,6 +861,7 @@ public:
 	bool hit_budget_cap; // True if max_splats_budget stopped further expansion before pixel_scale converged - i.e. detail is being truncated by the budget, not just naturally coarse at this distance. Consumed by the diagnostics display from stage 6 onward.
 	bool hit_density_cap; // True if getMaxLayerDensity() stopped at least one node's expansion this traversal - see GaussianSplatLodNode::layer_density.
 	bool hit_depth_cap; // True if getMaxTreeDepth() stopped at least one node's expansion this traversal.
+	size_t num_sat_bias_stops, num_sat_bias_tested; // SESSION085 ETAP 3: counts, not a bool. The first cut reported only "did the bias stop anything", which was true while the mechanism was in fact near-inert - a bool cannot distinguish "fired a few thousand times" from "fired on half the walk". stops/tested is the diagnosis: a low ratio means the occlusion test is being asked and refusing.
 
 	// SESSION079: scratch for the parallel saturation build's phase-1 records and the parallel read pass's keep mask
 	// USED TO live here, pooled on the reused per-kick scratch for the same first-touch-cost reason as the fields
@@ -1243,6 +1257,7 @@ enum FrontierStopReason
 	FrontierStop_DepthCap,   // max_tree_depth stopped expansion here.
 	FrontierStop_BudgetCap,  // max_splats_budget stopped expansion, and this node was drained from the heap as-is.
 	FrontierStop_NoTree,     // The member has no LoD tree at all, so every one of its splats is always selected.
+	FrontierStop_SatBias,        // SESSION085 ETAP 3: the saturation barrier's LoD bias stopped expansion here - the node is behind saturated geometry, so its own merged stand-in is drawn instead of its subtree. Only produced when the bias ceiling is above 1.
 	FrontierStop_OutOfFrustum, // SESSION055: the node's centre is outside the frustum (dilated by 1.5*feature_size to keep large nodes whose centre is just past a plane), so it and its subtree were skipped. Only produced when frustum-cull is on (see GaussianSplatRenderer::setFrustumCullEnabled). getFrustumStructureReport() disables cull, so this bucket stays 0 there - it exists so the runtime path can bucket cheaply and so the count matches what the fast path actually did.
 	FrontierStop_OutOfDistRange, // SESSION072: the node's whole bounding sphere is outside the distance-slice shell (or, inverted, entirely inside it) - see GaussianSplatRenderer::getDistClampEnabled(). Only produced when the dist-clamp checkbox is on; getFrustumStructureReport() always leaves it off, same reasoning as FrontierStop_OutOfFrustum above.
 	FrontierStop_NumReasons
@@ -2156,6 +2171,8 @@ public:
 		const Reference<GaussianSplatUnculledFrontier>& prev_frontier_ = Reference<GaussianSplatUnculledFrontier>(), // SESSION080 DIAGNOSTIC (plan doc STEP A) - see the field's comment.
 		bool sort_staleness_diag_enabled_ = false,
 		float reuse_split_dist_ = 0.f, // SESSION080 STEP B: 0 = walk the whole tree, the pre-session080 behaviour - see GaussianSplatRenderer::getFrontierReuseSplitDist() and reuse_enabled below.
+		const Reference<GaussianSplatSaturationBarrier>& sat_barrier_ = Reference<GaussianSplatSaturationBarrier>(), // SESSION085 ETAP 3: the cloud's barrier at kick time, for the LoD bias. Null (the default) leaves the bias off, so every existing call site is unaffected.
+		float sat_bias_ceiling_ = 1.f, // SESSION085 ETAP 3: 1 = off - see GaussianSplatRenderer::getSatBiasCeiling().
 		bool draw_unpruned_frontier_ = true) // SESSION081: true = install this frontier for drawing unconditionally (the session076 behaviour). False installs it only if nothing has been shown for this cloud yet - see the field's comment and drainTraversalResults()'s use of it. No longer means "defers to a same-traversal saturation follow-up" - apply is now a fully separate pipeline, see GaussianSplatSaturationApplyTask.
 	:	cloud_id(cloud_id_), topology_generation(topology_generation_), scratch(scratch_), cam_pos_ws(cam_pos_ws_),
 		pixel_scale_limit(pixel_scale_limit_), max_splats_budget(max_splats_budget_), max_layer_density(max_layer_density_), max_tree_depth(max_tree_depth_), focal_px(focal_px_),
@@ -2172,6 +2189,10 @@ public:
 		expand_seeds(0), expand_num_tasks(0), expand_prologue_ms(0.0), expand_task_max_ms(0.0), expand_task_sum_ms(0.0), // SESSION080 DIAGNOSTIC
 		expand_splice_reserve_ms(0.0), expand_splice_copy_ms(0.0), // SESSION080 DIAGNOSTIC (plan2 §4.1)
 		prev_frontier(prev_frontier_), sort_staleness_diag_enabled(sort_staleness_diag_enabled_), // SESSION080 DIAGNOSTIC
+		sat_barrier(sat_barrier_), sat_bias_ceiling(sat_bias_ceiling_), // SESSION085 ETAP 3
+		// Precomputed here, not per node: the DFS asks this millions of times. A barrier with sat_grid_res 0 is the "no
+		// grid" convention (stage off, or nothing saturated), and gsSatOccluded() would return false for every node anyway.
+		sat_bias_active(sat_bias_ceiling_ > 1.f && sat_barrier_.nonNull() && sat_barrier_->sat_grid_res != 0),
 		reuse_enabled(false), far_cut_is_frozen(false), reuse_prev_anchor_ws(0.f), reuse_split_dist(0.f) // SESSION080 §4.3 - derived below.
 	{
 		if(num_frustum_clip_planes < 0)
@@ -2212,6 +2233,10 @@ public:
 				prev_frontier->max_layer_density == max_layer_density &&
 				prev_frontier->max_tree_depth == max_tree_depth &&
 				prev_frontier->focal_px == focal_px &&
+				// SESSION085 ETAP 3: and the same barrier, or the inherited segment was cut under a different set of
+				// effective limits - see GaussianSplatUnculledFrontier::sat_bias_barrier_time. Inert while the bias is
+				// off, since both sides are then 0.
+				prev_frontier->sat_bias_barrier_time == satBiasBarrierTime() &&
 				prev_frontier->reuse_split_dist_used == reuse_split_dist_ && // The knob moved: the frozen cut is at the wrong distance now.
 				// The accumulated-drift bound, i.e. the full-rebuild safety trigger. The cut is frozen, so a node beyond
 				// it is never re-examined however far the camera travels; without this it would keep the key it was given
@@ -2356,6 +2381,7 @@ public:
 		bool hit_budget_cap = false;
 		bool hit_density_cap = false;
 		bool hit_depth_cap = false;
+		size_t num_sat_bias_stops = 0, num_sat_bias_tested = 0; // SESSION085 ETAP 3
 
 		// SESSION080: spread the DFS across the pool. Measured at 52% of the whole async pipeline once session079 had
 		// parallelised gather/grid/test and session080 the sort - by some distance the largest remaining serial stage.
@@ -2370,10 +2396,10 @@ public:
 		const bool expand_in_parallel = (task_manager != NULL) && (frontier_record == NULL);
 		if(expand_in_parallel && !stack.empty())
 			expandParallel(stack, decorated, positions, feature_sizes, cull_radii, diag_coarse_a, diag_coarse_b, diag_reuse_roots,
-				hit_budget_cap, hit_density_cap, hit_depth_cap);
+				hit_budget_cap, hit_density_cap, hit_depth_cap, num_sat_bias_stops, num_sat_bias_tested);
 		else
 			expandStack(stack, decorated, positions, feature_sizes, cull_radii, /*enforce_budget=*/true, /*breadth_first=*/false, /*pause_at_stack_size=*/0,
-				diag_coarse_a, diag_coarse_b, diag_reuse_roots, hit_budget_cap, hit_density_cap, hit_depth_cap);
+				diag_coarse_a, diag_coarse_b, diag_reuse_roots, hit_budget_cap, hit_density_cap, hit_depth_cap, num_sat_bias_stops, num_sat_bias_tested);
 
 		const double expand_ms = expand_timer.elapsed() * 1.0e3; // SESSION080 DIAGNOSTIC - stops here, before the sort.
 
@@ -2434,6 +2460,7 @@ public:
 		scratch->hit_budget_cap = hit_budget_cap;
 		scratch->hit_density_cap = hit_density_cap;
 		scratch->hit_depth_cap = hit_depth_cap;
+		scratch->num_sat_bias_stops = num_sat_bias_stops; scratch->num_sat_bias_tested = num_sat_bias_tested; // SESSION085 ETAP 3
 
 		// A null queue means nobody is waiting for this frontier to be drawn - the caller ran the task itself and reads the
 		// scratch directly.  Enqueueing anyway would have drainTraversalResults() apply a selection, and decrement an
@@ -2520,6 +2547,7 @@ public:
 				uf->anchor_pos_ws = cam_pos_ws;
 				uf->built_time_real_s = Clock::getCurTimeRealSec(); // SESSION080 DIAGNOSTIC - see the field's comment.
 				uf->pixel_scale_limit = pixel_scale_limit;
+				uf->sat_bias_barrier_time = satBiasBarrierTime(); // SESSION085 ETAP 3 - see the field.
 				uf->max_splats_budget = max_splats_budget;
 				uf->max_layer_density = max_layer_density;
 				uf->max_tree_depth = max_tree_depth;
@@ -2599,7 +2627,8 @@ public:
 				prev_frontier->max_splats_budget == max_splats_budget &&
 				prev_frontier->max_layer_density == max_layer_density &&
 				prev_frontier->max_tree_depth == max_tree_depth &&
-				prev_frontier->focal_px == focal_px)
+				prev_frontier->focal_px == focal_px &&
+				prev_frontier->sat_bias_barrier_time == satBiasBarrierTime()) // SESSION085 ETAP 3 - same key set as the reuse check above.
 			{
 				Timer staleness_timer;
 				const GaussianSplatUnculledFrontier& prev_uf = *prev_frontier; // Not `prev` - that name shadows glare::Task::prev, the intrusive task-list link.
@@ -2706,6 +2735,64 @@ private:
 		return item;
 	}
 
+	// SESSION085 ETAP 3 - THE SATURATION LoD BIAS. How much this node's pixel_scale_limit is multiplied by, given how
+	// deeply the barrier says it is buried. 1 = untouched.
+	//
+	// The idea in one line: instead of DROPPING a node behind saturated geometry (which is a hole whenever the barrier is
+	// wrong), stop the walk there and draw the node's own merged stand-in - what is given up is the subtree it would have
+	// unfolded into, not the geometry. See snapshots/2026-09-03-session085-progressiveSaturation_PLAN.md.
+	//
+	// The measure is gsSatBuriedRatioSq() - the node's centre tile, node as a point - and NOT gsSatOccluded(), which is
+	// the prune's test. That was etap 3's first cut and it left the mechanism near-inert; the reasoning, and the measured
+	// numbers, are recorded on gsSatBuriedRatioSq() itself. The short version: a prune must be certain, so it charges the
+	// node's whole extent and demands every tile it touches agree - and this is asked about ANCESTORS, which are exactly
+	// the nodes that cannot pay that. A bias removes nothing, so it does not owe that certainty.
+	//
+	// The multiplier reads as tree levels, since feature_size roughly halves per level: 2 is about one level coarser,
+	// 4 two levels, 8 three. What maps the barrier ratio onto it is the curve below, not the ratio itself - see there.
+	//
+	// Cost: called ONLY on nodes that have already failed the plain converged test, i.e. ones that would otherwise
+	// descend - never on the common early-out path - and it is one direction encode plus one array read.
+	inline float satBiasFor(uint32 cloud_idx, const js::Vector<Vec3f, 16>& positions) const
+	{
+		const GaussianSplatSaturationBarrier& b = *sat_barrier;
+		const Vec3f& p = positions[cloud_idx];
+		// From the BARRIER's anchor, not the camera: sat_depth is measured from where the barrier was built, and the two
+		// are not the same point (that is what region_radius is about). Using cam_pos_ws here would be a silent error.
+		const Vec4f offset(p.x - b.anchor_pos_ws[0], p.y - b.anchor_pos_ws[1], p.z - b.anchor_pos_ws[2], 0.f);
+		const float dist_sq = offset[0]*offset[0] + offset[1]*offset[1] + offset[2]*offset[2];
+
+		const float ratio_sq = gsSatBuriedRatioSq(offset, dist_sq, b.sat_depth, b.sat_grid_res);
+		if(ratio_sq <= 1.f)
+			return 1.f; // Not behind the barrier, or exactly on it - no bias either way.
+
+		// f = 1 + (ceiling - 1) * (1 - 1/ratio^2). Continuous, f(1) = 1 exactly, monotonic, and it approaches the ceiling
+		// quickly - about 89% of the way there by ratio 3.
+		//
+		// The first cut used the ratio ITSELF as the multiplier, and that was measured too weak to matter. The arithmetic,
+		// recorded because it is the argument for this shape: 689,864 stops out of 3,419,595 tests took the frontier from
+		// 11.5M to 7.45M, i.e. 5.8 nodes saved per stop - about 1.3 tree levels. That is exactly what the ratio can buy,
+		// since climbing the tree is logarithmic in the multiplier (feature_size halves per level) and the ratio is only
+		// 2-10 over most of a frontier. Meanwhile the PRUNE, reading the same barrier, took the same frontier to 2M: it
+		// draws the strongest possible conclusion from that evidence, while the bias was drawing one of the weakest.
+		//
+		// The reasoning behind the shape: the ratio is CONFIDENCE that the node is invisible, not a measure of how much
+		// detail it needs. Past a few multiples of the barrier the confidence is not meaningfully increasing any more -
+		// either the barrier is right, in which case nothing there is visible and the coarsening is free, or it is wrong,
+		// in which case a bigger ratio would not have saved us. So the sensible response is to reach the ceiling and stop,
+		// leaving the grading for the region near the barrier - which is where it is actually needed, both because the
+		// verdict is genuinely uncertain there and because a discontinuity there would be a moving seam (see the plan's
+		// etap 4 note on session064-style boiling).
+		//
+		// This makes the CEILING the operative knob rather than a backstop, which is the right shape for the project's
+		// "no manual per-scene tuning" rule: one number, calibrated once, with the per-node behaviour fixed in code.
+		//
+		// Works on ratio_sq directly - 1/ratio^2 is 1/ratio_sq - so the sqrt the first cut needed is gone from a path the
+		// walk takes millions of times per traversal.
+		return 1.f + (sat_bias_ceiling - 1.f) * (1.f - 1.f / ratio_sq);
+	}
+
+
 	// SESSION080: the DFS itself, lifted out of run() unchanged so that the serial path and each parallel task run
 	// literally the same code rather than two copies that can drift apart.
 	//
@@ -2724,7 +2811,7 @@ private:
 		const js::Vector<Vec3f, 16>& positions, const js::Vector<float, 16>& feature_sizes, const js::Vector<float, 16>& cull_radii,
 		bool enforce_budget, bool breadth_first, size_t pause_at_stack_size,
 		size_t& diag_coarse_a, size_t& diag_coarse_b, size_t& diag_reuse_roots,
-		bool& hit_budget_cap, bool& hit_density_cap, bool& hit_depth_cap)
+		bool& hit_budget_cap, bool& hit_density_cap, bool& hit_depth_cap, size_t& num_sat_bias_stops, size_t& num_sat_bias_tested)
 	{
 		size_t head = 0; // Read cursor; breadth-first only.
 		for(;;)
@@ -2946,6 +3033,28 @@ private:
 				continue;
 			}
 
+			// SESSION085 ETAP 3 - THE SATURATION LoD BIAS. Deliberately placed AFTER the two tests above rather than folded
+			// into the converged one, and the ordering is the whole reason this costs nothing when it is off:
+			//
+			//  - A node that already converged has stopped; the bias only ever RAISES the limit, so it could not have
+			//    changed that answer. Testing it first would pay gsSatOccluded() on every node in the walk for nothing.
+			//  - A leaf is emitted whichever way this goes, so asking is wasted there too.
+			//
+			// What is left is exactly the population the bias can act on: nodes that would otherwise DESCEND. And when
+			// sat_bias_active is false the whole thing is one bool test, so the off path is bit-for-bit what it was.
+			if(sat_bias_active && !force_descend)
+			{
+				++num_sat_bias_tested;
+				if(top.pixel_scale <= pixel_scale_limit * satBiasFor(cloud_idx_u32, positions))
+				{
+					++num_sat_bias_stops;
+					DistIdx d; d.dist_sq = top.dist_sq; d.idx = cloud_idx_u32 | far_bit; // SESSION080 §4.3: bit 30 - see far_bit.
+					decorated.push_back(d);
+					recordFrontierNode(cloud_idx_u32, top.member_idx, top.tree_local_idx, top.depth, FrontierStop_SatBias);
+					continue;
+				}
+			}
+
 			// Density-capped: expanding this node would recurse into a region estimated to be this dense with overdraw
 			// (see GaussianSplatLodNode::layer_density) - stop here and use this node's own merged approximation
 			// instead, regardless of how coarse its pixel_scale still looks. max_layer_density <= 0 disables this check
@@ -3004,7 +3113,7 @@ private:
 	class GsExpandTask : public glare::Task
 	{
 	public:
-		GsExpandTask() : diag_coarse_a(0), diag_coarse_b(0), diag_reuse_roots(0), hit_density_cap(false), hit_depth_cap(false), run_ms(0.0) {}
+		GsExpandTask() : diag_coarse_a(0), diag_coarse_b(0), diag_reuse_roots(0), hit_density_cap(false), hit_depth_cap(false), num_sat_bias_stops(0), num_sat_bias_tested(0), run_ms(0.0) {}
 
 		virtual void run(size_t /*thread_index*/) override
 		{
@@ -3012,7 +3121,7 @@ private:
 			bool unused_budget_cap = false; // Not enforced here - see expandParallel().
 			parent->expandStack(stack, decorated, *positions, *feature_sizes, *cull_radii,
 				/*enforce_budget=*/false, /*breadth_first=*/false, /*pause_at_stack_size=*/0,
-				diag_coarse_a, diag_coarse_b, diag_reuse_roots, unused_budget_cap, hit_density_cap, hit_depth_cap);
+				diag_coarse_a, diag_coarse_b, diag_reuse_roots, unused_budget_cap, hit_density_cap, hit_depth_cap, num_sat_bias_stops, num_sat_bias_tested);
 			run_ms = task_timer.elapsed() * 1.0e3;
 		}
 
@@ -3024,6 +3133,7 @@ private:
 		js::Vector<DistIdx, 16> decorated;
 		size_t diag_coarse_a, diag_coarse_b, diag_reuse_roots;
 		bool hit_density_cap, hit_depth_cap;
+		size_t num_sat_bias_stops, num_sat_bias_tested; // SESSION085 ETAP 3 - see the parent's.
 		double run_ms; // SESSION080 DIAGNOSTIC
 	};
 
@@ -3045,7 +3155,7 @@ private:
 	void expandParallel(std::vector<HeapItem>& stack, js::Vector<DistIdx, 16>& decorated,
 		const js::Vector<Vec3f, 16>& positions, const js::Vector<float, 16>& feature_sizes, const js::Vector<float, 16>& cull_radii,
 		size_t& diag_coarse_a, size_t& diag_coarse_b, size_t& diag_reuse_roots,
-		bool& hit_budget_cap, bool& hit_density_cap, bool& hit_depth_cap)
+		bool& hit_budget_cap, bool& hit_density_cap, bool& hit_depth_cap, size_t& num_sat_bias_stops, size_t& num_sat_bias_tested)
 	{
 		// Seeds are cut far finer than the thread count on purpose, for the same reason session079's saturation chunks
 		// are: subtree cost is wildly uneven (the member the camera is standing inside dwarfs the others), so an even
@@ -3061,7 +3171,7 @@ private:
 		// the first part of the identical DFS, and anything it finishes on the way lands in `decorated` directly.
 		Timer prologue_timer; // SESSION080 DIAGNOSTIC
 		expandStack(stack, decorated, positions, feature_sizes, cull_radii, /*enforce_budget=*/false, /*breadth_first=*/true, /*pause_at_stack_size=*/target_seeds,
-			diag_coarse_a, diag_coarse_b, diag_reuse_roots, hit_budget_cap, hit_density_cap, hit_depth_cap);
+			diag_coarse_a, diag_coarse_b, diag_reuse_roots, hit_budget_cap, hit_density_cap, hit_depth_cap, num_sat_bias_stops, num_sat_bias_tested);
 		expand_prologue_ms = prologue_timer.elapsed() * 1.0e3;
 		expand_seeds = stack.size();
 
@@ -3108,6 +3218,7 @@ private:
 			decorated.resize(initial_decorated); // NOT 0 - see initial_decorated's comment.
 			diag_coarse_a = diag_coarse_b = diag_reuse_roots = 0;
 			hit_density_cap = hit_depth_cap = false;
+			num_sat_bias_stops = num_sat_bias_tested = 0; // SESSION085 ETAP 3
 			stack.clear();
 			for(size_t mi=0; mi<scratch->members_snapshot.size(); ++mi)
 			{
@@ -3117,7 +3228,7 @@ private:
 				stack.push_back(makeHeapItem((uint32)mi, /*tree_local_idx=*/0, m.offset, /*depth=*/0, positions, feature_sizes));
 			}
 			expandStack(stack, decorated, positions, feature_sizes, cull_radii, /*enforce_budget=*/true, /*breadth_first=*/false, /*pause_at_stack_size=*/0,
-				diag_coarse_a, diag_coarse_b, diag_reuse_roots, hit_budget_cap, hit_density_cap, hit_depth_cap);
+				diag_coarse_a, diag_coarse_b, diag_reuse_roots, hit_budget_cap, hit_density_cap, hit_depth_cap, num_sat_bias_stops, num_sat_bias_tested);
 			return;
 		}
 
@@ -3155,6 +3266,8 @@ private:
 			diag_reuse_roots += task->diag_reuse_roots; // SESSION080 STEP B
 			hit_density_cap = hit_density_cap || task->hit_density_cap;
 			hit_depth_cap   = hit_depth_cap   || task->hit_depth_cap;
+			num_sat_bias_stops  += task->num_sat_bias_stops;  // SESSION085 ETAP 3 - summed, not or-ed: see the scratch field.
+			num_sat_bias_tested += task->num_sat_bias_tested;
 		}
 		assert(write_pos == total); // The sizing pass and this one walk the same tasks in the same order.
 		expand_splice_copy_ms = splice_copy_timer.elapsed() * 1.0e3;
@@ -3185,6 +3298,19 @@ private:
 	bool sat_diag_log;               // SESSION076 DIAGNOSTIC: see the ctor param.
 	bool coarse_layer_drawn;         // SESSION076: see the ctor param.
 	bool draw_unpruned_frontier;  // SESSION081: see the ctor param.
+
+	// SESSION085 ETAP 3 - the saturation LoD bias. The barrier the cloud had at kick time (may be NULL: a cloud's first
+	// traversal, or the stage off), used READ-ONLY and immutable once built, so sharing it with a worker is safe.
+	// Note this is the PREVIOUS build's barrier - one traversal behind, exactly as the apply stage already consumes it.
+	Reference<GaussianSplatSaturationBarrier> sat_barrier;
+	float sat_bias_ceiling;  // Cap on the multiplier - see GaussianSplatRenderer::getSatBiasCeiling(). 1 = off.
+	bool sat_bias_active;    // Precomputed once at kick: ceiling > 1 AND a usable barrier exists. Keeps the DFS's per-node test to one bool.
+
+	// SESSION085 ETAP 3: the value this traversal answers to for reuse purposes - see
+	// GaussianSplatUnculledFrontier::sat_bias_barrier_time. A function rather than two computations, because the
+	// ctor (which decides whether a far block may be inherited) and run() (which stamps the produced frontier) have
+	// to agree exactly; if they ever disagreed, a block would be inherited under one key and labelled with another.
+	inline double satBiasBarrierTime() const { return sat_bias_active ? sat_barrier->built_time_real_s : 0.0; }
 	glare::TaskManager* task_manager; // SESSION079: may be NULL - see the ctor param.
 
 	// SESSION080 DIAGNOSTIC: filled by expandParallel(), copied onto the frontier at the end of run() - see
@@ -3268,7 +3394,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	filter_debug_log(false), kick_debug_log(false), cpu_prof_log(false), // SESSION072: default off - see getFilterDebugLog()'s comment.
 	sat_prefilter_mode(GaussianSplatSatPrefilterMode_Off), filter_frustum_planes_enabled(true), // SESSION074: stage off by default, frustum planes on (i.e. unchanged pipeline) - see getSatPrefilterMode()/getFilterFrustumPlanesEnabled().
 	sat_prefilter_threshold(0.98f), // SESSION079 - see getSatPrefilterThreshold().
-	sat_diag_log(false), sat_debug_overlay_mode(GaussianSplatSatDebugOverlayMode_Off), sat_grid_subdiv(0.3f), sat_region_radius(0.f), sat_region_closing_tiles(0), sat_min_ratio(1.f), draw_unpruned_frontier(true), // SESSION076/078/081: diagnostics off by default - see getSatDiagLog()/getSatDebugOverlayMode(). Calibration defaults are the values reasoned to on paper, not yet confirmed on a scene. draw_unpruned_frontier defaults to the session076 publish-early behaviour.
+	sat_diag_log(false), sat_debug_overlay_mode(GaussianSplatSatDebugOverlayMode_Off), sat_grid_subdiv(0.3f), sat_region_radius(0.f), sat_region_closing_tiles(0), sat_min_ratio(1.f), sat_bias_ceiling(1.f), draw_unpruned_frontier(true), // SESSION076/078/081: diagnostics off by default - see getSatDiagLog()/getSatDebugOverlayMode(). Calibration defaults are the values reasoned to on paper, not yet confirmed on a scene. draw_unpruned_frontier defaults to the session076 publish-early behaviour.
 	frontier_reuse_split_dist(0.f), // SESSION080 STEP B: off by default - 0 is the pre-session080 walk-everything behaviour, bit-for-bit. See getFrontierReuseSplitDist().
 	splat_point_size_px(1.f),
 	splat_merge_spread_widen(3.0f), // SESSION071: analytic minimum is sqrt(3) (see widenedMergedScale()); owner default set higher for extra margin.
@@ -4722,6 +4848,7 @@ static const char* const stop_reason_labels[FrontierStop_NumReasons] =
 	"depth cap",
 	"budget cap",
 	"member has no LoD tree",
+	"saturation LoD bias", // SESSION085 ETAP 3 - only produced when the bias ceiling is above 1.
 	"out of frustum", // SESSION055 - only produced by the fast path with cull enabled; getFrustumStructureReport() disables cull so this stays 0 there.
 	"out of distance slice" // SESSION072 - only produced by the fast path with the dist-clamp checkbox on; getFrustumStructureReport() always leaves it off.
 };
@@ -6755,6 +6882,23 @@ void GaussianSplatRenderer::setSatRegionClosingTiles(int v)
 // skips a kick whose (source, barrier) pair is the one the last kick already used - without this the knob would
 // appear dead until the camera happened to move, which is exactly the sort of thing that gets mistaken for the
 // mechanism not working.
+// SESSION085 ETAP 3 - see getSatBiasCeiling(). Unlike setSatMinRatio() this changes what a TRAVERSAL produces (which
+// nodes the walk stops at), not merely what the apply decides - so cached frontiers built under the old value are not
+// valid under the new one, exactly like the four setters above it.
+void GaussianSplatRenderer::setSatBiasCeiling(float v)
+{
+	if(v == sat_bias_ceiling)
+		return;
+	sat_bias_ceiling = v;
+
+	for(size_t i=0; i<clouds.size(); ++i)
+	{
+		clouds[i]->cached_ufrontier = NULL;
+		clouds[i]->have_last_traversal_cam_pos = false;
+	}
+}
+
+
 void GaussianSplatRenderer::setSatMinRatio(float v)
 {
 	if(v == sat_min_ratio)
@@ -7858,6 +8002,21 @@ void GaussianSplatRenderer::drainSaturationBuildResults()
 			continue;
 
 		cloud->cached_sat_barrier = msg->barrier;
+
+		// SESSION085 ETAP 3: with the LoD bias on, a traversal's OUTPUT is a function of the barrier as well as of the
+		// camera and the knobs - so a new barrier invalidates the standing traversal exactly as a camera move does. This is
+		// a missing cache invalidation, not a refinement heuristic: without it the barrier updates and nothing re-walks, so
+		// the coarsening chosen under the PREVIOUS barrier stands until some unrelated event happens to kick a traversal.
+		//
+		// Owner-visible as the one complaint left after etap 3's sweep: stopping the camera left regions at the LoD the old
+		// barrier had justified, and they stayed there. Under the prune the same staleness showed as holes and the apply
+		// pipeline re-ran on a barrier change (kickOffSaturationApplies() keys on it), so the traversal never had to care.
+		//
+		// Same "unconditionally overdue" mechanism forceTraversalRefresh() uses, scoped to this cloud. No feedback loop:
+		// kickOffSaturationBuilds() decides to rebuild from the camera position and the knobs, never from the frontier, so
+		// the traversal this provokes cannot provoke another barrier.
+		if(sat_bias_ceiling > 1.f)
+			cloud->have_last_traversal_cam_pos = false;
 		const GaussianSplatSaturationBarrier& b = *msg->barrier;
 
 		// SESSION074/076/079/080/081 DIAGNOSTIC: the build's own numbers, printed once per build rather than once per
@@ -8177,13 +8336,19 @@ void GaussianSplatRenderer::drainTraversalResults()
 			// kickOffSaturationBuilds()'s and kickOffSaturationApplies()'s only source (neither reads cached_ufrontier
 			// any more), not just a diagnostic nicety. Without this, a session with diag off and reuse=0 would starve
 			// every barrier build and apply of input and neither would ever run.
-			const bool sat_wants_source = (sat_prefilter_mode != GaussianSplatSatPrefilterMode_Off) || (sat_debug_overlay_mode != GaussianSplatSatDebugOverlayMode_Off);
+			// SESSION085 ETAP 3: the bias is a third consumer - see kickOffSaturationBuilds(). The barrier build still
+			// requires a source frontier to exist (it reports occl= against frontier_n), so without this the bias-only
+			// configuration would drop the source here and then never get a barrier built at all.
+			const bool sat_wants_source = (sat_prefilter_mode != GaussianSplatSatPrefilterMode_Off) ||
+				(sat_debug_overlay_mode != GaussianSplatSatDebugOverlayMode_Off) || (sat_bias_ceiling > 1.f);
 			cloud->last_unpruned_ufrontier = (sat_diag_log || frontier_reuse_split_dist > 0.f || sat_wants_source) ?
 				msg->unculled_frontier : Reference<GaussianSplatUnculledFrontier>();
 
 			cloud->last_traversal_hit_budget_cap = msg->scratch->hit_budget_cap;
 			cloud->last_traversal_hit_density_cap = msg->scratch->hit_density_cap;
 			cloud->last_traversal_hit_depth_cap = msg->scratch->hit_depth_cap;
+			cloud->last_traversal_sat_bias_stops = msg->scratch->num_sat_bias_stops; // SESSION085 ETAP 3
+			cloud->last_traversal_sat_bias_tested = msg->scratch->num_sat_bias_tested;
 
 			// SESSION076/081: no saturation numbers to print here any more. A traversal's first (and now only) message
 			// carries the UNPRUNED frontier and never builds or applies a grid itself - APPLY prints from
@@ -8224,6 +8389,7 @@ void GaussianSplatRenderer::drainTraversalResults()
 						" budget_cap=" + boolToString(cloud->last_traversal_hit_budget_cap) +
 						" density_cap=" + boolToString(cloud->last_traversal_hit_density_cap) +
 						" depth_cap=" + boolToString(cloud->last_traversal_hit_depth_cap) +
+						" sat_bias=" + uInt64ToStringCommaSeparated(cloud->last_traversal_sat_bias_stops) + "/" + uInt64ToStringCommaSeparated(cloud->last_traversal_sat_bias_tested) + // SESSION085 ETAP 3: nodes the bias STOPPED, over nodes it was asked about. A big denominator with a small numerator means the occlusion test is refusing, not that the bias is idle.
 						// SESSION080 DIAGNOSTIC: the parallel expand's own shape - see the fields' comment. par= is
 						// task_sum/task_max, the parallelism the seed split actually offers; compare it against how much
 						// of expand_ms the longest task accounts for.
@@ -8574,7 +8740,15 @@ void GaussianSplatRenderer::kickOffSaturationBuilds()
 	if(task_manager == NULL)
 		return;
 
-	const bool sat_wanted = (sat_prefilter_mode != GaussianSplatSatPrefilterMode_Off) || (sat_debug_overlay_mode != GaussianSplatSatDebugOverlayMode_Off);
+	// SESSION085 ETAP 3: the barrier now has THREE consumers, not one - the prune, the debug overlay, and the LoD bias -
+	// so it is built when ANY of them wants it. Gating it on the prune checkbox alone meant turning the prune off to
+	// measure the bias on its own silently starved the bias of its only input, and the bias would have read as "does
+	// nothing" rather than as "was never given a barrier". That is exactly the failure session075 hit with the coarse
+	// floor (one flag conflating "capture it" with "draw it"), and it cost a wasted arm of the session085 occluder
+	// comparison when the same shape appeared again there.
+	const bool sat_wanted = (sat_prefilter_mode != GaussianSplatSatPrefilterMode_Off) ||
+		(sat_debug_overlay_mode != GaussianSplatSatDebugOverlayMode_Off) ||
+		(sat_bias_ceiling > 1.f); // SESSION085 ETAP 3 - see getSatBiasCeiling().
 	if(!sat_wanted)
 		return;
 
@@ -8951,6 +9125,10 @@ void GaussianSplatRenderer::kickOffTraversals()
 			// switch, so the pipeline could not be timed and traced at once. This checkbox already means exactly that
 			// trade for the saturation counters - see getSatDiagLog() - so it is the right home for it.
 			/*reuse_split_dist=*/frontier_reuse_split_dist, // SESSION080 STEP B - see getFrontierReuseSplitDist(). 0 = walk the whole tree, as before.
+			// SESSION085 ETAP 3: the cloud's current barrier, for the LoD bias. One build behind by construction - the same
+			// staleness the apply stage already lives with - and null on a cloud's first kick, which leaves the bias off.
+			/*sat_barrier=*/best_cloud->cached_sat_barrier,
+			/*sat_bias_ceiling=*/sat_bias_ceiling, // SESSION085 ETAP 3 - see getSatBiasCeiling(). 1 = off.
 			/*draw_unpruned_frontier=*/draw_unpruned_frontier)); // SESSION081 - see getDrawUnprunedFrontier(). true = publish-early, the session076 behaviour.
 	}
 

@@ -507,3 +507,32 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 bool gsSatOccluded(const Vec4f& offset, float dist_sq, float node_radius,
 	const js::Vector<float, 16>& sat_depth, int res, float region_radius, float min_ratio_sq = 1.f,
 	bool* out_aggressive = NULL, float* out_ratio_sq = NULL);
+
+
+// SESSION085 ETAP 3 - HOW BURIED IS THIS DIRECTION, as the squared ratio (dist / barrier)^2 at the node's CENTRE tile,
+// with the node treated as a point. 0 means "not behind the barrier" (no grid, unsaturated direction, or in front of
+// it); anything above 1 is how many times further than the barrier it sits, squared.
+//
+// This is deliberately the quantity gsSatOccluded() computes as out_aggressive and labels "deliberately wrong" - and
+// the label is right, for a PRUNE. Dropping a node has to be certain, so it must take the node's whole extent and
+// demand that every tile that extent touches agrees. For a BIAS nothing is removed: the answer only decides how coarse
+// a stand-in to draw, so the honest question is "how buried is this region", which is a property of where the node is,
+// not a safety guarantee about its whole subtree.
+//
+// That distinction is not academic - it was measured. Etap 3's first cut asked gsSatOccluded() proper, and the bias
+// was near-inert: with the prune reaching 2M nodes from the same barrier, the bias at a ceiling of 30 only moved the
+// frontier from 11.5M to 7.5M. Two compounding reasons, both from asking the prune's question:
+//   - the node's radius enters the threshold (dist > sat_depth + radius), and the walk asks this about ANCESTORS,
+//     whose radius is metres - so the very nodes worth stopping at could not clear their own barrier;
+//   - every tile the extent touches must agree, and a large ancestor spans dozens of tiles, so one doorway or window
+//     in that span vetoes the whole node.
+// Both vanish here: one tile, no radius, no conjunction. It is also far cheaper than gsSatOccluded() - one direction
+// encode and one array read, no loop - which matters because the walk asks it millions of times.
+//
+// What it gives up, stated plainly: a node whose centre is buried but which extends into visible space will be
+// coarsened as though fully buried. That is bounded by the grading (a node near the barrier gets a ratio near 1 and is
+// barely touched) and by the caller's ceiling, and it degrades as blurrier geometry rather than as a hole.
+//
+// offset is (node_pos - anchor_pos_ws), UNNORMALISED, same convention as gsSatOccluded(); dist_sq is its squared
+// length. No sqrt is taken here - the caller decides whether it wants the linear ratio.
+float gsSatBuriedRatioSq(const Vec4f& offset, float dist_sq, const js::Vector<float, 16>& sat_depth, int res);

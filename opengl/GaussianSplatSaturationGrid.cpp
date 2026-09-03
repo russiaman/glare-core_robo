@@ -1715,6 +1715,27 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 }
 
 
+// SESSION085 ETAP 3 - see the header for why this is the right question for a bias and the wrong one for a prune.
+float gsSatBuriedRatioSq(const Vec4f& offset, float dist_sq, const js::Vector<float, 16>& sat_depth, int res)
+{
+	if(res == 0)
+		return 0.f; // No grid built - never bias. Same convention as gsSatOccluded().
+
+	if(dist_sq < 1.0e-12f)
+		return 0.f; // Degenerate: node at the anchor, no meaningful direction.
+
+	const float sat_d = sat_depth[gsSatGridTileForDir(offset, res)];
+	if(sat_d == std::numeric_limits<float>::infinity())
+		return 0.f; // This direction never saturates.
+
+	const float thresh_sq = sat_d * sat_d;
+	if(dist_sq <= thresh_sq)
+		return 0.f; // In front of the barrier, or on it.
+
+	return dist_sq / thresh_sq;
+}
+
+
 bool gsSatOccluded(const Vec4f& offset, float dist_sq, float node_radius,
 	const js::Vector<float, 16>& sat_depth, int res, float region_radius, float min_ratio_sq,
 	bool* out_aggressive, float* out_ratio_sq)

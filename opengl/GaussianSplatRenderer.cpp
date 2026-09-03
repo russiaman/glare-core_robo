@@ -257,6 +257,14 @@ public:
 	size_t sat_num_tested;       // DIAGNOSTIC: fine nodes the verdict was computed for.
 	size_t sat_num_dropped;      // DIAGNOSTIC: of those, how many the conservative test found occluded (counted in Count mode too, where nothing is actually removed).
 	size_t sat_num_dropped_aggr; // DIAGNOSTIC: the deliberately-wrong upper bound - see gsSatOccluded()'s out_aggressive.
+	// SESSION085 PLAN ETAP 2/4 DIAGNOSTIC, TEMPORARY - printed as [gsr-sat-ratio], filled only under the "diag"
+	// checkbox. sat_ratio_ne: nodes where the drop verdict and (ratio_sq > 1) disagree, i.e. the float-rounding sliver
+	// gsSatOccluded()'s header describes - ETAP 3 drives the LoD cut from that ratio, so this says whether it may also
+	// be trusted as the verdict. sat_ratio_hist: how far behind the barrier the DROPPED nodes sit, on the linear ratio,
+	// bucketed [1,1.25) [1.25,1.5) [1.5,2) [2,3) [3,5) [5,inf) - ETAP 4's premise check (a distribution piled up just
+	// above 1 means no bias function can achieve much, whatever its shape).
+	size_t sat_ratio_ne;
+	size_t sat_ratio_hist[6];
 	// SESSION080 DIAGNOSTIC: how many traversals were inside their apply phase when this one entered its own (on_entry
 	// counts the OTHERS, so 0 means it had the stage to itself), and the most that were running at any point while it
 	// was there - see gs_sat_phases_running. test_ms below is only readable against these two: it is wall-clock on a
@@ -423,6 +431,7 @@ public:
 
 	GaussianSplatUnculledFrontier() // SESSION074: defaults are "stage never ran".
 	:	sat_num_tested(0), sat_num_dropped(0), sat_num_dropped_aggr(0),
+		sat_ratio_ne(0), // SESSION085 PLAN ETAP 2/4 DIAGNOSTIC - the array is zeroed in the body below.
 		sat_concurrency_on_entry(0), sat_concurrency_peak(0), // SESSION080 DIAGNOSTIC
 		sat_test_ms(0.0),
 		built_time_real_s(0.0), // SESSION080
@@ -436,6 +445,7 @@ public:
 		reuse_roots(0), reuse_n(0), reuse_ms(0.0), reuse_split_dist_used(0.f), reuse_base_anchor_ws(0.f) // SESSION080 §4.3
 	{
 		for(int i=0; i<5; ++i) dist_pctile[i] = 0.f; // SESSION080
+		for(int i=0; i<6; ++i) sat_ratio_hist[i] = 0;  // SESSION085 PLAN ETAP 2/4 DIAGNOSTIC.
 	}
 };
 
@@ -1362,6 +1372,11 @@ struct GsSatTestChunk
 	size_t mask_base;
 	size_t out_begin;        // Where this chunk's survivors start in the output. Filled by the prefix sum between the phases.
 	size_t kept, tested, dropped, dropped_aggr;
+	// SESSION085 PLAN ETAP 2/4 DIAGNOSTIC, TEMPORARY: the graded read's two questions - see GsSatTestTask::run().
+	// ratio_ne counts nodes where the bool verdict and (ratio_sq > 1) disagree; ratio_hist buckets how far behind the
+	// barrier the dropped nodes actually sit. Both zero unless ratio_diag asked for them.
+	size_t ratio_ne;
+	size_t ratio_hist[6];
 };
 
 
@@ -1375,6 +1390,11 @@ public:
 	virtual void run(size_t /*thread_index*/)
 	{
 		size_t tested = 0, dropped = 0, dropped_aggr = 0, kept = 0;
+		// SESSION085 PLAN ETAP 2/4 DIAGNOSTIC, TEMPORARY - see the chunk's fields. Asking for the ratio costs no extra
+		// tile iterations (see gsSatOccluded()'s header), but it does cost a divide per passing tile, so it stays behind
+		// the same "diag" checkbox everything else of this kind sits behind.
+		size_t ratio_ne = 0;
+		size_t ratio_hist[6] = { 0, 0, 0, 0, 0, 0 };
 		for(size_t i=chunk->i_begin; i<chunk->i_end; ++i)
 		{
 			bool drop = false;
@@ -1384,11 +1404,32 @@ public:
 				const float dy = py[i] - cam_pos_ws.x[1];
 				const float dz = pz[i] - cam_pos_ws.x[2];
 				bool aggr = false;
+				float ratio_sq = 0.f;
 				drop = gsSatOccluded(Vec4f(dx, dy, dz, 0.f), dx*dx + dy*dy + dz*dz, radius[i],
-					*sat_depth, res, region_radius, &aggr); // SESSION078
+					*sat_depth, res, region_radius, &aggr, ratio_diag ? &ratio_sq : NULL); // SESSION078, SESSION085
 				++tested;
 				if(drop) ++dropped;
 				if(aggr) ++dropped_aggr;
+
+				if(ratio_diag)
+				{
+					// The rounding sliver the header warns about: how often the graded value would disagree with the
+					// verdict if a caller took (ratio > 1) as the decision. Expected tiny; measured rather than assumed,
+					// because ETAP 3 is about to drive the LoD cut from this value.
+					if(drop != (ratio_sq > 1.f))
+						++ratio_ne;
+
+					// ETAP 4's premise check, taken here because this is the only pass that already has the number: how far
+					// behind the barrier the dropped population actually sits. If it piles up just above 1, no bias function
+					// can do much and the shape of that function stops mattering. Bounds are on the LINEAR ratio
+					// (1.25/1.5/2/3/5), compared squared so no sqrt is needed.
+					if(drop)
+					{
+						const int b = (ratio_sq < 1.5625f) ? 0 : ((ratio_sq < 2.25f) ? 1 : ((ratio_sq < 4.f) ? 2 :
+							((ratio_sq < 9.f) ? 3 : ((ratio_sq < 25.f) ? 4 : 5))));
+						++ratio_hist[b];
+					}
+				}
 			}
 
 			const uint8 keep = (prune && drop) ? 0 : 1;
@@ -1399,6 +1440,8 @@ public:
 		chunk->tested = tested;
 		chunk->dropped = dropped;
 		chunk->dropped_aggr = dropped_aggr;
+		chunk->ratio_ne = ratio_ne;
+		for(int b=0; b<6; ++b) chunk->ratio_hist[b] = ratio_hist[b];
 	}
 
 	const float* px; const float* py; const float* pz; const float* radius; const float* is_coarse;
@@ -1407,6 +1450,7 @@ public:
 	int res;
 	float region_radius;
 	bool prune;
+	bool ratio_diag; // SESSION085 PLAN ETAP 2/4 DIAGNOSTIC, TEMPORARY - the "diag" checkbox. See run().
 	uint8* keep_mask;
 	GsSatTestChunk* chunk;
 };
@@ -1977,6 +2021,7 @@ public:
 				ch.mask_base = seg_base[sg];
 				ch.out_begin = 0;
 				ch.kept = ch.tested = ch.dropped = ch.dropped_aggr = 0;
+				ch.ratio_ne = 0; for(int b=0; b<6; ++b) ch.ratio_hist[b] = 0; // SESSION085 PLAN ETAP 2/4 DIAGNOSTIC.
 				chunks.push_back(ch);
 			}
 		}
@@ -1998,6 +2043,7 @@ public:
 				t->res = barrier->sat_grid_res;
 				t->region_radius = barrier->region_radius_used; // The R this barrier was built with, not the live setting - they can differ.
 				t->prune = prune;
+				t->ratio_diag = diag_log; // SESSION085 PLAN ETAP 2/4 DIAGNOSTIC - see GsSatTestTask::run().
 				t->keep_mask = keep_mask.data() + chunks[c].mask_base;
 				t->chunk = &chunks[c];
 				if(task_manager != NULL) group->tasks.push_back(t); else t->run(0);
@@ -2006,6 +2052,7 @@ public:
 		}
 
 		size_t num_tested = 0, num_dropped = 0, num_dropped_aggr = 0, num_kept = 0;
+		size_t ratio_ne = 0, ratio_hist[6] = { 0, 0, 0, 0, 0, 0 }; // SESSION085 PLAN ETAP 2/4 DIAGNOSTIC.
 		for(size_t c=0; c<chunks.size(); ++c)
 		{
 			chunks[c].out_begin = num_kept;
@@ -2013,6 +2060,8 @@ public:
 			num_tested      += chunks[c].tested;
 			num_dropped     += chunks[c].dropped;
 			num_dropped_aggr+= chunks[c].dropped_aggr;
+			ratio_ne        += chunks[c].ratio_ne;
+			for(int b=0; b<6; ++b) ratio_hist[b] += chunks[c].ratio_hist[b];
 		}
 
 		uf2->indices.resizeNoCopy(num_kept);
@@ -2047,6 +2096,8 @@ public:
 		uf2->sat_num_tested = num_tested;
 		uf2->sat_num_dropped = num_dropped;
 		uf2->sat_num_dropped_aggr = num_dropped_aggr;
+		uf2->sat_ratio_ne = ratio_ne; // SESSION085 PLAN ETAP 2/4 DIAGNOSTIC.
+		for(int b=0; b<6; ++b) uf2->sat_ratio_hist[b] = ratio_hist[b];
 		uf2->sat_test_ms = sat_test_timer.elapsed() * 1.0e3;
 		sat_phase_scope.sample();
 		uf2->sat_concurrency_on_entry = sat_phase_scope.on_entry;
@@ -2065,6 +2116,7 @@ public:
 	Reference<GaussianSplatUnculledFrontier> source_frontier; // The cloud's last_unpruned_ufrontier at kick time - its own arrays + far_block, same segment shape GaussianSplatSaturationBuildTask enumerates.
 	Reference<GaussianSplatSaturationBarrier> barrier;         // The cloud's cached_sat_barrier at kick time.
 	GaussianSplatSatPrefilterMode prefilter_mode;               // Drop prunes; Count only tallies (matches the old inline behaviour).
+	bool diag_log; // SESSION085 PLAN ETAP 2/4 DIAGNOSTIC, TEMPORARY: the "diag" checkbox, gating the graded-read counters - see GsSatTestTask::ratio_diag.
 	glare::TaskManager* task_manager;
 	ThreadSafeQueue<Reference<ThreadMessage> >* result_queue;
 };
@@ -7993,6 +8045,24 @@ void GaussianSplatRenderer::drainSaturationApplyResults()
 						" aggr=" + uInt64ToStringCommaSeparated(uf.sat_num_dropped_aggr) + // Deliberately-wrong upper bound, not a real verdict - see gsSatOccluded()'s out_aggressive.
 						" (" + doubleToStringNDecimalPlaces(tested > 0 ? (100.0 * (double)uf.sat_num_dropped_aggr / tested) : 0.0, 1) + "%)" +
 						" pool_after=" + uInt64ToStringCommaSeparated(uf.indices.size())); // The pruned frontier every later filter kick streams - the whole point of pruning here.
+
+					// SESSION085 PLAN ETAP 2/4 DIAGNOSTIC, TEMPORARY - see GaussianSplatUnculledFrontier::sat_ratio_ne.
+					// Own line rather than more fields on the one above, because it is filled only under "diag" while that
+					// line prints whenever the filter log is on - folding them would make a captured line's meaning depend
+					// on a checkbox it does not mention.
+					if(sat_diag_log)
+					{
+						const double dropped_d = (double)uf.sat_num_dropped;
+						std::string hist;
+						const char* const bucket_name[6] = { "1-1.25", "1.25-1.5", "1.5-2", "2-3", "3-5", "5+" };
+						for(int b=0; b<6; ++b)
+							hist += std::string(" ") + bucket_name[b] + "=" +
+								doubleToStringNDecimalPlaces(dropped_d > 0 ? (100.0 * (double)uf.sat_ratio_hist[b] / dropped_d) : 0.0, 1) + "%";
+						conPrint("[gsr-sat-ratio] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms" +
+							" ratio_ne=" + uInt64ToStringCommaSeparated(uf.sat_ratio_ne) + // Must be ~0: see gsSatOccluded()'s header on the rounding sliver.
+							" of dropped=" + uInt64ToStringCommaSeparated(uf.sat_num_dropped) +
+							" | depth behind barrier:" + hist);
+					}
 				}
 			}
 		}
@@ -8591,6 +8661,7 @@ void GaussianSplatRenderer::kickOffSaturationApplies()
 		t->source_frontier = cloud.last_unpruned_ufrontier;
 		t->barrier = cloud.cached_sat_barrier;
 		t->prefilter_mode = sat_prefilter_mode;
+		t->diag_log = sat_diag_log; // SESSION085 PLAN ETAP 2/4 DIAGNOSTIC.
 		t->task_manager = task_manager;
 		t->result_queue = &sat_apply_result_queue;
 

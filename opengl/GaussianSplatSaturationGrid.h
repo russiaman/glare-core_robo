@@ -472,5 +472,26 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 // out_aggressive, if non-null, receives a deliberately-wrong upper-bound verdict computed from the same tile data:
 // centre tile only, node treated as a point. Purely Stage A's "how much could this ever cut" ceiling - see
 // [gsr-sat]'s would_drop_aggr. Nothing in the real drop path reads it.
+//
+// SESSION085 - THE GRADED READ. out_ratio_sq, if non-null, receives HOW FAR BEHIND the barrier this node sits, as the
+// SQUARED ratio (dist / threshold)^2 minimised over the same footprint tiles the verdict is taken over. The progressive
+// saturation plan needs a continuous "how occluded is this" rather than the boolean, and sat_depth is already a
+// distance, so the quantity is there for free - see snapshots/2026-09-03-session085-progressiveSaturation_PLAN.md.
+//
+// Value contract:
+//   0    - not unambiguously behind the barrier (any touched tile unsaturated, or the node failing the depth test
+//          there). Exactly the cases that return false.
+//   > 1  - behind the barrier by that squared factor. Exactly the cases that return true.
+// Nothing is ever returned in (0, 1]: a node that fails any tile short-circuits to 0, the same early-out the verdict
+// takes, so this costs no extra tile iterations at all - the loop already had to visit every tile to answer true.
+//
+// Returned SQUARED and as an out-param rather than as a return value, deliberately, and both for the same reason: the
+// verdict must not change. Deriving the bool from the ratio instead (ratio > 1) would route a decision currently made
+// by an exact `dist_sq > threshold*threshold` comparison through a division, and a dist_sq a hair above threshold^2
+// can round to exactly 1.0f - flipping the answer on the nodes closest to the boundary. So the comparison below stays
+// multiplicative and the ratio is computed only for tiles that already passed it. A caller wanting both must take the
+// bool as the verdict and this as the magnitude; they agree except in that rounding sliver, which [gsr-sat-ratio]
+// counts (ratio_ne=) rather than assumes away.
 bool gsSatOccluded(const Vec4f& offset, float dist_sq, float node_radius,
-	const js::Vector<float, 16>& sat_depth, int res, float region_radius, bool* out_aggressive = NULL);
+	const js::Vector<float, 16>& sat_depth, int res, float region_radius, bool* out_aggressive = NULL,
+	float* out_ratio_sq = NULL);

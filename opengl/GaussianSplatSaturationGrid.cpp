@@ -1716,10 +1716,13 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 
 
 bool gsSatOccluded(const Vec4f& offset, float dist_sq, float node_radius,
-	const js::Vector<float, 16>& sat_depth, int res, float region_radius, bool* out_aggressive)
+	const js::Vector<float, 16>& sat_depth, int res, float region_radius, bool* out_aggressive,
+	float* out_ratio_sq)
 {
 	if(out_aggressive)
 		*out_aggressive = false;
+	if(out_ratio_sq)
+		*out_ratio_sq = 0.f; // SESSION085: 0 means "not behind the barrier" - set here so every early return below carries it.
 
 	if(res == 0)
 		return false; // No grid built - never drop. See the header.
@@ -1769,6 +1772,8 @@ bool gsSatOccluded(const Vec4f& offset, float dist_sq, float node_radius,
 	// safe in both tiles), but at the node's real scale instead of a fixed +-1-tile margin, and with no extra pass
 	// over the grid. A single unsaturated (+inf) tile in the span makes the whole test fail, which is exactly the
 	// silhouette-edge behaviour wanted: nothing is culled where saturated coverage borders open space.
+	float min_ratio_sq = std::numeric_limits<float>::infinity(); // SESSION085 - see out_ratio_sq. Unused when it is null.
+
 	for(int v=v0; v<=v1; ++v)
 	{
 		const float* const depth_row = &sat_depth[(size_t)v * (size_t)res];
@@ -1784,9 +1789,22 @@ bool gsSatOccluded(const Vec4f& offset, float dist_sq, float node_radius,
 			// SESSION078: + region_radius because the nearest ball point to this node stands R closer to it than the
 			// anchor does - the node has to clear the barrier from there too, not just from the anchor.
 			const float threshold = sat_d + node_radius + region_radius;
-			if(dist_sq <= threshold * threshold)
+			const float thresh_sq = threshold * threshold;
+			if(dist_sq <= thresh_sq)
 				return false; // Not behind the saturation depth in this tile.
+
+			// SESSION085: reached only by a tile that already passed the test above, so the division is never the thing
+			// deciding anything - see the header's note on why the verdict stays multiplicative.
+			if(out_ratio_sq)
+			{
+				const float ratio_sq = dist_sq / thresh_sq;
+				if(ratio_sq < min_ratio_sq)
+					min_ratio_sq = ratio_sq;
+			}
 		}
 	}
+
+	if(out_ratio_sq)
+		*out_ratio_sq = min_ratio_sq;
 	return true;
 }

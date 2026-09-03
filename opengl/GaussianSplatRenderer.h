@@ -130,28 +130,32 @@ enum GaussianSplatSatDebugOverlayMode
 };
 
 
-// SESSION082: which set of nodes the saturation barrier is BUILT from. The tested population is unaffected - this
-// chooses the occluders only. See GaussianSplatRenderer::getSatOccluderSource().
-enum GaussianSplatOccluderSource
-{
-	// The frontier's fine nodes: every node the render traversal selected. The behaviour up to session082, and the
-	// largest possible input (13.5M nodes on the owner's interior).
-	GaussianSplatOccluderSource_Fine = 0,
-
-	// The frontier's coarse floor (session063 K4: one node per branch), which the gather normally discards as a
-	// redundant second description of the same surfaces. ~4.8x smaller than fine, and measured session082 to produce a
-	// barrier no worse than fine on the owner's interior - but still a by-product of the RENDER traversal, selected by
-	// pixel_scale, i.e. by a quality target rather than by anything to do with occlusion.
-	GaussianSplatOccluderSource_CoarseFloor = 1,
-
-	// SESSION082: a tree walk of its own, run inside the saturation build and anchored at the BUILD's anchor rather
-	// than at whatever camera position the source frontier happens to have been traversed from. It descends while a
-	// node is still bigger than one grid tile and stops there, so the occluder set is sized by the barrier's own
-	// resolution instead of by the render's. Measured 618k/843k nodes against the coarse floor's 2.80M/3.61M on two
-	// structurally different scenes - a 4.3-4.5x reduction that held across both, since it follows from the criterion
-	// rather than from the scene.
-	GaussianSplatOccluderSource_TreeWalk = 2
-};
+// SESSION085: the GaussianSplatOccluderSource selector (session082, always marked TEMPORARY) is gone. The saturation
+// barrier is now always built by the tree walk - see occluderTreeWalk() - and the two frontier-derived sources it was
+// compared against, Fine (every node the render traversal selected) and CoarseFloor (session063 K4's one-node-per-
+// branch layer), are removed along with the GsSatGatherTask that produced them.
+//
+// Measured session085 on three static viewpoints, tree walk against fine, everything else held equal:
+//
+//   viewpoint   occluders          dropped%        pool_after      gather+grid
+//   1           11.49M ->   810k   75.8 -> 77.3    -6.2%           275.0 ->  84.8 ms
+//   2           11.48M ->   766k   73.6 -> 75.4    -6.7%           259.0 ->  91.1 ms
+//   3           10.93M ->   197k   37.4 -> 42.5    -8.1%           229.3 ->  32.4 ms
+//
+// So the walk won on every axis at once: a STRONGER barrier (it prunes more, not less), from 14-55x fewer occluders,
+// at 2.8-7.1x less build cost. The owner confirmed the picture visually as unchanged bar insignificant differences, so
+// the extra pruning is a better barrier rather than over-pruning. The win grows exactly where pruning works worst
+// (viewpoint 3), which is the useful shape.
+//
+// Why it should win, rather than this being a lucky scene: the walk descends while a node is still bigger than one
+// grid tile and stops there, so its occluders are sized by the BARRIER's resolution. The frontier sources were sized
+// by the RENDER's quality target, which has nothing to do with occlusion - most of their nodes were far finer than a
+// tile and so were either diluted across it or rejected on the Gaussian's tail (measured session082: only ~38% of fine
+// occluders ever reached the accumulator).
+//
+// One deliberate behaviour change comes with it: a member with no LoD tree now contributes NO occluders, where the
+// frontier sources carried its splats individually - see occluderTreeWalk()'s member loop. That is an under-occlusion,
+// i.e. it can only ever prune less, never open a hole.
 
 
 class GaussianSplatRenderer
@@ -546,21 +550,8 @@ public:
 	// machinery AROUND the grid was the source of holes/slow updates, rather than the grid itself) was settled by
 	// session083's straddle-leaf fix, which found the artifact in the reuse cut instead.
 
-	// SESSION082, TEMPORARY - which node set the barrier is built from. See GaussianSplatOccluderSource for what each
-	// option means and what each one measured.
-	//
-	// This exists as one selector rather than as a switch per experiment because the options are mutually exclusive by
-	// construction - a build reads exactly one occluder set - and because the question they answer is a single one: how
-	// small and how coarse an occluder input the barrier can be built from before its verdict degrades. Nothing else
-	// changes under any of them; the render frontier, the traversal and the tested population are untouched, which is
-	// what makes the three directly comparable.
-	//
-	// Changes what a build PRODUCES, so the setter drops every cloud's cached barrier to force an immediate rebuild -
-	// same scoping as setSatDebugBypassGrid() above, and for the same reason (a traversal produces the same frontier
-	// whichever of these is selected).
-	GaussianSplatOccluderSource getSatOccluderSource() const { return sat_occluder_source; }
-	void setSatOccluderSource(GaussianSplatOccluderSource v);
-
+	// SESSION085: the session082 occluder-source selector is removed - the tree walk won the comparison outright and is
+	// now the only source. See the note above GaussianSplatRenderer for the measurements that settled it.
 
 	// SESSION081: whether a traversal's UNPRUNED frontier is drawn while its saturation prune is still being computed.
 	//
@@ -1721,7 +1712,6 @@ private:
 	float sat_region_radius;                         // SESSION078 - see getSatRegionRadius().
 	int sat_region_closing_tiles;                    // SESSION081 - see getSatRegionClosingTiles().
 	bool draw_unpruned_frontier;                     // SESSION081 - see getDrawUnprunedFrontier().
-	GaussianSplatOccluderSource sat_occluder_source; // SESSION082, TEMPORARY - see getSatOccluderSource().
 	float frontier_reuse_split_dist;                 // SESSION080 STEP B - see getFrontierReuseSplitDist(). 0 = disabled.
 
 	// SESSION055: camera-motion tracker for anisotropic frustum-cull dilation. think() diffs the current cam pose against

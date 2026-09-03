@@ -484,13 +484,12 @@ public:
 	// build it no longer does.
 	size_t num_occluders;
 	double gather_ms, grid_build_ms;
-	double gather_busy_ms; // SESSION082 GATHER-BUSY PROBE, TEMPORARY DIAGNOSTIC: summed per-chunk work of the gather, against gather_ms's wall time - see GsSatGatherTask::busy_ms for why wall alone could not answer the question it was being asked.
 	// SESSION081 PLAN ETAP 0 DIAGNOSTIC: grid_build_ms broken into its sub-phases - see gsBuildSaturationGridParallel()'s
 	// new out-params. Previously only the whole grid_build_ms was known, with no way to tell how much of it was the
 	// occluder-record pass, the strip deposit, closing, or erosion. misc_ms is not stored - the caller computes
 	// grid_build_ms - (rec_ms+dep_ms+close_ms+erode_ms) at print time as the "did we measure everything" check.
 	double rec_ms, dep_ms, close_ms, erode_ms;
-	size_t frontier_n; // SESSION081 PLAN ETAP 0 DIAGNOSTIC: size of the source frontier handed to gather (near+far segments), BEFORE the is_coarse filter gather itself applies - distinct from num_occluders (occl=), which is gather's OUTPUT.
+	size_t frontier_n; // SESSION081 PLAN ETAP 0 DIAGNOSTIC: size of the traversal frontier current at build time (near+far segments). SESSION085: no longer an INPUT to the gather (the tree walk supplies its own occluders) - kept because occl= is only readable against the render frontier it is being spent instead of.
 	size_t num_recs;   // Records that survived the amp reject and reached phase 2 - what every strip re-reads (see num_strips).
 	int num_strips;    // The strip count phase 2 actually ran with - num_strips*num_recs is the phase-2 re-read volume the plan's stage 5 targets.
 	int concurrency_used; // task_manager->getConcurrency() at build time - num_strips is clamp(res/8, 1, this), so this says whether num_strips was capped by resolution or by thread count.
@@ -501,10 +500,9 @@ public:
 	size_t diag_writers, diag_tile_writes;
 	size_t diag_tile_stats[3]; // [0] total per-tile iterations, [1] rejected off the Gaussian's tail, [2] skipped as already saturated - see gsSatDepositRec().
 	size_t erode_stats[4];     // [0] er_ceil, [1] er_win, [2] er_radmax, [3] cl (closed) - see gsSatApplyRegionErosion()/gsSatApplyClosing().
-	// SESSION082, TEMPORARY DIAGNOSTIC: the tree-walk source's own costs - see GaussianSplatOccluderSource_TreeWalk.
-	// Reported apart from gather_ms because the sort is genuinely NEW work: the frontier sources inherit their
-	// front-to-back order from the traversal's own sort and pay nothing for it, so burying this one in a total would
-	// hide exactly the number that decides whether the walk is worth it.
+	// The tree walk's own costs, reported apart from gather_ms. The sort is work the retired frontier sources did not
+	// do - they inherited their front-to-back order from the traversal's own sort and paid nothing for it - so it stays
+	// visible on its own rather than buried in a total.
 	double walk_ms, walk_sort_ms;
 	size_t walk_visited;
 	size_t inf_hist[5];        // SESSION082 PLAN §1.1, TEMPORARY DIAGNOSTIC - see gsBuildSaturationGridParallel()'s out_inf_hist for the layout and the question.
@@ -514,21 +512,14 @@ public:
 	js::Vector<float, 16> sat_accum_t;
 	js::Vector<float, 16> sat_amp_sum;
 
-	// SESSION082, TEMPORARY: which occluder population this barrier was built from - see
-	// GaussianSplatRenderer::getSatOccluderSource(). Recorded for two reasons: [gsr-sat-build] self-describes a
-	// captured log line, and kickOffSaturationBuilds() compares it against the live selector so a barrier from a build
-	// already in flight when it was changed is not mistaken for a current one.
-	GaussianSplatOccluderSource occluder_source_used;
-
 	GaussianSplatSaturationBarrier()
 	:	sat_grid_res(0), anchor_pos_ws(0.f), built_time_real_s(0.0),
 		threshold_used(0.f), subdiv_used(0.f), region_radius_used(0.f), closing_tiles_used(0),
-		num_occluders(0), gather_ms(0.0), grid_build_ms(0.0), gather_busy_ms(0.0),
+		num_occluders(0), gather_ms(0.0), grid_build_ms(0.0),
 		frontier_n(0), rec_ms(0.0), dep_ms(0.0), close_ms(0.0), erode_ms(0.0), num_recs(0), num_strips(0), concurrency_used(0), num_blocks(0), gate1_survivors(0),
 		rec_task_ms_min(0.0), rec_task_ms_max(0.0), rec_task_ms_mean(0.0),
 		diag_writers(0), diag_tile_writes(0),
-		walk_ms(0.0), walk_sort_ms(0.0), walk_visited(0), // SESSION082, TEMPORARY.
-		occluder_source_used(GaussianSplatOccluderSource_Fine)
+		walk_ms(0.0), walk_sort_ms(0.0), walk_visited(0)
 	{
 		for(int i=0; i<9; ++i) sched_stats[i] = 0.0; // SESSION081 SCHEDULING PROBE.
 		for(int i=0; i<3; ++i) diag_tile_stats[i] = 0;
@@ -1335,7 +1326,7 @@ public:
 };
 
 
-// SESSION081 STAGE 4B: how far ahead GsSatGatherTask prefetches the packed occluder record. Swept, not assumed -
+// SESSION081 STAGE 4B: how far ahead the occluder gather prefetches the packed occluder record. Swept, not assumed -
 // ns per occluder on the owner's reference scene, 5-7 barrier builds each, teleporting between viewpoints:
 //
 //   none 7.05 (6.62-7.91) | 8: 5.66 (5.49-11.62) | 16: 5.67 (5.31-11.76) | 32: 5.34 (5.14-5.46) | 64: 5.72 (5.38-6.31)
@@ -1349,110 +1340,10 @@ public:
 static const size_t gs_sat_gather_prefetch_dist = 32;
 
 
-// SESSION079: one slice of the occluder gather - see GsSatGatherTask.
-struct GsSatGatherChunk
-{
-	size_t i_begin, i_end; // Input range, LOCAL to this chunk's segment - see out_base.
-	// SESSION080 §4.3: where this chunk's slice starts in the (single, shared) output. A frontier is two segments whose
-	// input indices both start at 0, so the input range above can no longer double as the output offset the way it did
-	// when a frontier was one flat array.
-	size_t out_base;
-	size_t count;        // Survivors this chunk wrote into its own slice.
-};
-
-
-// SESSION079: builds the occluder SoA the saturation grid is fed from, split across the pool.
-//
-// This turned out to be the largest single cost in the whole stage and had never been timed: ~845ms of a ~1010ms
-// stage on the owner's full scene (11.49M nodes), against 96ms for the grid build and 73ms for the read. Most of that
-// was scattered reads - a node's cloud index lands wherever it points in arrays of ~30M entries, so it is pure DRAM
-// miss latency and almost no arithmetic.
-//
-// That is exactly the shape that gains MOST from threading: the limit is outstanding misses, not issue width, so
-// N threads give close to N times the memory-level parallelism. (The other ~228ms was the five outputs growing
-// from empty by push_back; they are sized up front now, which is what let each chunk own a slice.)
-//
-// SESSION081 ETAP 4: there used to be THREE scattered reads per node - scales, rotations and alpha, in three separate
-// arrays - and P4.1 measured them as essentially the whole remaining cost of this loop: 169.8ms of gather became
-// 43.8ms with them removed. There is now exactly ONE, into the 12-byte packed record; see GsSatPackedOccluder for the
-// format, the disc model it encodes, and that model's measured quality cost.
-//
-// Each chunk writes into its own slice of full-size arrays and reports how many it kept; the caller closes the
-// gaps afterwards. Same shape as the grid build's phase 1, deliberately - and where the coarse floor is off
-// nothing is dropped at all, so the compaction is a no-op.
-class GsSatGatherTask : public glare::Task
-{
-public:
-	virtual void run(size_t /*thread_index*/)
-	{
-		// SESSION082 GATHER-BUSY PROBE, TEMPORARY DIAGNOSTIC: gather has only ever had a WALL time (gather_ms), which
-		// measures queueing for the shared pool as much as it measures work - measured spread 50-211ms on one
-		// configuration, which is wider than any effect worth testing here. rec/dep already have the busy-time
-		// counterpart in [gsr-sat-sched]; this gives gather the same, so a change that removes memory stalls can be
-		// judged on work done rather than on time waited. See the session081 precedent (rec busy 223-257ms stable while
-		// rec wall swung 18->94ms).
-		Timer task_timer;
-		size_t c = 0;
-		for(size_t i=chunk->i_begin; i<chunk->i_end; ++i)
-		{
-			// SESSION081 STAGE 4B: the hardware prefetcher cannot follow occl[indices[i]] - the stride is whatever the index
-			// list says - but WE can: indices is sequential, so the address wanted N iterations from now is already
-			// readable. Without this a thread stalls on its single outstanding miss (measured 7.05ns per node against a
-			// 3.32ns floor with the read removed entirely), so the loop ran at a memory-level parallelism of roughly 1.
-			//
-			// SESSION082: gated on the SAME accept test the loop body uses, applied to the node being prefetched rather
-			// than the current one. The prefetch pulls a scattered cache line; the reject below needs only is_coarse,
-			// which is a sequential read - so issuing the prefetch first meant every REJECTED node still paid a random
-			// memory access for a value nothing would read. Harmless while the rejected fraction was small (26% with the
-			// coarse floor on, 0% with it off), but the coarse-occluder mode inverts the ratio: 16.4M lines pulled to use
-			// 1.9M. Reading is_coarse[i + dist] to decide costs one more sequential access on a line the loop is about to
-			// walk into anyway.
-			const size_t pf_i = i + gs_sat_gather_prefetch_dist;
-			if(pf_i < chunk->i_end && ((is_coarse[pf_i] != 0.f) == want_coarse))
-				_mm_prefetch((const char*)&occl[indices[pf_i]], _MM_HINT_T0);
-
-			// SESSION082 PLAN §1.2 DIAGNOSTIC, TEMPORARY: want_coarse inverts this test, so the build sees the coarse
-			// floor INSTEAD of the fine frontier - see GaussianSplatRenderer::getSatDebugCoarseOccluders(). Normally
-			// false, and then this is exactly the original line: coarse nodes are a second, redundant description of
-			// the same surfaces - see the call site.
-			if((is_coarse[i] != 0.f) != want_coarse)
-				continue;
-
-			out_px[c] = px[i]; out_py[c] = py[i]; out_pz[c] = pz[i];
-
-			const GsSatPackedOccluder p = occl[indices[i]]; // The one scattered read left in this loop - see GsSatPackedOccluder.
-
-			const float ddx = px[i] - cam_pos_ws.x[0];
-			const float ddy = py[i] - cam_pos_ws.x[1];
-			const float ddz = pz[i] - cam_pos_ws.x[2];
-			const float d_len = std::sqrt(ddx*ddx + ddy*ddy + ddz*ddz);
-			const float inv_d = d_len > 1.0e-6f ? (1.f / d_len) : 0.f; // Degenerate (node at the anchor) - the grid build skips such nodes anyway.
-
-			// r = g * (1 + c^2*(inv_t^2 - 1))^(1/4). cos_n is clamped because the snorm16 normal is unit only to ~3e-5,
-			// and a value a hair over 1 would push the fourth root past the true face-on radius.
-			const float nx = (float)p.nx * (1.f / 32767.f), ny = (float)p.ny * (1.f / 32767.f), nz = (float)p.nz * (1.f / 32767.f);
-			const float cos_n = myMin(std::fabs(ddx*nx + ddy*ny + ddz*nz) * inv_d, 1.f);
-			const float inv_t = gsSatUnpackHalf(p.inv_t_half);
-			const float w = 1.f + cos_n*cos_n * (inv_t*inv_t - 1.f);
-
-			// The two pack scales divide back out here; folded into constants, so they cost nothing at runtime.
-			out_radius[c] = (gs_sat_occluder_sigmas / gs_sat_half_g_scale) * gsSatUnpackHalf(p.g_half) * std::sqrt(std::sqrt(w));
-			out_alpha[c] = adjustSplatAlpha(gsSatUnpackHalf(p.alpha_half) * (1.f / gs_sat_half_alpha_scale), alpha_gain, alpha_gamma); // The DRAWN opacity, not the stored one - see GaussianSplatRenderer::getAlphaGain().
-			++c;
-		}
-		chunk->count = c;
-		busy_ms = task_timer.elapsed() * 1.0e3; // SESSION082 GATHER-BUSY PROBE, TEMPORARY.
-	}
-
-	double busy_ms; // SESSION082 GATHER-BUSY PROBE, TEMPORARY - this chunk's own wall time, i.e. its share of the work. Summed across chunks by the caller.
-	const uint32* indices; const float* px; const float* py; const float* pz; const float* is_coarse;
-	const GsSatPackedOccluder* occl; // SESSION081 ETAP 4: indexed by indices[i] - the only scattered access in run().
-	float* out_px; float* out_py; float* out_pz; float* out_radius; float* out_alpha;
-	Vec4f cam_pos_ws;
-	float alpha_gain, alpha_gamma;
-	bool want_coarse; // SESSION082 PLAN §1.2 DIAGNOSTIC, TEMPORARY - see the is_coarse test in run().
-	GsSatGatherChunk* chunk;
-};
+// SESSION085: GsSatGatherChunk / GsSatGatherTask - the frontier-derived occluder gather - are removed with the
+// Fine and CoarseFloor sources they existed to serve. The tree walk builds its occluder set itself (see
+// occluderTreeWalk() and GsSatWalkGatherTask), so nothing reads the frontier's SoA for occluders any more. This
+// also retires the duplicated radius/alpha expression the two gathers had to keep in step: there is one left.
 
 
 // SESSION079: one slice of the saturation read pass. Both phases below are cut the same way and share these, so a
@@ -1565,14 +1456,13 @@ struct GsWalkDistLess { inline bool operator () (const GsDistIdx& a, const GsDis
 
 
 // SESSION082: the tree walk's gather - fills the grid's five input arrays from the walk's own, already-sorted index
-// list. It differs from GsSatGatherTask in what it READS, not in what it computes: there is no frontier SoA to copy
-// positions out of and no is_coarse filter to apply, so it reads positions[idx] as well as occl[idx] - two scattered
-// reads per node against that path's one, over a node count measured 4.3-4.5x below the coarse floor's.
+// list. SESSION085: the only occluder gather there is, now that the frontier-derived sources are retired. It reads
+// positions[idx] as well as occl[idx] - two scattered reads per node, where the frontier path had one because it could
+// copy positions straight out of the frontier's SoA. Measured session085 at ~10.6 ns/node against that path's
+// ~5.4 ns/node, over 14-55x fewer nodes: the per-node cost roughly doubled and the total fell by an order of magnitude.
 //
-// The radius/alpha expression below mirrors GsSatGatherTask::run()'s and has to be kept in step with it. They are two
-// copies rather than one shared helper only because merging them means editing that (session081) task, which is a
-// change worth making once the occluder source is settled rather than while the three sources are still being
-// compared - recorded as tech debt in the session plan.
+// The duplicated radius/alpha expression that used to sit here and in GsSatGatherTask, with a standing obligation to
+// keep the two in step, is resolved: this is the surviving copy.
 class GsSatWalkGatherTask : public glare::Task
 {
 public:
@@ -1580,7 +1470,7 @@ public:
 	{
 		for(size_t i=i_begin; i<i_end; ++i)
 		{
-			// Same reasoning, and the same measured distance, as GsSatGatherTask's prefetch: the stride is whatever the
+			// Same reasoning, and the same measured distance, as the retired frontier gather's prefetch: the stride is whatever the
 			// index list says, so the hardware prefetcher cannot follow it but we can. Both scattered reads are issued,
 			// since this loop stalls on either of them.
 			const size_t pf_i = i + gs_sat_gather_prefetch_dist;
@@ -1637,10 +1527,9 @@ class GaussianSplatSaturationBuildTask : public glare::Task
 public:
 	virtual void run(size_t /*thread_index*/) override
 	{
+		// SESSION085: the frontier is no longer READ for occluders (the tree walk supplies its own - see below); its size
+		// is still recorded, because frontier_n is what [gsr-sat-build] reports the walk's occluder count against.
 		const GaussianSplatUnculledFrontier& uf = *source_frontier;
-		const GaussianSplatUnculledFrontier* const segs[2] = { &uf, uf.far_block.ptr() };
-		const size_t num_segs = uf.far_block.nonNull() ? 2 : 1;
-		const size_t seg_base[2] = { 0, uf.indices.size() };
 		const size_t n = uf.indices.size() + (uf.far_block.nonNull() ? uf.far_block->indices.size() : 0);
 
 		Reference<GaussianSplatSaturationBarrier> barrier = new GaussianSplatSaturationBarrier();
@@ -1651,98 +1540,14 @@ public:
 		barrier->subdiv_used = grid_subdiv;
 		barrier->region_radius_used = region_radius;
 		barrier->closing_tiles_used = closing_tiles;
-		barrier->occluder_source_used = occluder_source; // SESSION082, TEMPORARY - see the field.
 
-		// ---- Gather: collect this build's occluders - see GsSatGatherTask, or occluderTreeWalk() for the tree-walk
-		// source, which replaces this whole stage with a walk of its own. ----
+		// ---- Gather: collect this build's occluders. SESSION085: always the tree walk - see occluderTreeWalk(), and
+		// the note above GaussianSplatRenderer for the measurements that retired the two frontier-derived sources. ----
 		js::Vector<float, 16> occl_px, occl_py, occl_pz, occl_radius, occl_alpha;
 		Timer sat_gather_timer;
-		if(occluder_source == GaussianSplatOccluderSource_TreeWalk)
-		{
-			occluderTreeWalk(*barrier, occl_px, occl_py, occl_pz, occl_radius, occl_alpha);
-		}
-		else
-		{
-			occl_px.resizeNoCopy(n); occl_py.resizeNoCopy(n); occl_pz.resizeNoCopy(n);
-			occl_radius.resizeNoCopy(n); occl_alpha.resizeNoCopy(n);
-
-			const int gather_concurrency = (task_manager != NULL) ? myMax(1, (int)task_manager->getConcurrency()) : 1;
-			const size_t num_gather_chunks = myMax<size_t>(1, myMin((size_t)gather_concurrency * 4, n / 16384));
-
-			js::Vector<GsSatGatherChunk, 16> chunks;
-			chunks.reserve(num_gather_chunks + num_segs);
-			for(size_t sg=0; sg<num_segs; ++sg) // Sizing pass first: chunks must not move once a task holds a pointer into it.
-			{
-				const size_t seg_n = segs[sg]->indices.size();
-				if(seg_n == 0)
-					continue;
-				const size_t seg_chunks = myMax<size_t>(1, (num_gather_chunks * seg_n) / myMax<size_t>(1, n));
-				for(size_t c=0; c<seg_chunks; ++c)
-				{
-					GsSatGatherChunk ch;
-					ch.i_begin = (seg_n * c)       / seg_chunks;
-					ch.i_end   = (seg_n * (c + 1)) / seg_chunks;
-					ch.out_base = seg_base[sg] + ch.i_begin;
-					ch.count = 0;
-					chunks.push_back(ch);
-				}
-			}
-
-			double gather_busy_ms = 0.0; // SESSION082 GATHER-BUSY PROBE, TEMPORARY - see GsSatGatherTask::busy_ms.
-			glare::TaskGroupRef group = new glare::TaskGroup();
-			{
-				size_t c = 0;
-				for(size_t sg=0; sg<num_segs; ++sg)
-				{
-					const GaussianSplatUnculledFrontier& seg = *segs[sg];
-					const size_t seg_end = seg_base[sg] + seg.indices.size();
-					for(; c<chunks.size() && chunks[c].out_base < seg_end; ++c)
-					{
-						Reference<GsSatGatherTask> t = new GsSatGatherTask();
-						t->indices = seg.indices.data(); t->px = seg.px.data(); t->py = seg.py.data(); t->pz = seg.pz.data();
-						t->is_coarse = seg.is_coarse.data();
-						t->occl = geom->sat_occl.data(); // SESSION081 ETAP 4 - see GsSatPackedOccluder.
-						t->out_px = occl_px.data() + chunks[c].out_base; t->out_py = occl_py.data() + chunks[c].out_base;
-						t->out_pz = occl_pz.data() + chunks[c].out_base; t->out_radius = occl_radius.data() + chunks[c].out_base;
-						t->out_alpha = occl_alpha.data() + chunks[c].out_base;
-						t->cam_pos_ws = anchor_pos_ws;
-						t->alpha_gain = alpha_gain; t->alpha_gamma = alpha_gamma;
-						t->want_coarse = (occluder_source == GaussianSplatOccluderSource_CoarseFloor); // SESSION082, TEMPORARY.
-						t->chunk = &chunks[c];
-						t->busy_ms = 0.0; // SESSION082 GATHER-BUSY PROBE, TEMPORARY.
-						if(task_manager != NULL) group->tasks.push_back(t); else { t->run(0); gather_busy_ms += t->busy_ms; }
-					}
-				}
-			}
-			if(task_manager != NULL)
-			{
-				task_manager->runTaskGroup(group);
-				// SESSION082 GATHER-BUSY PROBE, TEMPORARY: every task in this group is a GsSatGatherTask (the loop above
-				// pushes nothing else), so the downcast needs no check. Summed, not averaged, to match how
-				// [gsr-sat-sched] reports rec/dep busy.
-				for(size_t t=0; t<group->tasks.size(); ++t)
-					gather_busy_ms += group->tasks[t].downcast<GsSatGatherTask>()->busy_ms;
-			}
-
-			size_t kept = 0;
-			for(size_t c=0; c<chunks.size(); ++c)
-			{
-				const size_t slice_begin = chunks[c].out_base, cnt = chunks[c].count;
-				if(cnt > 0 && kept != slice_begin)
-				{
-					std::memmove(occl_px.data() + kept, occl_px.data() + slice_begin, cnt * sizeof(float));
-					std::memmove(occl_py.data() + kept, occl_py.data() + slice_begin, cnt * sizeof(float));
-					std::memmove(occl_pz.data() + kept, occl_pz.data() + slice_begin, cnt * sizeof(float));
-					std::memmove(occl_radius.data() + kept, occl_radius.data() + slice_begin, cnt * sizeof(float));
-					std::memmove(occl_alpha.data() + kept, occl_alpha.data() + slice_begin, cnt * sizeof(float));
-				}
-				kept += cnt;
-			}
-			occl_px.resize(kept); occl_py.resize(kept); occl_pz.resize(kept);
-			occl_radius.resize(kept); occl_alpha.resize(kept);
-			barrier->gather_busy_ms = gather_busy_ms; // SESSION082 GATHER-BUSY PROBE, TEMPORARY. Set inside the block where the variable lives. The compaction above is deliberately NOT counted - it is the caller's serial tail, not chunk work.
-		}
-		barrier->gather_ms = sat_gather_timer.elapsed() * 1.0e3;
+		occluderTreeWalk(*barrier, occl_px, occl_py, occl_pz, occl_radius, occl_alpha);
+		// SESSION085: less the self-check, which occluderTreeWalk() times for exactly this - see walk_verify_ms.
+		barrier->gather_ms = sat_gather_timer.elapsed() * 1.0e3 - walk_verify_ms;
 		barrier->num_occluders = occl_px.size();
 
 		// ---- Build: the grid itself (+closing +erosion) - see GaussianSplatSaturationGrid.h. Empty occluder set is a
@@ -1867,7 +1672,7 @@ public:
 	};
 
 
-	// SESSION082: the tree-walk occluder source - see GaussianSplatOccluderSource_TreeWalk. Chooses the barrier's
+	// SESSION082: the tree-walk occluder source, the only one since session085. Chooses the barrier's
 	// occluders by walking the LoD trees here, in the build, instead of filtering a set the render traversal chose.
 	//
 	// Three things follow from doing it here rather than inside the traversal, and together they are the point:
@@ -1892,12 +1697,12 @@ public:
 		js::Vector<float, 16>& occl_radius, js::Vector<float, 16>& occl_alpha)
 	{
 		const js::Vector<Vec3f, 16>& positions = geom->positions;
-		const js::Vector<float, 16>& feature_sizes = geom->feature_size;
 
 		// The resolution this barrier is about to be built at - the same call run() makes below, so the walk's stop
 		// rule and the grid's tile size cannot drift apart.
 		const int res = gsSatGridResForFocal(focal_px, coarse_pixel_scale, grid_subdiv);
 		walk_tile_ang = myMax(gsSatGridTileAngle(res), 1.0e-6f); // Stored, not local: every walk task reads it - see walkStack().
+		walk_verify_ms = 0.0; // SESSION085: set only if the self-check below runs, and the caller subtracts it unconditionally.
 
 		Timer walk_timer;
 		js::Vector<GsDistIdx, 16> selected;
@@ -1977,6 +1782,11 @@ public:
 		// compaction race is the precedent).
 		if(diag_log && task_manager != NULL)
 		{
+			// SESSION085: timed so the caller can take it back out of gather_ms. walk_ms already excluded it (see above), but
+			// gather_ms is wall time around this whole function, so with "diag" on the self-check's second full walk landed
+			// inside the very number used to judge the walk's cost - measured 3-5x inflation (250ms reported against 50ms
+			// real). A diagnostic must not change the measurement it is printed beside.
+			Timer verify_timer;
 			js::Vector<GsDistIdx, 16> serial_sel;
 			size_t serial_visited = 0;
 			std::vector<GsWalkItem> serial_stack;
@@ -2000,6 +1810,7 @@ public:
 					if(a[i].idx != b[i].idx || a[i].dist_sq != b[i].dist_sq)
 					{ match = false; break; }
 			}
+			walk_verify_ms = verify_timer.elapsed() * 1.0e3; // SESSION085 - see the Timer above.
 			conPrint("[gsr-occ-verify] cloud=" + toString(cloud_id) + " parallel=" + uInt64ToStringCommaSeparated(selected.size()) +
 				" serial=" + uInt64ToStringCommaSeparated(serial_sel.size()) +
 				" visited " + uInt64ToStringCommaSeparated(visited) + "/" + uInt64ToStringCommaSeparated(serial_visited) +
@@ -2058,15 +1869,15 @@ public:
 	float focal_px, coarse_pixel_scale; // Needed for gsSatGridResForFocal() - see GaussianSplatRenderer::kickOffSaturationBuilds().
 	float alpha_gain, alpha_gamma;
 	bool diag_log, overlay_requested;
-	GaussianSplatOccluderSource occluder_source; // SESSION082, TEMPORARY - see GaussianSplatRenderer::getSatOccluderSource(). Fine/CoarseFloor pick which way GsSatGatherTask::want_coarse filters the frontier; TreeWalk replaces that whole stage with occluderTreeWalk() below.
 	// SESSION082: the cloud's members as of kick time, so the tree walk can run here without a frontier and without the
 	// traversal's scratch. Filled by kickOffSaturationBuilds() rather than taken from GaussianSplatCachedGeom, because
 	// `hidden` can change without a topology-generation bump (see GaussianSplatRenderer::setObjectHidden()) and would go
-	// stale in a generation-scoped cache. Only read when occluder_source is TreeWalk.
+	// stale in a generation-scoped cache.
 	struct WalkMember { GaussianSplatDataRef splat_data; size_t offset; bool hidden; };
 	std::vector<WalkMember> walk_members;
 	float walk_tile_ang; // SESSION082: angular size of one grid tile, derived in occluderTreeWalk() from this build's own gsSatGridResForFocal() call so the walk's stop rule and the grid's resolution cannot drift apart.
-	double walk_ms, walk_sort_ms; // SESSION082: the tree-walk path's own two costs, reported apart from gather_ms - the sort is new work that the frontier path gets for free from the traversal's own sort, so it has to be visible on its own rather than buried in a total.
+	double walk_ms, walk_sort_ms; // SESSION082: the walk's own two costs, reported apart from gather_ms - see the barrier's fields of the same name.
+	double walk_verify_ms;        // SESSION085: cost of the "diag" self-check below, subtracted back out of gather_ms by the caller so a diagnostic cannot inflate the number it is printed beside. 0 when the check did not run.
 	size_t walk_visited;          // SESSION082: nodes the walk touched, against the number it selected - the walk's own overhead ratio.
 	glare::TaskManager* task_manager; // May be NULL - see gsBuildSaturationGridParallel()'s caller-side branch above.
 	ThreadSafeQueue<Reference<ThreadMessage> >* result_queue;
@@ -3400,7 +3211,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	filter_debug_log(false), kick_debug_log(false), cpu_prof_log(false), // SESSION072: default off - see getFilterDebugLog()'s comment.
 	sat_prefilter_mode(GaussianSplatSatPrefilterMode_Off), filter_frustum_planes_enabled(true), // SESSION074: stage off by default, frustum planes on (i.e. unchanged pipeline) - see getSatPrefilterMode()/getFilterFrustumPlanesEnabled().
 	sat_prefilter_threshold(0.98f), // SESSION079 - see getSatPrefilterThreshold().
-	sat_diag_log(false), sat_debug_overlay_mode(GaussianSplatSatDebugOverlayMode_Off), sat_grid_subdiv(0.3f), sat_region_radius(0.f), sat_region_closing_tiles(0), draw_unpruned_frontier(true), sat_occluder_source(GaussianSplatOccluderSource_Fine), // SESSION076/078/081: diagnostics off by default - see getSatDiagLog()/getSatDebugOverlayMode(). Calibration defaults are the values reasoned to on paper, not yet confirmed on a scene. draw_unpruned_frontier defaults to the session076 publish-early behaviour.
+	sat_diag_log(false), sat_debug_overlay_mode(GaussianSplatSatDebugOverlayMode_Off), sat_grid_subdiv(0.3f), sat_region_radius(0.f), sat_region_closing_tiles(0), draw_unpruned_frontier(true), // SESSION076/078/081: diagnostics off by default - see getSatDiagLog()/getSatDebugOverlayMode(). Calibration defaults are the values reasoned to on paper, not yet confirmed on a scene. draw_unpruned_frontier defaults to the session076 publish-early behaviour.
 	frontier_reuse_split_dist(0.f), // SESSION080 STEP B: off by default - 0 is the pre-session080 walk-everything behaviour, bit-for-bit. See getFrontierReuseSplitDist().
 	splat_point_size_px(1.f),
 	splat_merge_spread_widen(3.0f), // SESSION071: analytic minimum is sqrt(3) (see widenedMergedScale()); owner default set higher for extra margin.
@@ -6892,19 +6703,6 @@ void GaussianSplatRenderer::setDrawUnprunedFrontier(bool v)
 }
 
 
-// SESSION082, TEMPORARY - see getSatOccluderSource(). Drops only cached_sat_barrier, not the whole traversal cache:
-// which nodes the barrier is built from changes what a BARRIER build produces, not what a traversal produces.
-void GaussianSplatRenderer::setSatOccluderSource(GaussianSplatOccluderSource v)
-{
-	if(v == sat_occluder_source)
-		return;
-	sat_occluder_source = v;
-
-	for(size_t i=0; i<clouds.size(); ++i)
-		clouds[i]->cached_sat_barrier = NULL;
-}
-
-
 // SESSION080 STEP B: same reasoning as the two setters above - this changes what a traversal PRODUCES (a frontier
 // partly inherited from its predecessor rather than walked from scratch), so cached frontiers built under the old value
 // are not valid inputs under the new one. Dropping last_unpruned_ufrontier too is what makes turning the knob back to 0
@@ -7999,13 +7797,11 @@ void GaussianSplatRenderer::drainSaturationBuildResults()
 					if(std::isfinite(b.sat_depth[t]))
 						++sat_tiles;
 				conPrint("[gsr-sat-build] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms " +
-					// SESSION082, TEMPORARY - see getSatOccluderSource(). occl= below then counts whatever that source
-					// yielded, not the fine frontier; the tree-walk line also carries its own walk/sort costs.
-					(b.occluder_source_used == GaussianSplatOccluderSource_CoarseFloor ? "COARSE-OCCL " :
-					(b.occluder_source_used == GaussianSplatOccluderSource_TreeWalk ?
-						"TREE-WALK visited=" + uInt64ToStringCommaSeparated(b.walk_visited) +
-						" walk_ms=" + doubleToStringNDecimalPlaces(b.walk_ms, 2) +
-						" walk_sort_ms=" + doubleToStringNDecimalPlaces(b.walk_sort_ms, 2) + " " : "")) +
+					// SESSION085: the walk is the only occluder source now, so this is unconditional. occl= below counts
+					// what the walk yielded, against frontier_n (the render frontier it is spent instead of).
+					"visited=" + uInt64ToStringCommaSeparated(b.walk_visited) +
+					" walk_ms=" + doubleToStringNDecimalPlaces(b.walk_ms, 2) +
+					" walk_sort_ms=" + doubleToStringNDecimalPlaces(b.walk_sort_ms, 2) + " " +
 					"thr=" + doubleToStringNDecimalPlaces(b.threshold_used, 3) + // SESSION080: the knobs THIS barrier was built with, not the live settings - see the field's old comment on GaussianSplatUnculledFrontier.
 					" sub=" + doubleToStringNDecimalPlaces(b.subdiv_used, 3) +
 					" R=" + doubleToStringNDecimalPlaces(b.region_radius_used, 3) +
@@ -8073,11 +7869,10 @@ void GaussianSplatRenderer::drainSaturationBuildResults()
 					const double rec_wall = b.sched_stats[3], dep_wall = b.dep_ms;
 					conPrint("[gsr-sat-sched] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms " +
 						"conc=" + doubleToStringNDecimalPlaces(b.sched_stats[7], 0) +
-						// SESSION082 GATHER-BUSY PROBE, TEMPORARY: gather's work against its wall, the same pair rec/dep
-						// already report. par near 1 with a long wall means the gather sat queued rather than worked.
+						// SESSION085: the gather busy/par pair went with GsSatGatherTask. The walk path reports its two
+						// costs on [gsr-sat-build] itself (walk_ms/walk_sort_ms), which together with gather_ms account
+						// for the whole of this stage.
 						" | gather wall=" + doubleToStringNDecimalPlaces(b.gather_ms, 2) +
-						" busy=" + doubleToStringNDecimalPlaces(b.gather_busy_ms, 1) +
-						" par=" + doubleToStringNDecimalPlaces(b.gather_ms > 0.0 ? (b.gather_busy_ms / b.gather_ms) : 0.0, 2) +
 						" | rec wall=" + doubleToStringNDecimalPlaces(rec_wall, 2) +
 						" busy=" + doubleToStringNDecimalPlaces(b.sched_stats[2], 1) +
 						" par=" + doubleToStringNDecimalPlaces(rec_wall > 0.0 ? (b.sched_stats[2] / rec_wall) : 0.0, 2) +
@@ -8711,8 +8506,7 @@ void GaussianSplatRenderer::kickOffSaturationBuilds()
 			// A live-tuned knob has moved since this barrier was built - it must take effect on the next opportunity,
 			// not silently keep serving a stale barrier indefinitely.
 			if(barrier->threshold_used != sat_prefilter_threshold || barrier->subdiv_used != sat_grid_subdiv ||
-				barrier->region_radius_used != sat_region_radius || barrier->closing_tiles_used != sat_region_closing_tiles ||
-				barrier->occluder_source_used != sat_occluder_source) // SESSION082, TEMPORARY: the setter already drops the cache on toggle, but this also catches a barrier built by a task that was already in flight when the toggle happened.
+				barrier->region_radius_used != sat_region_radius || barrier->closing_tiles_used != sat_region_closing_tiles)
 				needs_build = true;
 			else if(cam_pos_ws.getDist(barrier->anchor_pos_ws) > sat_region_radius) // SESSION081: the ball guarantee itself - see GaussianSplatSaturationBarrier. > not >=: at R=0 (point-anchored) any nonzero movement invalidates, but standing still does not.
 				needs_build = true;
@@ -8739,18 +8533,13 @@ void GaussianSplatRenderer::kickOffSaturationBuilds()
 		t->alpha_gain = splat_alpha_gain; t->alpha_gamma = splat_alpha_gamma;
 		t->diag_log = sat_diag_log;
 		t->overlay_requested = sat_debug_overlay_mode != GaussianSplatSatDebugOverlayMode_Off;
-		t->occluder_source = sat_occluder_source; // SESSION082, TEMPORARY - see getSatOccluderSource().
 		// SESSION082: snapshot the members for the tree walk - fresh, not from the geom cache, see the field's comment.
-		// Only the walk reads this, so it is filled only when that is the selected source.
-		if(sat_occluder_source == GaussianSplatOccluderSource_TreeWalk)
+		t->walk_members.resize(cloud.members.size());
+		for(size_t m=0; m<cloud.members.size(); ++m)
 		{
-			t->walk_members.resize(cloud.members.size());
-			for(size_t m=0; m<cloud.members.size(); ++m)
-			{
-				t->walk_members[m].splat_data = cloud.members[m].splat_data;
-				t->walk_members[m].offset = cloud.members[m].offset;
-				t->walk_members[m].hidden = cloud.members[m].hidden;
-			}
+			t->walk_members[m].splat_data = cloud.members[m].splat_data;
+			t->walk_members[m].offset = cloud.members[m].offset;
+			t->walk_members[m].hidden = cloud.members[m].hidden;
 		}
 		t->task_manager = task_manager;
 		t->result_queue = &sat_build_result_queue;

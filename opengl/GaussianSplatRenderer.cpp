@@ -535,7 +535,7 @@ public:
 		importance_layout_fingerprint(0), slice_sample_draw_count(0),
 		have_last_sort_cam_pos(false), last_sort_cam_pos_ws(0.f), aabb_ws(js::AABBox::emptyAABBox()), added_to_engine(false),
 		topology_generation(0), traversal_in_flight(false), have_last_traversal_cam_pos(false), last_traversal_cam_pos_ws(0.f), last_traversal_cam_forward_ws(0.f), last_traversal_kick_time_s(0.0),
-		last_traversal_kicked_topology_generation(0), last_traversal_hit_budget_cap(false), last_traversal_hit_density_cap(false), last_traversal_hit_depth_cap(false), last_traversal_sat_bias_stops(0), last_traversal_sat_bias_tested(0), last_traversal_dilation_elevated(false),
+		last_traversal_kicked_topology_generation(0), last_traversal_hit_budget_cap(false), last_traversal_hit_density_cap(false), last_traversal_hit_depth_cap(false), last_traversal_sat_bias_stops(0), last_traversal_sat_bias_tested(0), last_traversal_sat_bias_ceiling(1.f), last_traversal_dilation_elevated(false),
 		cached_traversal_geom_generation(0), importance_num_views(0),
 		sat_grid_debug_anchor_ws(0.f), // SESSION076 §9
 		filter_in_flight(false), ufrontier_needs_filter(false), have_last_filter_cam_forward(false), last_filter_cam_forward_ws(0.f), // SESSION063
@@ -592,6 +592,7 @@ public:
 	bool last_traversal_hit_density_cap; // As above, for GaussianSplatLodTraversalScratch::hit_density_cap.
 	bool last_traversal_hit_depth_cap; // As above, for GaussianSplatLodTraversalScratch::hit_depth_cap.
 	size_t last_traversal_sat_bias_stops, last_traversal_sat_bias_tested; // SESSION085 ETAP 3: as above, for the scratch's counters of the same name.
+	float last_traversal_sat_bias_ceiling;  // SESSION085 ETAP 6: as above, for GaussianSplatLodTraversalScratch::sat_bias_ceiling_used.
 
 	// SESSION063: the cached unculled frontier U(P) for the split filter architecture, when split_filter_enabled. Set by
 	// drainTraversalResults() from a cull-off traversal; a rotation re-filters this instead of re-traversing. Null until
@@ -787,6 +788,7 @@ public:
 	bool hit_budget_cap; // True if max_splats_budget stopped further expansion before pixel_scale converged - i.e. detail is being truncated by the budget, not just naturally coarse at this distance. Consumed by the diagnostics display from stage 6 onward.
 	bool hit_density_cap; // True if getMaxLayerDensity() stopped at least one node's expansion this traversal - see GaussianSplatLodNode::layer_density.
 	bool hit_depth_cap; // True if getMaxTreeDepth() stopped at least one node's expansion this traversal.
+	float sat_bias_ceiling_used; // SESSION085 ETAP 6: the ceiling THIS traversal ran with, not the live setting - same rule the barrier follows for thr=/sub=/R=: a captured log line has to say what produced it. Found missing while reading a walking capture: the one knob that now decides the whole stage appeared in no log line at all.
 	size_t num_sat_bias_stops, num_sat_bias_tested; // SESSION085 ETAP 3: counts, not a bool. The first cut reported only "did the bias stop anything", which was true while the mechanism was in fact near-inert - a bool cannot distinguish "fired a few thousand times" from "fired on half the walk". stops/tested is the diagnosis: a low ratio means the occlusion test is being asked and refusing.
 
 	// SESSION079: scratch for the parallel saturation build's phase-1 records and the parallel read pass's keep mask
@@ -2049,6 +2051,7 @@ public:
 		scratch->hit_density_cap = hit_density_cap;
 		scratch->hit_depth_cap = hit_depth_cap;
 		scratch->num_sat_bias_stops = num_sat_bias_stops; scratch->num_sat_bias_tested = num_sat_bias_tested; // SESSION085 ETAP 3
+		scratch->sat_bias_ceiling_used = sat_bias_active ? sat_bias_ceiling : 1.f; // SESSION085 ETAP 6 - 1 means the bias was off or had no barrier, which is what the reader needs to know.
 
 		// A null queue means nobody is waiting for this frontier to be drawn - the caller ran the task itself and reads the
 		// scratch directly.  Enqueueing anyway would have drainTraversalResults() apply a selection, and decrement an
@@ -7767,6 +7770,7 @@ void GaussianSplatRenderer::drainTraversalResults()
 			cloud->last_traversal_hit_density_cap = msg->scratch->hit_density_cap;
 			cloud->last_traversal_hit_depth_cap = msg->scratch->hit_depth_cap;
 			cloud->last_traversal_sat_bias_stops = msg->scratch->num_sat_bias_stops; // SESSION085 ETAP 3
+			cloud->last_traversal_sat_bias_ceiling = msg->scratch->sat_bias_ceiling_used; // SESSION085 ETAP 6
 			cloud->last_traversal_sat_bias_tested = msg->scratch->num_sat_bias_tested;
 
 			// SESSION076/081: no saturation numbers to print here any more. A traversal's first (and now only) message
@@ -7808,6 +7812,7 @@ void GaussianSplatRenderer::drainTraversalResults()
 						" budget_cap=" + boolToString(cloud->last_traversal_hit_budget_cap) +
 						" density_cap=" + boolToString(cloud->last_traversal_hit_density_cap) +
 						" depth_cap=" + boolToString(cloud->last_traversal_hit_depth_cap) +
+						" bias=" + doubleToStringNDecimalPlaces(cloud->last_traversal_sat_bias_ceiling, 2) + // SESSION085 ETAP 6: the ceiling this traversal ran with. 1 = the bias was off (or no barrier yet).
 						" sat_bias=" + uInt64ToStringCommaSeparated(cloud->last_traversal_sat_bias_stops) + "/" + uInt64ToStringCommaSeparated(cloud->last_traversal_sat_bias_tested) + // SESSION085 ETAP 3: nodes the bias STOPPED, over nodes it was asked about. A big denominator with a small numerator means the occlusion test is refusing, not that the bias is idle.
 						// SESSION080 DIAGNOSTIC: the parallel expand's own shape - see the fields' comment. par= is
 						// task_sum/task_max, the parallelism the seed split actually offers; compare it against how much

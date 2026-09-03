@@ -454,59 +454,9 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 	double* out_sched_stats = NULL); // SESSION081 SCHEDULING PROBE, TEMPORARY DIAGNOSTIC: 9 doubles, summed across blocks except [0]/[5] which are maxima and [7] which is a constant. [0] latest phase-1 chunk START, ms after that group's launch; [1] mean chunk start; [2] sum of chunk busy time; [3] phase-1 group wall time; [4] the compaction memmove inside rec_ms (parallel since SESSION081, was serial and never timed before that - see GsSatCompactTask); [5] latest phase-2 strip start; [6] sum of strip busy time; [7] concurrency; [8] the phase-1c binning pass (SESSION081), the cost that buys away the per-strip scan. [2]/[3] give phase 1's effective thread count, and [0] vs [3] says whether the chunks were QUEUED (starts spread across the group) or PREEMPTED while running (all start near zero yet the group runs long) - see GsSatRecordTask::start_ms in the .cpp.
 
 
-// SESSION074: pass 2's per-node read - true if this fine node is unambiguously behind saturated coarse geometry, so
-// it can be dropped before it ever costs a GPU instance. offset is (node_pos - anchor_pos_ws), UNNORMALISED (see
-// gsDirToOct()); dist_sq is its squared length, which every caller already has.
-//
-// SESSION074 REVISION - tests the tiles the node's own angular footprint actually touches, rather than reading a
-// blanket 3x3-dilated map. The first cut dilated the whole grid by a 3x3 max so a node straddling a tile boundary
-// would be compared against a safe value; that is a +-1-whole-tile margin applied to a node whose angular radius is
-// a fraction of a tile, and it interacted badly with the sparse writes the build pass used to produce. Now the node's
-// footprint is turned into a small tile span (usually 1 tile, 2 or 4 when it straddles) and every touched tile must
-// agree the node is occluded - the same conservative intent, at the node's true scale rather than the grid's.
-//
-// The depth test is done squared, against (sat_depth + radius)^2, so no sqrt of dist is ever taken.  Returns false
-// when res == 0 ("no grid built" - stage disabled, or the coarse floor was empty), so a missing grid can never cause
-// a drop.
-//
-// out_aggressive, if non-null, receives a deliberately-wrong upper-bound verdict computed from the same tile data:
-// centre tile only, node treated as a point. Purely Stage A's "how much could this ever cut" ceiling - see
-// [gsr-sat]'s would_drop_aggr. Nothing in the real drop path reads it.
-//
-// SESSION085 - THE GRADED READ. out_ratio_sq, if non-null, receives HOW FAR BEHIND the barrier this node sits, as the
-// SQUARED ratio (dist / threshold)^2 minimised over the same footprint tiles the verdict is taken over. The progressive
-// saturation plan needs a continuous "how occluded is this" rather than the boolean, and sat_depth is already a
-// distance, so the quantity is there for free - see snapshots/2026-09-03-session085-progressiveSaturation_PLAN.md.
-//
-// Value contract:
-//   0    - not unambiguously behind the barrier (any touched tile unsaturated, or the node failing the depth test
-//          there). Exactly the cases that return false.
-//   > 1  - behind the barrier by that squared factor. Exactly the cases that return true.
-// Nothing is ever returned in (0, 1]: a node that fails any tile short-circuits to 0, the same early-out the verdict
-// takes, so this costs no extra tile iterations at all - the loop already had to visit every tile to answer true.
-//
-// Returned SQUARED and as an out-param rather than as a return value, deliberately, and both for the same reason: the
-// verdict must not change. Deriving the bool from the ratio instead (ratio > 1) would route a decision currently made
-// by an exact `dist_sq > threshold*threshold` comparison through a division, and a dist_sq a hair above threshold^2
-// can round to exactly 1.0f - flipping the answer on the nodes closest to the boundary. So the comparison below stays
-// multiplicative and the ratio is computed only for tiles that already passed it. A caller wanting both must take the
-// bool as the verdict and this as the magnitude; they agree except in that rounding sliver, which [gsr-sat-ratio]
-// counts (ratio_ne=) rather than assumes away.
-// SESSION085, TEMPORARY - THE DEPTH MARGIN. See GaussianSplatRenderer::getSatMinRatio() for the measurements and for
-// why this is not the answer (it is a switch, not a dial, and where it switches is per-scene). Removed at the
-// progressive-saturation plan's etap 6.
-//
-// min_ratio_sq raises the bar a node must clear before it may be dropped: it must sit at least sqrt(min_ratio_sq)
-// TIMES further than the barrier, not merely past it. 1 (the default) is exactly the old behaviour, bit-for-bit - the
-// test below is multiplicative and scaling by 1.0f is exact in IEEE754, so no call site that leaves this alone can
-// change its answer.
-//
-// It is NOT a second region_radius. R widens the claim in metres and, per session080, only ever moved the CANDIDATE's
-// side of the parallax - its angular half was never sound. This scales with the barrier's own distance instead, costs
-// one multiply on a comparison already being made, and needs no sqrt: the caller passes the ratio already squared.
-bool gsSatOccluded(const Vec4f& offset, float dist_sq, float node_radius,
-	const js::Vector<float, 16>& sat_depth, int res, float region_radius, float min_ratio_sq = 1.f,
-	bool* out_aggressive = NULL, float* out_ratio_sq = NULL);
+// SESSION085 ETAP 6: gsSatOccluded() - the prune's per-node verdict, with its region dilation, footprint
+// conjunction and depth margin - is gone with the prune itself. gsSatBuriedRatioSq() above is the only barrier
+// reader left; see its comment for why a bias asks a different question than a prune.
 
 
 // SESSION085 ETAP 3 - HOW BURIED IS THIS DIRECTION, as the squared ratio (dist / barrier)^2 at the node's CENTRE tile,

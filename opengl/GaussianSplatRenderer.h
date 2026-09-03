@@ -107,16 +107,9 @@ Not handled:
    maxSplatsPerCloud()).  A merge that would exceed it is refused, leaving the
    clouds separate and their relative order approximate.
 =====================================================================*/
-// SESSION074: pre-GPU saturation cull stage (see snapshots/2026-08-24-session074-cpu-saturation-prefilter-plan.md).
-// Off: stage disabled entirely, no grid built, no cost anywhere (default). Count: grid built and every fine node
-// tested, but nothing is dropped - Stage A, measurement only, see GaussianSplatRenderer::getSatPrefilterMode().
-// Drop: Stage A's tested behaviour, actually applied to the draw list - Stage B.
-enum GaussianSplatSatPrefilterMode
-{
-	GaussianSplatSatPrefilterMode_Off = 0,
-	GaussianSplatSatPrefilterMode_Count = 1,
-	GaussianSplatSatPrefilterMode_Drop = 2
-};
+
+// SESSION085 ETAP 6: GaussianSplatSatPrefilterMode is gone - the saturation barrier is applied as an LoD bias
+// during traversal now, never as a prune. See getSatBiasCeiling().
 
 
 // SESSION078: which view of the saturation-grid debug overlay (session076 §9) is drawn, if any - see
@@ -226,22 +219,21 @@ public:
 	// anything downstream cut it down to 'drawn'. Sits between 'total'/'in_frustum' (a static, LoD-independent ceiling
 	// over the whole tree) and 'drawn' (this frame's post-filter draw list) in the pipeline.
 	//
-	// SESSION085: 'after_sat' splits the one step 'frontier'->'drawn' used to be into the two real stages it has been
-	// since session074, so the chain the button reports is the pipeline as actually built:
+	// SESSION085 ETAP 6: the chain the button reports is
 	//
-	//     total  ->  frontier  ->  after_sat  ->  drawn  ->  visible
-	//      raw       LoD U(P)     saturation    frustum      final
-	//                              prefilter     filter      frame
+	//     total  ->  frontier  ->  drawn  ->  visible
+	//      raw       LoD U(P)    frustum      final
+	//                             filter      frame
 	//
-	// Two corrections come with it, both of which made the old two-stage chain misreport:
-	//  - 'frontier' now reads GaussianSplatUnculledFrontier::pre_sat_n rather than the cached frontier's array length.
-	//    The cached frontier is USUALLY the saturation stage's pruned copy, so the old number was already post-prune and
-	//    was labelled as the LoD stage's output; the prune was invisible precisely because it had been folded into the
-	//    stage above it.
-	//  - both frontier figures count the reuse far_block as well as the frontier's own array. A frontier holding an
-	//    inherited far segment (frontier reuse on, session080 STEP B) is two arrays, and counting only the near one
-	//    under-reported the stage by whatever was inherited - which is most of it at a normal walking step.
-	struct FrustumCounts { size_t in_frustum; size_t total; size_t frontier; size_t after_sat; size_t drawn; size_t visible; };
+	// Session085 briefly had a fifth column, 'after_sat', splitting 'frontier' into before/after the saturation prune.
+	// That stage no longer exists: the barrier is applied as an LoD bias DURING the walk (see getSatBiasCeiling()), so
+	// the frontier a traversal produces is already the saturated one and a separate column would repeat this number.
+	//
+	// One correction from that work survives and matters: 'frontier' counts the reuse far_block as well as the
+	// frontier's own array. A frontier holding an inherited far segment (frontier reuse, session080 STEP B) is two
+	// arrays, and counting only the near one under-reported the stage by whatever was inherited - most of it at a
+	// normal walking step.
+	struct FrustumCounts { size_t in_frustum; size_t total; size_t frontier; size_t drawn; size_t visible; };
 	FrustumCounts countSplatsInFrustum() const;
 
 	// One-off diagnostic (GaussianSplatSettingsWidget's "Frustum report" button, Qt only): a multi-line breakdown of what
@@ -424,16 +416,6 @@ public:
 	bool getCoarseLayerDebug() const { return coarse_layer_debug; }
 	void setCoarseLayerDebug(bool v) { coarse_layer_debug = v; }
 
-	// SESSION074: pre-GPU saturation cull stage - see GaussianSplatSatPrefilterMode's own comment above and the
-	// session074 plan snapshot. Off by default; only takes effect when the coarse floor is also enabled (the grid is
-	// built from it - see kickOffTraversals()'s use of this).
-	// The verdict is baked into U(P) when the frontier is built, not re-evaluated per frame, so a live change of this
-	// setting cannot take effect until a fresh traversal runs - and during pure rotation no traversal is ever kicked,
-	// which would leave the switch looking broken for as long as the camera stays put. The setter therefore drops every
-	// cached frontier, forcing one. Out-of-line for that reason; nothing else here needs to touch cloud state.
-	GaussianSplatSatPrefilterMode getSatPrefilterMode() const { return sat_prefilter_mode; }
-	void setSatPrefilterMode(GaussianSplatSatPrefilterMode v);
-
 	// SESSION079: this stage's OWN saturation threshold - "thr" in the "Saturation filter" row. Used to share
 	// getSaturationThreshold()/splat_saturation_threshold with the GPU-side "Saturation gate" (session072), on the
 	// reasoning that one number should mean one thing. Split out independent: the owner expects the GPU gate may be
@@ -545,43 +527,6 @@ public:
 	void setSatRegionClosingTiles(int v);
 
 
-	// SESSION085, TEMPORARY - NOT A FEATURE, and to be removed at the progressive-saturation plan's etap 6. It was
-	// built to test one hypothesis cheaply, it answered it, and the answer was that it cannot be the solution. Kept
-	// only so etap 5 can quote a baseline - "what a naive hard margin costs for the same visual outcome" - against
-	// what the LoD bias achieves, without writing it a second time.
-	//
-	// THE DEPTH MARGIN, as a LINEAR ratio (this squares it for gsSatOccluded()). A node is dropped only if it sits at
-	// least this many TIMES further than the barrier, not merely past it. 1 = off, the old behaviour bit-for-bit.
-	//
-	// The hypothesis: holes on a moving camera are the BOUNDARY population. The barrier is anchored, so a viewpoint
-	// change perturbs the nodes nearest it and few others; session085's ratio histogram ([gsr-sat-ratio]) showed that
-	// population is also the cheapest to give up where pruning pays - in occluded interiors 54-58% of drops sit beyond
-	// 5x the barrier and only 5.7-7.5% inside 1.25x. An open viewpoint inverts that (44% inside 1.25x).
-	//
-	// MEASURED, owner walking two locations until holes stopped being visible:
-	//
-	//   interior  minR 1 -> 2:  dropped 77.1% -> 64.3%,  pool 2.64M -> 4.10M  (+55%)   holes gone
-	//   forest    minR 1 -> 3:  dropped 19.4% ->  0.1%,  pool 8.86M -> 10.95M (+24%)   holes gone
-	//
-	// The hypothesis held - and the knob still fails. Interior has a real working point. Forest does not: at the margin
-	// where its holes disappear the stage has simply STOPPED PRUNING (0.1%), so "no holes" there is not a fix, it is
-	// the mechanism switched off. Between the two states there is nothing, because in an open view almost every drop is
-	// a boundary drop (the histogram predicted exactly this: 2.2% beyond 5x). So the margin is a switch, not a dial,
-	// and where it switches is decided by the content - which is per-scene tuning by definition, and against the
-	// project's own rule. A binary prune cannot be tuned out of this; that is the argument for the LoD bias, which has
-	// no such cliff because a boundary node gets coarsened a little instead of being dropped or kept whole.
-	//
-	// Note the denominators: 16.6% of the DROPS is +55% of the POOL, and the pool is what the GPU pays for.
-	//
-	// Unlike region_radius this is not a claim about a ball of camera positions; it is a straight confidence floor on
-	// the barrier's own verdict, and it costs one multiply on a comparison already being made.
-	//
-	// Changes what an APPLY produces, not what a barrier or a traversal produces - so the setter clears the apply
-	// throttle rather than dropping any cache, or a change would not take effect until the camera happened to move.
-	float getSatMinRatio() const { return sat_min_ratio; }
-	void setSatMinRatio(float v);
-
-
 	// SESSION085 ETAP 3 - THE SATURATION LoD BIAS: the ceiling on how far it may push a node's pixel_scale_limit.
 	// 1 = off, and off is bit-for-bit the pre-etap-3 behaviour.
 	//
@@ -632,28 +577,6 @@ public:
 
 	// SESSION085: the session082 occluder-source selector is removed - the tree walk won the comparison outright and is
 	// now the only source. See the note above GaussianSplatRenderer for the measurements that settled it.
-
-	// SESSION081: whether a traversal's UNPRUNED frontier is drawn while its saturation prune is still being computed.
-	//
-	// On (the session076 behaviour): the traversal publishes its frontier the moment the tree walk is done, so a new
-	// viewpoint reaches the screen at traversal latency (~170ms) instead of traversal + saturation (~570ms), and the
-	// prune lands afterwards as a refinement. The cost is that the ~13.2M-node unpruned set is what gets DRAWN for the
-	// saturation phase's whole duration - and since a moving camera re-kicks faster than the phase completes, the draw
-	// load spends much of any walk at the unpruned figure rather than the pruned ~2.8M.
-	//
-	// Off: message 1 is still sent (it owns the scratch, the in-flight slot, the reuse source and the traversal's own
-	// diagnostics) but is not installed for drawing; the PREVIOUS pruned frontier keeps drawing until this traversal's
-	// own pruned result arrives. The draw load stays flat at the pruned figure.
-	//
-	// What makes this safe to turn off is sat_region_radius (R) above, and only it: the previous pruned frontier is an
-	// assertion about where the camera WAS, so holding it while the camera moves is exactly the stale-prune hole this
-	// pipeline's split was built to avoid - unless the barrier is valid over a ball of radius R around that anchor, in
-	// which case it stays correct for as long as the camera is inside the ball. The honest limit is that R only buys
-	// R metres of travel: past that, and before the new prune lands, holes are possible again. That trade is the point
-	// of the knob - see the session081 snapshot.
-	bool getDrawUnprunedFrontier() const { return draw_unpruned_frontier; }
-	void setDrawUnprunedFrontier(bool v);
-
 
 	// SESSION080 STEP B: FRONTIER REUSE. Distance, in world units, beyond which a traversal stops re-walking the tree and
 	// instead copies the previous traversal's own selection for that region. 0 disables it, reproducing the current
@@ -1655,12 +1578,6 @@ private:
 	void kickOffSaturationBuilds();
 	void drainSaturationBuildResults();
 
-	// SESSION081: the saturation APPLY, decoupled from the traversal pipeline AND from the build above - see
-	// GaussianSplatSaturationApplyTask. Throttled to at most one in flight per cloud, kicked only when there is
-	// something new to test (a fresher source frontier or a fresher barrier than the last attempt) - see the .cpp.
-	void kickOffSaturationApplies();
-	void drainSaturationApplyResults();
-
 	// SESSION069 - Per-frame TAA bookkeeping.  Called from think(), before the per-cloud loop writes the jitter uniform.
 	// See the .cpp for the exact reset condition list.
 	void updateTAAState(const Vec2i& accum_dims);
@@ -1726,12 +1643,6 @@ private:
 	ThreadSafeQueue<Reference<ThreadMessage> > sat_build_result_queue;
 	js::Vector<Reference<ThreadMessage>, 16> completed_sat_build_msgs;
 
-	// SESSION081: the saturation APPLY pipeline - see GaussianSplatSaturationApplyTask and
-	// kickOffSaturationApplies()/drainSaturationApplyResults(). Same shape as the build pipeline above, same reasoning
-	// (no pool, capped at one in flight per cloud via SplatCloud::sat_apply_in_flight).
-	ThreadSafeQueue<Reference<ThreadMessage> > sat_apply_result_queue;
-	js::Vector<Reference<ThreadMessage>, 16> completed_sat_apply_msgs;
-
 	// Live-tunable via GaussianSplatSettingsWidget (Qt only); hardcoded defaults if that panel's saved settings are never
 	// applied (e.g. no UI). pixel_scale_limit is roughly "stop refining once a node projects to about this many pixels";
 	// max_splats_budget is a per-cloud cap on how many nodes one traversal may select, matched to what the old
@@ -1783,7 +1694,6 @@ private:
 	float filter_coarse_dilation_latency;   // s - the coarse tail's (wider) dilation window.
 	bool coarse_layer_debug;                // Draw only the coarse floor - see getCoarseLayerDebug().
 	bool filter_debug_log, kick_debug_log, cpu_prof_log; // SESSION072: live log toggles - see getFilterDebugLog() etc.
-	GaussianSplatSatPrefilterMode sat_prefilter_mode; // SESSION074 - see getSatPrefilterMode(). [gsr-sat] trace reuses filter_debug_log above (plan's own choice - one checkbox, not a second toggle) - see drainFilterResults().
 	float sat_prefilter_threshold;                    // SESSION079 - see getSatPrefilterThreshold(). This stage's own threshold, independent of splat_saturation_threshold (the GPU gate's).
 	bool filter_frustum_planes_enabled;              // SESSION074 - see getFilterFrustumPlanesEnabled().
 	bool sat_diag_log;                               // SESSION076 - see getSatDiagLog(). Own toggle, not folded into filter_debug_log, because the counting itself perturbs what is being measured.
@@ -1791,9 +1701,7 @@ private:
 	float sat_grid_subdiv;                           // SESSION076 CALIBRATION - see getSatGridSubdiv().
 	float sat_region_radius;                         // SESSION078 - see getSatRegionRadius().
 	int sat_region_closing_tiles;                    // SESSION081 - see getSatRegionClosingTiles().
-	float sat_min_ratio;                             // SESSION085 - see getSatMinRatio().
 	float sat_bias_ceiling;                          // SESSION085 ETAP 3 - see getSatBiasCeiling().
-	bool draw_unpruned_frontier;                     // SESSION081 - see getDrawUnprunedFrontier().
 	float frontier_reuse_split_dist;                 // SESSION080 STEP B - see getFrontierReuseSplitDist(). 0 = disabled.
 
 	// SESSION055: camera-motion tracker for anisotropic frustum-cull dilation. think() diffs the current cam pose against

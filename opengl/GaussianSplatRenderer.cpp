@@ -232,48 +232,9 @@ public:
 	// tight, cheap dilation without leaving holes on motion. See filterUnculledFrontier() / kickOffFilters().
 	js::Vector<float, 16> is_coarse;
 
-	// SESSION074 REVISION: the saturation verdict is applied HERE, when this frontier is built, not in the per-frame
-	// filter - the arrays above are already pruned of occluded nodes by the time anyone sees them (in Drop mode; Count
-	// mode only tallies). Two reasons, both decisive:
-	//
-	//  - It is orientation-independent by construction. Whether a node sits behind opaque geometry is a fact about the
-	//    camera POSITION, exactly like everything else in U(P). The first cut ran the test inside the filter and
-	//    exempted nodes that were only in the dilation margin, which made the verdict depend on where the frustum
-	//    happened to be that frame - so a node flipped between "exempt, drawn" and "tested, dropped" as the tight
-	//    frustum swept across it during rotation. That is the session064 membership-churn failure mode, and it showed
-	//    up as holes crawling along the screen edge on every turn.
-	//
-	//  - It moves the cost off the per-frame path entirely. The test is ~35ns/node scalar (octahedral map + sqrt);
-	//    running it per filter kick cost 105ms+ EVERY kick during rotation, which tripled the filter's async round trip
-	//    and thereby outran the dilation band that keeps the frustum edge fresh. Done once per traversal it costs
-	//    nothing per frame, AND it shrinks the pool every later filter kick has to stream (~12M -> ~2.5M measured), so
-	//    the cheap frustum test gets faster too.
-	//
-	// SESSION081: the grid this verdict is tested against (sat_depth, formerly a field here) moved out to
-	// GaussianSplatSaturationBarrier - see that class. It is no longer this frontier's own build, so nothing about it
-	// is kept here beyond the APPLY-side numbers below: what the test against a barrier did to THIS frontier.
-	//
-	// Coarse-floor nodes are deliberately never pruned - see the traversal task's use of this.
-	size_t sat_num_tested;       // DIAGNOSTIC: fine nodes the verdict was computed for.
-	size_t sat_num_dropped;      // DIAGNOSTIC: of those, how many the conservative test found occluded (counted in Count mode too, where nothing is actually removed).
-	size_t sat_num_dropped_aggr; // DIAGNOSTIC: the deliberately-wrong upper bound - see gsSatOccluded()'s out_aggressive.
-	// SESSION085 PLAN ETAP 2/4 DIAGNOSTIC, TEMPORARY - printed as [gsr-sat-ratio], filled only under the "diag"
-	// checkbox. sat_ratio_ne: nodes where the drop verdict and (ratio_sq > 1) disagree, i.e. the float-rounding sliver
-	// gsSatOccluded()'s header describes - ETAP 3 drives the LoD cut from that ratio, so this says whether it may also
-	// be trusted as the verdict. sat_ratio_hist: how far behind the barrier the DROPPED nodes sit, on the linear ratio,
-	// bucketed [1,1.25) [1.25,1.5) [1.5,2) [2,3) [3,5) [5,inf) - ETAP 4's premise check (a distribution piled up just
-	// above 1 means no bias function can achieve much, whatever its shape).
-	size_t sat_ratio_ne;
-	size_t sat_ratio_hist[6];
-	float sat_min_ratio_used; // SESSION085: the depth margin THIS prune was made with, not the live setting - same reason the barrier records thr=/sub=/R=: a captured log line has to say what produced it.
-	// SESSION080 DIAGNOSTIC: how many traversals were inside their apply phase when this one entered its own (on_entry
-	// counts the OTHERS, so 0 means it had the stage to itself), and the most that were running at any point while it
-	// was there - see gs_sat_phases_running. test_ms below is only readable against these two: it is wall-clock on a
-	// shared pool, so a doubled test_ms with sat_concurrency_peak=3 is contention, not a change in the work.
-	size_t sat_concurrency_on_entry;
-	size_t sat_concurrency_peak;
-
-	double sat_test_ms;          // DIAGNOSTIC: cost of testing (and, in Drop mode, compacting) the frontier - see [gsr-sat-apply].
+	// SESSION085 ETAP 6: the prune's diagnostics (tested/dropped/aggr, the graded-read counters, apply timing and
+	// concurrency) went with the prune. What the saturation stage does now is visible on [gsr-traversal]'s sat_bias=
+	// instead - it is a traversal property, not a separate stage's.
 
 	// Key this frontier was built for; drainTraversalResults() checks these before reusing it, so a settings change that
 	// alters the selection can't be answered from a stale U(P).  Orientation is deliberately NOT here - that's the point.
@@ -371,19 +332,6 @@ public:
 	// i.e. what the DFS actually walked/sorted, BEFORE the saturation prune. indices.size() is NOT this on the pruned
 	// replacement (uf2): it shrinks to pool_after, which would misattribute expand_ms/sort_ms's cost to the wrong N.
 
-	// SESSION085: node count of the frontier this one was pruned FROM, i.e. the LoD stage's output before the saturation
-	// stage touched it. Needed by countSplatsInFrustum(), which reports the pipeline as a chain and therefore has to show
-	// both sides of the prune from whichever single frontier the cloud currently holds.
-	//
-	// Not derivable from the fields that already exist, which is why it is its own:
-	//  - traversal_output_n is what THIS traversal's DFS walked. With frontier reuse on it excludes an inherited
-	//    far_block, so it is short of the frontier's real size by however much was inherited.
-	//  - indices.size() + far_block is the size AFTER the prune on uf2, and the size before it on an unpruned frontier -
-	//    the same expression means different stages depending on which object it is read from.
-	//  - sat_num_dropped only counts what Drop mode removed; in Count mode it tallies without removing, so
-	//    indices.size() + sat_num_dropped would double-count.
-	// On an unpruned frontier this equals its own node count, which reads correctly as "no prune has been applied".
-	size_t pre_sat_n;
 
 	// SESSION080 DIAGNOSTIC (plan doc session080-plan.md STEP A): how much this frontier's front-to-back order has
 	// moved since prev_frontier - the cloud's cached_ufrontier at kick time, i.e. whatever was
@@ -443,22 +391,17 @@ public:
 	Vec4f reuse_base_anchor_ws;
 
 	GaussianSplatUnculledFrontier() // SESSION074: defaults are "stage never ran".
-	:	sat_num_tested(0), sat_num_dropped(0), sat_num_dropped_aggr(0),
-		sat_ratio_ne(0), sat_min_ratio_used(1.f), // SESSION085 - the hist array is zeroed in the body below.
-		sat_concurrency_on_entry(0), sat_concurrency_peak(0), // SESSION080 DIAGNOSTIC
-		sat_test_ms(0.0),
-		built_time_real_s(0.0), // SESSION080
+	:	built_time_real_s(0.0), // SESSION080
 		expand_ms(0.0), sort_ms(0.0), // SESSION080
 		expand_seeds(0), expand_num_tasks(0), expand_prologue_ms(0.0), expand_task_max_ms(0.0), expand_task_sum_ms(0.0), // SESSION080
 		expand_splice_reserve_ms(0.0), expand_splice_copy_ms(0.0), sort_alloc_ms(0.0), soa_ms(0.0), // SESSION080 (plan2 §4.1)
 		traversal_output_n(0), // SESSION080
-		pre_sat_n(0), sat_bias_barrier_time(0.0), // SESSION085
+		sat_bias_barrier_time(0.0), // SESSION085
 		sort_staleness_delta_ws(0.0), sort_staleness_prev_n(0), sort_staleness_common_n(0), sort_staleness_max_disp(0), // SESSION080
 		sort_staleness_mean_disp(0.0), sort_staleness_gt1k(0), sort_staleness_gt10k(0), sort_staleness_ms(0.0), // SESSION080
 		reuse_roots(0), reuse_n(0), reuse_ms(0.0), reuse_split_dist_used(0.f), reuse_base_anchor_ws(0.f) // SESSION080 §4.3
 	{
 		for(int i=0; i<5; ++i) dist_pctile[i] = 0.f; // SESSION080
-		for(int i=0; i<6; ++i) sat_ratio_hist[i] = 0;  // SESSION085 PLAN ETAP 2/4 DIAGNOSTIC.
 	}
 };
 
@@ -599,7 +542,7 @@ public:
 		last_applied_filter_frontier_time_s(0.0), // SESSION081
 		filter_dilation_elevated(false), // SESSION066
 		diag_filter_kick_time_s(0.0), diag_filter_band_fine_rad(0.f), diag_applied_kick_forward_ws(0.f), diag_have_applied_filter(false), // SESSION073 DIAGNOSTIC
-		sat_build_in_flight(false), sat_apply_in_flight(false), last_apply_source_built_time_s(0.0), last_apply_barrier_built_time_s(0.0) // SESSION081
+		sat_build_in_flight(false) // SESSION081
 	{}
 
 	uint64 cloud_id; // Stable, never reused.  Sort results carry it, so a result for a cloud that has since been merged away can be dropped.
@@ -680,24 +623,7 @@ public:
 	// case for the result, and this keeps the buffers the running task is still writing into alive to match.
 	Reference<GaussianSplatSaturationBuildScratch> sat_build_scratch;
 
-	// SESSION081: the saturation APPLY pipeline's own in-flight/throttle state - see GaussianSplatSaturationApplyTask
-	// and kickOffSaturationApplies()/drainSaturationApplyResults(). sat_apply_in_flight mirrors sat_build_in_flight
-	// above; the two timestamps record what the MOST RECENTLY KICKED apply was given (set at kick time, not at
-	// completion), so kickOffSaturationApplies() can tell "nothing new to test since the last attempt" apart from
-	// "in flight" - both are throttle conditions, but only the first one should ever go away on its own (once the
-	// in-flight apply lands, its inputs may already be stale, and a fresher pair kicks next tick).
-	//
-	// TIMESTAMPS, not Reference<>s, on purpose. Holding references here would pin a whole extra frontier alive between
-	// applies - during motion, last_unpruned_ufrontier has already moved on to the next one, so the reference kept
-	// here would be the ONLY owner of its predecessor, costing an extra frontier's worth of memory for nothing but a
-	// pointer comparison. Raw pointers would remove the pinning but reintroduce it as a correctness bug: a freed
-	// frontier's address can be reused by the next allocation, and the comparison would then read as "same, nothing
-	// new" and stall the pipeline. built_time_real_s is already stamped on both classes (for the anchor_age
-	// diagnostic), comes from a monotonic real clock, and is unique per object in any realistic timeline - so it
-	// identifies them for this purpose with neither drawback. 0 means "no apply has been kicked yet".
-	bool sat_apply_in_flight;
-	double last_apply_source_built_time_s;
-	double last_apply_barrier_built_time_s;
+	// SESSION085 ETAP 6: the saturation APPLY pipeline's in-flight/throttle state went with the prune itself.
 
 	// SESSION076 §9 / SESSION077: debug-only visualisation of cached_ufrontier's saturation grid, rebuilt by
 	// drainTraversalResults() alongside cached_ufrontier whenever getSatDiagLog() is on. Null whenever the diag
@@ -1221,24 +1147,6 @@ public:
 };
 
 
-// SESSION081: result of a background saturation APPLY - see GaussianSplatSaturationApplyTask. Carries the pruned
-// frontier and, in source_frontier, exactly what it was pruned FROM - the staleness comparison drainSaturationApplyResults()
-// makes against it is by TIMESTAMP (source_frontier->built_time_real_s), not identity: accept whenever this prune is not
-// OLDER than whatever the cloud is currently showing, even if it is not the literal newest thing available. See that
-// function's own comment for why this is safe (it can only ever move the picture FORWARD in camera-position time,
-// never back to a staler one) and why the old identity-only check was needlessly strict once apply became a
-// separately-throttled, at-most-one-in-flight pipeline: with only one apply ever in flight per cloud, there is no
-// scenario where a NEWER apply result could already be sitting in cached_ufrontier when an OLDER one lands - the only
-// way to be "superseded" now is the interaction with draw_unpruned_frontier installing something fresher in between.
-class GaussianSplatSaturationApplyResultMsg : public ThreadMessage
-{
-public:
-	uint64 cloud_id;
-	uint64 topology_generation;
-	Reference<GaussianSplatUnculledFrontier> source_frontier; // What this prune was computed FROM. Carried so a reader of this message can see the apply's actual input without a separate lookup; the freshness decision itself is made from pruned_frontier->built_time_real_s, which this copies.
-	Reference<GaussianSplatSaturationBarrier> barrier_used;    // What it was tested AGAINST - echoed back for the same reason, and so [gsr-sat-apply] can report the barrier's own anchor_age/anchor_dist without a separate lookup.
-	Reference<GaussianSplatUnculledFrontier> pruned_frontier;  // The result.
-};
 
 
 // Why the traversal stopped unfolding the tree at a particular frontier node.  Only recorded when a caller asks for it
@@ -1372,133 +1280,10 @@ static const size_t gs_sat_gather_prefetch_dist = 32;
 // also retires the duplicated radius/alpha expression the two gathers had to keep in step: there is one left.
 
 
-// SESSION079: one slice of the saturation read pass. Both phases below are cut the same way and share these, so a
-// chunk's verdict pass and its copy pass agree on the range by construction rather than by two matching divisions.
-struct GsSatTestChunk
-{
-	size_t i_begin, i_end;   // Input range, LOCAL to this chunk's segment - see mask_base.
-	// SESSION080 §4.3: which segment this chunk reads, and where that segment starts in the (single, shared) keep mask.
-	// The tasks index the mask by their segment-local i, so the dispatch hands them a pointer already displaced by
-	// mask_base - which keeps both task bodies exactly as they were when a frontier was one flat array.
-	//
-	// seg_idx is carried explicitly rather than deduced from mask_base: a frontier whose near part is empty (the camera
-	// far enough that every root sits beyond the frozen cut) gives BOTH segments a base of 0, and deducing from that
-	// would send the far chunks to read the empty near arrays.
-	size_t seg_idx;
-	size_t mask_base;
-	size_t out_begin;        // Where this chunk's survivors start in the output. Filled by the prefix sum between the phases.
-	size_t kept, tested, dropped, dropped_aggr;
-	// SESSION085 PLAN ETAP 2/4 DIAGNOSTIC, TEMPORARY: the graded read's two questions - see GsSatTestTask::run().
-	// ratio_ne counts nodes where the bool verdict and (ratio_sq > 1) disagree; ratio_hist buckets how far behind the
-	// barrier the dropped nodes actually sit. Both zero unless ratio_diag asked for them.
-	size_t ratio_ne;
-	size_t ratio_hist[6];
-};
 
 
-// SESSION079: phase 1 of the read pass - the per-node occlusion verdict, which is what the pass actually costs. It is a
-// pure map: each node's answer depends only on that node and on the (finished, read-only) grid, so unlike the build
-// there is nothing to order and nothing to make exact. The result is a byte per node rather than a compacted list,
-// because the survivors' POSITIONS in the output are not knowable until every chunk has counted its own.
-class GsSatTestTask : public glare::Task
-{
-public:
-	virtual void run(size_t /*thread_index*/)
-	{
-		size_t tested = 0, dropped = 0, dropped_aggr = 0, kept = 0;
-		// SESSION085 PLAN ETAP 2/4 DIAGNOSTIC, TEMPORARY - see the chunk's fields. Asking for the ratio costs no extra
-		// tile iterations (see gsSatOccluded()'s header), but it does cost a divide per passing tile, so it stays behind
-		// the same "diag" checkbox everything else of this kind sits behind.
-		size_t ratio_ne = 0;
-		size_t ratio_hist[6] = { 0, 0, 0, 0, 0, 0 };
-		for(size_t i=chunk->i_begin; i<chunk->i_end; ++i)
-		{
-			bool drop = false;
-			if(is_coarse[i] == 0.f) // Coarse nodes are never saturation-tested - see the call site.
-			{
-				const float dx = px[i] - cam_pos_ws.x[0];
-				const float dy = py[i] - cam_pos_ws.x[1];
-				const float dz = pz[i] - cam_pos_ws.x[2];
-				bool aggr = false;
-				float ratio_sq = 0.f;
-				drop = gsSatOccluded(Vec4f(dx, dy, dz, 0.f), dx*dx + dy*dy + dz*dz, radius[i],
-					*sat_depth, res, region_radius, min_ratio_sq, &aggr, ratio_diag ? &ratio_sq : NULL); // SESSION078, SESSION085
-				++tested;
-				if(drop) ++dropped;
-				if(aggr) ++dropped_aggr;
-
-				if(ratio_diag)
-				{
-					// The rounding sliver the header warns about: how often the graded value would disagree with the
-					// verdict if a caller took (ratio > 1) as the decision. Expected tiny; measured rather than assumed,
-					// because ETAP 3 is about to drive the LoD cut from this value.
-					if(drop != (ratio_sq > 1.f))
-						++ratio_ne;
-
-					// ETAP 4's premise check, taken here because this is the only pass that already has the number: how far
-					// behind the barrier the dropped population actually sits. If it piles up just above 1, no bias function
-					// can do much and the shape of that function stops mattering. Bounds are on the LINEAR ratio
-					// (1.25/1.5/2/3/5), compared squared so no sqrt is needed.
-					if(drop)
-					{
-						const int b = (ratio_sq < 1.5625f) ? 0 : ((ratio_sq < 2.25f) ? 1 : ((ratio_sq < 4.f) ? 2 :
-							((ratio_sq < 9.f) ? 3 : ((ratio_sq < 25.f) ? 4 : 5))));
-						++ratio_hist[b];
-					}
-				}
-			}
-
-			const uint8 keep = (prune && drop) ? 0 : 1;
-			keep_mask[i] = keep;
-			kept += keep;
-		}
-		chunk->kept = kept;
-		chunk->tested = tested;
-		chunk->dropped = dropped;
-		chunk->dropped_aggr = dropped_aggr;
-		chunk->ratio_ne = ratio_ne;
-		for(int b=0; b<6; ++b) chunk->ratio_hist[b] = ratio_hist[b];
-	}
-
-	const float* px; const float* py; const float* pz; const float* radius; const float* is_coarse;
-	const js::Vector<float, 16>* sat_depth;
-	Vec4f cam_pos_ws;
-	int res;
-	float region_radius;
-	bool prune;
-	bool ratio_diag; // SESSION085 PLAN ETAP 2/4 DIAGNOSTIC, TEMPORARY - the "diag" checkbox. See run().
-	float min_ratio_sq; // SESSION085: the depth margin, already squared - see gsSatOccluded().
-	uint8* keep_mask;
-	GsSatTestChunk* chunk;
-};
 
 
-// SESSION079: phase 2 - the gather. Each chunk copies its own survivors to the exact offsets the prefix sum handed it,
-// so the output keeps the input's front-to-back order (which everything downstream depends on) with no coordination
-// between the chunks at all. Pure bandwidth; it exists as a separate pass only because phase 1 has to finish counting
-// before any chunk knows where to write.
-class GsSatCompactTask : public glare::Task
-{
-public:
-	virtual void run(size_t /*thread_index*/)
-	{
-		size_t d = chunk->out_begin;
-		for(size_t i=chunk->i_begin; i<chunk->i_end; ++i)
-			if(keep_mask[i])
-			{
-				out_indices[d] = in_indices[i];
-				out_px[d] = in_px[i]; out_py[d] = in_py[i]; out_pz[d] = in_pz[i];
-				out_radius[d] = in_radius[i];
-				out_is_coarse[d] = in_is_coarse[i];
-				++d;
-			}
-	}
-
-	const uint32* in_indices; const float* in_px; const float* in_py; const float* in_pz; const float* in_radius; const float* in_is_coarse;
-	uint32* out_indices; float* out_px; float* out_py; float* out_pz; float* out_radius; float* out_is_coarse;
-	const uint8* keep_mask;
-	GsSatTestChunk* chunk;
-};
 
 
 // SESSION082: one entry in the occluder tree walk's DFS stack - see GaussianSplatSaturationBuildTask::occluderTreeWalk().
@@ -1945,201 +1730,6 @@ public:
 };
 
 
-// SESSION081 - THE SATURATION APPLY, decoupled from any one traversal - see GaussianSplatSaturationApplyResultMsg and
-// kickOffSaturationApplies()/drainSaturationApplyResults(). This is exactly the test+compact code that used to run
-// inline inside GaussianSplatLodTraversalTask::run() as its "message 2", unchanged in substance, only re-targeted to
-// read its two inputs (the frontier to prune, and the barrier to prune it against) from ctor fields instead of the
-// traversal's own locals, and to run on its own cadence instead of once per traversal.
-//
-// Why this needed to move out, not just have its guard relaxed: with apply running inline inside EVERY traversal that
-// found a usable barrier, and traversal now taking ~40-120ms against apply's own ~75-97ms, up to two traversals'
-// worth of apply work could be running on the shared worker pool at once, each parallelised across the WHOLE pool via
-// its own TaskGroup - directly measured to double a concurrent traversal's own sort_ms (16ms -> 70-90ms) through pool
-// contention. Discarding a result after the fact (relaxing the guard) does not recover that cost - the compute has
-// already happened by the time a discard verdict is even possible. Only running apply LESS OFTEN does. Throttled here
-// to at most one in flight per cloud, and to only starting a new one when there is something actually NEW to test
-// (a fresher source frontier or a fresher barrier than the last attempt) - see kickOffSaturationApplies().
-class GaussianSplatSaturationApplyTask : public glare::Task
-{
-public:
-	virtual void run(size_t /*thread_index*/) override
-	{
-		// SESSION080 DIAGNOSTIC: scoped to exactly this run() call, same as the old inline code's local of the same
-		// name - see gs_sat_phases_running for what the number is for.
-		GsSatPhaseScope sat_phase_scope;
-
-		const GaussianSplatUnculledFrontier& uf = *source_frontier;
-		const GaussianSplatUnculledFrontier* const segs[2] = { &uf, uf.far_block.ptr() };
-		const size_t num_segs = uf.far_block.nonNull() ? 2 : 1;
-		const size_t seg_base[2] = { 0, uf.indices.size() };
-		const size_t n = uf.indices.size() + (uf.far_block.nonNull() ? uf.far_block->indices.size() : 0);
-
-		// The pruned replacement. Key fields are copied verbatim from the source frontier, same reasoning as the old
-		// inline code: it describes the same camera position and the same selection parameters, only with occluded
-		// nodes removed, so drainSaturationApplyResults()'s freshness comparison (by built_time_real_s) means the same
-		// thing whichever of the two it is reading.
-		Reference<GaussianSplatUnculledFrontier> uf2 = new GaussianSplatUnculledFrontier();
-		uf2->topology_generation = uf.topology_generation;
-		uf2->anchor_pos_ws = uf.anchor_pos_ws;
-		uf2->built_time_real_s = uf.built_time_real_s;
-		uf2->pixel_scale_limit = uf.pixel_scale_limit;
-		uf2->max_splats_budget = uf.max_splats_budget;
-		uf2->max_layer_density = uf.max_layer_density;
-		uf2->max_tree_depth = uf.max_tree_depth;
-		uf2->focal_px = uf.focal_px;
-		uf2->expand_ms = uf.expand_ms;
-		uf2->sort_ms = uf.sort_ms;
-		uf2->traversal_output_n = uf.traversal_output_n;
-		uf2->expand_seeds = uf.expand_seeds;
-		uf2->expand_num_tasks = uf.expand_num_tasks;
-		uf2->expand_prologue_ms = uf.expand_prologue_ms;
-		uf2->expand_task_max_ms = uf.expand_task_max_ms;
-		uf2->expand_task_sum_ms = uf.expand_task_sum_ms;
-		uf2->expand_splice_reserve_ms = uf.expand_splice_reserve_ms;
-		uf2->expand_splice_copy_ms = uf.expand_splice_copy_ms;
-		uf2->sort_alloc_ms = uf.sort_alloc_ms;
-		uf2->soa_ms = uf.soa_ms;
-		for(int k=0; k<5; ++k) uf2->dist_pctile[k] = uf.dist_pctile[k];
-		uf2->sort_staleness_delta_ws = uf.sort_staleness_delta_ws;
-		uf2->sort_staleness_prev_n = uf.sort_staleness_prev_n;
-		uf2->sort_staleness_common_n = uf.sort_staleness_common_n;
-		uf2->sort_staleness_max_disp = uf.sort_staleness_max_disp;
-		uf2->sort_staleness_mean_disp = uf.sort_staleness_mean_disp;
-		uf2->sort_staleness_gt1k = uf.sort_staleness_gt1k;
-		uf2->sort_staleness_gt10k = uf.sort_staleness_gt10k;
-		uf2->sort_staleness_ms = uf.sort_staleness_ms;
-		uf2->reuse_roots = uf.reuse_roots;
-		uf2->reuse_n = uf.reuse_n;
-		uf2->reuse_ms = uf.reuse_ms;
-		uf2->reuse_split_dist_used = uf.reuse_split_dist_used;
-		uf2->reuse_base_anchor_ws = uf.reuse_base_anchor_ws;
-
-		Timer sat_test_timer;
-		const bool prune = (prefilter_mode == GaussianSplatSatPrefilterMode_Drop);
-
-		const int concurrency = (task_manager != NULL) ? myMax(1, (int)task_manager->getConcurrency()) : 1;
-		const size_t min_chunk_nodes = 16384;
-		const size_t num_chunks = myMax<size_t>(1, myMin((size_t)concurrency * 4, n / min_chunk_nodes));
-
-		js::Vector<GsSatTestChunk, 16> chunks;
-		chunks.reserve(num_chunks + num_segs);
-		for(size_t sg=0; sg<num_segs; ++sg)
-		{
-			const size_t seg_n = segs[sg]->indices.size();
-			if(seg_n == 0)
-				continue;
-			const size_t seg_chunks = myMax<size_t>(1, (num_chunks * seg_n) / myMax<size_t>(1, n));
-			for(size_t c=0; c<seg_chunks; ++c)
-			{
-				GsSatTestChunk ch;
-				ch.i_begin = (seg_n * c)       / seg_chunks;
-				ch.i_end   = (seg_n * (c + 1)) / seg_chunks;
-				ch.seg_idx = sg;
-				ch.mask_base = seg_base[sg];
-				ch.out_begin = 0;
-				ch.kept = ch.tested = ch.dropped = ch.dropped_aggr = 0;
-				ch.ratio_ne = 0; for(int b=0; b<6; ++b) ch.ratio_hist[b] = 0; // SESSION085 PLAN ETAP 2/4 DIAGNOSTIC.
-				chunks.push_back(ch);
-			}
-		}
-
-		js::Vector<uint8, 16> keep_mask;
-		keep_mask.resizeNoCopy(n);
-
-		// ---- Phase 1: the verdict, per node. ----
-		{
-			glare::TaskGroupRef group = new glare::TaskGroup();
-			for(size_t c=0; c<chunks.size(); ++c)
-			{
-				const GaussianSplatUnculledFrontier& seg = *segs[chunks[c].seg_idx];
-				Reference<GsSatTestTask> t = new GsSatTestTask();
-				t->px = seg.px.data(); t->py = seg.py.data(); t->pz = seg.pz.data();
-				t->radius = seg.radius.data(); t->is_coarse = seg.is_coarse.data();
-				t->sat_depth = &barrier->sat_depth;
-				t->cam_pos_ws = barrier->anchor_pos_ws; // The BARRIER's own anchor, not the frontier's - the ball guarantee's offsets are measured from where sat_depth was actually built.
-				t->res = barrier->sat_grid_res;
-				t->region_radius = barrier->region_radius_used; // The R this barrier was built with, not the live setting - they can differ.
-				t->prune = prune;
-				t->ratio_diag = diag_log; // SESSION085 PLAN ETAP 2/4 DIAGNOSTIC - see GsSatTestTask::run().
-				t->min_ratio_sq = min_ratio_sq; // SESSION085 - see gsSatOccluded().
-				t->keep_mask = keep_mask.data() + chunks[c].mask_base;
-				t->chunk = &chunks[c];
-				if(task_manager != NULL) group->tasks.push_back(t); else t->run(0);
-			}
-			if(task_manager != NULL) task_manager->runTaskGroup(group);
-		}
-
-		size_t num_tested = 0, num_dropped = 0, num_dropped_aggr = 0, num_kept = 0;
-		size_t ratio_ne = 0, ratio_hist[6] = { 0, 0, 0, 0, 0, 0 }; // SESSION085 PLAN ETAP 2/4 DIAGNOSTIC.
-		for(size_t c=0; c<chunks.size(); ++c)
-		{
-			chunks[c].out_begin = num_kept;
-			num_kept        += chunks[c].kept;
-			num_tested      += chunks[c].tested;
-			num_dropped     += chunks[c].dropped;
-			num_dropped_aggr+= chunks[c].dropped_aggr;
-			ratio_ne        += chunks[c].ratio_ne;
-			for(int b=0; b<6; ++b) ratio_hist[b] += chunks[c].ratio_hist[b];
-		}
-
-		uf2->indices.resizeNoCopy(num_kept);
-		uf2->px.resizeNoCopy(num_kept); uf2->py.resizeNoCopy(num_kept); uf2->pz.resizeNoCopy(num_kept);
-		uf2->radius.resizeNoCopy(num_kept);
-		uf2->is_coarse.resizeNoCopy(num_kept);
-
-		// ---- Phase 2: the gather, into the offsets the prefix sum just fixed. ----
-		if(num_kept > 0)
-		{
-			glare::TaskGroupRef group = new glare::TaskGroup();
-			for(size_t c=0; c<chunks.size(); ++c)
-			{
-				const GaussianSplatUnculledFrontier& seg = *segs[chunks[c].seg_idx];
-				Reference<GsSatCompactTask> t = new GsSatCompactTask();
-				t->in_indices = seg.indices.data(); t->in_px = seg.px.data(); t->in_py = seg.py.data();
-				t->in_pz = seg.pz.data(); t->in_radius = seg.radius.data(); t->in_is_coarse = seg.is_coarse.data();
-				t->out_indices = uf2->indices.data(); t->out_px = uf2->px.data(); t->out_py = uf2->py.data();
-				t->out_pz = uf2->pz.data(); t->out_radius = uf2->radius.data(); t->out_is_coarse = uf2->is_coarse.data();
-				t->keep_mask = keep_mask.data() + chunks[c].mask_base;
-				t->chunk = &chunks[c];
-				if(task_manager != NULL) group->tasks.push_back(t); else t->run(0);
-			}
-			if(task_manager != NULL) task_manager->runTaskGroup(group);
-		}
-
-		// SESSION085: the size of what this apply READ, so the pruned copy still knows the LoD stage's output - see the
-		// field. `n` already spans both of the source's segments, which uf2 itself no longer has (the compaction above
-		// flattens near + far_block into one array).
-		uf2->pre_sat_n = n;
-
-		uf2->sat_num_tested = num_tested;
-		uf2->sat_num_dropped = num_dropped;
-		uf2->sat_num_dropped_aggr = num_dropped_aggr;
-		uf2->sat_ratio_ne = ratio_ne; // SESSION085 PLAN ETAP 2/4 DIAGNOSTIC.
-		uf2->sat_min_ratio_used = min_ratio_sq > 0.f ? std::sqrt(min_ratio_sq) : 1.f; // SESSION085: back to the linear ratio the UI shows.
-		for(int b=0; b<6; ++b) uf2->sat_ratio_hist[b] = ratio_hist[b];
-		uf2->sat_test_ms = sat_test_timer.elapsed() * 1.0e3;
-		sat_phase_scope.sample();
-		uf2->sat_concurrency_on_entry = sat_phase_scope.on_entry;
-		uf2->sat_concurrency_peak = sat_phase_scope.peak;
-
-		Reference<GaussianSplatSaturationApplyResultMsg> msg = new GaussianSplatSaturationApplyResultMsg();
-		msg->cloud_id = cloud_id;
-		msg->topology_generation = topology_generation;
-		msg->source_frontier = source_frontier;
-		msg->barrier_used = barrier;
-		msg->pruned_frontier = uf2;
-		result_queue->enqueue(msg);
-	}
-
-	uint64 cloud_id, topology_generation;
-	Reference<GaussianSplatUnculledFrontier> source_frontier; // The cloud's last_unpruned_ufrontier at kick time - its own arrays + far_block, same segment shape GaussianSplatSaturationBuildTask enumerates.
-	Reference<GaussianSplatSaturationBarrier> barrier;         // The cloud's cached_sat_barrier at kick time.
-	GaussianSplatSatPrefilterMode prefilter_mode;               // Drop prunes; Count only tallies (matches the old inline behaviour).
-	bool diag_log; // SESSION085 PLAN ETAP 2/4 DIAGNOSTIC, TEMPORARY: the "diag" checkbox, gating the graded-read counters - see GsSatTestTask::ratio_diag.
-	float min_ratio_sq; // SESSION085: the depth margin, already squared - see GaussianSplatRenderer::getSatMinRatio().
-	glare::TaskManager* task_manager;
-	ThreadSafeQueue<Reference<ThreadMessage> >* result_queue;
-};
 
 
 class GaussianSplatLodTraversalTask : public glare::Task
@@ -2172,8 +1762,7 @@ public:
 		bool sort_staleness_diag_enabled_ = false,
 		float reuse_split_dist_ = 0.f, // SESSION080 STEP B: 0 = walk the whole tree, the pre-session080 behaviour - see GaussianSplatRenderer::getFrontierReuseSplitDist() and reuse_enabled below.
 		const Reference<GaussianSplatSaturationBarrier>& sat_barrier_ = Reference<GaussianSplatSaturationBarrier>(), // SESSION085 ETAP 3: the cloud's barrier at kick time, for the LoD bias. Null (the default) leaves the bias off, so every existing call site is unaffected.
-		float sat_bias_ceiling_ = 1.f, // SESSION085 ETAP 3: 1 = off - see GaussianSplatRenderer::getSatBiasCeiling().
-		bool draw_unpruned_frontier_ = true) // SESSION081: true = install this frontier for drawing unconditionally (the session076 behaviour). False installs it only if nothing has been shown for this cloud yet - see the field's comment and drainTraversalResults()'s use of it. No longer means "defers to a same-traversal saturation follow-up" - apply is now a fully separate pipeline, see GaussianSplatSaturationApplyTask.
+		float sat_bias_ceiling_ = 1.f) // SESSION085 ETAP 3: 1 = off - see GaussianSplatRenderer::getSatBiasCeiling().
 	:	cloud_id(cloud_id_), topology_generation(topology_generation_), scratch(scratch_), cam_pos_ws(cam_pos_ws_),
 		pixel_scale_limit(pixel_scale_limit_), max_splats_budget(max_splats_budget_), max_layer_density(max_layer_density_), max_tree_depth(max_tree_depth_), focal_px(focal_px_),
 		num_frustum_clip_planes(num_frustum_clip_planes_), frustum_cull_enabled(frustum_cull_enabled_),
@@ -2184,14 +1773,13 @@ public:
 		coarse_floor_enabled(coarse_floor_enabled_), coarse_pixel_scale(coarse_pixel_scale_),
 		dist_clamp_enabled(dist_clamp_enabled_), dist_clamp_min(dist_clamp_min_), dist_clamp_max(dist_clamp_max_), dist_clamp_invert(dist_clamp_invert_),
 		sat_diag_log(sat_diag_log_), coarse_layer_drawn(coarse_layer_drawn_),
-		draw_unpruned_frontier(draw_unpruned_frontier_), // SESSION081
 		task_manager(task_manager_), // SESSION079
 		expand_seeds(0), expand_num_tasks(0), expand_prologue_ms(0.0), expand_task_max_ms(0.0), expand_task_sum_ms(0.0), // SESSION080 DIAGNOSTIC
 		expand_splice_reserve_ms(0.0), expand_splice_copy_ms(0.0), // SESSION080 DIAGNOSTIC (plan2 §4.1)
 		prev_frontier(prev_frontier_), sort_staleness_diag_enabled(sort_staleness_diag_enabled_), // SESSION080 DIAGNOSTIC
 		sat_barrier(sat_barrier_), sat_bias_ceiling(sat_bias_ceiling_), // SESSION085 ETAP 3
 		// Precomputed here, not per node: the DFS asks this millions of times. A barrier with sat_grid_res 0 is the "no
-		// grid" convention (stage off, or nothing saturated), and gsSatOccluded() would return false for every node anyway.
+		// grid" convention (nothing saturated, or no barrier yet), and the bias would be inert for every node anyway.
 		sat_bias_active(sat_bias_ceiling_ > 1.f && sat_barrier_.nonNull() && sat_barrier_->sat_grid_res != 0),
 		reuse_enabled(false), far_cut_is_frozen(false), reuse_prev_anchor_ws(0.f), reuse_split_dist(0.f) // SESSION080 §4.3 - derived below.
 	{
@@ -2567,8 +2155,6 @@ public:
 				uf->reuse_roots = diag_reuse_roots; // SESSION080 §4.3 DIAGNOSTIC: subtrees the walk stopped at, or marked as the block's.
 				uf->reuse_n = uf->far_block.nonNull() ? uf->far_block->indices.size() : 0;
 				// SESSION085: this frontier's own size, both segments - see the field. Nothing has pruned it yet, so the
-				// "before saturation" figure IS its size; a later apply overwrites this with the size of whatever it read.
-				uf->pre_sat_n = near_n + uf->reuse_n;
 				uf->reuse_ms = reuse_ms_accum; // Partition + the far SoA build, i.e. what BUILDING a block costs. 0 when one was inherited - which is the whole point of §4.3.
 				uf->reuse_split_dist_used = reuse_enabled ? reuse_split_dist : 0.f;
 				// SESSION080 §4.3: the frozen anchor the far block's cut was made at, carried so the next traversal can measure
@@ -2583,17 +2169,10 @@ public:
 			// tree walk is what the picture is waiting on, and the saturation grid + its prune were adding ~300ms to that
 			// wait for a result that only ever REMOVES nodes. Sending the unpruned frontier first means the camera's new
 			// viewpoint is on screen at DFS-only latency, and the prune arrives afterwards as a refinement.
-			//
-			// Why this cannot show holes: the saturation stage only ever drops nodes, so the unpruned frontier is a strict
-			// superset of the pruned one - the intermediate state costs extra splats for a few hundred ms, never missing
-			// ones. That is exactly the state the owner already runs (and calls smooth) with the stage switched off.
-			// SESSION081: whether this frontier gets INSTALLED for drawing (as opposed to just being available as the
-			// saturation pipeline's source and the reuse/staleness diagnostics' input) is no longer decided here. It used
-			// to depend on whether a same-traversal saturation follow-up was coming (a promise this worker thread could
-			// reason about); now that apply is a fully separate, independently-throttled pipeline (see
-			// GaussianSplatSaturationApplyTask), there is no such promise to make or keep from inside a traversal task.
-			// drainTraversalResults() decides instead, on the main thread, from the LIVE draw_unpruned_frontier setting
-			// and whatever the cloud currently has on screen - see its own comment at the install site.
+			// SESSION085 ETAP 6: nothing follows a traversal any more. The saturation prune that used to arrive later as a
+			// refinement - and the "is it safe to draw the unpruned frontier meanwhile?" question that came with it - are
+			// gone: the barrier is applied as an LoD bias DURING this walk, so what is published here is already the
+			// saturated selection. drainTraversalResults() installs it unconditionally.
 			result_queue->enqueue(msg);
 
 			// SESSION080 DIAGNOSTIC (plan doc STEP A): how far this frontier's front-to-back order has moved since the
@@ -3297,7 +2876,6 @@ private:
 	bool dist_clamp_invert;
 	bool sat_diag_log;               // SESSION076 DIAGNOSTIC: see the ctor param.
 	bool coarse_layer_drawn;         // SESSION076: see the ctor param.
-	bool draw_unpruned_frontier;  // SESSION081: see the ctor param.
 
 	// SESSION085 ETAP 3 - the saturation LoD bias. The barrier the cloud had at kick time (may be NULL: a cloud's first
 	// traversal, or the stage off), used READ-ONLY and immutable once built, so sharing it with a worker is safe.
@@ -3392,9 +2970,9 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	filter_dilation_latency(0.2f), filter_min_rot_rate_deg_per_s(50.f), filter_max_rot_rate_deg_per_s(200.f), filter_min_trans_rate_m_per_s(2.0f), // SESSION063 K3, SESSION072, SESSION079 - see above.
 	split_coarse_floor_enabled(true), split_coarse_pixel_scale(30.f), filter_coarse_dilation_latency(0.9f), coarse_layer_debug(false), // SESSION063 K4
 	filter_debug_log(false), kick_debug_log(false), cpu_prof_log(false), // SESSION072: default off - see getFilterDebugLog()'s comment.
-	sat_prefilter_mode(GaussianSplatSatPrefilterMode_Off), filter_frustum_planes_enabled(true), // SESSION074: stage off by default, frustum planes on (i.e. unchanged pipeline) - see getSatPrefilterMode()/getFilterFrustumPlanesEnabled().
+	filter_frustum_planes_enabled(true), // SESSION074 - see getFilterFrustumPlanesEnabled().
 	sat_prefilter_threshold(0.98f), // SESSION079 - see getSatPrefilterThreshold().
-	sat_diag_log(false), sat_debug_overlay_mode(GaussianSplatSatDebugOverlayMode_Off), sat_grid_subdiv(0.3f), sat_region_radius(0.f), sat_region_closing_tiles(0), sat_min_ratio(1.f), sat_bias_ceiling(1.f), draw_unpruned_frontier(true), // SESSION076/078/081: diagnostics off by default - see getSatDiagLog()/getSatDebugOverlayMode(). Calibration defaults are the values reasoned to on paper, not yet confirmed on a scene. draw_unpruned_frontier defaults to the session076 publish-early behaviour.
+	sat_diag_log(false), sat_debug_overlay_mode(GaussianSplatSatDebugOverlayMode_Off), sat_grid_subdiv(0.3f), sat_region_radius(0.f), sat_region_closing_tiles(0), sat_bias_ceiling(1.f), // SESSION076/078/081: diagnostics off by default - see getSatDiagLog()/getSatDebugOverlayMode(). SESSION085 ETAP 6: sat_bias_ceiling 1 = the LoD bias off, i.e. the pre-bias behaviour; the calibrated value is still owner-selected rather than a default.
 	frontier_reuse_split_dist(0.f), // SESSION080 STEP B: off by default - 0 is the pre-session080 walk-everything behaviour, bit-for-bit. See getFrontierReuseSplitDist().
 	splat_point_size_px(1.f),
 	splat_merge_spread_widen(3.0f), // SESSION071: analytic minimum is sqrt(3) (see widenedMergedScale()); owner default set higher for extra margin.
@@ -4414,7 +3992,6 @@ GaussianSplatRenderer::FrustumCounts GaussianSplatRenderer::countSplatsInFrustum
 	result.in_frustum = 0;
 	result.total = 0;
 	result.frontier = 0;
-	result.after_sat = 0; // SESSION085
 	result.drawn = 0;
 	result.visible = 0;
 	for(size_t c=0; c<clouds.size(); ++c)
@@ -4456,15 +4033,14 @@ GaussianSplatRenderer::FrustumCounts GaussianSplatRenderer::countSplatsInFrustum
 
 		result.total += cloud.total_splats; // Leaves + merged internal nodes - matches what the traversal iterates over.
 
-		// SESSION085: the two frontier stages, both read off the ONE frontier the cloud currently holds - see FrustumCounts.
-		// Whether that is the traversal's own output or an apply's pruned copy, pre_sat_n is the LoD stage's figure and the
-		// array length (both segments) is the saturation stage's, so the pair reads the same way in either state. Both are
-		// 0 for a cloud with nothing cached yet, and equal to each other while the saturation stage is off.
+		// SESSION085 ETAP 6: ONE frontier stage again. There used to be two - before and after the saturation prune - but
+		// the barrier is applied during the walk now, so the frontier a traversal produces is already the saturated one and
+		// a separate "after saturation" figure would just repeat this number. Both segments, since reuse splits a frontier
+		// into near + inherited far. 0 for a cloud with nothing cached yet.
 		if(cloud.cached_ufrontier.nonNull())
 		{
 			const GaussianSplatUnculledFrontier& uf = *cloud.cached_ufrontier;
-			result.frontier += uf.pre_sat_n;
-			result.after_sat += uf.indices.size() + (uf.far_block.nonNull() ? uf.far_block->indices.size() : 0);
+			result.frontier += uf.indices.size() + (uf.far_block.nonNull() ? uf.far_block->indices.size() : 0);
 		}
 
 		result.drawn += (size_t)myMax(0, cloud.ob->num_instances_to_draw); // SESSION066: the live LoD draw list S(P,R) size - the pre-slice, dilation-band-inclusive selection the pixel_scale limit / camera position pick this frame.
@@ -6701,26 +6277,6 @@ static void bakeMember(SplatCloud& cloud, CloudMember& member, const GaussianSpl
 }
 
 
-// SESSION074 - see the declaration's comment for why this can't be an inline assignment.
-void GaussianSplatRenderer::setSatPrefilterMode(GaussianSplatSatPrefilterMode v)
-{
-	if(v == sat_prefilter_mode)
-		return;
-	sat_prefilter_mode = v;
-
-	// Drop every cached frontier so the next kickOffTraversals() rebuilds one under the new setting. Clearing the
-	// Reference is enough: the in-flight traversal (if any) still holds its own, and drainTraversalResults() adopts
-	// whatever lands next regardless. Nothing is drawn from U(P) directly - the live draw list is the last filter's
-	// survivors, which keeps rendering untouched until the fresh frontier's own filter lands, exactly as it does after
-	// any other traversal.
-	for(size_t i=0; i<clouds.size(); ++i)
-	{
-		clouds[i]->cached_ufrontier = NULL;
-		clouds[i]->have_last_traversal_cam_pos = false; // Makes this cloud unconditionally overdue - see kickOffTraversals()'s "first" reason.
-	}
-}
-
-
 // SESSION079: same reasoning as setSatPrefilterMode() just above - the verdict is baked into U(P) at traversal time,
 // so a live change needs a fresh traversal forced. See getSatPrefilterThreshold().
 void GaussianSplatRenderer::setSatPrefilterThreshold(float v)
@@ -6896,30 +6452,6 @@ void GaussianSplatRenderer::setSatBiasCeiling(float v)
 		clouds[i]->cached_ufrontier = NULL;
 		clouds[i]->have_last_traversal_cam_pos = false;
 	}
-}
-
-
-void GaussianSplatRenderer::setSatMinRatio(float v)
-{
-	if(v == sat_min_ratio)
-		return;
-	sat_min_ratio = v;
-
-	for(size_t i=0; i<clouds.size(); ++i)
-	{
-		clouds[i]->last_apply_source_built_time_s = 0.0;
-		clouds[i]->last_apply_barrier_built_time_s = 0.0;
-	}
-}
-
-
-// SESSION081: unlike the setters above, this changes only WHICH of a traversal's two results is drawn, never what a
-// traversal produces - so cached frontiers stay valid and are deliberately NOT dropped. Turning it off mid-walk simply
-// means the next traversal's unpruned frontier is not installed; turning it back on means the one after that is. That
-// makes it an A/B switch that can be flipped while walking without a reload, which is the whole point of it.
-void GaussianSplatRenderer::setDrawUnprunedFrontier(bool v)
-{
-	draw_unpruned_frontier = v;
 }
 
 
@@ -8158,102 +7690,6 @@ void GaussianSplatRenderer::drainSaturationBuildResults()
 }
 
 
-// SESSION081: applies a finished saturation APPLY to its cloud - see GaussianSplatSaturationApplyTask and
-// kickOffSaturationApplies(). The freshness check here is intentionally NOT identity-based any more (contrast
-// drainSaturationBuildResults() above, which never needed one): with apply capped at one in flight per cloud
-// (SplatCloud::sat_apply_in_flight), results for one cloud always land in the same order they were kicked, so a
-// stricter "is this still THE newest thing" check is not protecting against reordering - reordering cannot happen.
-// What it WOULD still protect against is a fresher frontier having been installed by something else entirely (the
-// traversal side's own draw_unpruned_frontier install) while this apply was in flight - and for that, "not older than
-// what's currently shown" (compared by built_time_real_s, already stamped on every frontier for the anchor_age
-// diagnostic) is the correct, and correctly weaker, test: accepting a result that is fresh but not literally the
-// newest object can only ever move the picture FORWARD in camera-position time relative to what is on screen, never
-// back to something staler - the one thing the original identity check existed to prevent (session053's
-// "top-layer-peeled" hole). See the message class's own comment for the fuller argument.
-void GaussianSplatRenderer::drainSaturationApplyResults()
-{
-	sat_apply_result_queue.dequeueAnyQueuedItems(completed_sat_apply_msgs);
-
-	for(size_t i=0; i<completed_sat_apply_msgs.size(); ++i)
-	{
-		const GaussianSplatSaturationApplyResultMsg* const msg = static_cast<const GaussianSplatSaturationApplyResultMsg*>(completed_sat_apply_msgs[i].ptr());
-
-		SplatCloud* cloud = NULL;
-		for(size_t c=0; c<clouds.size(); ++c)
-			if(clouds[c]->cloud_id == msg->cloud_id)
-			{
-				cloud = clouds[c].ptr();
-				break;
-			}
-		if(!cloud)
-			continue;
-
-		cloud->sat_apply_in_flight = false; // Unconditional bookkeeping, same rule every other drain in this file follows.
-
-		if(msg->topology_generation != cloud->topology_generation)
-			continue; // Structural change invalidated the frontier this was computed from.
-
-		const bool fresh_enough = cloud->cached_ufrontier.isNull() || msg->pruned_frontier->built_time_real_s >= cloud->cached_ufrontier->built_time_real_s;
-		if(fresh_enough)
-		{
-			cloud->cached_ufrontier = msg->pruned_frontier;
-			cloud->ufrontier_needs_filter = true; // Re-filter against the pruned frontier; until that lands the previous S(P,R) keeps drawing.
-
-			// SESSION074/076/080/081 DIAGNOSTIC: the APPLY stage's own numbers - what testing THIS frontier against its
-			// barrier cost and found. The BUILD-side numbers (thr=/sub=/R=/occl=/gather_ms=/grid_ms=/etc) print
-			// separately from drainSaturationBuildResults()'s [gsr-sat-build] - the two are independently-paced events.
-			//
-			// anchor_age/anchor_dist: how stale is the BARRIER this prune enforces, at the moment the prune takes
-			// effect - msg->barrier_used->anchor_pos_ws is where the barrier was built, not where the source frontier's
-			// own traversal ran. If the camera has since moved, this says by how much and for how long (the ball
-			// guarantee bounds this as long as anchor_dist stays under R).
-			if(filter_debug_log)
-			{
-				const GaussianSplatUnculledFrontier& uf = *msg->pruned_frontier;
-				const OpenGLScene* const cur_scene = opengl_engine->getCurrentScene();
-				if(cur_scene != NULL && msg->barrier_used.nonNull())
-				{
-					const Vec4f cam_pos_now_ws = cur_scene->cam_to_world.getColumn(3);
-					const float anchor_dist_m = cam_pos_now_ws.getDist(msg->barrier_used->anchor_pos_ws);
-					const double anchor_age_ms = (Clock::getCurTimeRealSec() - msg->barrier_used->built_time_real_s) * 1.0e3;
-					const double tested = (double)uf.sat_num_tested;
-					conPrint("[gsr-sat-apply] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms anchor_age=" +
-						doubleToStringNDecimalPlaces(anchor_age_ms, 1) + "ms anchor_dist=" + doubleToStringNDecimalPlaces(anchor_dist_m, 3) + "m" +
-						" test_ms=" + doubleToStringNDecimalPlaces(uf.sat_test_ms, 2) +
-						" sat_conc=" + uInt64ToStringCommaSeparated(uf.sat_concurrency_on_entry) + // SESSION080 DIAGNOSTIC: how many APPLY phases shared the pool with this one - peak=1 means this one had it to itself.
-						" sat_conc_peak=" + uInt64ToStringCommaSeparated(uf.sat_concurrency_peak) +
-						" tested=" + uInt64ToStringCommaSeparated(uf.sat_num_tested) +
-						" minR=" + doubleToStringNDecimalPlaces(uf.sat_min_ratio_used, 2) + // SESSION085 - see getSatMinRatio().
-						" dropped=" + uInt64ToStringCommaSeparated(uf.sat_num_dropped) +
-						" (" + doubleToStringNDecimalPlaces(tested > 0 ? (100.0 * (double)uf.sat_num_dropped / tested) : 0.0, 1) + "%)" +
-						" aggr=" + uInt64ToStringCommaSeparated(uf.sat_num_dropped_aggr) + // Deliberately-wrong upper bound, not a real verdict - see gsSatOccluded()'s out_aggressive.
-						" (" + doubleToStringNDecimalPlaces(tested > 0 ? (100.0 * (double)uf.sat_num_dropped_aggr / tested) : 0.0, 1) + "%)" +
-						" pool_after=" + uInt64ToStringCommaSeparated(uf.indices.size())); // The pruned frontier every later filter kick streams - the whole point of pruning here.
-
-					// SESSION085 PLAN ETAP 2/4 DIAGNOSTIC, TEMPORARY - see GaussianSplatUnculledFrontier::sat_ratio_ne.
-					// Own line rather than more fields on the one above, because it is filled only under "diag" while that
-					// line prints whenever the filter log is on - folding them would make a captured line's meaning depend
-					// on a checkbox it does not mention.
-					if(sat_diag_log)
-					{
-						const double dropped_d = (double)uf.sat_num_dropped;
-						std::string hist;
-						const char* const bucket_name[6] = { "1-1.25", "1.25-1.5", "1.5-2", "2-3", "3-5", "5+" };
-						for(int b=0; b<6; ++b)
-							hist += std::string(" ") + bucket_name[b] + "=" +
-								doubleToStringNDecimalPlaces(dropped_d > 0 ? (100.0 * (double)uf.sat_ratio_hist[b] / dropped_d) : 0.0, 1) + "%";
-						conPrint("[gsr-sat-ratio] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms" +
-							" ratio_ne=" + uInt64ToStringCommaSeparated(uf.sat_ratio_ne) + // Must be ~0: see gsSatOccluded()'s header on the rounding sliver.
-							" of dropped=" + uInt64ToStringCommaSeparated(uf.sat_num_dropped) +
-							" | depth behind barrier:" + hist);
-					}
-				}
-			}
-		}
-		else if(filter_debug_log)
-			conPrint("[gsr-sat-apply] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms DISCARDED (a fresher frontier was installed while this apply ran)");
-	}
-}
 
 
 void GaussianSplatRenderer::drainTraversalResults()
@@ -8303,29 +7739,13 @@ void GaussianSplatRenderer::drainTraversalResults()
 		// are still copied out - the scratch is about to return to the pool.
 		if(split_filter_enabled && msg->unculled_frontier.nonNull())
 		{
-			// SESSION081: with "draw unpruned" off, this frontier is held back from the screen so the previous PRUNED
-			// frontier keeps drawing until an apply catches up with a fresher one - but ONLY when an apply is actually
-			// going to arrive. apply_will_refine is that condition, and all three of its parts are load-bearing: the
-			// stage has to be on, a barrier has to already exist, and it has to be a real one (sat_grid_res > 0, i.e.
-			// not the "no occluders" empty barrier). Without this check the picture FREEZES in the configuration
-			// "draw unpruned off + saturation off": nothing would ever install again after the first frontier, because
-			// the apply pipeline that was supposed to do the installing never runs. (The pre-session081 code got this
-			// right via defer_to_saturation, which carried the same three-part condition; it was lost when that field
-			// was removed with the traversal's own saturation phase.)
-			//
-			// draw_unpruned_frontier and the barrier are read LIVE here rather than snapshotted at kick time: apply is
-			// now a fully separate pipeline, so nothing depends on this traversal's own view of either, and reading
-			// them now is what makes flipping the checkbox mid-walk take effect on the very next traversal.
-			//
-			// Everything else in this branch runs regardless of the decision: the frontier is real, it is the
-			// saturation pipelines' and reuse's source, and its [gsr-traversal] numbers are complete either way.
-			const bool apply_will_refine = (sat_prefilter_mode != GaussianSplatSatPrefilterMode_Off) &&
-				cloud->cached_sat_barrier.nonNull() && cloud->cached_sat_barrier->sat_grid_res > 0;
-			if(draw_unpruned_frontier || !apply_will_refine || cloud->cached_ufrontier.isNull())
-			{
-				cloud->cached_ufrontier = msg->unculled_frontier;
-				cloud->ufrontier_needs_filter = true; // Produce the first S(P,R) for this fresh U(P) even with no rotation.
-			}
+			// SESSION085 ETAP 6: unconditional. This used to defer installing a fresh frontier when a saturation APPLY was
+			// about to replace it with a pruned copy - the "draw unpruned" question. With the prune gone there is no
+			// follow-up to wait for: what a traversal produces IS what gets drawn, already biased by the barrier during the
+			// walk itself. That is the latency win the plan's etap 0 identified, arriving as a structural simplification
+			// rather than as an optimisation.
+			cloud->cached_ufrontier = msg->unculled_frontier;
+			cloud->ufrontier_needs_filter = true; // Produce the first S(P,R) for this fresh U(P) even with no rotation.
 
 			// SESSION080: this branch is the only place the UNPRUNED frontier is ever seen - a saturation apply
 			// overwrites cached_ufrontier with its pruned copy once it lands - so it is the only place the "previous
@@ -8339,8 +7759,7 @@ void GaussianSplatRenderer::drainTraversalResults()
 			// SESSION085 ETAP 3: the bias is a third consumer - see kickOffSaturationBuilds(). The barrier build still
 			// requires a source frontier to exist (it reports occl= against frontier_n), so without this the bias-only
 			// configuration would drop the source here and then never get a barrier built at all.
-			const bool sat_wants_source = (sat_prefilter_mode != GaussianSplatSatPrefilterMode_Off) ||
-				(sat_debug_overlay_mode != GaussianSplatSatDebugOverlayMode_Off) || (sat_bias_ceiling > 1.f);
+			const bool sat_wants_source = (sat_debug_overlay_mode != GaussianSplatSatDebugOverlayMode_Off) || (sat_bias_ceiling > 1.f);
 			cloud->last_unpruned_ufrontier = (sat_diag_log || frontier_reuse_split_dist > 0.f || sat_wants_source) ?
 				msg->unculled_frontier : Reference<GaussianSplatUnculledFrontier>();
 
@@ -8746,8 +8165,7 @@ void GaussianSplatRenderer::kickOffSaturationBuilds()
 	// nothing" rather than as "was never given a barrier". That is exactly the failure session075 hit with the coarse
 	// floor (one flag conflating "capture it" with "draw it"), and it cost a wasted arm of the session085 occluder
 	// comparison when the same shape appeared again there.
-	const bool sat_wanted = (sat_prefilter_mode != GaussianSplatSatPrefilterMode_Off) ||
-		(sat_debug_overlay_mode != GaussianSplatSatDebugOverlayMode_Off) ||
+	const bool sat_wanted = (sat_debug_overlay_mode != GaussianSplatSatDebugOverlayMode_Off) ||
 		(sat_bias_ceiling > 1.f); // SESSION085 ETAP 3 - see getSatBiasCeiling().
 	if(!sat_wanted)
 		return;
@@ -8819,58 +8237,6 @@ void GaussianSplatRenderer::kickOffSaturationBuilds()
 }
 
 
-// SESSION081: kicks a GaussianSplatSaturationApplyTask for any cloud with something new to test - a source frontier
-// or a barrier the cloud's last apply attempt has not already been kicked against. This is the throttle: with at
-// most one apply in flight per cloud (sat_apply_in_flight), and a new kick only firing when the (source, barrier)
-// pair has actually changed since the LAST KICK (not the last completion), a burst of traversals landing while one
-// apply is still computing does not queue up more work - the next apply, once this one finishes, simply picks up
-// whatever is the latest pair by then, skipping every intermediate one for free. See the class comment on
-// GaussianSplatSaturationApplyTask for the measured cost this removes (pool contention with concurrent traversals).
-void GaussianSplatRenderer::kickOffSaturationApplies()
-{
-	glare::TaskManager* const task_manager = opengl_engine->getMainTaskManager();
-	if(task_manager == NULL)
-		return;
-
-	if(sat_prefilter_mode == GaussianSplatSatPrefilterMode_Off)
-		return;
-
-	for(size_t i=0; i<clouds.size(); ++i)
-	{
-		SplatCloud& cloud = *clouds[i];
-		if(cloud.total_splats == 0 || cloud.sat_apply_in_flight)
-			continue;
-		if(cloud.last_unpruned_ufrontier.isNull() || cloud.last_unpruned_ufrontier->topology_generation != cloud.topology_generation)
-			continue; // Nothing to test yet, or what we have predates a structural change.
-		if(cloud.cached_sat_barrier.isNull() || cloud.cached_sat_barrier->sat_grid_res == 0)
-			continue; // No barrier built yet for this cloud - see kickOffSaturationBuilds().
-
-		// Throttle: skip if the (source, barrier) pair is exactly what the last KICK already used - nothing new to
-		// test. Comparing the pair, not just one half, matters: the source can advance without the barrier changing
-		// (camera still inside the R-ball) or vice versa (a knob-driven rebuild while standing still), and either one
-		// changing alone is real new information worth another apply. Identified by build timestamp rather than by
-		// pointer - see the fields' comment on SplatCloud for why.
-		if(cloud.last_apply_source_built_time_s == cloud.last_unpruned_ufrontier->built_time_real_s &&
-			cloud.last_apply_barrier_built_time_s == cloud.cached_sat_barrier->built_time_real_s)
-			continue;
-
-		Reference<GaussianSplatSaturationApplyTask> t = new GaussianSplatSaturationApplyTask();
-		t->cloud_id = cloud.cloud_id;
-		t->topology_generation = cloud.topology_generation;
-		t->source_frontier = cloud.last_unpruned_ufrontier;
-		t->barrier = cloud.cached_sat_barrier;
-		t->prefilter_mode = sat_prefilter_mode;
-		t->diag_log = sat_diag_log; // SESSION085 PLAN ETAP 2/4 DIAGNOSTIC.
-		t->min_ratio_sq = sat_min_ratio * sat_min_ratio; // SESSION085: squared once here, not per node - see getSatMinRatio().
-		t->task_manager = task_manager;
-		t->result_queue = &sat_apply_result_queue;
-
-		cloud.sat_apply_in_flight = true;
-		cloud.last_apply_source_built_time_s = cloud.last_unpruned_ufrontier->built_time_real_s;
-		cloud.last_apply_barrier_built_time_s = cloud.cached_sat_barrier->built_time_real_s;
-		task_manager->addTask(t);
-	}
-}
 
 
 void GaussianSplatRenderer::kickOffTraversals()
@@ -9128,8 +8494,7 @@ void GaussianSplatRenderer::kickOffTraversals()
 			// SESSION085 ETAP 3: the cloud's current barrier, for the LoD bias. One build behind by construction - the same
 			// staleness the apply stage already lives with - and null on a cloud's first kick, which leaves the bias off.
 			/*sat_barrier=*/best_cloud->cached_sat_barrier,
-			/*sat_bias_ceiling=*/sat_bias_ceiling, // SESSION085 ETAP 3 - see getSatBiasCeiling(). 1 = off.
-			/*draw_unpruned_frontier=*/draw_unpruned_frontier)); // SESSION081 - see getDrawUnprunedFrontier(). true = publish-early, the session076 behaviour.
+			/*sat_bias_ceiling=*/sat_bias_ceiling)); // SESSION085 ETAP 3 - see getSatBiasCeiling(). 1 = off.
 	}
 
 	// SESSION055 diag: after the while-loop, detect *unmet* rotation demand - a cloud whose forward has shifted past the
@@ -9261,7 +8626,6 @@ void GaussianSplatRenderer::think()
 	// here on the main thread rather than in the worker tasks.
 	drainSortResults();
 	drainSaturationBuildResults(); // SESSION081: independent of the traversal pipeline - see kickOffSaturationBuilds().
-	drainSaturationApplyResults(); // SESSION081: independent of both the traversal and the build pipeline - see kickOffSaturationApplies().
 	drainTraversalResults();
 	drainFilterResults(); // SESSION063: apply completed per-orientation filters (split architecture).
 
@@ -9429,7 +8793,6 @@ void GaussianSplatRenderer::think()
 
 	kickOffSorts();
 	kickOffSaturationBuilds(); // SESSION081: independent cadence - see the function's own comment. Before apply so a build that just landed this frame can be picked up immediately.
-	kickOffSaturationApplies(); // SESSION081: independent cadence - see the function's own comment.
 	kickOffTraversals();
 	kickOffFilters(); // SESSION063: derive S(P,R) from cached U(P) on rotation / after a fresh U(P) (split architecture).
 }

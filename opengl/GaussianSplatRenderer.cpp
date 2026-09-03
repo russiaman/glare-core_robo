@@ -265,6 +265,7 @@ public:
 	// above 1 means no bias function can achieve much, whatever its shape).
 	size_t sat_ratio_ne;
 	size_t sat_ratio_hist[6];
+	float sat_min_ratio_used; // SESSION085: the depth margin THIS prune was made with, not the live setting - same reason the barrier records thr=/sub=/R=: a captured log line has to say what produced it.
 	// SESSION080 DIAGNOSTIC: how many traversals were inside their apply phase when this one entered its own (on_entry
 	// counts the OTHERS, so 0 means it had the stage to itself), and the most that were running at any point while it
 	// was there - see gs_sat_phases_running. test_ms below is only readable against these two: it is wall-clock on a
@@ -431,7 +432,7 @@ public:
 
 	GaussianSplatUnculledFrontier() // SESSION074: defaults are "stage never ran".
 	:	sat_num_tested(0), sat_num_dropped(0), sat_num_dropped_aggr(0),
-		sat_ratio_ne(0), // SESSION085 PLAN ETAP 2/4 DIAGNOSTIC - the array is zeroed in the body below.
+		sat_ratio_ne(0), sat_min_ratio_used(1.f), // SESSION085 - the hist array is zeroed in the body below.
 		sat_concurrency_on_entry(0), sat_concurrency_peak(0), // SESSION080 DIAGNOSTIC
 		sat_test_ms(0.0),
 		built_time_real_s(0.0), // SESSION080
@@ -1406,7 +1407,7 @@ public:
 				bool aggr = false;
 				float ratio_sq = 0.f;
 				drop = gsSatOccluded(Vec4f(dx, dy, dz, 0.f), dx*dx + dy*dy + dz*dz, radius[i],
-					*sat_depth, res, region_radius, &aggr, ratio_diag ? &ratio_sq : NULL); // SESSION078, SESSION085
+					*sat_depth, res, region_radius, min_ratio_sq, &aggr, ratio_diag ? &ratio_sq : NULL); // SESSION078, SESSION085
 				++tested;
 				if(drop) ++dropped;
 				if(aggr) ++dropped_aggr;
@@ -1451,6 +1452,7 @@ public:
 	float region_radius;
 	bool prune;
 	bool ratio_diag; // SESSION085 PLAN ETAP 2/4 DIAGNOSTIC, TEMPORARY - the "diag" checkbox. See run().
+	float min_ratio_sq; // SESSION085: the depth margin, already squared - see gsSatOccluded().
 	uint8* keep_mask;
 	GsSatTestChunk* chunk;
 };
@@ -2044,6 +2046,7 @@ public:
 				t->region_radius = barrier->region_radius_used; // The R this barrier was built with, not the live setting - they can differ.
 				t->prune = prune;
 				t->ratio_diag = diag_log; // SESSION085 PLAN ETAP 2/4 DIAGNOSTIC - see GsSatTestTask::run().
+				t->min_ratio_sq = min_ratio_sq; // SESSION085 - see gsSatOccluded().
 				t->keep_mask = keep_mask.data() + chunks[c].mask_base;
 				t->chunk = &chunks[c];
 				if(task_manager != NULL) group->tasks.push_back(t); else t->run(0);
@@ -2097,6 +2100,7 @@ public:
 		uf2->sat_num_dropped = num_dropped;
 		uf2->sat_num_dropped_aggr = num_dropped_aggr;
 		uf2->sat_ratio_ne = ratio_ne; // SESSION085 PLAN ETAP 2/4 DIAGNOSTIC.
+		uf2->sat_min_ratio_used = min_ratio_sq > 0.f ? std::sqrt(min_ratio_sq) : 1.f; // SESSION085: back to the linear ratio the UI shows.
 		for(int b=0; b<6; ++b) uf2->sat_ratio_hist[b] = ratio_hist[b];
 		uf2->sat_test_ms = sat_test_timer.elapsed() * 1.0e3;
 		sat_phase_scope.sample();
@@ -2117,6 +2121,7 @@ public:
 	Reference<GaussianSplatSaturationBarrier> barrier;         // The cloud's cached_sat_barrier at kick time.
 	GaussianSplatSatPrefilterMode prefilter_mode;               // Drop prunes; Count only tallies (matches the old inline behaviour).
 	bool diag_log; // SESSION085 PLAN ETAP 2/4 DIAGNOSTIC, TEMPORARY: the "diag" checkbox, gating the graded-read counters - see GsSatTestTask::ratio_diag.
+	float min_ratio_sq; // SESSION085: the depth margin, already squared - see GaussianSplatRenderer::getSatMinRatio().
 	glare::TaskManager* task_manager;
 	ThreadSafeQueue<Reference<ThreadMessage> >* result_queue;
 };
@@ -3263,7 +3268,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	filter_debug_log(false), kick_debug_log(false), cpu_prof_log(false), // SESSION072: default off - see getFilterDebugLog()'s comment.
 	sat_prefilter_mode(GaussianSplatSatPrefilterMode_Off), filter_frustum_planes_enabled(true), // SESSION074: stage off by default, frustum planes on (i.e. unchanged pipeline) - see getSatPrefilterMode()/getFilterFrustumPlanesEnabled().
 	sat_prefilter_threshold(0.98f), // SESSION079 - see getSatPrefilterThreshold().
-	sat_diag_log(false), sat_debug_overlay_mode(GaussianSplatSatDebugOverlayMode_Off), sat_grid_subdiv(0.3f), sat_region_radius(0.f), sat_region_closing_tiles(0), draw_unpruned_frontier(true), // SESSION076/078/081: diagnostics off by default - see getSatDiagLog()/getSatDebugOverlayMode(). Calibration defaults are the values reasoned to on paper, not yet confirmed on a scene. draw_unpruned_frontier defaults to the session076 publish-early behaviour.
+	sat_diag_log(false), sat_debug_overlay_mode(GaussianSplatSatDebugOverlayMode_Off), sat_grid_subdiv(0.3f), sat_region_radius(0.f), sat_region_closing_tiles(0), sat_min_ratio(1.f), draw_unpruned_frontier(true), // SESSION076/078/081: diagnostics off by default - see getSatDiagLog()/getSatDebugOverlayMode(). Calibration defaults are the values reasoned to on paper, not yet confirmed on a scene. draw_unpruned_frontier defaults to the session076 publish-early behaviour.
 	frontier_reuse_split_dist(0.f), // SESSION080 STEP B: off by default - 0 is the pre-session080 walk-everything behaviour, bit-for-bit. See getFrontierReuseSplitDist().
 	splat_point_size_px(1.f),
 	splat_merge_spread_widen(3.0f), // SESSION071: analytic minimum is sqrt(3) (see widenedMergedScale()); owner default set higher for extra margin.
@@ -6745,6 +6750,25 @@ void GaussianSplatRenderer::setSatRegionClosingTiles(int v)
 }
 
 
+// SESSION085 - see getSatMinRatio(). Deliberately NOT like the four setters above: this changes only what the APPLY
+// decides, so no barrier and no frontier is invalidated. What it must do instead is clear the apply throttle, which
+// skips a kick whose (source, barrier) pair is the one the last kick already used - without this the knob would
+// appear dead until the camera happened to move, which is exactly the sort of thing that gets mistaken for the
+// mechanism not working.
+void GaussianSplatRenderer::setSatMinRatio(float v)
+{
+	if(v == sat_min_ratio)
+		return;
+	sat_min_ratio = v;
+
+	for(size_t i=0; i<clouds.size(); ++i)
+	{
+		clouds[i]->last_apply_source_built_time_s = 0.0;
+		clouds[i]->last_apply_barrier_built_time_s = 0.0;
+	}
+}
+
+
 // SESSION081: unlike the setters above, this changes only WHICH of a traversal's two results is drawn, never what a
 // traversal produces - so cached frontiers stay valid and are deliberately NOT dropped. Turning it off mid-walk simply
 // means the next traversal's unpruned frontier is not installed; turning it back on means the one after that is. That
@@ -8040,6 +8064,7 @@ void GaussianSplatRenderer::drainSaturationApplyResults()
 						" sat_conc=" + uInt64ToStringCommaSeparated(uf.sat_concurrency_on_entry) + // SESSION080 DIAGNOSTIC: how many APPLY phases shared the pool with this one - peak=1 means this one had it to itself.
 						" sat_conc_peak=" + uInt64ToStringCommaSeparated(uf.sat_concurrency_peak) +
 						" tested=" + uInt64ToStringCommaSeparated(uf.sat_num_tested) +
+						" minR=" + doubleToStringNDecimalPlaces(uf.sat_min_ratio_used, 2) + // SESSION085 - see getSatMinRatio().
 						" dropped=" + uInt64ToStringCommaSeparated(uf.sat_num_dropped) +
 						" (" + doubleToStringNDecimalPlaces(tested > 0 ? (100.0 * (double)uf.sat_num_dropped / tested) : 0.0, 1) + "%)" +
 						" aggr=" + uInt64ToStringCommaSeparated(uf.sat_num_dropped_aggr) + // Deliberately-wrong upper bound, not a real verdict - see gsSatOccluded()'s out_aggressive.
@@ -8662,6 +8687,7 @@ void GaussianSplatRenderer::kickOffSaturationApplies()
 		t->barrier = cloud.cached_sat_barrier;
 		t->prefilter_mode = sat_prefilter_mode;
 		t->diag_log = sat_diag_log; // SESSION085 PLAN ETAP 2/4 DIAGNOSTIC.
+		t->min_ratio_sq = sat_min_ratio * sat_min_ratio; // SESSION085: squared once here, not per node - see getSatMinRatio().
 		t->task_manager = task_manager;
 		t->result_queue = &sat_apply_result_queue;
 

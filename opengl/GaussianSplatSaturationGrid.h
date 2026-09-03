@@ -492,6 +492,18 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 // multiplicative and the ratio is computed only for tiles that already passed it. A caller wanting both must take the
 // bool as the verdict and this as the magnitude; they agree except in that rounding sliver, which [gsr-sat-ratio]
 // counts (ratio_ne=) rather than assumes away.
+// SESSION085, TEMPORARY - THE DEPTH MARGIN. See GaussianSplatRenderer::getSatMinRatio() for the measurements and for
+// why this is not the answer (it is a switch, not a dial, and where it switches is per-scene). Removed at the
+// progressive-saturation plan's etap 6.
+//
+// min_ratio_sq raises the bar a node must clear before it may be dropped: it must sit at least sqrt(min_ratio_sq)
+// TIMES further than the barrier, not merely past it. 1 (the default) is exactly the old behaviour, bit-for-bit - the
+// test below is multiplicative and scaling by 1.0f is exact in IEEE754, so no call site that leaves this alone can
+// change its answer.
+//
+// It is NOT a second region_radius. R widens the claim in metres and, per session080, only ever moved the CANDIDATE's
+// side of the parallax - its angular half was never sound. This scales with the barrier's own distance instead, costs
+// one multiply on a comparison already being made, and needs no sqrt: the caller passes the ratio already squared.
 bool gsSatOccluded(const Vec4f& offset, float dist_sq, float node_radius,
-	const js::Vector<float, 16>& sat_depth, int res, float region_radius, bool* out_aggressive = NULL,
-	float* out_ratio_sq = NULL);
+	const js::Vector<float, 16>& sat_depth, int res, float region_radius, float min_ratio_sq = 1.f,
+	bool* out_aggressive = NULL, float* out_ratio_sq = NULL);

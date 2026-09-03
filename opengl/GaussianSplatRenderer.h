@@ -545,6 +545,43 @@ public:
 	void setSatRegionClosingTiles(int v);
 
 
+	// SESSION085, TEMPORARY - NOT A FEATURE, and to be removed at the progressive-saturation plan's etap 6. It was
+	// built to test one hypothesis cheaply, it answered it, and the answer was that it cannot be the solution. Kept
+	// only so etap 5 can quote a baseline - "what a naive hard margin costs for the same visual outcome" - against
+	// what the LoD bias achieves, without writing it a second time.
+	//
+	// THE DEPTH MARGIN, as a LINEAR ratio (this squares it for gsSatOccluded()). A node is dropped only if it sits at
+	// least this many TIMES further than the barrier, not merely past it. 1 = off, the old behaviour bit-for-bit.
+	//
+	// The hypothesis: holes on a moving camera are the BOUNDARY population. The barrier is anchored, so a viewpoint
+	// change perturbs the nodes nearest it and few others; session085's ratio histogram ([gsr-sat-ratio]) showed that
+	// population is also the cheapest to give up where pruning pays - in occluded interiors 54-58% of drops sit beyond
+	// 5x the barrier and only 5.7-7.5% inside 1.25x. An open viewpoint inverts that (44% inside 1.25x).
+	//
+	// MEASURED, owner walking two locations until holes stopped being visible:
+	//
+	//   interior  minR 1 -> 2:  dropped 77.1% -> 64.3%,  pool 2.64M -> 4.10M  (+55%)   holes gone
+	//   forest    minR 1 -> 3:  dropped 19.4% ->  0.1%,  pool 8.86M -> 10.95M (+24%)   holes gone
+	//
+	// The hypothesis held - and the knob still fails. Interior has a real working point. Forest does not: at the margin
+	// where its holes disappear the stage has simply STOPPED PRUNING (0.1%), so "no holes" there is not a fix, it is
+	// the mechanism switched off. Between the two states there is nothing, because in an open view almost every drop is
+	// a boundary drop (the histogram predicted exactly this: 2.2% beyond 5x). So the margin is a switch, not a dial,
+	// and where it switches is decided by the content - which is per-scene tuning by definition, and against the
+	// project's own rule. A binary prune cannot be tuned out of this; that is the argument for the LoD bias, which has
+	// no such cliff because a boundary node gets coarsened a little instead of being dropped or kept whole.
+	//
+	// Note the denominators: 16.6% of the DROPS is +55% of the POOL, and the pool is what the GPU pays for.
+	//
+	// Unlike region_radius this is not a claim about a ball of camera positions; it is a straight confidence floor on
+	// the barrier's own verdict, and it costs one multiply on a comparison already being made.
+	//
+	// Changes what an APPLY produces, not what a barrier or a traversal produces - so the setter clears the apply
+	// throttle rather than dropping any cache, or a change would not take effect until the camera happened to move.
+	float getSatMinRatio() const { return sat_min_ratio; }
+	void setSatMinRatio(float v);
+
+
 	// SESSION085: the session081 "bypass grid" diagnostic (skip stage 3, mark every direction saturated at one flat
 	// distance) is removed - it was always labelled temporary, and the question it was built to answer (whether the
 	// machinery AROUND the grid was the source of holes/slow updates, rather than the grid itself) was settled by
@@ -1711,6 +1748,7 @@ private:
 	float sat_grid_subdiv;                           // SESSION076 CALIBRATION - see getSatGridSubdiv().
 	float sat_region_radius;                         // SESSION078 - see getSatRegionRadius().
 	int sat_region_closing_tiles;                    // SESSION081 - see getSatRegionClosingTiles().
+	float sat_min_ratio;                             // SESSION085 - see getSatMinRatio().
 	bool draw_unpruned_frontier;                     // SESSION081 - see getDrawUnprunedFrontier().
 	float frontier_reuse_split_dist;                 // SESSION080 STEP B - see getFrontierReuseSplitDist(). 0 = disabled.
 

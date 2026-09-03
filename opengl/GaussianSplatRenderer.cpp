@@ -350,6 +350,20 @@ public:
 	// i.e. what the DFS actually walked/sorted, BEFORE the saturation prune. indices.size() is NOT this on the pruned
 	// replacement (uf2): it shrinks to pool_after, which would misattribute expand_ms/sort_ms's cost to the wrong N.
 
+	// SESSION085: node count of the frontier this one was pruned FROM, i.e. the LoD stage's output before the saturation
+	// stage touched it. Needed by countSplatsInFrustum(), which reports the pipeline as a chain and therefore has to show
+	// both sides of the prune from whichever single frontier the cloud currently holds.
+	//
+	// Not derivable from the fields that already exist, which is why it is its own:
+	//  - traversal_output_n is what THIS traversal's DFS walked. With frontier reuse on it excludes an inherited
+	//    far_block, so it is short of the frontier's real size by however much was inherited.
+	//  - indices.size() + far_block is the size AFTER the prune on uf2, and the size before it on an unpruned frontier -
+	//    the same expression means different stages depending on which object it is read from.
+	//  - sat_num_dropped only counts what Drop mode removed; in Count mode it tallies without removing, so
+	//    indices.size() + sat_num_dropped would double-count.
+	// On an unpruned frontier this equals its own node count, which reads correctly as "no prune has been applied".
+	size_t pre_sat_n;
+
 	// SESSION080 DIAGNOSTIC (plan doc session080-plan.md STEP A): how much this frontier's front-to-back order has
 	// moved since prev_frontier - the cloud's cached_ufrontier at kick time, i.e. whatever was
 	// actually being drawn just before this traversal started. Matches nodes by identity (cloud_idx = member
@@ -416,6 +430,7 @@ public:
 		expand_seeds(0), expand_num_tasks(0), expand_prologue_ms(0.0), expand_task_max_ms(0.0), expand_task_sum_ms(0.0), // SESSION080
 		expand_splice_reserve_ms(0.0), expand_splice_copy_ms(0.0), sort_alloc_ms(0.0), soa_ms(0.0), // SESSION080 (plan2 §4.1)
 		traversal_output_n(0), // SESSION080
+		pre_sat_n(0), // SESSION085
 		sort_staleness_delta_ws(0.0), sort_staleness_prev_n(0), sort_staleness_common_n(0), sort_staleness_max_disp(0), // SESSION080
 		sort_staleness_mean_disp(0.0), sort_staleness_gt1k(0), sort_staleness_gt10k(0), sort_staleness_ms(0.0), // SESSION080
 		reuse_roots(0), reuse_n(0), reuse_ms(0.0), reuse_split_dist_used(0.f), reuse_base_anchor_ws(0.f) // SESSION080 §4.3
@@ -499,17 +514,11 @@ public:
 	js::Vector<float, 16> sat_accum_t;
 	js::Vector<float, 16> sat_amp_sum;
 
-	// SESSION081 DIAGNOSTIC, TEMPORARY: true when this barrier was produced by the "bypass grid" test mode instead of
-	// the real gather+build+closing+erosion - see GaussianSplatRenderer::getSatDebugBypassGrid(). Purely so
-	// [gsr-sat-build] self-describes which kind of barrier a captured log line is looking at; carries no other
-	// behaviour. Remove alongside the rest of the bypass machinery once the experiment is done.
-	bool bypass_used;
 	// SESSION082, TEMPORARY: which occluder population this barrier was built from - see
-	// GaussianSplatRenderer::getSatOccluderSource(). Recorded for the same two reasons bypass_used is:
-	// [gsr-sat-build] self-describes a captured log line, and kickOffSaturationBuilds() compares it against the live
-	// selector so a barrier from a build already in flight when it was changed is not mistaken for a current one.
+	// GaussianSplatRenderer::getSatOccluderSource(). Recorded for two reasons: [gsr-sat-build] self-describes a
+	// captured log line, and kickOffSaturationBuilds() compares it against the live selector so a barrier from a build
+	// already in flight when it was changed is not mistaken for a current one.
 	GaussianSplatOccluderSource occluder_source_used;
-	float bypass_distance_used; // The flat distance THIS barrier was filled with when bypass_used - see kickOffSaturationBuilds()'s needs_build check, which watches this so dragging the "Distance slice max" spinbox retriggers a rebuild even while standing still (nothing else would notice the change otherwise).
 
 	GaussianSplatSaturationBarrier()
 	:	sat_grid_res(0), anchor_pos_ws(0.f), built_time_real_s(0.0),
@@ -519,7 +528,7 @@ public:
 		rec_task_ms_min(0.0), rec_task_ms_max(0.0), rec_task_ms_mean(0.0),
 		diag_writers(0), diag_tile_writes(0),
 		walk_ms(0.0), walk_sort_ms(0.0), walk_visited(0), // SESSION082, TEMPORARY.
-		bypass_used(false), occluder_source_used(GaussianSplatOccluderSource_Fine), bypass_distance_used(0.f)
+		occluder_source_used(GaussianSplatOccluderSource_Fine)
 	{
 		for(int i=0; i<9; ++i) sched_stats[i] = 0.0; // SESSION081 SCHEDULING PROBE.
 		for(int i=0; i<3; ++i) diag_tile_stats[i] = 0;
@@ -1644,30 +1653,6 @@ public:
 		barrier->closing_tiles_used = closing_tiles;
 		barrier->occluder_source_used = occluder_source; // SESSION082, TEMPORARY - see the field.
 
-		// SESSION081 DIAGNOSTIC, TEMPORARY - "bypass grid" test mode. Skips gather, grid build, closing and erosion
-		// entirely - the whole cost of pipeline stage 3 - and instead marks every direction saturated at one flat
-		// distance (bypass_distance, driven by the "Distance slice max" spinbox so no new UI is needed). The point is
-		// to isolate whether the REST of the pipeline (R-ball re-kick cadence, apply/test, the async frustum filter,
-		// the draw_unpruned trade-off) behaves acceptably once stage 3's own cost is taken out of the equation
-		// entirely - see the session081 snapshot for the owner's framing of this experiment. Every downstream
-		// consumer (gsSatOccluded(), the overlay, [gsr-sat-build]'s own numbers) reads this exactly like a real
-		// barrier; only the WAY sat_depth was produced differs. Remove this whole branch, the bypass_grid/
-		// bypass_distance ctor fields, GaussianSplatSaturationBarrier::bypass_used, and the UI checkbox once the
-		// experiment concludes.
-		if(bypass_grid)
-		{
-			barrier->sat_grid_res = gsSatGridResForFocal(focal_px, coarse_pixel_scale, grid_subdiv); // Same formula the real path uses, so tile math, the overlay and sat_tiles% all behave identically - only the CONTENT is fake.
-			barrier->sat_depth.resize((size_t)barrier->sat_grid_res * (size_t)barrier->sat_grid_res, bypass_distance);
-			barrier->bypass_used = true;
-			barrier->bypass_distance_used = bypass_distance;
-			Reference<GaussianSplatSaturationBuildResultMsg> msg = new GaussianSplatSaturationBuildResultMsg();
-			msg->cloud_id = cloud_id;
-			msg->topology_generation = topology_generation;
-			msg->barrier = barrier;
-			result_queue->enqueue(msg);
-			return;
-		}
-
 		// ---- Gather: collect this build's occluders - see GsSatGatherTask, or occluderTreeWalk() for the tree-walk
 		// source, which replaces this whole stage with a walk of its own. ----
 		js::Vector<float, 16> occl_px, occl_py, occl_pz, occl_radius, occl_alpha;
@@ -2073,8 +2058,6 @@ public:
 	float focal_px, coarse_pixel_scale; // Needed for gsSatGridResForFocal() - see GaussianSplatRenderer::kickOffSaturationBuilds().
 	float alpha_gain, alpha_gamma;
 	bool diag_log, overlay_requested;
-	bool bypass_grid;       // SESSION081 DIAGNOSTIC, TEMPORARY - see the "bypass grid" branch in run().
-	float bypass_distance;  // Only read when bypass_grid is true.
 	GaussianSplatOccluderSource occluder_source; // SESSION082, TEMPORARY - see GaussianSplatRenderer::getSatOccluderSource(). Fine/CoarseFloor pick which way GsSatGatherTask::want_coarse filters the frontier; TreeWalk replaces that whole stage with occluderTreeWalk() below.
 	// SESSION082: the cloud's members as of kick time, so the tree walk can run here without a frontier and without the
 	// traversal's scratch. Filled by kickOffSaturationBuilds() rather than taken from GaussianSplatCachedGeom, because
@@ -2244,6 +2227,11 @@ public:
 			}
 			if(task_manager != NULL) task_manager->runTaskGroup(group);
 		}
+
+		// SESSION085: the size of what this apply READ, so the pruned copy still knows the LoD stage's output - see the
+		// field. `n` already spans both of the source's segments, which uf2 itself no longer has (the compaction above
+		// flattens near + far_block into one array).
+		uf2->pre_sat_n = n;
 
 		uf2->sat_num_tested = num_tested;
 		uf2->sat_num_dropped = num_dropped;
@@ -2682,6 +2670,9 @@ public:
 				uf->soa_ms = soa_timer.elapsed() * 1.0e3; // SESSION080 DIAGNOSTIC - the whole segment build, partition included.
 				uf->reuse_roots = diag_reuse_roots; // SESSION080 §4.3 DIAGNOSTIC: subtrees the walk stopped at, or marked as the block's.
 				uf->reuse_n = uf->far_block.nonNull() ? uf->far_block->indices.size() : 0;
+				// SESSION085: this frontier's own size, both segments - see the field. Nothing has pruned it yet, so the
+				// "before saturation" figure IS its size; a later apply overwrites this with the size of whatever it read.
+				uf->pre_sat_n = near_n + uf->reuse_n;
 				uf->reuse_ms = reuse_ms_accum; // Partition + the far SoA build, i.e. what BUILDING a block costs. 0 when one was inherited - which is the whole point of §4.3.
 				uf->reuse_split_dist_used = reuse_enabled ? reuse_split_dist : 0.f;
 				// SESSION080 §4.3: the frozen anchor the far block's cut was made at, carried so the next traversal can measure
@@ -3409,7 +3400,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	filter_debug_log(false), kick_debug_log(false), cpu_prof_log(false), // SESSION072: default off - see getFilterDebugLog()'s comment.
 	sat_prefilter_mode(GaussianSplatSatPrefilterMode_Off), filter_frustum_planes_enabled(true), // SESSION074: stage off by default, frustum planes on (i.e. unchanged pipeline) - see getSatPrefilterMode()/getFilterFrustumPlanesEnabled().
 	sat_prefilter_threshold(0.98f), // SESSION079 - see getSatPrefilterThreshold().
-	sat_diag_log(false), sat_debug_overlay_mode(GaussianSplatSatDebugOverlayMode_Off), sat_grid_subdiv(0.3f), sat_region_radius(0.f), sat_region_closing_tiles(0), draw_unpruned_frontier(true), sat_debug_bypass_grid(false), sat_occluder_source(GaussianSplatOccluderSource_Fine), // SESSION076/078/081: diagnostics off by default - see getSatDiagLog()/getSatDebugOverlayMode(). Calibration defaults are the values reasoned to on paper, not yet confirmed on a scene. draw_unpruned_frontier defaults to the session076 publish-early behaviour. sat_debug_bypass_grid is a temporary test switch, off by default.
+	sat_diag_log(false), sat_debug_overlay_mode(GaussianSplatSatDebugOverlayMode_Off), sat_grid_subdiv(0.3f), sat_region_radius(0.f), sat_region_closing_tiles(0), draw_unpruned_frontier(true), sat_occluder_source(GaussianSplatOccluderSource_Fine), // SESSION076/078/081: diagnostics off by default - see getSatDiagLog()/getSatDebugOverlayMode(). Calibration defaults are the values reasoned to on paper, not yet confirmed on a scene. draw_unpruned_frontier defaults to the session076 publish-early behaviour.
 	frontier_reuse_split_dist(0.f), // SESSION080 STEP B: off by default - 0 is the pre-session080 walk-everything behaviour, bit-for-bit. See getFrontierReuseSplitDist().
 	splat_point_size_px(1.f),
 	splat_merge_spread_widen(3.0f), // SESSION071: analytic minimum is sqrt(3) (see widenedMergedScale()); owner default set higher for extra margin.
@@ -4429,6 +4420,7 @@ GaussianSplatRenderer::FrustumCounts GaussianSplatRenderer::countSplatsInFrustum
 	result.in_frustum = 0;
 	result.total = 0;
 	result.frontier = 0;
+	result.after_sat = 0; // SESSION085
 	result.drawn = 0;
 	result.visible = 0;
 	for(size_t c=0; c<clouds.size(); ++c)
@@ -4469,7 +4461,18 @@ GaussianSplatRenderer::FrustumCounts GaussianSplatRenderer::countSplatsInFrustum
 		};
 
 		result.total += cloud.total_splats; // Leaves + merged internal nodes - matches what the traversal iterates over.
-		result.frontier += cloud.cached_ufrontier.isNull() ? 0 : cloud.cached_ufrontier->indices.size(); // SESSION072: U(P) as last cached by the traversal stage (split_filter_enabled) - 0 if none cached yet.
+
+		// SESSION085: the two frontier stages, both read off the ONE frontier the cloud currently holds - see FrustumCounts.
+		// Whether that is the traversal's own output or an apply's pruned copy, pre_sat_n is the LoD stage's figure and the
+		// array length (both segments) is the saturation stage's, so the pair reads the same way in either state. Both are
+		// 0 for a cloud with nothing cached yet, and equal to each other while the saturation stage is off.
+		if(cloud.cached_ufrontier.nonNull())
+		{
+			const GaussianSplatUnculledFrontier& uf = *cloud.cached_ufrontier;
+			result.frontier += uf.pre_sat_n;
+			result.after_sat += uf.indices.size() + (uf.far_block.nonNull() ? uf.far_block->indices.size() : 0);
+		}
+
 		result.drawn += (size_t)myMax(0, cloud.ob->num_instances_to_draw); // SESSION066: the live LoD draw list S(P,R) size - the pre-slice, dilation-band-inclusive selection the pixel_scale limit / camera position pick this frame.
 
 		// in_frustum: over the whole baked tree (the geometric ceiling, LoD-independent).
@@ -6889,21 +6892,8 @@ void GaussianSplatRenderer::setDrawUnprunedFrontier(bool v)
 }
 
 
-// SESSION081 DIAGNOSTIC, TEMPORARY - see getSatDebugBypassGrid(). Drops only cached_sat_barrier, not the whole
-// traversal cache: a bypass toggle changes what a BARRIER build produces, not what a traversal produces.
-void GaussianSplatRenderer::setSatDebugBypassGrid(bool v)
-{
-	if(v == sat_debug_bypass_grid)
-		return;
-	sat_debug_bypass_grid = v;
-
-	for(size_t i=0; i<clouds.size(); ++i)
-		clouds[i]->cached_sat_barrier = NULL;
-}
-
-
-// SESSION082, TEMPORARY - see getSatOccluderSource(). Same scoping as the setter above: which nodes the barrier is
-// built from changes what a BARRIER build produces, not what a traversal produces.
+// SESSION082, TEMPORARY - see getSatOccluderSource(). Drops only cached_sat_barrier, not the whole traversal cache:
+// which nodes the barrier is built from changes what a BARRIER build produces, not what a traversal produces.
 void GaussianSplatRenderer::setSatOccluderSource(GaussianSplatOccluderSource v)
 {
 	if(v == sat_occluder_source)
@@ -8009,7 +7999,6 @@ void GaussianSplatRenderer::drainSaturationBuildResults()
 					if(std::isfinite(b.sat_depth[t]))
 						++sat_tiles;
 				conPrint("[gsr-sat-build] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms " +
-					(b.bypass_used ? ("BYPASS dist=" + doubleToStringNDecimalPlaces(b.bypass_distance_used, 2) + "m ") : "") + // SESSION081 DIAGNOSTIC, TEMPORARY - see getSatDebugBypassGrid(). gather_ms/grid_ms below read 0.00 in this mode, not a real measurement.
 					// SESSION082, TEMPORARY - see getSatOccluderSource(). occl= below then counts whatever that source
 					// yielded, not the fine frontier; the tree-walk line also carries its own walk/sort costs.
 					(b.occluder_source_used == GaussianSplatOccluderSource_CoarseFloor ? "COARSE-OCCL " :
@@ -8723,10 +8712,7 @@ void GaussianSplatRenderer::kickOffSaturationBuilds()
 			// not silently keep serving a stale barrier indefinitely.
 			if(barrier->threshold_used != sat_prefilter_threshold || barrier->subdiv_used != sat_grid_subdiv ||
 				barrier->region_radius_used != sat_region_radius || barrier->closing_tiles_used != sat_region_closing_tiles ||
-				barrier->bypass_used != sat_debug_bypass_grid || // SESSION081 DIAGNOSTIC, TEMPORARY: the setter already drops the cache on toggle, but this also catches a barrier built by a task that was already in flight when the toggle happened.
-				barrier->occluder_source_used != sat_occluder_source) // SESSION082, TEMPORARY - same in-flight case as the line above.
-				needs_build = true;
-			else if(sat_debug_bypass_grid && barrier->bypass_distance_used != splat_dist_clamp_max) // SESSION081 DIAGNOSTIC, TEMPORARY: the ball check below does not apply in bypass mode's favour - a flat barrier has no real occluders to go stale, so without this, dragging "Distance slice max" while standing still would never retrigger a rebuild.
+				barrier->occluder_source_used != sat_occluder_source) // SESSION082, TEMPORARY: the setter already drops the cache on toggle, but this also catches a barrier built by a task that was already in flight when the toggle happened.
 				needs_build = true;
 			else if(cam_pos_ws.getDist(barrier->anchor_pos_ws) > sat_region_radius) // SESSION081: the ball guarantee itself - see GaussianSplatSaturationBarrier. > not >=: at R=0 (point-anchored) any nonzero movement invalidates, but standing still does not.
 				needs_build = true;
@@ -8753,8 +8739,6 @@ void GaussianSplatRenderer::kickOffSaturationBuilds()
 		t->alpha_gain = splat_alpha_gain; t->alpha_gamma = splat_alpha_gamma;
 		t->diag_log = sat_diag_log;
 		t->overlay_requested = sat_debug_overlay_mode != GaussianSplatSatDebugOverlayMode_Off;
-		t->bypass_grid = sat_debug_bypass_grid; // SESSION081 DIAGNOSTIC, TEMPORARY - see getSatDebugBypassGrid().
-		t->bypass_distance = splat_dist_clamp_max; // Reuses the "Distance slice max" spinbox - no new UI needed for this experiment.
 		t->occluder_source = sat_occluder_source; // SESSION082, TEMPORARY - see getSatOccluderSource().
 		// SESSION082: snapshot the members for the tree walk - fresh, not from the geom cache, see the field's comment.
 		// Only the walk reads this, so it is filled only when that is the selected source.

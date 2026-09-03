@@ -218,11 +218,26 @@ public:
 	// counts only the splats that pass the frustum + size/distance slices this frame - i.e. what really reaches the screen;
 	// it is the number that drops when the pixel_scale limit or the distance slice tighten. So the button reports the
 	// geometric-in-frustum ceiling (in_frustum/total), the raw draw count (drawn), and the real on-screen count (visible).
-	// SESSION072: 'frontier' is the cached unculled LoD frontier U(P) (sum of cached_ufrontier->indices.size() across
-	// clouds, split_filter_enabled only - 0 for a cloud with none cached yet) - what the traversal stage handed to the
-	// filter stage, before filterUnculledFrontier() cuts it down to 'drawn'. Sits between 'total'/'in_frustum' (a static,
-	// LoD-independent ceiling over the whole tree) and 'drawn' (this frame's post-filter draw list) in the pipeline.
-	struct FrustumCounts { size_t in_frustum; size_t total; size_t frontier; size_t drawn; size_t visible; };
+	// SESSION072: 'frontier' is the cached unculled LoD frontier U(P) - what the traversal stage handed onward, before
+	// anything downstream cut it down to 'drawn'. Sits between 'total'/'in_frustum' (a static, LoD-independent ceiling
+	// over the whole tree) and 'drawn' (this frame's post-filter draw list) in the pipeline.
+	//
+	// SESSION085: 'after_sat' splits the one step 'frontier'->'drawn' used to be into the two real stages it has been
+	// since session074, so the chain the button reports is the pipeline as actually built:
+	//
+	//     total  ->  frontier  ->  after_sat  ->  drawn  ->  visible
+	//      raw       LoD U(P)     saturation    frustum      final
+	//                              prefilter     filter      frame
+	//
+	// Two corrections come with it, both of which made the old two-stage chain misreport:
+	//  - 'frontier' now reads GaussianSplatUnculledFrontier::pre_sat_n rather than the cached frontier's array length.
+	//    The cached frontier is USUALLY the saturation stage's pruned copy, so the old number was already post-prune and
+	//    was labelled as the LoD stage's output; the prune was invisible precisely because it had been folded into the
+	//    stage above it.
+	//  - both frontier figures count the reuse far_block as well as the frontier's own array. A frontier holding an
+	//    inherited far segment (frontier reuse on, session080 STEP B) is two arrays, and counting only the near one
+	//    under-reported the stage by whatever was inherited - which is most of it at a normal walking step.
+	struct FrustumCounts { size_t in_frustum; size_t total; size_t frontier; size_t after_sat; size_t drawn; size_t visible; };
 	FrustumCounts countSplatsInFrustum() const;
 
 	// One-off diagnostic (GaussianSplatSettingsWidget's "Frustum report" button, Qt only): a multi-line breakdown of what
@@ -526,20 +541,10 @@ public:
 	void setSatRegionClosingTiles(int v);
 
 
-	// SESSION081 DIAGNOSTIC, TEMPORARY - "bypass grid" test. Skips gather+build+closing+erosion (pipeline stage 3)
-	// entirely and marks every direction saturated at one flat distance, taken from getDistClampMax() (the "Distance
-	// slice max" spinbox - reused rather than adding a new control) - see the "bypass grid" branch in
-	// GaussianSplatSaturationBuildTask::run() for the full rationale. Everything else - the R-ball re-kick cadence in
-	// kickOffSaturationBuilds(), the apply/test stage, the async frustum filter, draw_unpruned - is untouched, so
-	// this isolates whether THAT machinery is acceptable once stage 3's own cost and correctness are taken out of the
-	// picture. A live, owner-driven diagnostic switch meant to be removed once the experiment concludes, not a
-	// permanent feature - see the ctor field's own comment on GaussianSplatSaturationBuildTask for the full removal
-	// list. Changes what a build PRODUCES, so the setter drops every cloud's cached barrier to force an immediate
-	// rebuild under the new mode - same reasoning as setSatRegionRadius() etc, but scoped to just the barrier (a
-	// bypass toggle doesn't change what a TRAVERSAL produces, so cached_ufrontier is left alone).
-	bool getSatDebugBypassGrid() const { return sat_debug_bypass_grid; }
-	void setSatDebugBypassGrid(bool v);
-
+	// SESSION085: the session081 "bypass grid" diagnostic (skip stage 3, mark every direction saturated at one flat
+	// distance) is removed - it was always labelled temporary, and the question it was built to answer (whether the
+	// machinery AROUND the grid was the source of holes/slow updates, rather than the grid itself) was settled by
+	// session083's straddle-leaf fix, which found the artifact in the reuse cut instead.
 
 	// SESSION082, TEMPORARY - which node set the barrier is built from. See GaussianSplatOccluderSource for what each
 	// option means and what each one measured.
@@ -1716,7 +1721,6 @@ private:
 	float sat_region_radius;                         // SESSION078 - see getSatRegionRadius().
 	int sat_region_closing_tiles;                    // SESSION081 - see getSatRegionClosingTiles().
 	bool draw_unpruned_frontier;                     // SESSION081 - see getDrawUnprunedFrontier().
-	bool sat_debug_bypass_grid;                      // SESSION081 DIAGNOSTIC, TEMPORARY - see getSatDebugBypassGrid().
 	GaussianSplatOccluderSource sat_occluder_source; // SESSION082, TEMPORARY - see getSatOccluderSource().
 	float frontier_reuse_split_dist;                 // SESSION080 STEP B - see getFrontierReuseSplitDist(). 0 = disabled.
 

@@ -496,19 +496,26 @@ public:
 	void setSatGridSubdiv(float v);
 
 
-	// SESSION078: REGION PRUNING. Radius of the ball of camera positions the saturation grid's barrier is made valid
-	// for, in world units. 0 reproduces exactly the old point-anchored behaviour.
+	// SESSION078: REGION ANCHORING. Radius of the ball of camera positions the saturation barrier is made valid for, in
+	// world units. 0 reproduces exactly the old point-anchored behaviour.
 	//
-	// sat_depth is otherwise an assertion about the single camera position it was built from, which is the root of the
-	// staleness this stage has always had: the moment the camera moves the barrier describes somewhere the camera no
-	// longer is, and the ~300ms before a fresh unpruned frontier lands showed as shadow-shaped holes. Asserting over a
-	// whole neighbourhood up front means the barrier does not go stale inside it at all - nothing to switch between and
+	// sat_depth is otherwise an assertion about the single camera position it was built from. Asserting over a whole
+	// neighbourhood up front means the barrier does not go stale inside it at all - nothing to switch between and
 	// nothing to re-latch. See gsBuildSaturationGrid()'s header for the geometry (why a ball and not a cube, and what
 	// each side pays for it).
 	//
-	// Strictly weakens the cull - both the build and read sides widen their conservatism - so the useful question is
-	// what it costs in drop rate, which is what [gsr-sat]'s dropped= is for. A live knob to find that, to be frozen
-	// once found (project rule: no manual per-scene tuning).
+	// SESSION086: FROZEN AT 0.5, and the reason it is no longer a pure conservatism knob. R bounds how far the camera
+	// may travel before the barrier is thrown away and rebuilt, so it directly sets the rebuild CADENCE - and the
+	// rebuild runs on the same task pool as the traversal. Measured session085: at R=0 a barrier lasts ~49ms, i.e. 158
+	// rebuilds in 8.7s, roughly a core permanently occupied competing with the DFS; at R=0.5 the same exterior motion
+	// gave 50 rebuilds against 24 traversals. 0.5 is the largest value measured healthy (session085, two scenes,
+	// er_ceil=0 both times, erosion costing ~8% of saturated tiles - a price, not a break). A measured working point,
+	// not a calibration: expected to be revisited once the rebuild itself is cheaper.
+	//
+	// Under the LoD bias (session085 etap 3-6) R only ever weakens the stage: it pushes sat_depth out by +R at build
+	// time, so the barrier is more conservative, ratios are smaller, the bias is gentler. It cannot produce a hole -
+	// the read side deliberately does not dilate by R, that was prune-era strictness. So raising it is safe in kind;
+	// the only question is how much bias is left, never whether geometry survives.
 	//
 	// Changes what a traversal PRODUCES, so the setter drops cached frontiers, as setSatGridSubdiv() does.
 	float getSatRegionRadius() const { return sat_region_radius; }

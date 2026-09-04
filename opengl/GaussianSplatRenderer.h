@@ -608,8 +608,87 @@ public:
 	//
 	// A live knob to find the working value, to be frozen once found (project rule: no manual per-scene tuning).
 	// Changes what a traversal PRODUCES, so the setter drops cached frontiers, as setSatRegionRadius() does.
+	// SESSION086 VERDICT: MEASURED, AND TURNED BACK OFF. Left at 0 by default; the machinery below stays, because what
+	// failed is the interaction with the LoD bias, not the scheme.
+	//
+	// The cut freezes a subtree's SELECTION at the anchor. That was safe while selection was a function of distance
+	// alone (STEP A's 99.2-99.9%). The saturation LoD bias (session085 etap 3) made selection a function of the barrier
+	// as well, and a frozen walk never re-reads the barrier below the cut - so the block pins the far field's DETAIL
+	// LEVEL until the drift bound discards it. Owner, session086: the shadow behind an object stops following it, and
+	// only catches up on the rebuild.
+	//
+	// Calibrated against that, on the owner's scene, split 25, at two speeds each (rebuild share / median expand_ms;
+	// a full walk costs 173-187ms here):
+	//
+	//     drift 0.10 (2.5m bound)   7% / 117ms walking,  21% / 122ms flying   - visibly lagging
+	//     drift 0.05 (1.25m bound) 15% / 123ms walking,  38% / 121ms flying   - visibly lagging
+	//     drift 0.02 (0.5m bound)  65% / 164ms walking,  55% / 181ms flying   - acceptable, and no cheaper than no reuse
+	//
+	// The arithmetic behind that last row is the actual finding, and no adaptive rule escapes it: a traversal takes
+	// ~270ms, so at a 3 m/s walk the camera covers ~0.8m per traversal, while the bias needs refreshing every ~0.5m.
+	// The bound is breached faster than a traversal completes, at walking speed and anything above it. Reuse can
+	// therefore only engage while the camera is still - which is exactly when it saves nothing.
+	//
+	// The redesign this points at, if it is ever picked up: freeze by what the bias DID NOT TOUCH rather than by
+	// distance. Re-walk the subtrees the bias stopped (~9% of tested nodes) and inherit the rest. The bias-touched set
+	// moves with the camera, so the error is one-sided - a subtree that newly falls into shadow is merely not coarsened
+	// yet (a slightly larger pool), while one leaving shadow is re-walked and refines, which is the direction that was
+	// visible. Not attempted.
+
 	float getFrontierReuseSplitDist() const { return frontier_reuse_split_dist; }
 	void setFrontierReuseSplitDist(float v);
+
+	// How far, as a fraction of the split distance above, the camera may drift from a far block's frozen anchor before a
+	// traversal discards it and walks the whole tree. Session080 hard-coded 0.25; session086 made it settable to
+	// calibrate it, and it is back at 0.25 with no UI knob, because the calibration ended in reuse being switched off -
+	// see the verdict on getFrontierReuseSplitDist() above for the three values that were measured and why none of them
+	// worked. Left settable rather than re-frozen as a constant so that a future bias-aware cut has it to hand.
+	//
+	// Why it stopped being a constant. Session080 sized it purely as an ORDERING error budget: the far segment keeps the
+	// front-to-back order it was sorted into at its anchor, and an ordering error E among nodes at range D matters in
+	// proportion to E/D, so a quarter of the split distance kept the ratio small. The saturation LoD bias (session085
+	// etap 3) gave the block a second, much more sensitive dependence on where the camera is: the bias reads the
+	// barrier, the barrier is an occlusion statement about the camera's position, and below the cut a frozen walk never
+	// re-asks it. So the block's LoD - not just its order - is pinned until the block is rebuilt.
+	//
+	// Measured session086 (owner's exterior, split 25, i.e. a 6.25m bound): 13 consecutive traversals reported
+	// sat_bias=~1.5k/476k (the bias effectively idle, it can only see the near shell), then the one traversal that
+	// tripped the bound reported 317k/3.03M. That is ~85% of the bias's work happening once per 6.25m of travel, which
+	// is what "the shadows behind objects only update every 7 metres" looks like from the log side.
+	//
+	// An adaptive rule here would have to key on camera SPEED rather than a distance - walking is ~3 m/s and the avatar
+	// also runs and flies, so any fixed fraction is right for exactly one gait. Session086's measurement is that such a
+	// rule would correctly conclude reuse must stay off whenever the camera moves at all, which is why none was built.
+	float getFrontierReuseDriftFraction() const { return frontier_reuse_drift_fraction; }
+	void setFrontierReuseDriftFraction(float v);
+
+
+	// SESSION086: how many seeds the parallel expand's targeted split runs down to, adjusted from the previous
+	// traversal's own measurements rather than fixed. Not a setting - there is no knob, and nothing to choose per scene.
+	//
+	// Why it cannot be a constant. Handing the walk out in N pieces says nothing about BALANCE; what matters is that no
+	// single piece exceeds a thread's share. Session086 measured, on one scene, a single seed carrying 20.6% of the
+	// frontier and taking 172ms against a 1079ms total across ~17 threads - a fair share of 63ms. Ordering the split by
+	// pixel_scale was right (that seed's px was 851 with the limit in single digits, i.e. the first thing the heap would
+	// pick), but a stop rule of "until there are 273 of them" ran out of splits long before that seed was small. On a
+	// different scene the same 273 might be plenty, or nowhere near - which is exactly the shape of thing that has to be
+	// measured rather than chosen.
+	//
+	// The loop, and why it is asymmetric. It RAISES the target while the costliest single seed (expand_seed_max_ms)
+	// exceeds a thread's fair share (expand_task_sum_ms / concurrency). It LOWERS it only when the split itself starts
+	// costing something - when expand_prologue_ms is a noticeable fraction of expand_ms - and not merely because the
+	// balance came out good.
+	//
+	// The first version did lower it on "comfortably balanced", and that oscillated between two states forever: at 4352
+	// seeds the worst seed measured 13-33ms against a 44-83ms share so the loop halved it, and at 2176 the same seed
+	// measured 95-161ms so the loop doubled it straight back (par swinging 14.9 -> 8.7 -> 14.0 with it). The mistake was
+	// treating a small target as if it saved something. It does not: the ONLY cost of splitting further is the serial
+	// split loop, measured at 0.3-1.5ms against a 60-125ms expand, so "the balance is better than it needs to be" is not
+	// a reason to give balance up. Being asymmetric on purpose, it settles instead of hunting.
+	//
+	// The 1.5x band and the 5% split-cost ceiling are the loop's own hysteresis - dimensionless, about its stability,
+	// with nothing in them chosen per scene.
+	void updateExpandSeedTarget(double seed_max_ms, double task_sum_ms, double prologue_ms, double expand_ms);
 
 
 	// SESSION074: whether the per-orientation filter applies the frustum planes at all. On (the default) is the normal
@@ -1710,6 +1789,8 @@ private:
 	int sat_region_closing_tiles;                    // SESSION081 - see getSatRegionClosingTiles().
 	float sat_bias_ceiling;                          // SESSION085 ETAP 3 - see getSatBiasCeiling().
 	float frontier_reuse_split_dist;                 // SESSION080 STEP B - see getFrontierReuseSplitDist(). 0 = disabled.
+	float frontier_reuse_drift_fraction;             // SESSION086 - see getFrontierReuseDriftFraction().
+	size_t expand_seed_target;                       // SESSION086 - see updateExpandSeedTarget(). 0 until the first traversal reports back.
 
 	// SESSION055: camera-motion tracker for anisotropic frustum-cull dilation. think() diffs the current cam pose against
 	// the previous one to compute an instantaneous velocity and angular speed, feeds them through an EMA with a

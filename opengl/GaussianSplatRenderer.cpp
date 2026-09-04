@@ -248,14 +248,14 @@ public:
 	// SESSION085 ETAP 3: which barrier's LoD bias shaped this selection, identified by the barrier's own build timestamp,
 	// or 0.0 when the bias was OFF and therefore had no influence.
 	//
-	// This belongs to the key set above and is the reason it had to be extended. Frontier reuse (session080 STEP B)
-	// inherits a far segment from a previous traversal and accepts it if the previous traversal answered to the same
-	// selection rules. pixel_scale_limit alone used to say that; with the bias the EFFECTIVE limit is per-node and comes
-	// from the barrier, so two traversals can agree on every scalar here and still have made different cuts. Inheriting
-	// across that would splice a segment shaped by one barrier into a frontier shaped by another - rare, silent, and
-	// visible only as artifacts in the far field.
+	// SESSION086: this is NOT part of the key set above any more. It was added to it in etap 3 and removed here - the
+	// full argument sits at the reuse acceptance check in GaussianSplatLodTraversalTask's constructor, but the short
+	// form is that the barrier cannot move the CUT (the cut predicate does not read it, and the bias stop is suppressed
+	// on straddling nodes), only the detail level below it - and requiring it to match meant the far block was
+	// inheritable only while the barrier held still, which at any usable R is never.
 	//
-	// 0.0 when the bias is off means a bias-off session's reuse behaves exactly as it did before this field existed.
+	// Still stamped, and still read by the sort-staleness diagnostic in run(): that one measures how far the selection
+	// moves between traversals, and two selections cut under different barriers would report the barrier, not the motion.
 	double sat_bias_barrier_time;
 
 	// SESSION080 DIAGNOSTIC: Clock::getCurTimeRealSec() at the moment this frontier was built on the worker thread (set
@@ -291,6 +291,18 @@ public:
 	double expand_prologue_ms;  // The serial top-of-tree walk before any of them started.
 	double expand_task_max_ms;
 	double expand_task_sum_ms;
+
+	// SESSION086 DIAGNOSTIC: the two things par= cannot tell apart. par is task_sum/task_max, and a task's run_ms is
+	// the window between a thread picking it up and the shared seed cursor running dry - so a task that no thread ever
+	// got to while work remained contributes ~0 to the sum and drags par down exactly as an indivisible subtree would.
+	// expand_workers counts the tasks that took at least one seed (how many threads we actually got); expand_seed_max_ms
+	// is the costliest single seed (whether any one subtree is genuinely too big to split). The two call for opposite
+	// fixes, so measuring them apart is the whole point of printing both.
+	size_t expand_workers;
+	double expand_seed_max_ms;
+	// SESSION086: how finely the split ran, so the closed loop in updateExpandSeedTarget() can be read off the log -
+	// expand_seed_max_ms above is the quantity it steers, this is where it steered to.
+	size_t expand_seed_target;
 	// SESSION080 DIAGNOSTIC (plan2 §4.1): the serial concatenation of the tasks' per-thread output vectors into
 	// `decorated`, AFTER runTaskGroup() returns - not covered by task_max_ms/task_sum_ms, which are the tasks' own
 	// wall-clock. Suspected (from expand_ms minus an estimate of the parallel section) to be roughly half of expand
@@ -394,6 +406,7 @@ public:
 	:	built_time_real_s(0.0), // SESSION080
 		expand_ms(0.0), sort_ms(0.0), // SESSION080
 		expand_seeds(0), expand_num_tasks(0), expand_prologue_ms(0.0), expand_task_max_ms(0.0), expand_task_sum_ms(0.0), // SESSION080
+		expand_workers(0), expand_seed_max_ms(0.0), expand_seed_target(0), // SESSION086
 		expand_splice_reserve_ms(0.0), expand_splice_copy_ms(0.0), sort_alloc_ms(0.0), soa_ms(0.0), // SESSION080 (plan2 §4.1)
 		traversal_output_n(0), // SESSION080
 		sat_bias_barrier_time(0.0), // SESSION085
@@ -1764,7 +1777,9 @@ public:
 		bool sort_staleness_diag_enabled_ = false,
 		float reuse_split_dist_ = 0.f, // SESSION080 STEP B: 0 = walk the whole tree, the pre-session080 behaviour - see GaussianSplatRenderer::getFrontierReuseSplitDist() and reuse_enabled below.
 		const Reference<GaussianSplatSaturationBarrier>& sat_barrier_ = Reference<GaussianSplatSaturationBarrier>(), // SESSION085 ETAP 3: the cloud's barrier at kick time, for the LoD bias. Null (the default) leaves the bias off, so every existing call site is unaffected.
-		float sat_bias_ceiling_ = 1.f) // SESSION085 ETAP 3: 1 = off - see GaussianSplatRenderer::getSatBiasCeiling().
+		float sat_bias_ceiling_ = 1.f, // SESSION085 ETAP 3: 1 = off - see GaussianSplatRenderer::getSatBiasCeiling().
+		float reuse_drift_fraction_ = 0.25f, // SESSION086: was a static const - see GaussianSplatRenderer::getFrontierReuseDriftFraction(). 0.25 is session080's original value.
+		size_t expand_seed_target_ = 0) // SESSION086: 0 = nothing measured yet, expandParallel() falls back to concurrency*16.
 	:	cloud_id(cloud_id_), topology_generation(topology_generation_), scratch(scratch_), cam_pos_ws(cam_pos_ws_),
 		pixel_scale_limit(pixel_scale_limit_), max_splats_budget(max_splats_budget_), max_layer_density(max_layer_density_), max_tree_depth(max_tree_depth_), focal_px(focal_px_),
 		num_frustum_clip_planes(num_frustum_clip_planes_), frustum_cull_enabled(frustum_cull_enabled_),
@@ -1777,12 +1792,15 @@ public:
 		sat_diag_log(sat_diag_log_), coarse_layer_drawn(coarse_layer_drawn_),
 		task_manager(task_manager_), // SESSION079
 		expand_seeds(0), expand_num_tasks(0), expand_prologue_ms(0.0), expand_task_max_ms(0.0), expand_task_sum_ms(0.0), // SESSION080 DIAGNOSTIC
+		expand_workers(0), expand_seed_max_ms(0.0), // SESSION086
+		expand_seed_target(expand_seed_target_), // SESSION086 - see GaussianSplatRenderer::updateExpandSeedTarget().
 		expand_splice_reserve_ms(0.0), expand_splice_copy_ms(0.0), // SESSION080 DIAGNOSTIC (plan2 §4.1)
 		prev_frontier(prev_frontier_), sort_staleness_diag_enabled(sort_staleness_diag_enabled_), // SESSION080 DIAGNOSTIC
 		sat_barrier(sat_barrier_), sat_bias_ceiling(sat_bias_ceiling_), // SESSION085 ETAP 3
 		// Precomputed here, not per node: the DFS asks this millions of times. A barrier with sat_grid_res 0 is the "no
 		// grid" convention (nothing saturated, or no barrier yet), and the bias would be inert for every node anyway.
 		sat_bias_active(sat_bias_ceiling_ > 1.f && sat_barrier_.nonNull() && sat_barrier_->sat_grid_res != 0),
+		reuse_drift_fraction(reuse_drift_fraction_), // SESSION086
 		reuse_enabled(false), far_cut_is_frozen(false), reuse_prev_anchor_ws(0.f), reuse_split_dist(0.f) // SESSION080 §4.3 - derived below.
 	{
 		if(num_frustum_clip_planes < 0)
@@ -1823,10 +1841,26 @@ public:
 				prev_frontier->max_layer_density == max_layer_density &&
 				prev_frontier->max_tree_depth == max_tree_depth &&
 				prev_frontier->focal_px == focal_px &&
-				// SESSION085 ETAP 3: and the same barrier, or the inherited segment was cut under a different set of
-				// effective limits - see GaussianSplatUnculledFrontier::sat_bias_barrier_time. Inert while the bias is
-				// off, since both sides are then 0.
-				prev_frontier->sat_bias_barrier_time == satBiasBarrierTime() &&
+				// SESSION086: the barrier is deliberately NOT part of this key, though session085 etap 3 briefly made it
+				// one. Reasoning, in the order it has to hold:
+				//
+				//  - COVERAGE is bias-independent, which is the only property the two halves must agree on. The cut
+				//    predicate P below reads the frozen anchor and the node's own sphere and nothing else, and the bias
+				//    stop sits under `!force_descend` exactly as the caps do, so a straddling node is never stopped by
+				//    it. The build-mode and frozen-mode walks therefore resolve the cut at the same nodes whatever the
+				//    barrier says - which is the property session083 (b) established and the bias does not disturb.
+				//  - What the barrier does change is the DETAIL LEVEL chosen below the cut. Requiring it to match made
+				//    the far block inheritable only while the barrier held still, and the barrier is rebuilt every time
+				//    the camera leaves its R-ball (session085: ~180ms at R=0.5, ~49ms at R=0) - far more often than a
+				//    traversal completes. So the key did not make reuse conservative, it made it never happen.
+				//  - And the staleness it was guarding against is one this scheme already accepts by construction: the
+				//    far segment's whole selection is frozen for up to reuse_max_drift_fraction of the split distance.
+				//    A bias from a barrier one or two rebuilds old is the same kind of error, in the same segment,
+				//    bounded by the same trigger - and since the prune's removal (etap 6) its failure mode is geometry
+				//    that is momentarily too coarse, never geometry that is missing.
+				//
+				// The field itself stays: the sort-staleness diagnostic in run() still keys on it, where comparing two
+				// frontiers cut under different barriers really would measure the barrier instead of the motion.
 				prev_frontier->reuse_split_dist_used == reuse_split_dist_ && // The knob moved: the frozen cut is at the wrong distance now.
 				// The accumulated-drift bound, i.e. the full-rebuild safety trigger. The cut is frozen, so a node beyond
 				// it is never re-examined however far the camera travels; without this it would keep the key it was given
@@ -1839,7 +1873,7 @@ public:
 				// drift at a fixed fraction of it caps the relative error, at any scene scale and any knob setting, with
 				// no second number to tune. A traversal that trips this walks the whole tree and builds a fresh block for
 				// the ones after it - visible in the log as reuse_n dropping to 0 for one traversal.
-				cam_pos_ws_.getDist(block->anchor_pos_ws) <= reuse_split_dist_ * reuse_max_drift_fraction)
+				cam_pos_ws_.getDist(block->anchor_pos_ws) <= reuse_split_dist_ * reuse_drift_fraction_)
 			{
 				far_cut_is_frozen = true;
 				reuse_prev_anchor_ws = block->anchor_pos_ws; // The FROZEN anchor, not the predecessor's - that is the whole point.
@@ -2150,6 +2184,8 @@ public:
 				uf->expand_num_tasks = expand_num_tasks;
 				uf->expand_prologue_ms = expand_prologue_ms;
 				uf->expand_task_max_ms = expand_task_max_ms;
+				uf->expand_workers = expand_workers; uf->expand_seed_max_ms = expand_seed_max_ms; // SESSION086 DIAGNOSTIC
+				uf->expand_seed_target = expand_seed_target;
 				uf->expand_task_sum_ms = expand_task_sum_ms;
 				uf->expand_splice_reserve_ms = expand_splice_reserve_ms; // SESSION080 DIAGNOSTIC (plan2 §4.1)
 				uf->expand_splice_copy_ms = expand_splice_copy_ms;
@@ -2298,6 +2334,10 @@ private:
 		// past it, so nothing below it is ever reached. See the classification block in expandStack().
 		bool below_far_cut;
 	};
+
+	// SESSION086: orders seeds by how much walking they still have ahead of them - see the targeted split in
+	// expandParallel() for why pixel_scale is the cost signal.
+	struct SeedPixelScaleLess { bool operator() (const HeapItem& a, const HeapItem& b) const { return a.pixel_scale < b.pixel_scale; } };
 
 	HeapItem makeHeapItem(uint32 member_idx, uint32 tree_local_idx, size_t member_offset, uint32 depth, const js::Vector<Vec3f, 16>& positions, const js::Vector<float, 16>& feature_sizes) const
 	{
@@ -2689,21 +2729,48 @@ private:
 			stack.erase(stack.begin(), stack.begin() + head);
 	}
 
-	// SESSION080: one seed subtree's worth of DFS, on a pool thread, into its own output vector. No shared mutable state
-	// at all: every array it reads is a frozen snapshot, and the two diag counters and two cap flags are per-task and
-	// reduced by the caller.
+	// SESSION080: seed subtrees' worth of DFS, on a pool thread, into its own output vector. The only shared mutable
+	// state is the seed cursor described below; every array it reads is a frozen snapshot, and the diag counters and cap
+	// flags are per-task and reduced by the caller.
+	//
+	// SESSION086: the seeds are PULLED one at a time off a shared cursor rather than dealt out to the tasks up front.
+	//
+	// Session080 dealt them round-robin - seed s to task s % num_tasks - reasoning that round-robin decorrelates sibling
+	// costs. It does, but the assignment is still fixed before any work starts, so a task that draws an expensive subtree
+	// runs long while the tasks that drew cheap ones finish and idle. Measured session086 over six captures: par
+	// (task_sum/task_max) 3.0-5.3 against ~17 threads, with task_max within 8% of the whole of expand_ms - one bucket
+	// held roughly a third of the work and the group waited on it. Pulling bounds the imbalance by the cost of the
+	// largest single SEED rather than the largest BUCKET; it needs no cost estimate for a subtree (the tree does not
+	// carry one - subtree sizes are not stored, and the breadth-first linearisation makes them non-local); and it adapts
+	// on its own when the pool is already busy with a barrier build, which a static deal cannot.
+	//
+	// run_ms now means "how long this thread was working", not "how long one bucket took", so par reads as true
+	// utilisation. Fragment order across tasks was already documented as not mattering - see expandParallel().
 	class GsExpandTask : public glare::Task
 	{
 	public:
-		GsExpandTask() : diag_coarse_a(0), diag_coarse_b(0), diag_reuse_roots(0), hit_density_cap(false), hit_depth_cap(false), num_sat_bias_stops(0), num_sat_bias_tested(0), run_ms(0.0) {}
+		GsExpandTask() : diag_coarse_a(0), diag_coarse_b(0), diag_reuse_roots(0), hit_density_cap(false), hit_depth_cap(false), num_sat_bias_stops(0), num_sat_bias_tested(0), run_ms(0.0), seeds_taken(0), seed_max_ms(0.0) {}
 
 		virtual void run(size_t /*thread_index*/) override
 		{
 			Timer task_timer; // SESSION080 DIAGNOSTIC - see GaussianSplatUnculledFrontier::expand_task_max_ms.
 			bool unused_budget_cap = false; // Not enforced here - see expandParallel().
-			parent->expandStack(stack, decorated, *positions, *feature_sizes, *cull_radii,
-				/*enforce_budget=*/false, /*breadth_first=*/false, /*pause_at_stack_size=*/0,
-				diag_coarse_a, diag_coarse_b, diag_reuse_roots, unused_budget_cap, hit_density_cap, hit_depth_cap, num_sat_bias_stops, num_sat_bias_tested);
+			while(1)
+			{
+				const int64 seed_i = next_seed->increment(); // Returns the value BEFORE the increment - see AtomicInt::increment().
+				if(seed_i >= (int64)seeds->size())
+					break;
+
+				// expandStack() runs the stack down to empty in DFS mode and APPENDS to `decorated`, so taking one seed at a
+				// time accumulates into the same output block a whole bucket used to fill.
+				++seeds_taken; // SESSION086 DIAGNOSTIC
+				Timer seed_timer; // SESSION086 DIAGNOSTIC - see GaussianSplatUnculledFrontier::expand_seed_max_ms.
+				stack.push_back((*seeds)[(size_t)seed_i]);
+				parent->expandStack(stack, decorated, *positions, *feature_sizes, *cull_radii,
+					/*enforce_budget=*/false, /*breadth_first=*/false, /*pause_at_stack_size=*/0,
+					diag_coarse_a, diag_coarse_b, diag_reuse_roots, unused_budget_cap, hit_density_cap, hit_depth_cap, num_sat_bias_stops, num_sat_bias_tested);
+				seed_max_ms = myMax(seed_max_ms, seed_timer.elapsed() * 1.0e3);
+			}
 			run_ms = task_timer.elapsed() * 1.0e3;
 		}
 
@@ -2711,12 +2778,15 @@ private:
 		const js::Vector<Vec3f, 16>* positions;
 		const js::Vector<float, 16>* feature_sizes;
 		const js::Vector<float, 16>* cull_radii;
-		std::vector<HeapItem> stack; // This task's seeds, and its own working stack thereafter.
+		const std::vector<HeapItem>* seeds; // SESSION086: shared and read-only, owned by expandParallel() for the group's lifetime.
+		glare::AtomicInt* next_seed;        // SESSION086: the shared cursor into `seeds`.
+		std::vector<HeapItem> stack; // This task's working stack - empty between seeds.
 		js::Vector<DistIdx, 16> decorated;
 		size_t diag_coarse_a, diag_coarse_b, diag_reuse_roots;
 		bool hit_density_cap, hit_depth_cap;
 		size_t num_sat_bias_stops, num_sat_bias_tested; // SESSION085 ETAP 3 - see the parent's.
 		double run_ms; // SESSION080 DIAGNOSTIC
+		size_t seeds_taken; double seed_max_ms; // SESSION086 DIAGNOSTIC - see the frontier's expand_workers/expand_seed_max_ms.
 	};
 
 	// SESSION080: the parallel expand. Walks the top of the tree serially just far enough to have a good supply of
@@ -2739,31 +2809,92 @@ private:
 		size_t& diag_coarse_a, size_t& diag_coarse_b, size_t& diag_reuse_roots,
 		bool& hit_budget_cap, bool& hit_density_cap, bool& hit_depth_cap, size_t& num_sat_bias_stops, size_t& num_sat_bias_tested)
 	{
-		// Seeds are cut far finer than the thread count on purpose, for the same reason session079's saturation chunks
-		// are: subtree cost is wildly uneven (the member the camera is standing inside dwarfs the others), so an even
-		// split of the SUBTREES is not an even split of the work. Many small tasks let the pool even that out itself.
+		// SESSION080/086: the seed set the pool pulls from. Two numbers, meaning different things: `spread_seeds` is how
+		// far the plain breadth-first prologue runs before the targeted splitting below takes over, `target_seeds` is how
+		// many independent pieces the walk is finally handed out in.
+		//
+		// Both are granularity, not tuning. What decides the BALANCE is the split rule below, which is driven by a measured
+		// property of each seed rather than by a number chosen per scene - see there.
 		const size_t concurrency = myMax<size_t>(1, (size_t)task_manager->getConcurrency());
-		const size_t target_seeds = concurrency * 16;
+		const size_t spread_seeds = concurrency * 4;
+		// SESSION086: not a fixed count any more - the renderer carries it and adjusts it from the previous traversal's
+		// own measurements. See GaussianSplatRenderer::updateExpandSeedTarget(). 0 means "nothing measured yet".
+		const size_t target_seeds = myMax(spread_seeds, expand_seed_target > 0 ? expand_seed_target : concurrency * 16);
 
 		// run()'s seed loop has already written any no-tree member's splats into `decorated`, and this function never
 		// revisits those - so the over-budget fallback below must rewind to here, not to empty.
 		const size_t initial_decorated = decorated.size();
 
-		// Walk the top serially until the stack holds enough subtree roots. Same code, same decisions - this is simply
-		// the first part of the identical DFS, and anything it finishes on the way lands in `decorated` directly.
+		// Walk the top serially until the stack holds a first spread of subtree roots. Same code, same decisions - this is
+		// simply the first part of the identical DFS, and anything it finishes on the way lands in `decorated` directly.
 		Timer prologue_timer; // SESSION080 DIAGNOSTIC
-		expandStack(stack, decorated, positions, feature_sizes, cull_radii, /*enforce_budget=*/false, /*breadth_first=*/true, /*pause_at_stack_size=*/target_seeds,
+		expandStack(stack, decorated, positions, feature_sizes, cull_radii, /*enforce_budget=*/false, /*breadth_first=*/true, /*pause_at_stack_size=*/spread_seeds,
 			diag_coarse_a, diag_coarse_b, diag_reuse_roots, hit_budget_cap, hit_density_cap, hit_depth_cap, num_sat_bias_stops, num_sat_bias_tested);
+
+		// SESSION086: TARGETED SPLITTING. Keep expanding whichever seed has the largest pixel_scale until there are enough
+		// of them, instead of expanding everything uniformly and stopping on a global count.
+		//
+		// Why the plain prologue cannot do this. Its stop condition is "enough entries are pending", a property of the whole
+		// QUEUE, so it halts the instant the count is reached and whatever monster is sitting unexpanded in that queue stays
+		// whole. Measured session086, which is what expand_workers/expand_seed_max_ms were added to settle: with the
+		// distribution already dynamic and workers=15 of 17 threads confirmed available, seed_max_ms was 131.0 against a
+		// task_max_ms of 131 - one seed WAS the whole window, ~15% of all the work in a single piece. Deepening the plain
+		// prologue 16x (272 -> 4354 seeds) moved it only from 142 to 131: uniform deepening splits the entire tree to pay
+		// for splitting one branch of it, and mostly misses the branch.
+		//
+		// pixel_scale as the cost signal. It is not a guess at subtree size - it is the quantity the walk STOPS on
+		// (pixel_scale <= pixel_scale_limit), so a seed's pixel_scale says how many levels it still has to descend, and the
+		// node count grows roughly as its square. The tree stores no subtree sizes and its breadth-first linearisation makes
+		// them non-local, so this is the only cost signal available for free, and it happens to be the right one. It can be
+		// fooled by an unusually dense subtree at a modest pixel_scale (layer_density is not consulted); that failure shows
+		// up as an unsplit straggler, which is exactly what seed_max_ms reports, so it would not be silent.
+		//
+		// Cost. One iteration expands ONE node - pause_at_stack_size=2 stops as soon as that node's children are pending -
+		// so this is a few hundred to a few thousand node expansions, not a walk (measured 0.02-0.21ms).
+		//
+		// HOW MANY splits is not decided here. Ordering by pixel_scale was confirmed right by measurement - the costliest
+		// seed reported px 851 with the limit at single digits, i.e. it WAS the heap's first pick - but a stop rule of
+		// "until there are N seeds" is not a statement about balance at all, and on a scene where hundreds of nodes need
+		// splitting a fixed N runs out long before the worst one is small. So the count comes from the closed loop in
+		// updateExpandSeedTarget(), which raises it while the measured costliest seed exceeds a thread's fair share of the
+		// measured total and lowers it when it does not. Nothing here is chosen per scene.
+		if(stack.size() < target_seeds)
+		{
+			std::vector<HeapItem> split_tmp; // Holds one node's children at a time; kept outside the loop so the capacity is reused.
+			split_tmp.reserve(16);
+			std::make_heap(stack.begin(), stack.end(), SeedPixelScaleLess());
+			while(!stack.empty() && stack.size() < target_seeds)
+			{
+				std::pop_heap(stack.begin(), stack.end(), SeedPixelScaleLess()); // Largest pixel_scale moves to the back.
+				split_tmp.clear();
+				split_tmp.push_back(stack.back());
+				stack.pop_back();
+
+				// One level. If the node stops here instead (converged, leaf, capped) it is emitted into `decorated` by the very
+				// same code that would have emitted it during the walk, and split_tmp comes back empty - nothing to re-add.
+				expandStack(split_tmp, decorated, positions, feature_sizes, cull_radii, /*enforce_budget=*/false, /*breadth_first=*/true, /*pause_at_stack_size=*/2,
+					diag_coarse_a, diag_coarse_b, diag_reuse_roots, hit_budget_cap, hit_density_cap, hit_depth_cap, num_sat_bias_stops, num_sat_bias_tested);
+
+				for(size_t i=0; i<split_tmp.size(); ++i)
+				{
+					stack.push_back(split_tmp[i]);
+					std::push_heap(stack.begin(), stack.end(), SeedPixelScaleLess());
+				}
+			}
+		}
 		expand_prologue_ms = prologue_timer.elapsed() * 1.0e3;
 		expand_seeds = stack.size();
 
 		if(stack.empty()) // The whole tree fitted in the serial prologue (a small or heavily culled scene).
 			return;
 
-		// One task per seed, round-robined into `num_tasks` buckets so that a task gets a spread of the tree rather than
-		// a contiguous run of siblings, whose costs are correlated.
-		const size_t num_tasks = myMin(stack.size(), concurrency * 4);
+		// SESSION086: one task per THREAD, each pulling seeds off a shared cursor, rather than session080's fixed
+		// round-robin deal of seeds into concurrency*4 buckets - see GsExpandTask for the measurement that motivated it.
+		// More tasks than threads no longer buys anything once the balancing is dynamic; it would only add task overhead.
+		// `stack` stays alive as the seed array for the whole group, so it is cleared after the run rather than before it.
+		const size_t num_tasks = myMin(stack.size(), concurrency);
 		expand_num_tasks = num_tasks;
+		glare::AtomicInt next_seed(0);
 		glare::TaskGroupRef group = new glare::TaskGroup();
 		group->tasks.resize(num_tasks);
 		for(size_t t=0; t<num_tasks; ++t)
@@ -2771,13 +2902,13 @@ private:
 			Reference<GsExpandTask> task = new GsExpandTask();
 			task->parent = this;
 			task->positions = &positions; task->feature_sizes = &feature_sizes; task->cull_radii = &cull_radii;
-			for(size_t s=t; s<stack.size(); s += num_tasks)
-				task->stack.push_back(stack[s]);
+			task->seeds = &stack;
+			task->next_seed = &next_seed;
 			group->tasks[t] = task;
 		}
-		stack.clear();
 
 		task_manager->runTaskGroup(group);
+		stack.clear(); // Only now: the tasks read it as their seed array - see above.
 
 		// SESSION080: what the serial part (run()'s no-tree seeds plus this function's prologue) already put in - NOT
 		// initial_decorated, which predates the prologue. This is where the tasks' blocks start, and it is the same
@@ -2791,6 +2922,8 @@ private:
 			total += task->decorated.size();
 			expand_task_sum_ms += task->run_ms; // SESSION080 DIAGNOSTIC - see the fields' comment.
 			expand_task_max_ms = myMax(expand_task_max_ms, task->run_ms);
+			if(task->seeds_taken > 0) ++expand_workers; // SESSION086 DIAGNOSTIC - see the fields' comment.
+			expand_seed_max_ms = myMax(expand_seed_max_ms, task->seed_max_ms); // SESSION086 - the quantity updateExpandSeedTarget() steers on.
 		}
 
 		// Over budget: the parallel walk's truncation would not match the serial one's, so throw it away and redo the
@@ -2898,6 +3031,8 @@ private:
 	// GaussianSplatUnculledFrontier's matching fields for what the numbers are for. All stay zero on the serial path.
 	size_t expand_seeds, expand_num_tasks;
 	double expand_prologue_ms, expand_task_max_ms, expand_task_sum_ms;
+	size_t expand_workers; double expand_seed_max_ms; // SESSION086 DIAGNOSTIC - see the frontier's matching fields.
+	size_t expand_seed_target;  // SESSION086 - see GaussianSplatRenderer::updateExpandSeedTarget().
 	double expand_splice_reserve_ms, expand_splice_copy_ms; // SESSION080 DIAGNOSTIC (plan2 §4.1)
 
 	// SESSION080: the previous traversal's UNPRUNED frontier for this cloud, captured by kickOffTraversals() before this
@@ -2940,11 +3075,8 @@ private:
 	// what it protects against. A fraction of the split distance, not an absolute: 1/4 keeps the accumulated ordering
 	// error inside the far region well under the range at which that region sits, which is the ratio that decides
 	// whether it can be seen.
-	static const float reuse_max_drift_fraction;
+	float reuse_drift_fraction; // SESSION086: was `static const float reuse_max_drift_fraction = 0.25f` - see GaussianSplatRenderer::getFrontierReuseDriftFraction() for why it had to become adjustable.
 };
-
-
-const float GaussianSplatLodTraversalTask::reuse_max_drift_fraction = 0.25f; // SESSION080 §4.3 - see the declaration.
 
 
 } // end anonymous namespace
@@ -2976,7 +3108,11 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	filter_frustum_planes_enabled(true), // SESSION074 - see getFilterFrustumPlanesEnabled().
 	sat_prefilter_threshold(0.98f), // SESSION079 - see getSatPrefilterThreshold().
 	sat_diag_log(false), sat_debug_overlay_mode(GaussianSplatSatDebugOverlayMode_Off), sat_grid_subdiv(0.3f), sat_region_radius(0.5f), sat_region_closing_tiles(0), sat_bias_ceiling(1.f), // SESSION076/078/081: diagnostics off by default - see getSatDiagLog()/getSatDebugOverlayMode(). SESSION085 ETAP 6: sat_bias_ceiling 1 = the LoD bias off, i.e. the pre-bias behaviour; the calibrated value is still owner-selected rather than a default. SESSION086: sat_region_radius frozen at 0.5 - it is no longer only a conservatism knob, it also sets how long a barrier survives camera motion, which is what keeps the barrier rebuild off the traversal's threads. See getSatRegionRadius().
-	frontier_reuse_split_dist(0.f), // SESSION080 STEP B: off by default - 0 is the pre-session080 walk-everything behaviour, bit-for-bit. See getFrontierReuseSplitDist().
+	// SESSION080 STEP B: 0 = walk everything, the pre-session080 behaviour, bit-for-bit. SESSION086 turned it on at 25,
+	// measured it against the LoD bias, and turned it back off - the mechanism is sound but incompatible with the bias
+	// as cut. The measurement and the verdict are in getFrontierReuseSplitDist(); the drift fraction that measured it
+	// stays at session080's 0.25 and no longer has a UI knob.
+	frontier_reuse_split_dist(0.f), frontier_reuse_drift_fraction(0.25f), expand_seed_target(0), // SESSION086: 0 = nothing measured yet - see updateExpandSeedTarget().
 	splat_point_size_px(1.f),
 	splat_merge_spread_widen(3.0f), // SESSION071: analytic minimum is sqrt(3) (see widenedMergedScale()); owner default set higher for extra margin.
 	// SESSION071: GaussianSplatMergeColourParams defaults to Energy - owner-confirmed better at every pixel scale limit tested; Legacy is kept only as the A/B comparison.
@@ -6478,6 +6614,43 @@ void GaussianSplatRenderer::setFrontierReuseSplitDist(float v)
 }
 
 
+// SESSION086 CALIBRATION: no cache drop. Unlike the three setters above this does not change what a traversal
+// PRODUCES - the far block it accepts or rejects is the same object either way, and the only thing that moves is HOW
+// FAR the camera may get from that block's anchor before the next traversal walks the tree instead. A frontier already
+// in hand stays a valid input under the new value; the new bound simply applies from the next traversal on. See
+// getFrontierReuseDriftFraction().
+void GaussianSplatRenderer::setFrontierReuseDriftFraction(float v)
+{
+	frontier_reuse_drift_fraction = v;
+}
+
+
+// SESSION086 - see the declaration for why the seed count is measured rather than chosen.
+void GaussianSplatRenderer::updateExpandSeedTarget(double seed_max_ms, double task_sum_ms, double prologue_ms, double expand_ms)
+{
+	if(seed_max_ms <= 0.0 || task_sum_ms <= 0.0)
+		return; // Serial path, or a traversal that never reached expandParallel() - nothing measured, so nothing to learn from.
+
+	glare::TaskManager* const task_manager = opengl_engine->getMainTaskManager();
+	const size_t concurrency = myMax<size_t>(1, task_manager != NULL ? (size_t)task_manager->getConcurrency() : 1);
+	const double fair_share_ms = task_sum_ms / (double)concurrency; // What one thread would carry if the split were perfect.
+
+	// Bounds. The floor is the smallest split that could keep the pool fed at all; the ceiling is what stops a
+	// pathological scene from driving the serial split loop somewhere expensive - the loop is one node expansion per
+	// iteration (measured 0.21ms at 4354 seeds), so the ceiling is generous rather than tight.
+	const size_t min_target = concurrency * 4;
+	const size_t max_target = concurrency * 4096;
+
+	size_t target = expand_seed_target > 0 ? expand_seed_target : concurrency * 16;
+	if(seed_max_ms > fair_share_ms * 1.5)
+		target *= 2;                                   // The worst seed still carries well over its share: split finer.
+	else if(prologue_ms > expand_ms * 0.05)
+		target /= 2;                                   // The split is now a real cost of its own: back off. See the declaration.
+
+	expand_seed_target = myClamp(target, min_target, max_target);
+}
+
+
 void GaussianSplatRenderer::setMergeColourMode(GaussianSplatMergeColourMode v)
 {
 	if(v == splat_merge_colour_params.mode)
@@ -7773,6 +7946,11 @@ void GaussianSplatRenderer::drainTraversalResults()
 			cloud->last_traversal_sat_bias_ceiling = msg->scratch->sat_bias_ceiling_used; // SESSION085 ETAP 6
 			cloud->last_traversal_sat_bias_tested = msg->scratch->num_sat_bias_tested;
 
+			// SESSION086: close the loop on how finely the next traversal splits its seeds - see updateExpandSeedTarget().
+			if(msg->unculled_frontier.nonNull())
+				updateExpandSeedTarget(msg->unculled_frontier->expand_seed_max_ms, msg->unculled_frontier->expand_task_sum_ms,
+					msg->unculled_frontier->expand_prologue_ms, msg->unculled_frontier->expand_ms);
+
 			// SESSION076/081: no saturation numbers to print here any more. A traversal's first (and now only) message
 			// carries the UNPRUNED frontier and never builds or applies a grid itself - APPLY prints from
 			// drainSaturationApplyResults() ([gsr-sat-apply]); BUILD prints from drainSaturationBuildResults()
@@ -7821,6 +7999,9 @@ void GaussianSplatRenderer::drainTraversalResults()
 						" tasks=" + uInt64ToStringCommaSeparated(uf.expand_num_tasks) +
 						" prologue_ms=" + doubleToStringNDecimalPlaces(uf.expand_prologue_ms, 2) +
 						" task_max_ms=" + doubleToStringNDecimalPlaces(uf.expand_task_max_ms, 2) +
+						" workers=" + uInt64ToStringCommaSeparated(uf.expand_workers) + // SESSION086 DIAGNOSTIC - see the field.
+						" seed_max_ms=" + doubleToStringNDecimalPlaces(uf.expand_seed_max_ms, 2) +
+						" seed_target=" + uInt64ToStringCommaSeparated(uf.expand_seed_target) +
 						" task_sum_ms=" + doubleToStringNDecimalPlaces(uf.expand_task_sum_ms, 2) +
 						// SESSION080 DIAGNOSTIC (plan2 §4.1): the serial concatenation after runTaskGroup() returns, split
 						// into the destination's allocation and the copy loop itself - see expand_splice_reserve_ms. Both
@@ -8499,7 +8680,9 @@ void GaussianSplatRenderer::kickOffTraversals()
 			// SESSION085 ETAP 3: the cloud's current barrier, for the LoD bias. One build behind by construction - the same
 			// staleness the apply stage already lives with - and null on a cloud's first kick, which leaves the bias off.
 			/*sat_barrier=*/best_cloud->cached_sat_barrier,
-			/*sat_bias_ceiling=*/sat_bias_ceiling)); // SESSION085 ETAP 3 - see getSatBiasCeiling(). 1 = off.
+			/*sat_bias_ceiling=*/sat_bias_ceiling, // SESSION085 ETAP 3 - see getSatBiasCeiling(). 1 = off.
+			/*reuse_drift_fraction=*/frontier_reuse_drift_fraction, // SESSION086 - see getFrontierReuseDriftFraction().
+			/*expand_seed_target=*/expand_seed_target)); // SESSION086 - see updateExpandSeedTarget().
 	}
 
 	// SESSION055 diag: after the while-loop, detect *unmet* rotation demand - a cloud whose forward has shifted past the

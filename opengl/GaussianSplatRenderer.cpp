@@ -281,6 +281,13 @@ public:
 	// page faults included. Same question, and the same candidate fix (pool it on the traversal scratch), as
 	// expand_splice_reserve_ms - measured together because one rebuild answers both.
 	double sort_alloc_ms;
+	// SESSION087: sort_ms is not one thing. Session086 recorded it as a serial radix that "was never parallelised", which
+	// the code contradicted - the parallel branch has been taken since session080 - and reading the total as if it were
+	// only the sort hid that a quarter of it was a serial unpack loop, plus a copy-back that bought nothing. Kept, unlike
+	// that session's other diagnostics, because the sort block is an active work area and this is the split that makes
+	// its cost readable: an interleaved A/B over these two measured -18 ms interior / -23 ms exterior per traversal.
+	double sort_radix_ms;        // The sort call itself, nothing else.
+	double sort_unpack_ms;       // Splitting the packed idx into output/coarse_flags. Parallel since session087.
 	// SESSION080 DIAGNOSTIC: why the parallel expand did or did not pay off - see expandParallel(). The pair that matters
 	// is sum vs max: task_sum_ms is the total work the tasks did, task_max_ms the longest single one, i.e. the critical
 	// path. sum/max is the parallelism actually available in the seed split. If max ~= expand_ms one subtree dominates
@@ -408,6 +415,7 @@ public:
 		expand_seeds(0), expand_num_tasks(0), expand_prologue_ms(0.0), expand_task_max_ms(0.0), expand_task_sum_ms(0.0), // SESSION080
 		expand_workers(0), expand_seed_max_ms(0.0), expand_seed_target(0), // SESSION086
 		expand_splice_reserve_ms(0.0), expand_splice_copy_ms(0.0), sort_alloc_ms(0.0), soa_ms(0.0), // SESSION080 (plan2 §4.1)
+		sort_radix_ms(0.0), sort_unpack_ms(0.0), // SESSION087
 		traversal_output_n(0), // SESSION080
 		sat_bias_barrier_time(0.0), // SESSION085
 		sort_staleness_delta_ws(0.0), sort_staleness_prev_n(0), sort_staleness_common_n(0), sort_staleness_max_disp(0), // SESSION080
@@ -1275,6 +1283,29 @@ public:
 };
 
 
+// SESSION087: one slice of the post-sort unpack - see the call site in GaussianSplatLodTraversalTask::run(). Splits the
+// sorted DistIdx stream into the two arrays the rest of the pipeline consumes. Measured serial at 12-16 ms (a quarter of
+// sort_ms) purely because it was the one pass in the sort block nobody had split; it is the same pure map as
+// GsFrontierSoATask - slot i is written from element i alone - so it parallelises without any reasoning about order.
+class GsSortUnpackTask : public glare::Task
+{
+public:
+	virtual void run(size_t /*thread_index*/)
+	{
+		for(size_t i=i_begin; i<i_end; ++i)
+		{
+			const uint32 packed = sorted[i].idx;
+			out_indices[i] = packed & 0x7FFFFFFFu;             // Real cloud index (bit 31 stripped).
+			out_coarse_flags[i] = (packed >> 31) ? 1.f : 0.f;  // 1 = coarse-floor node, for the filter's per-node dilation.
+		}
+	}
+
+	size_t i_begin, i_end;
+	const GsDistIdx* sorted;
+	uint32* out_indices; float* out_coarse_flags;
+};
+
+
 // SESSION081 STAGE 4B: how far ahead the occluder gather prefetches the packed occluder record. Swept, not assumed -
 // ns per occluder on the owner's reference scene, 5-7 barrier builds each, teleporting between viewpoints:
 //
@@ -2055,30 +2086,72 @@ public:
 		sort_scratch.resizeNoCopy(decorated.size());
 		const double sort_alloc_ms = sort_alloc_timer.elapsed() * 1.0e3;
 		const size_t parallel_sort_min_elements = 16384;
-		if(task_manager != NULL && decorated.size() >= parallel_sort_min_elements)
-			Sort::radixSortWithParallelPartition<DistIdx, DistIdxKey>(*task_manager, decorated.data(), (uint32)decorated.size(), DistIdxKey(), sort_scratch.data(), /*put_result_in_working_space=*/false);
+		// SESSION087: hoisted out of the if below only so the two costs inside sort_ms - the sort proper and the unpack
+		// that follows it - can be timed apart. Reading the total as one number is what hid the unpack for six sessions.
+		const bool sort_parallel = (task_manager != NULL) && (decorated.size() >= parallel_sort_min_elements);
+		Timer sort_radix_timer; // SESSION087 DIAGNOSTIC - see GaussianSplatUnculledFrontier::sort_radix_ms.
+		// SESSION087: put_result_in_working_space=true. Both radix variants run an odd number of 11-bit passes (3, no
+		// branching - checked in Sort.h, not assumed) and so end with the sorted data in the working space; false made them
+		// pay a final full-array copy back into `decorated` (memcpy in the parallel variant, an element loop in the serial
+		// one) purely so the result would sit in the buffer the two readers below happened to name. Those readers now name
+		// sort_scratch instead, which is the same data without the copy - 34 MB read + 34 MB written per traversal at 4M
+		// nodes, and it bought nothing.
+		// floatKeyAscendingSort honours the flag on its small-N std::sort path too, so the fallback stays correct.
+		if(sort_parallel)
+			Sort::radixSortWithParallelPartition<DistIdx, DistIdxKey>(*task_manager, decorated.data(), (uint32)decorated.size(), DistIdxKey(), sort_scratch.data(), /*put_result_in_working_space=*/true);
 		else
-			Sort::floatKeyAscendingSort(decorated.data(), decorated.size(), DistIdxLess(), DistIdxKey(), sort_scratch.data(), /*put_result_in_working_space=*/false);
+			Sort::floatKeyAscendingSort(decorated.data(), decorated.size(), DistIdxLess(), DistIdxKey(), sort_scratch.data(), /*put_result_in_working_space=*/true);
+		const double sort_radix_ms = sort_radix_timer.elapsed() * 1.0e3; // SESSION087 DIAGNOSTIC
+		// The sorted stream. NOTE for anyone extending this block: `decorated` is NOT it any more - it holds an
+		// intermediate radix pass's output and is dead from here on. Both readers below (the unpack and dist_pctile) take
+		// `sorted`, and anything added after them must too.
+		const DistIdx* const sorted = sort_scratch.data();
+		const size_t sorted_n = decorated.size();
 
-		output.resizeNoCopy(decorated.size());
-		coarse_flags.resizeNoCopy(decorated.size());
-		for(size_t i=0; i<decorated.size(); ++i)
+		output.resizeNoCopy(sorted_n);
+		coarse_flags.resizeNoCopy(sorted_n);
+
+		// SESSION087: was a serial loop, measured at 12-16 ms - a quarter of sort_ms and the last unsplit pass in this
+		// block. Chunked exactly like buildFrontierSoA() (same pure-map argument: slot i depends on element i alone, so the
+		// result is bit-identical to the serial version), with the same chunk sizing.
+		Timer sort_unpack_timer; // SESSION087 DIAGNOSTIC
+		const size_t unpack_concurrency = (task_manager != NULL) ? myMax<size_t>(1, (size_t)task_manager->getConcurrency()) : 1;
+		const size_t unpack_chunks = myMax<size_t>(1, myMin(unpack_concurrency * 4, sorted_n / 16384));
+		if(task_manager != NULL && unpack_chunks > 1)
 		{
-			const uint32 packed = decorated[i].idx;
-			output[i] = packed & 0x7FFFFFFFu;                  // Real cloud index (bit 31 stripped).
-			coarse_flags[i] = (packed >> 31) ? 1.f : 0.f;      // 1 = coarse-floor node, for the filter's per-node dilation.
+			glare::TaskGroupRef unpack_group = new glare::TaskGroup();
+			unpack_group->tasks.resize(unpack_chunks);
+			for(size_t c=0; c<unpack_chunks; ++c)
+			{
+				Reference<GsSortUnpackTask> t = new GsSortUnpackTask();
+				t->i_begin = (sorted_n * c)       / unpack_chunks;
+				t->i_end   = (sorted_n * (c + 1)) / unpack_chunks;
+				t->sorted = sorted;
+				t->out_indices = output.data(); t->out_coarse_flags = coarse_flags.data();
+				unpack_group->tasks[c] = t;
+			}
+			task_manager->runTaskGroup(unpack_group);
 		}
+		else
+			for(size_t i=0; i<sorted_n; ++i)
+			{
+				const uint32 packed = sorted[i].idx;
+				output[i] = packed & 0x7FFFFFFFu;                  // Real cloud index (bit 31 stripped).
+				coarse_flags[i] = (packed >> 31) ? 1.f : 0.f;      // 1 = coarse-floor node, for the filter's per-node dilation.
+			}
+		const double sort_unpack_ms = sort_unpack_timer.elapsed() * 1.0e3; // SESSION087 DIAGNOSTIC
 		const double sort_ms = sort_timer.elapsed() * 1.0e3; // SESSION080 DIAGNOSTIC - includes the unpack loop above, not just the sort call.
 
 		// SESSION080 DIAGNOSTIC: where this frontier's nodes actually sit, in metres - see GaussianSplatUnculledFrontier::
-		// dist_pctile. `decorated` is already ascending by dist_sq, so this is five lookups; deliberately not gated on a
+		// dist_pctile. The sorted stream is ascending by dist_sq, so this is five lookups; deliberately not gated on a
 		// debug flag for that reason. Sizes the "reuse the far tail" question before any of it is built.
+		// SESSION087: reads `sorted`, not `decorated` - see the sort call's put_result_in_working_space note.
 		float dist_pctile[5] = { 0.f, 0.f, 0.f, 0.f, 0.f };
-		if(!decorated.empty())
+		if(sorted_n > 0)
 		{
 			const int pct[5] = { 10, 25, 50, 75, 90 };
 			for(int k=0; k<5; ++k)
-				dist_pctile[k] = std::sqrt(decorated[myMin(decorated.size() - 1, (decorated.size() * pct[k]) / 100)].dist_sq);
+				dist_pctile[k] = std::sqrt(sorted[myMin(sorted_n - 1, (sorted_n * pct[k]) / 100)].dist_sq);
 		}
 
 		scratch->hit_budget_cap = hit_budget_cap;
@@ -2179,6 +2252,7 @@ public:
 				uf->focal_px = focal_px;
 				uf->expand_ms = expand_ms; // SESSION080 DIAGNOSTIC
 				uf->sort_ms = sort_ms;
+				uf->sort_radix_ms = sort_radix_ms; uf->sort_unpack_ms = sort_unpack_ms; // SESSION087
 				uf->traversal_output_n = n;
 				uf->expand_seeds = expand_seeds;
 				uf->expand_num_tasks = expand_num_tasks;
@@ -7978,6 +8052,9 @@ void GaussianSplatRenderer::drainTraversalResults()
 					conPrint("[gsr-traversal] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms " +
 						"expand_ms=" + doubleToStringNDecimalPlaces(uf.expand_ms, 2) +
 						" sort_ms=" + doubleToStringNDecimalPlaces(uf.sort_ms, 2) +
+						// SESSION087: sort_ms split into the sort proper and the unpack that follows it - see the fields.
+						" radix_ms=" + doubleToStringNDecimalPlaces(uf.sort_radix_ms, 2) +
+						" unpack_ms=" + doubleToStringNDecimalPlaces(uf.sort_unpack_ms, 2) +
 						" total_ms=" + doubleToStringNDecimalPlaces(uf.expand_ms + uf.sort_ms, 2) +
 						// SESSION080: traversal_output_n rather than uf.indices.size(). They are equal on THIS (unpruned)
 						// frontier, but the field is the one that stays right if this line is ever read off a pruned copy,

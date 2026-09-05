@@ -14,6 +14,8 @@ Copyright Glare Technologies Limited 2026 -
 #include <cstring> // SESSION079: memmove() in gsBuildSaturationGridParallel().
 #include <cmath>
 #include <limits>
+#include <vector>    // SESSION088 DIAGNOSTIC: gsSatGridStats()'s percentile scratch.
+#include <algorithm> // SESSION088 DIAGNOSTIC: std::sort() in gsSatGridStats().
 
 
 // SESSION074: fixed margin for the octahedral mapping's area distortion (not equal-area; the literature bounds the
@@ -1733,6 +1735,91 @@ float gsSatBuriedRatioSq(const Vec4f& offset, float dist_sq, const js::Vector<fl
 		return 0.f; // In front of the barrier, or on it.
 
 	return dist_sq / thresh_sq;
+}
+
+
+GsSatGridStats::GsSatGridStats()
+:	num_tiles(0), num_finite(0), d_p10(0.f), d_med(0.f), d_p90(0.f), d_max(0.f),
+	num_pairs(0), num_edge_pairs(0), num_both_finite(0),
+	adj_p50(1.f), adj_p90(1.f), adj_max(1.f), num_adj_gt2(0), num_adj_gt4(0), max_window_frac(0.f)
+{}
+
+
+// SESSION088 DIAGNOSTIC - see the header for what this is measuring and why.
+void gsSatGridStats(const js::Vector<float, 16>& sat_depth, int res, GsSatGridStats& out)
+{
+	out = GsSatGridStats();
+	if(res <= 2 || sat_depth.size() != (size_t)res * (size_t)res)
+		return; // No grid, or a res too small to have any interior pair at all.
+
+	out.num_tiles = sat_depth.size();
+
+	// Depth percentiles over the finite tiles. Collected into a scratch copy and sorted outright rather than estimated -
+	// this runs twice a second at most, and an exact median is worth more than the microseconds a histogram would save.
+	std::vector<float> finite;
+	finite.reserve(sat_depth.size());
+	for(size_t t=0; t<sat_depth.size(); ++t)
+		if(std::isfinite(sat_depth[t]))
+			finite.push_back(sat_depth[t]);
+
+	out.num_finite = finite.size();
+	if(!finite.empty())
+	{
+		std::sort(finite.begin(), finite.end());
+		const size_t last = finite.size() - 1;
+		out.d_p10 = finite[(size_t)(0.10 * (double)last)];
+		out.d_med = finite[(size_t)(0.50 * (double)last)];
+		out.d_p90 = finite[(size_t)(0.90 * (double)last)];
+		out.d_max = finite[last];
+	}
+
+	// Adjacent-tile contrast. Right and down neighbours only, so each pair is visited exactly once; the outermost ring is
+	// skipped rather than wrapped - see the header for why that is the honest choice on an octahedral map.
+	std::vector<float> ratios;
+	ratios.reserve(sat_depth.size() * 2);
+	size_t num_equal = 0;
+	for(int v=1; v<res-1; ++v)
+		for(int u=1; u<res-1; ++u)
+		{
+			const float here = sat_depth[(size_t)v * (size_t)res + (size_t)u];
+			const float nbr[2] = {
+				sat_depth[(size_t)v       * (size_t)res + (size_t)(u + 1)],
+				sat_depth[(size_t)(v + 1) * (size_t)res + (size_t)u]
+			};
+			for(int k=0; k<2; ++k)
+			{
+				const float other = nbr[k];
+				const bool a_fin = std::isfinite(here), b_fin = std::isfinite(other);
+				++out.num_pairs;
+				if(a_fin != b_fin)
+				{
+					++out.num_edge_pairs; // Mask silhouette: one side biased, the other not touched at all.
+					continue;
+				}
+				if(!a_fin)
+					continue; // Both +inf - no bias on either side, nothing to contrast.
+
+				++out.num_both_finite;
+				if(here == other)
+					++num_equal; // Exactly equal: the max-window's signature - see max_window_frac.
+
+				const float lo = myMin(here, other), hi = myMax(here, other);
+				const float ratio = (lo > 0.f) ? (hi / lo) : 1.f;
+				ratios.push_back(ratio);
+				if(ratio > 2.f) ++out.num_adj_gt2;
+				if(ratio > 4.f) ++out.num_adj_gt4;
+			}
+		}
+
+	if(!ratios.empty())
+	{
+		std::sort(ratios.begin(), ratios.end());
+		const size_t last = ratios.size() - 1;
+		out.adj_p50 = ratios[(size_t)(0.50 * (double)last)];
+		out.adj_p90 = ratios[(size_t)(0.90 * (double)last)];
+		out.adj_max = ratios[last];
+		out.max_window_frac = (float)((double)num_equal / (double)ratios.size());
+	}
 }
 
 

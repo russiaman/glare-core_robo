@@ -486,3 +486,41 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 // offset is (node_pos - anchor_pos_ws), UNNORMALISED, same convention as gsSatOccluded(); dist_sq is its squared
 // length. No sqrt is taken here - the caller decides whether it wants the linear ratio.
 float gsSatBuriedRatioSq(const Vec4f& offset, float dist_sq, const js::Vector<float, 16>& sat_depth, int res);
+
+
+// SESSION088 DIAGNOSTIC - WHAT SHAPE IS THE FIELD THE BIAS ACTUALLY READS?
+//
+// gsSatBuriedRatioSq() above samples ONE tile, with no interpolation, so the bias multiplier is a piecewise-constant
+// function of direction. Whether that is visible depends entirely on how much neighbouring tiles disagree, and nothing
+// in the pipeline measured that. The owner reports hard-edged, tile-shaped zones of coarsened LoD in far exterior
+// geometry (dense canopy); the two candidate generators - raw per-tile depth noise, and the plateaus the R erosion's
+// max-window builds (gsSatErodeRegionRows()) - produce visibly similar artifacts but very different distributions here:
+//
+//   - raw noise      -> broad, continuous spread of adjacent ratios, no mass at exactly 1.
+//   - erosion plateau-> bimodal: most pairs at exactly 1.0 (inside a plateau) plus a sparse set of large jumps
+//                       (at plateau edges). max_window_frac below counts the "exactly 1" mass directly.
+//
+// So this reports the depth distribution and the ADJACENT-TILE CONTRAST, which is the quantity the artifact is made of.
+//
+// Pairs are 4-connected and counted once each (right and down neighbours only). The octahedral seam is NOT handled:
+// tiles on the grid border fold onto other borders in a way naive indexing gets wrong, so border pairs are skipped
+// entirely rather than counted incorrectly. That drops ~4/res of the pairs (4% at res=99) and cannot bias the verdict,
+// since the artifact is reported across the whole far field, not on one seam.
+//
+// Cost: one pass over res^2 for the pairs, plus a sort of the finite depths for the percentiles - ~0.1ms at res=99.
+// Called once per probe print (twice a second at most), never from the walk.
+struct GsSatGridStats
+{
+	GsSatGridStats();
+
+	size_t num_tiles, num_finite;      // num_finite / num_tiles is [gsr-sat-build]'s sat_tiles=, recomputed here so the two lines are self-contained.
+	float d_p10, d_med, d_p90, d_max;  // Percentiles of the FINITE depths, metres. d_max excludes +inf by construction.
+
+	size_t num_pairs;                  // 4-connected interior pairs examined - the denominator for everything below.
+	size_t num_edge_pairs;             // Exactly one side finite: the mask's own silhouette. A bias step of the full ceiling happens across every one of these.
+	size_t num_both_finite;            // Both sides finite - the pairs adj_* below are computed over.
+	float adj_p50, adj_p90, adj_max;   // max(a,b)/min(a,b) over both-finite pairs. 1.0 = neighbours agree exactly.
+	size_t num_adj_gt2, num_adj_gt4;   // Both-finite pairs whose depth ratio exceeds 2x / 4x - i.e. neighbours the bias reads very differently.
+	float max_window_frac;             // Fraction of both-finite pairs at EXACTLY equal depth. High = the erosion's max-window has flattened the field into plateaus; near zero = the field is raw per-tile measurement.
+};
+void gsSatGridStats(const js::Vector<float, 16>& sat_depth, int res, GsSatGridStats& out);

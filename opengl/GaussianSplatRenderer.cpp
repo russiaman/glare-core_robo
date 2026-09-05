@@ -391,12 +391,33 @@ public:
 	// generation's first traversal, of every traversal while the reuse knob is 0, and of a far block itself.
 	Reference<GaussianSplatUnculledFrontier> far_block;
 
+	// SESSION088: on a far BLOCK, a copy of the saturation grid its selection was actually made under - the evidence the
+	// LoD below the cut was chosen from. Empty on a normal frontier, and on a block built with the bias off.
+	//
+	// Why a copy of the grid rather than a Reference to the barrier: GaussianSplatSaturationBarrier is defined below this
+	// class and only forward-declared above it, so a Reference member here would need its destructor instantiated against
+	// an incomplete type. The grid is sat_grid_res^2 floats - 39KB at the 99x99 the owner's interior builds - copied once
+	// per block build, which is nothing next to the block's own SoA.
+	//
+	// What it is FOR - see getSatBarrierAgreeTol(). Session080 sized the drift bound purely as an ordering error budget,
+	// and session085's LoD bias then gave the block a second, far more sensitive dependence on the barrier that the same
+	// one number was left to cover. This is the second dependence's own evidence, so it can be checked directly instead
+	// of proxied by how far the camera has walked.
+	js::Vector<float, 16> sat_depth_used;
+	int sat_grid_res_used;
+	Vec4f sat_anchor_used; // The barrier anchor that grid was measured from - two grids are only comparable tile-by-tile while their anchors are close, see gsSatBarrierDisagreement().
+	double sat_built_time_used; // SESSION088 DIAGNOSTIC: the captured barrier's own built_time_real_s - printed alongside the LIVE barrier's, on [gsr-traversal], purely so a suspicious barrier_dis= reading can be checked against "were these actually two different barrier builds" before it is trusted.
+
 	// SESSION080: diagnostics for the above - see [gsr-traversal]. reuse_n is far_block's size, repeated here so a log
 	// line describes the whole frontier without dereferencing anything.
 	size_t reuse_roots;          // Subtrees this walk stopped at and left to the far block.
 	size_t reuse_n;              // Nodes the far block contributes, i.e. how much of the frontier was not walked.
 	double reuse_ms;             // Cost of producing the far segment: 0 when it was inherited, the partition+SoA cost when it was built.
 	float reuse_split_dist_used; // The frozen split distance this frontier's cut was made at - see far_block.
+	float barrier_disagreement;  // SESSION088 DIAGNOSTIC: flip + depth, what the acceptance clause gates on - see gsSatBarrierDisagreement().
+	float barrier_flip, barrier_depth, barrier_mean_rel_depth; // SESSION088: its two components, and the mean relative depth move behind the second.
+	bool barrier_measured;       // SESSION088: false = nothing was compared. Printed as n/a, so a not-measured row can no longer be read as perfect agreement.
+	double diag_live_barrier_time, diag_block_barrier_time; // SESSION088 DIAGNOSTIC, TEMPORARY - see the task member of the same name. Near-equal values with a nonzero disagreement would mean the comparator is broken; note these are KICK-time facts while this line is printed at DRAIN, so a one-cadence gap here is normal and is not evidence of anything.
 
 	// SESSION080: the camera position the far block's cut was frozen at, carried on every frontier that references it so
 	// the next traversal can measure drift in one subtraction. Equal to anchor_pos_ws on a self-contained frontier.
@@ -420,7 +441,10 @@ public:
 		sat_bias_barrier_time(0.0), // SESSION085
 		sort_staleness_delta_ws(0.0), sort_staleness_prev_n(0), sort_staleness_common_n(0), sort_staleness_max_disp(0), // SESSION080
 		sort_staleness_mean_disp(0.0), sort_staleness_gt1k(0), sort_staleness_gt10k(0), sort_staleness_ms(0.0), // SESSION080
-		reuse_roots(0), reuse_n(0), reuse_ms(0.0), reuse_split_dist_used(0.f), reuse_base_anchor_ws(0.f) // SESSION080 §4.3
+		sat_grid_res_used(0), sat_anchor_used(0.f), sat_built_time_used(0.0), // SESSION088 - see sat_depth_used.
+		reuse_roots(0), reuse_n(0), reuse_ms(0.0), reuse_split_dist_used(0.f), barrier_disagreement(0.f), // SESSION080 §4.3; SESSION088
+		barrier_flip(0.f), barrier_depth(0.f), barrier_mean_rel_depth(0.f), barrier_measured(false),
+		diag_live_barrier_time(0.0), diag_block_barrier_time(0.0), reuse_base_anchor_ws(0.f)
 	{
 		for(int i=0; i<5; ++i) dist_pctile[i] = 0.f; // SESSION080
 	}
@@ -562,7 +586,8 @@ public:
 		filter_in_flight(false), ufrontier_needs_filter(false), have_last_filter_cam_forward(false), last_filter_cam_forward_ws(0.f), // SESSION063
 		last_applied_filter_frontier_time_s(0.0), // SESSION081
 		filter_dilation_elevated(false), // SESSION066
-		diag_filter_kick_time_s(0.0), diag_filter_band_fine_rad(0.f), diag_applied_kick_forward_ws(0.f), diag_have_applied_filter(false), // SESSION073 DIAGNOSTIC
+		diag_filter_kick_time_s(0.0), sat_build_kick_time_s(0.0), // SESSION073 DIAGNOSTIC; SESSION088 - see the members.
+		diag_filter_band_fine_rad(0.f), diag_applied_kick_forward_ws(0.f), diag_have_applied_filter(false), // SESSION073 DIAGNOSTIC
 		sat_build_in_flight(false) // SESSION081
 	{}
 
@@ -680,6 +705,11 @@ public:
 	// think() drains before it kicks, so last_filter_cam_forward_ws still holds the forward of the kick that produced the
 	// result being drained. See the [gsr-filter-drain] print in drainFilterResults().
 	double diag_filter_kick_time_s;        // diag_timer.elapsed() at that kick, for the real kick->drain round-trip.
+	// SESSION088: the same measurement for the BARRIER build - diag_timer.elapsed() at its kick, read back in
+	// drainSaturationBuildResults() to feed sat_build_latency_measured. Kept here rather than on the task because the
+	// round trip that matters is kick->APPLIED (what the LoD bias actually waits for), not the task's own run time,
+	// which the build already reports as gather_ms/grid_build_ms/walk_ms and which excludes every queue it sat in.
+	double sat_build_kick_time_s;
 	float diag_filter_band_fine_rad;       // swept_fine of that kick - the angular half-width the fine layer was dilated by.
 	Vec4f diag_applied_kick_forward_ws;    // Camera forward at the kick of the list CURRENTLY on screen, so the next drain can report the total angle that list went stale by before being replaced (the worst-case deficit, roughly double the kick->drain figure).
 	bool diag_have_applied_filter;         // False until the first result has been applied, so the first drain doesn't report a bogus staleness against a zero vector.
@@ -1778,6 +1808,86 @@ public:
 
 
 
+// SESSION088: how much of the saturation barrier has MOVED between two grids, as a fraction of tiles in [0,1].
+//
+// This is the evidence a frozen far block's detail level rests on. The block's selection was made by asking the bias a
+// question about the barrier; if the answer would still be the same everywhere, the selection is still the one this
+// traversal would make, however far the camera has walked since. If it has changed, no amount of standing still makes
+// the block right. That is the quantity, and until now it was proxied by camera displacement - see
+// GaussianSplatRenderer::getSatBarrierAgreeTol() and the drift bound in the ctor below.
+//
+// A tile disagrees when its SATURATION STATE flipped (a direction that was blocked is now open, or the reverse - the
+// case that actually changes a bias verdict), or when both are blocked but the depth moved by more than rel_tol of the
+// nearer of the two. Relative, not absolute, because the bias reads a RATIO of distance to barrier depth: a 2m shift at
+// 4m is a different statement about occlusion than the same 2m at 200m.
+//
+// Grids from different anchors are only comparable tile-for-tile while the anchors are close, since a tile is a
+// DIRECTION and the two are measured from different origins. That is normally guaranteed - a barrier is rebuilt as soon
+// as the camera leaves its R-ball, so consecutive ones sit within R of each other - but a long-lived block can hold a
+// grid many rebuilds old. The failure is in the safe direction: distant anchors compare different rays, report heavy
+// disagreement, and the block is discarded. Never the reverse.
+//
+// Cost: one linear pass over sat_grid_res^2 floats - 9,801 on the owner's interior. Run once per traversal kick on the
+// main thread, against a walk that costs 60-180ms.
+// SESSION088, SECOND CUT: reported as TWO components rather than one number, because the first cut's single figure was
+// dominated by the half the bias barely reads, and that was invisible while they were summed.
+//
+//   flip  - the tile's saturation STATE changed: a direction that was blocked is now open, or the reverse. This is the
+//           change that can actually flip a bias verdict, since gsSatBuriedRatioSq() returns "not behind the barrier"
+//           for an unsaturated tile whatever the numbers around it say.
+//   depth - both are still blocked, but the depth moved by more than rel_tol. The bias reads depth only through a
+//           ratio, and its curve is ~89% of the way to the ceiling by ratio 3, so a 10% depth wobble moves the
+//           multiplier by a fraction of a percent. Nearly all of this is churn the bias would never have noticed.
+//
+// The measurement that forced the split: consecutive builds on the owner's interior reported sat_tiles 79.6% -> 70.9%,
+// i.e. ~9% of tiles changed state, while the summed figure read 68%. So ~59 of those 68 points were the depth clause.
+// Judging a reuse threshold on the sum would have been judging it on the noise.
+//
+// mean_rel_depth is the average |da| / min(a,b) over tiles blocked in BOTH grids - the magnitude behind the depth
+// count, so rel_tol can be chosen against the distribution instead of guessed at.
+//
+// Grids from different anchors are only comparable tile-for-tile while the anchors are close, since a tile is a
+// DIRECTION measured from an origin. A long-lived block can hold a grid many rebuilds old; that failure is in the safe
+// direction - distant anchors compare different rays, report heavy disagreement, and the block is discarded.
+//
+// Cost: one linear pass over sat_grid_res^2 floats - 9,801 on the owner's interior - once per traversal kick, against a
+// walk that costs 60-180ms.
+static void gsSatBarrierDisagreement(const js::Vector<float, 16>& cur, const js::Vector<float, 16>& ref, float rel_tol,
+	float& out_flip_frac, float& out_depth_frac, float& out_mean_rel_depth)
+{
+	const size_t n = cur.size();
+	if(n == 0 || n != ref.size())
+	{
+		// No grid, or grids of different resolutions (the subdiv knob moved): nothing comparable. Report total
+		// disagreement on the flip component so the caller's threshold rejects, whatever it is set to.
+		out_flip_frac = 1.f; out_depth_frac = 0.f; out_mean_rel_depth = 0.f;
+		return;
+	}
+
+	size_t num_flip = 0, num_depth = 0, num_both_sat = 0;
+	double rel_sum = 0.0;
+	for(size_t i=0; i<n; ++i)
+	{
+		const float a = cur[i], b = ref[i];
+		const bool a_sat = std::isfinite(a), b_sat = std::isfinite(b);
+		if(a_sat != b_sat)
+			++num_flip;
+		else if(a_sat)
+		{
+			++num_both_sat;
+			const float denom = myMin(a, b);
+			const float rel = (denom > 0.f) ? (std::fabs(a - b) / denom) : 0.f;
+			rel_sum += rel;
+			if(rel > rel_tol)
+				++num_depth;
+		}
+	}
+	out_flip_frac  = (float)((double)num_flip  / (double)n);
+	out_depth_frac = (float)((double)num_depth / (double)n);
+	out_mean_rel_depth = (num_both_sat > 0) ? (float)(rel_sum / (double)num_both_sat) : 0.f;
+}
+
+
 class GaussianSplatLodTraversalTask : public glare::Task
 {
 public:
@@ -1810,7 +1920,8 @@ public:
 		const Reference<GaussianSplatSaturationBarrier>& sat_barrier_ = Reference<GaussianSplatSaturationBarrier>(), // SESSION085 ETAP 3: the cloud's barrier at kick time, for the LoD bias. Null (the default) leaves the bias off, so every existing call site is unaffected.
 		float sat_bias_ceiling_ = 1.f, // SESSION085 ETAP 3: 1 = off - see GaussianSplatRenderer::getSatBiasCeiling().
 		float reuse_drift_fraction_ = 0.25f, // SESSION086: was a static const - see GaussianSplatRenderer::getFrontierReuseDriftFraction(). 0.25 is session080's original value.
-		size_t expand_seed_target_ = 0) // SESSION086: 0 = nothing measured yet, expandParallel() falls back to concurrency*16.
+		size_t expand_seed_target_ = 0, // SESSION086: 0 = nothing measured yet, expandParallel() falls back to concurrency*16.
+		float sat_barrier_agree_tol_ = 1.f) // SESSION088: 1 = accept any barrier change, i.e. the pre-session088 behaviour - see GaussianSplatRenderer::getSatBarrierAgreeTol().
 	:	cloud_id(cloud_id_), topology_generation(topology_generation_), scratch(scratch_), cam_pos_ws(cam_pos_ws_),
 		pixel_scale_limit(pixel_scale_limit_), max_splats_budget(max_splats_budget_), max_layer_density(max_layer_density_), max_tree_depth(max_tree_depth_), focal_px(focal_px_),
 		num_frustum_clip_planes(num_frustum_clip_planes_), frustum_cull_enabled(frustum_cull_enabled_),
@@ -1832,6 +1943,9 @@ public:
 		// grid" convention (nothing saturated, or no barrier yet), and the bias would be inert for every node anyway.
 		sat_bias_active(sat_bias_ceiling_ > 1.f && sat_barrier_.nonNull() && sat_barrier_->sat_grid_res != 0),
 		reuse_drift_fraction(reuse_drift_fraction_), // SESSION086
+		sat_barrier_agree_tol(sat_barrier_agree_tol_), diag_barrier_disagreement(0.f), // SESSION088 - see getSatBarrierAgreeTol(); the rest are measured in the block below.
+		diag_barrier_flip(0.f), diag_barrier_depth(0.f), diag_barrier_mean_rel_depth(0.f), diag_barrier_measured(false),
+		diag_live_barrier_time(0.0), diag_block_barrier_time(0.0),
 		reuse_enabled(false), far_cut_is_frozen(false), reuse_prev_anchor_ws(0.f), reuse_split_dist(0.f) // SESSION080 §4.3 - derived below.
 	{
 		if(num_frustum_clip_planes < 0)
@@ -1862,6 +1976,28 @@ public:
 			reuse_split_dist = reuse_split_dist_;
 
 			const GaussianSplatUnculledFrontier* const block = prev_frontier.nonNull() ? prev_frontier->far_block.ptr() : NULL;
+
+			// SESSION088: measure how far the barrier has moved since this block's selection was made - see
+			// gsSatBarrierDisagreement() and the acceptance clause that reads it below. Measured whenever there is a block
+			// and a live bias, whatever the tolerance is set to, so the number is in the log to be read BEFORE it is
+			// trusted to gate anything. Costs one pass over ~9,801 floats against a 60-180ms walk.
+			if(block != NULL && sat_bias_active && !block->sat_depth_used.empty())
+			{
+				gsSatBarrierDisagreement(sat_barrier->sat_depth, block->sat_depth_used, 0.10f,
+					diag_barrier_flip, diag_barrier_depth, diag_barrier_mean_rel_depth);
+				// SESSION088, THIRD CUT: the gate reads the FLIP component alone. Measured on the owner's two scenes, the
+				// summed figure ran at 68% (interior) / 36% (exterior) per barrier cadence while the part that can
+				// actually change a bias verdict ran at 20% / 8.6% - so the sum was 1.75-2.4x dominated by depth churn the
+				// bias reads only through a ratio whose curve is already ~89% saturated by ratio 3. Gating on the sum would
+				// have meant no threshold below 68% could keep a block on the interior at all, which is exactly the shape
+				// of session086's failed distance calibration, arrived at for the same reason: judging the mechanism on a
+				// quantity it does not actually depend on. bd_depth stays measured and printed, just not gated on.
+				diag_barrier_disagreement = diag_barrier_flip;
+				diag_barrier_measured = true; // SESSION088: without this a not-measured row is indistinguishable from a perfect-agreement row, since every field above defaults to 0. The first cut's "instrument verified" check was exactly that collision and proved nothing.
+				diag_live_barrier_time = sat_barrier->built_time_real_s; // SESSION088 DIAGNOSTIC, TEMPORARY - see the members.
+				diag_block_barrier_time = block->sat_built_time_used;
+			}
+
 			if(block != NULL &&
 				// The block must describe the same selection, or the nodes in it are not the ones our own stop rules
 				// would have picked and the two halves would disagree about what a cut even means. Same key set
@@ -1904,7 +2040,22 @@ public:
 				// drift at a fixed fraction of it caps the relative error, at any scene scale and any knob setting, with
 				// no second number to tune. A traversal that trips this walks the whole tree and builds a fresh block for
 				// the ones after it - visible in the log as reuse_n dropping to 0 for one traversal.
-				cam_pos_ws_.getDist(block->anchor_pos_ws) <= reuse_split_dist_ * reuse_drift_fraction_)
+				cam_pos_ws_.getDist(block->anchor_pos_ws) <= reuse_split_dist_ * reuse_drift_fraction_ &&
+				// SESSION088: the LoD half of that same bound, now answering to its own evidence - see
+				// GaussianSplatRenderer::getSatBarrierAgreeTol() and gsSatBarrierDisagreement().
+				//
+				// The clause above is an ORDERING budget and session080 derived it as one. Session085's LoD bias then gave
+				// the block a second dependence on the barrier, far more sensitive than order and not a function of camera
+				// displacement at all, and it was left to the same single number - which is why session086 could find no
+				// value that worked: at 0.10 and 0.05 the far field visibly lagged, and the 0.02 that did not was no
+				// cheaper than never reusing. A distance cannot express "the occlusion in that direction changed", so no
+				// setting of it was going to.
+				//
+				// This asks the barrier instead. tol 1 accepts any change, which is the pre-session088 behaviour exactly;
+				// below 1 the block is discarded when the grid has moved further than that, whether it took the camera
+				// five metres or one. Ordering and detail are now bounded by the quantity each is actually about, which is
+				// what makes raising reuse_drift_fraction (the order budget, which is genuinely tolerant) safe to try.
+				(!sat_bias_active || block->sat_depth_used.empty() || diag_barrier_disagreement <= sat_barrier_agree_tol))
 			{
 				far_cut_is_frozen = true;
 				reuse_prev_anchor_ws = block->anchor_pos_ws; // The FROZEN anchor, not the predecessor's - that is the whole point.
@@ -2235,6 +2386,17 @@ public:
 					block->anchor_pos_ws = reuse_prev_anchor_ws;
 					block->reuse_split_dist_used = reuse_split_dist;
 					block->topology_generation = topology_generation;
+					// SESSION088: the barrier this block's LoD was actually chosen under, kept so later traversals can ask
+					// whether that choice still stands - see GaussianSplatUnculledFrontier::sat_depth_used. Captured only
+					// when the bias was live: with it off the selection does not depend on the barrier at all, and an empty
+					// grid is the signal the acceptance clause reads as "this block owes the barrier nothing".
+					if(sat_bias_active)
+					{
+						block->sat_depth_used = sat_barrier->sat_depth;
+						block->sat_grid_res_used = sat_barrier->sat_grid_res;
+						block->sat_anchor_used = sat_barrier->anchor_pos_ws;
+						block->sat_built_time_used = sat_barrier->built_time_real_s;
+					}
 					uf->far_block = block;
 					reuse_ms_accum += far_soa_timer.elapsed() * 1.0e3;
 				}
@@ -2270,6 +2432,10 @@ public:
 				// SESSION085: this frontier's own size, both segments - see the field. Nothing has pruned it yet, so the
 				uf->reuse_ms = reuse_ms_accum; // Partition + the far SoA build, i.e. what BUILDING a block costs. 0 when one was inherited - which is the whole point of §4.3.
 				uf->reuse_split_dist_used = reuse_enabled ? reuse_split_dist : 0.f;
+				uf->barrier_disagreement = diag_barrier_disagreement; // SESSION088 DIAGNOSTIC - what the acceptance clause measured for THIS kick, see the field.
+				uf->barrier_flip = diag_barrier_flip; uf->barrier_depth = diag_barrier_depth;
+				uf->barrier_mean_rel_depth = diag_barrier_mean_rel_depth; uf->barrier_measured = diag_barrier_measured;
+				uf->diag_live_barrier_time = diag_live_barrier_time; uf->diag_block_barrier_time = diag_block_barrier_time; // SESSION088 DIAGNOSTIC, TEMPORARY
 				// SESSION080 §4.3: the frozen anchor the far block's cut was made at, carried so the next traversal can measure
 				// drift against it in one subtraction. Equal to cam_pos_ws on a self-contained frontier.
 				uf->reuse_base_anchor_ws = uf->far_block.nonNull() ? uf->far_block->anchor_pos_ws : cam_pos_ws;
@@ -3150,6 +3316,17 @@ private:
 	// error inside the far region well under the range at which that region sits, which is the ratio that decides
 	// whether it can be seen.
 	float reuse_drift_fraction; // SESSION086: was `static const float reuse_max_drift_fraction = 0.25f` - see GaussianSplatRenderer::getFrontierReuseDriftFraction() for why it had to become adjustable.
+	// SESSION088: the LoD half of the drift bound - see GaussianSplatRenderer::getSatBarrierAgreeTol(). 1 accepts any
+	// barrier change, i.e. exactly the pre-session088 behaviour.
+	float sat_barrier_agree_tol;
+	float diag_barrier_disagreement; // What the acceptance clause gates on: the FLIP component only, see where it is assigned. Meaningless unless diag_barrier_measured - see below.
+	float diag_barrier_flip, diag_barrier_depth, diag_barrier_mean_rel_depth; // SESSION088: the two components and the magnitude behind the second - see gsSatBarrierDisagreement().
+	bool diag_barrier_measured; // SESSION088: false = no block, no bias, or no captured grid, so nothing was compared. Distinct from "compared and agreed", which the first cut conflated with it - every field here defaults to 0.
+	// SESSION088 DIAGNOSTIC, TEMPORARY: the two build_time_real_s the disagreement above was computed FROM - the live
+	// barrier's own, and the one the block's grid was captured under. Exists purely to let a suspicious barrier_dis=
+	// reading be checked against ground truth: equal timestamps with nonzero disagreement means the comparison itself is
+	// broken (same barrier, should read 0), not that the barrier moved. Remove once the instrument is trusted.
+	double diag_live_barrier_time, diag_block_barrier_time;
 };
 
 
@@ -3181,12 +3358,15 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	filter_debug_log(false), kick_debug_log(false), cpu_prof_log(false), // SESSION072: default off - see getFilterDebugLog()'s comment.
 	filter_frustum_planes_enabled(true), // SESSION074 - see getFilterFrustumPlanesEnabled().
 	sat_prefilter_threshold(0.98f), // SESSION079 - see getSatPrefilterThreshold().
-	sat_diag_log(false), sat_debug_overlay_mode(GaussianSplatSatDebugOverlayMode_Off), sat_grid_subdiv(0.3f), sat_region_radius(0.5f), sat_region_closing_tiles(0), sat_bias_ceiling(1.f), // SESSION076/078/081: diagnostics off by default - see getSatDiagLog()/getSatDebugOverlayMode(). SESSION085 ETAP 6: sat_bias_ceiling 1 = the LoD bias off, i.e. the pre-bias behaviour; the calibrated value is still owner-selected rather than a default. SESSION086: sat_region_radius frozen at 0.5 - it is no longer only a conservatism knob, it also sets how long a barrier survives camera motion, which is what keeps the barrier rebuild off the traversal's threads. See getSatRegionRadius().
+	sat_diag_log(false), sat_probe_log(false), sat_probe_last_print_s(0.0), // SESSION088 DIAGNOSTIC: the probe is off by default like every other trace - see getSatProbeLog().
+	sat_debug_overlay_mode(GaussianSplatSatDebugOverlayMode_Off), sat_grid_subdiv(0.3f), sat_region_radius(0.5f), sat_region_closing_tiles(0), sat_bias_ceiling(1.f), // SESSION076/078/081: diagnostics off by default - see getSatDiagLog()/getSatDebugOverlayMode(). SESSION085 ETAP 6: sat_bias_ceiling 1 = the LoD bias off, i.e. the pre-bias behaviour; the calibrated value is still owner-selected rather than a default. SESSION086: sat_region_radius frozen at 0.5 - it is no longer only a conservatism knob, it also sets how long a barrier survives camera motion, which is what keeps the barrier rebuild off the traversal's threads. See getSatRegionRadius().
 	// SESSION080 STEP B: 0 = walk everything, the pre-session080 behaviour, bit-for-bit. SESSION086 turned it on at 25,
 	// measured it against the LoD bias, and turned it back off - the mechanism is sound but incompatible with the bias
 	// as cut. The measurement and the verdict are in getFrontierReuseSplitDist(); the drift fraction that measured it
 	// stays at session080's 0.25 and no longer has a UI knob.
-	frontier_reuse_split_dist(0.f), frontier_reuse_drift_fraction(0.25f), expand_seed_target(0), // SESSION086: 0 = nothing measured yet - see updateExpandSeedTarget().
+	frontier_reuse_split_dist(0.f), frontier_reuse_drift_fraction(0.25f), sat_barrier_agree_tol(1.f), expand_seed_target(0), // SESSION086: 0 = nothing measured yet - see updateExpandSeedTarget(). SESSION088: tol 1 = accept any barrier change, as before.
+	filter_latency_measured_enabled(false), sat_predict_gain(0.f), // SESSION088: both default to today's behaviour - see getFilterLatencyMeasuredEnabled()/getSatPredictGain(). The two GsMeasuredLatency members self-initialise.
+	sat_predict_prev_kick_pos_ws(0.f), sat_predict_prev_kick_time_s(0.0), have_sat_predict_prev_kick(false), diag_sat_predict_lead_m(0.f), // SESSION088 - see kickOffSaturationBuilds().
 	splat_point_size_px(1.f),
 	splat_merge_spread_widen(3.0f), // SESSION071: analytic minimum is sqrt(3) (see widenedMergedScale()); owner default set higher for extra margin.
 	// SESSION071: GaussianSplatMergeColourParams defaults to Energy - owner-confirmed better at every pixel scale limit tested; Legacy is kept only as the A/B comparison.
@@ -7777,6 +7957,12 @@ void GaussianSplatRenderer::drainSaturationBuildResults()
 
 		cloud->sat_build_in_flight = false; // Unconditional - the slot is free whether or not the result below is still usable, same "bookkeeping first" rule drainTraversalResults() follows.
 
+		// SESSION088: feed the predictive anchor's lead - see GsMeasuredLatency and getSatPredictGain(). Taken here,
+		// before the topology guard below, and unconditionally: a build that gets DISCARDED still measured how long a
+		// build takes on this machine and this scene, which is the only thing this number is used for. Placed with the
+		// other bookkeeping for the same reason that one is unconditional.
+		sat_build_latency_measured.addSample(diag_timer.elapsed() - cloud->sat_build_kick_time_s);
+
 		// A structural change invalidated the frontier this was built from - see SplatCloud::topology_generation.
 		// Drop the result; kickOffSaturationBuilds() will see cached_sat_barrier is stale (or null) against the fresh
 		// last_unpruned_ufrontier the next traversal produces, and re-kick.
@@ -7832,7 +8018,18 @@ void GaussianSplatRenderer::drainSaturationBuildResults()
 					" (" + doubleToStringNDecimalPlaces(num_tiles > 0 ? (100.0 * (double)(b.erode_stats[0] + b.erode_stats[1]) / (double)num_tiles) : 0.0, 1) + "%)" +
 					" er_radmax=" + uInt64ToStringCommaSeparated(b.erode_stats[2]) +
 					" gather_ms=" + doubleToStringNDecimalPlaces(b.gather_ms, 2) +
-					" grid_ms=" + doubleToStringNDecimalPlaces(b.grid_build_ms, 2));
+					" grid_ms=" + doubleToStringNDecimalPlaces(b.grid_build_ms, 2) +
+					// SESSION088 PREDICTIVE ANCHOR - see getSatPredictGain(). Three numbers that have to be read together:
+					//   lat_meas : the EMA of THIS stage's kick->drain round trip, which is the lead's whole basis.
+					//   lead     : how far ahead of the camera the kick that produced this barrier was aimed. 0 = the knob
+					//              is off, or the camera was not moving - both are correct and indistinguishable here.
+					//   lead/R   : the lead against sat_region_radius, the ball this barrier is valid over. Above ~1 the
+					//              anchor is a whole ball ahead of the camera, so the prediction is doing more than the
+					//              guarantee's own slack - that is the ratio to watch if the far field starts leading
+					//              rather than lagging.
+					" lat_meas=" + doubleToStringNDecimalPlaces(sat_build_latency_measured.get(0.f) * 1000.0, 1) + "ms" +
+					" lead=" + doubleToStringNDecimalPlaces(diag_sat_predict_lead_m, 2) + "m" +
+					" (" + doubleToStringNDecimalPlaces(b.region_radius_used > 0.f ? (diag_sat_predict_lead_m / b.region_radius_used) : 0.0, 2) + "R)");
 
 				// SESSION081 PLAN ETAP 0 DIAGNOSTIC: grid_ms broken into its measured sub-phases, plus the "sum of parts
 				// vs whole" check (misc_ms) - see [[reconcile_parts_with_the_whole]]. A significant misc_ms means a
@@ -8112,6 +8309,13 @@ void GaussianSplatRenderer::drainTraversalResults()
 						// means the knob was off OR a precondition declined it (see the task's reuse_enabled), so a non-zero
 						// split with reuse_n=0 is the interesting failure: the scheme ran and inherited nothing.
 						" reuse_split=" + doubleToStringNDecimalPlaces(uf.reuse_split_dist_used, 2) +
+						// SESSION088: the two knobs that decide whether a block survives, printed so a capture identifies
+						// which arm it is without being taken on trust. Added after a two-arm comparison was run, and only
+						// caught afterwards, on a region radius that had not been put back - neither knob appeared anywhere
+						// in the log, so nothing contradicted the assumption.
+						" btol=" + doubleToStringNDecimalPlaces(sat_barrier_agree_tol, 3) +
+						" rdrift=" + doubleToStringNDecimalPlaces(frontier_reuse_drift_fraction, 3) +
+						" satR=" + doubleToStringNDecimalPlaces(sat_region_radius, 3) +
 						" reuse_roots=" + uInt64ToStringCommaSeparated(uf.reuse_roots) +
 						" reuse_n=" + uInt64ToStringCommaSeparated(uf.reuse_n) +
 						" (" + doubleToStringNDecimalPlaces(uf.indices.size() + uf.reuse_n > 0 ? (100.0 * (double)uf.reuse_n / (double)(uf.indices.size() + uf.reuse_n)) : 0.0, 1) + "%)" + // SESSION080 §4.3: indices.size() is this frontier's NEAR segment; the far block is reuse_n. traversal_output_n counts the whole walk, which double-counts on the traversal that builds a block.
@@ -8119,7 +8323,28 @@ void GaussianSplatRenderer::drainTraversalResults()
 						// How far this frontier's OLDEST inherited data's anchor is from where the camera is now - the quantity
 						// the full-rebuild safety trigger watches. Rising towards split*0.25 and then reuse_n dropping to 0 for
 						// one traversal is the trigger firing, which is working as intended, not a fault.
-						" reuse_drift=" + doubleToStringNDecimalPlaces(cam_pos_now_for_drift.getDist(uf.reuse_base_anchor_ws), 2));
+						" reuse_drift=" + doubleToStringNDecimalPlaces(cam_pos_now_for_drift.getDist(uf.reuse_base_anchor_ws), 2) +
+					// SESSION088: the LoD half of the reuse bound, measured whatever the tolerance is set to - see
+					// gsSatBarrierDisagreement(). Read it against reuse_drift= above: the two are the two independent
+					// reasons a block can be too old, and the point of this line is to show how differently they move.
+					// SESSION088: n/a, not 0, when nothing was compared - a not-measured row and a perfect-agreement row are
+					// different facts and the first cut of this printed both as 0.00%.
+					(uf.barrier_measured ?
+						(" barrier_dis=" + doubleToStringNDecimalPlaces(uf.barrier_disagreement * 100.0, 2) + "%" +
+						// barrier_dis is what the gate reads, which since the third cut is bd_flip alone. The other two stay
+						// printed so that choice remains checkable rather than assumed - see gsSatBarrierDisagreement().
+						// NOTE bd_reld is a MEAN over both-saturated tiles, and a handful of near-zero depths dominate it
+						// (it read 483% on the interior against a 10% tolerance): treat it as "there is a heavy tail",
+						// never as a typical move.
+						" bd_flip=" + doubleToStringNDecimalPlaces(uf.barrier_flip * 100.0, 2) + "%" +
+						" bd_depth=" + doubleToStringNDecimalPlaces(uf.barrier_depth * 100.0, 2) + "%" +
+						" bd_reld=" + doubleToStringNDecimalPlaces(uf.barrier_mean_rel_depth * 100.0, 1) + "%") :
+						std::string(" barrier_dis=n/a")) +
+					// SESSION088 DIAGNOSTIC, TEMPORARY - see GaussianSplatUnculledFrontier::diag_live_barrier_time. The gap
+					// between the two barrier builds the comparison was made across. NOTE both are KICK-time facts while
+					// this line prints at DRAIN, so a gap of about one barrier cadence is the normal steady state and says
+					// nothing about correctness - reading it otherwise cost session088 a wrong bug report.
+					" bt_delta=" + doubleToStringNDecimalPlaces((uf.diag_live_barrier_time - uf.diag_block_barrier_time) * 1000.0, 1) + "ms");
 			}
 
 			continue;
@@ -8173,8 +8398,29 @@ void GaussianSplatRenderer::kickOffFilters()
 
 	// Motion dilation, shared by every cloud kicked this pass (depends only on camera motion, not on the cloud). Knobs are
 	// live-tunable - see getFilterDilationLatency() etc.
-	const Vec4f ema_expected = cam_velocity_ema_ws * filter_dilation_latency;
-	const float min_trans_dilation_m = filter_min_trans_rate_m_per_s * filter_dilation_latency;
+	// SESSION088: the window is the stage's own MEASURED kick->drain round trip when that is switched on, and the fixed
+	// filter_dilation_latency otherwise - see getFilterLatencyMeasuredEnabled(). One value substituted at one place: every
+	// use below (translation floor, rotation baseline, swept_fine) reads this, so the fine layer's whole dilation moves
+	// together and the coarse tail keeps its own separate, deliberately wider window untouched.
+	//
+	// The x2 is not padding, it is the quantity the window is actually supposed to cover, and leaving it out was the
+	// first version of this code's mistake. What must be covered is not "how long until THIS result lands" but "how long
+	// this result stays on screen", and a list is displayed from its own kick until the NEXT drain replaces it - two
+	// round trips, not one. That is exactly why session079 raised the constant to 0.3 against an ~85ms measured round
+	// trip ("the envelope is ~2x"), and session088's own captures agree from the other side: filter age= reads
+	// med 127ms / p90 257ms / max 307ms on the interior, i.e. the 0.3 constant is not an over-estimate of the round trip,
+	// it is a correct estimate of the ENVELOPE. Substituting a 1x typical-case EMA for a 2x worst-case envelope would
+	// have narrowed the band ~1.8x and shown up as edge holes under rotation - the one thing this knob must not do.
+	//
+	// So what the measurement buys is not a smaller number, it is a number that follows the machine and the scene
+	// instead of being frozen at the one they were measured on: 2 x 165ms interior and 2 x 163ms exterior both land
+	// within 10% of the 0.3 the owner arrived at by hand, which is the measurement confirming the constant rather than
+	// replacing it.
+	const float filter_latency_envelope_factor = 2.f;
+	const float dilation_latency_eff = filter_latency_measured_enabled ?
+		(filter_latency_measured.get(filter_dilation_latency * 0.5f) * filter_latency_envelope_factor) : filter_dilation_latency; // Cold-start fallback is halved so that x2 reproduces the constant exactly until the first sample lands.
+	const Vec4f ema_expected = cam_velocity_ema_ws * dilation_latency_eff;
+	const float min_trans_dilation_m = filter_min_trans_rate_m_per_s * dilation_latency_eff;
 	float trans_dilation[6] = { 0,0,0,0,0,0 };
 	for(int i=0; i<scene->num_frustum_clip_planes && i<6; ++i)
 		trans_dilation[i] = myMax(min_trans_dilation_m, myMax(0.f, dot(scene->frustum_clip_planes[i].getNormal(), ema_expected)));
@@ -8223,12 +8469,12 @@ void GaussianSplatRenderer::kickOffFilters()
 	// The two are combined with max(), not sum, at the per-node/per-plane site in filterUnculledFrontier() - mirrors
 	// exactly how translation_dilation[] above already floors its per-plane EMA/empirical shift against
 	// min_trans_dilation_m.
-	const float rate_fine_baseline   = min_rot_rate_rad_s * filter_dilation_latency;        // SESSION063 K4 tight window, SESSION072: baseline-only now.
+	const float rate_fine_baseline   = min_rot_rate_rad_s * dilation_latency_eff;           // SESSION063 K4 tight window, SESSION072: baseline-only now. SESSION088: measured window when enabled - see dilation_latency_eff.
 	const float rate_coarse_baseline = min_rot_rate_rad_s * filter_coarse_dilation_latency;  // wider coarse window, baseline-only.
 	// SESSION072: axis and swept magnitudes passed separately rather than as two pre-scaled vectors - the two swept
 	// vectors are parallel (same axis, different latency), so the filter can do one cross product per plane instead of
 	// two and hoist the fine/coarse blend out of its plane loop. See filterUnculledFrontier().
-	const float swept_fine   = w_effective * filter_dilation_latency;
+	const float swept_fine   = w_effective * dilation_latency_eff; // SESSION088 - see dilation_latency_eff.
 	const float swept_coarse = w_effective * filter_coarse_dilation_latency;
 
 	const char* filter_kick_reason = "?"; // SESSION064 DIAG
@@ -8315,6 +8561,11 @@ void GaussianSplatRenderer::drainFilterResults()
 		{
 			num_filters_in_flight--;
 			cloud->filter_in_flight = false;
+			// SESSION088: the round trip session073's age= has been printing all along, now read back rather than only
+			// looked at - see GsMeasuredLatency and getFilterLatencyMeasuredEnabled(). With the bookkeeping above and
+			// unconditional for the same two reasons: it costs a subtraction, and a result the staleness guard below
+			// DISCARDS still measured how long this pipeline takes, which is the only thing this number is for.
+			filter_latency_measured.addSample(diag_timer.elapsed() - cloud->diag_filter_kick_time_s);
 		}
 		else
 		{
@@ -8382,6 +8633,12 @@ void GaussianSplatRenderer::drainFilterResults()
 				" compute=" + doubleToStringNDecimalPlaces(msg->filter_compute_ms, 2) + "ms" + // SESSION072 DIAGNOSTIC: pure filterUnculledFrontier() cost, no scheduling.
 				// SESSION073 DIAGNOSTIC - see the block above.
 				" age=" + doubleToStringNDecimalPlaces((now_s_diag - cloud->diag_filter_kick_time_s) * 1000.0, 1) + "ms" +
+				// SESSION088: the EMA over that same age, and the window kickOffFilters() actually used. Printed
+				// unconditionally of the knob so the measurement can be checked against the constant it would replace
+				// BEFORE it is switched on - lat_used= says which of the two is currently in the loop. See
+				// getFilterLatencyMeasuredEnabled().
+				" lat_meas=" + doubleToStringNDecimalPlaces(filter_latency_measured.get(0.f) * 1000.0, 1) + "ms" +
+				" lat_used=" + doubleToStringNDecimalPlaces((filter_latency_measured_enabled ? (filter_latency_measured.get(filter_dilation_latency * 0.5f) * 2.f) : filter_dilation_latency) * 1000.0, 1) + "ms" + // The x2 envelope, mirroring kickOffFilters()'s dilation_latency_eff - see there.
 				" swept=" + doubleToStringNDecimalPlaces(swept_deg, 2) + "deg" +
 				" band=" + doubleToStringNDecimalPlaces(band_deg, 2) + "deg" +
 				" stale=" + doubleToStringNDecimalPlaces(stale_deg, 2) + "deg" +
@@ -8436,6 +8693,41 @@ void GaussianSplatRenderer::kickOffSaturationBuilds()
 	const OpenGLScene* const scene = opengl_engine->getCurrentScene();
 	const Vec4f cam_pos_ws = scene->cam_to_world.getColumn(3);
 
+	// SESSION088 PREDICTIVE ANCHOR - see getSatPredictGain() for the full argument. A build kicked now lands one
+	// measured round trip from now, by which time the camera is elsewhere; aim the anchor at where it will be instead of
+	// where it is. Gain 0 makes lead exactly zero, so predicted_cam_pos_ws is cam_pos_ws and everything below is
+	// bit-for-bit the previous behaviour.
+	//
+	// The lead is the MEASURED barrier round trip (getSatPredictGain()'s last paragraph on why it must not be a
+	// constant), and it is zero until the first build has been drained - a cold start therefore anchors at the camera,
+	// which is the safe direction to be wrong in.
+	//
+	// SESSION088, SECOND CUT: the velocity is measured KICK TO KICK here rather than read from cam_velocity_ema_ws,
+	// and that is the whole difference between this working and not. The shared EMA is a per-FRAME differencer whose dt
+	// guard in think() admits intervals down to 0.1ms, so an ordinary few-millimetre step on a very short frame reports
+	// a triple-digit m/s, and alpha=0.15 then carries that spike for ~7 frames. Harmless where it was built for -
+	// dilation, where over-prediction is just padding - but this is an ANCHOR, where over-prediction does not widen a
+	// margin, it builds the barrier in the wrong place. Measured session088 with the first cut running: real camera
+	// speed (recovered from reuse_drift's slope, which is differenced over whole traversals) never left 3 m/s interior
+	// or 15 m/s exterior, while the lead the EMA produced reached 10.45m against a 103ms round trip - an implied
+	// ~100 m/s, and 70% of exterior builds anchored further than a whole region radius out.
+	//
+	// Differencing over the kick-to-kick interval instead averages over exactly the window the prediction is about
+	// (~160ms interior, ~300ms exterior), so a single short frame cannot move it, and no clamp or magic speed cap is
+	// needed - the estimator is simply measuring the right thing over the right span. The interval guard mirrors
+	// think()'s: too short and it is the same small-dt amplifier again, too long and the camera's path between the two
+	// samples is not a straight line any more, so a chord speed says nothing useful about where it is heading.
+	// The reference is the last ACTUAL kick, not the last time this function ran: it runs every frame and mostly decides
+	// to do nothing, so sampling per call would difference over a frame again - the very thing this replaces - and the
+	// interval guard would then reject nearly every sample. The state is therefore advanced at the kick site below.
+	const double sat_kick_now_s = diag_timer.elapsed();
+	const double sat_kick_dt = sat_kick_now_s - sat_predict_prev_kick_time_s;
+	Vec4f sat_predict_lead_ws(0.f);
+	if(have_sat_predict_prev_kick && sat_kick_dt > 0.03 && sat_kick_dt < 1.0)
+		sat_predict_lead_ws = (cam_pos_ws - sat_predict_prev_kick_pos_ws) * (float)((sat_build_latency_measured.get(0.f) * sat_predict_gain) / sat_kick_dt);
+	const Vec4f predicted_cam_pos_ws = cam_pos_ws + sat_predict_lead_ws;
+	diag_sat_predict_lead_m = sat_predict_lead_ws.length(); // DIAGNOSTIC only - printed on [gsr-sat-build], see there.
+
 	const Vec2i viewport_dims = opengl_engine->getViewportDims();
 	const float focal_x = (float)viewport_dims.x * scene->lens_sensor_dist / scene->use_sensor_width;
 	const float focal_y = (float)viewport_dims.y * scene->lens_sensor_dist / scene->use_sensor_height;
@@ -8458,7 +8750,15 @@ void GaussianSplatRenderer::kickOffSaturationBuilds()
 			if(barrier->threshold_used != sat_prefilter_threshold || barrier->subdiv_used != sat_grid_subdiv ||
 				barrier->region_radius_used != sat_region_radius || barrier->closing_tiles_used != sat_region_closing_tiles)
 				needs_build = true;
-			else if(cam_pos_ws.getDist(barrier->anchor_pos_ws) > sat_region_radius) // SESSION081: the ball guarantee itself - see GaussianSplatSaturationBarrier. > not >=: at R=0 (point-anchored) any nonzero movement invalidates, but standing still does not.
+			// SESSION081: the ball guarantee itself - see GaussianSplatSaturationBarrier. > not >=: at R=0 (point-anchored)
+			// any nonzero movement invalidates, but standing still does not.
+			// SESSION088: tested from the PREDICTED point, not the raw camera, because that is the point the anchor was
+			// placed at - the two must agree or the mechanism fights itself. Testing the raw camera against a lead anchor
+			// would report a standing offset of |lead| that no amount of rebuilding could reduce, so any lead longer than
+			// sat_region_radius would rebuild the barrier every single frame. Kept consistent, the cadence is unchanged:
+			// under steady motion anchor and test point translate together, so the ball is still left after exactly
+			// sat_region_radius of travel. See getSatPredictGain().
+			else if(predicted_cam_pos_ws.getDist(barrier->anchor_pos_ws) > sat_region_radius)
 				needs_build = true;
 		}
 		if(!needs_build)
@@ -8473,7 +8773,7 @@ void GaussianSplatRenderer::kickOffSaturationBuilds()
 		if(cloud.sat_build_scratch.isNull())
 			cloud.sat_build_scratch = new GaussianSplatSaturationBuildScratch();
 		t->build_scratch = cloud.sat_build_scratch;
-		t->anchor_pos_ws = cam_pos_ws;
+		t->anchor_pos_ws = predicted_cam_pos_ws; // SESSION088: the predicted camera position, = cam_pos_ws when the gain is 0 - see the lead's computation above.
 		t->saturation_threshold = sat_prefilter_threshold;
 		t->grid_subdiv = sat_grid_subdiv;
 		t->region_radius = sat_region_radius;
@@ -8495,6 +8795,14 @@ void GaussianSplatRenderer::kickOffSaturationBuilds()
 		t->result_queue = &sat_build_result_queue;
 
 		cloud.sat_build_in_flight = true;
+		cloud.sat_build_kick_time_s = sat_kick_now_s; // SESSION088: unconditional (one assignment) so the latency tracker is fed whether or not any log is on - see the member and drainSaturationBuildResults().
+		// SESSION088: advance the predictive velocity's reference to THIS kick - see sat_predict_lead_ws above for why it
+		// has to be the last real kick rather than the last call. Assigned per kick rather than once after the loop
+		// because both writes are the same values for every cloud in this pass (one camera, one clock), so a second
+		// cloud simply re-writes what the first did.
+		sat_predict_prev_kick_pos_ws = cam_pos_ws;
+		sat_predict_prev_kick_time_s = sat_kick_now_s;
+		have_sat_predict_prev_kick = true;
 		task_manager->addTask(t);
 	}
 }
@@ -8759,7 +9067,8 @@ void GaussianSplatRenderer::kickOffTraversals()
 			/*sat_barrier=*/best_cloud->cached_sat_barrier,
 			/*sat_bias_ceiling=*/sat_bias_ceiling, // SESSION085 ETAP 3 - see getSatBiasCeiling(). 1 = off.
 			/*reuse_drift_fraction=*/frontier_reuse_drift_fraction, // SESSION086 - see getFrontierReuseDriftFraction().
-			/*expand_seed_target=*/expand_seed_target)); // SESSION086 - see updateExpandSeedTarget().
+			/*expand_seed_target=*/expand_seed_target, // SESSION086 - see updateExpandSeedTarget().
+			/*sat_barrier_agree_tol=*/sat_barrier_agree_tol)); // SESSION088 - see getSatBarrierAgreeTol(). 1 = accept any barrier change, as before.
 	}
 
 	// SESSION055 diag: after the while-loop, detect *unmet* rotation demand - a cloud whose forward has shifted past the
@@ -9054,6 +9363,94 @@ void GaussianSplatRenderer::think()
 		prev_think_cam_pos_ws = cur_cam_pos;
 		prev_think_cam_forward_ws = cur_cam_forward;
 		have_prev_think_cam_state = true;
+	}
+
+	// SESSION088 DIAGNOSTIC - [gsr-sat-probe]. See getSatProbeLog() for what question this exists to answer. Entirely
+	// read-only: it samples the barrier the bias is already reading and prints, touching no cached state, so unlike the
+	// overlay toggles it cannot perturb what it measures.
+	//
+	// Off the FRAME rather than off a build, deliberately - a build only happens once the camera leaves the R-ball, so
+	// every build-tied trace goes silent exactly when the camera is held still on the geometry under investigation.
+	if(sat_probe_log)
+	{
+		const double probe_now_s = diag_timer.elapsed();
+		if(probe_now_s - sat_probe_last_print_s > 0.5) // Twice a second: enough to read while holding a view, cheap enough that the sort inside gsSatGridStats() never shows.
+		{
+			sat_probe_last_print_s = probe_now_s;
+
+			for(size_t i=0; i<clouds.size(); ++i)
+			{
+				const SplatCloud& cloud = *clouds[i];
+				if(cloud.cached_sat_barrier.isNull() || cloud.cached_sat_barrier->sat_grid_res == 0)
+					continue;
+				const GaussianSplatSaturationBarrier& b = *cloud.cached_sat_barrier;
+				const int res = b.sat_grid_res;
+
+				GsSatGridStats gs;
+				gsSatGridStats(b.sat_depth, res, gs);
+
+				const Vec4f probe_cam_pos = scene->cam_to_world.getColumn(3);
+				const Vec4f probe_fwd = normalise(scene->cam_to_world.getColumn(1)); // Column 1 is forward - see the tracker block above.
+
+				// The direction is taken from the BARRIER'S ANCHOR, not the camera, because that is the origin sat_depth is
+				// measured from and the one satBiasFor() encodes against. At R = 1 the two are within a metre, but the probe
+				// must not quietly answer a different question than the bias asks.
+				const Vec4f anchor_to_cam = probe_cam_pos - b.anchor_pos_ws;
+				const int centre_tile = gsSatGridTileForDir(probe_fwd, res);
+				const float centre_depth = b.sat_depth[centre_tile];
+
+				// The 3x3 neighbourhood of the aimed-at tile, in grid order. This IS the artifact, printed: if the field is
+				// smooth these nine numbers are close, and if it is not, the spread here is the LoD step the owner is looking at.
+				const int cu = centre_tile % res, cv = centre_tile / res;
+				std::string nbr_str;
+				for(int dv=-1; dv<=1; ++dv)
+					for(int du=-1; du<=1; ++du)
+					{
+						const int u = myClamp(cu + du, 0, res - 1), v = myClamp(cv + dv, 0, res - 1);
+						const float d = b.sat_depth[(size_t)v * (size_t)res + (size_t)u];
+						nbr_str += (std::isfinite(d) ? doubleToStringNDecimalPlaces(d, 1) : std::string("inf"));
+						nbr_str += (du == 1) ? ((dv == 1) ? "" : " | ") : " ";
+					}
+
+				// What a node sitting at each of these distances STRAIGHT AHEAD would actually be multiplied by. This is the
+				// whole bias arithmetic reproduced - gsSatBuriedRatioSq() then satBiasFor()'s curve - so the number printed is
+				// the number the walk would use, not an approximation of it.
+				std::string bias_str;
+				static const float probe_dists_m[4] = { 50.f, 100.f, 200.f, 400.f };
+				for(int k=0; k<4; ++k)
+				{
+					const Vec4f node_offset = anchor_to_cam + probe_fwd * probe_dists_m[k]; // Node at that distance ahead of the CAMERA, expressed from the anchor.
+					const float dist_sq = node_offset[0]*node_offset[0] + node_offset[1]*node_offset[1] + node_offset[2]*node_offset[2]; // Same form satBiasFor() uses, so the probe's arithmetic matches the walk's bit for bit.
+					const float ratio_sq = gsSatBuriedRatioSq(node_offset, dist_sq, b.sat_depth, res);
+					const float bias = (ratio_sq <= 1.f) ? 1.f : (1.f + (sat_bias_ceiling - 1.f) * (1.f - 1.f / ratio_sq));
+					bias_str += doubleToStringNDecimalPlaces(probe_dists_m[k], 0) + "m=x" + doubleToStringNDecimalPlaces(bias, 2) + " ";
+				}
+
+				conPrint("[gsr-sat-probe] t" + doubleToStringNDecimalPlaces(probe_now_s * 1000.0, 0) + "ms " +
+					"res=" + toString(res) +
+					" R=" + doubleToStringNDecimalPlaces(b.region_radius_used, 3) +
+					" ceil=" + doubleToStringNDecimalPlaces(sat_bias_ceiling, 1) +
+					" anchor_d=" + doubleToStringNDecimalPlaces(probe_cam_pos.getDist(b.anchor_pos_ws), 2) + "m" +
+					" | sat=" + doubleToStringNDecimalPlaces(gs.num_tiles > 0 ? (100.0 * (double)gs.num_finite / (double)gs.num_tiles) : 0.0, 1) + "%" +
+					" depth p10=" + doubleToStringNDecimalPlaces(gs.d_p10, 1) +
+					" med=" + doubleToStringNDecimalPlaces(gs.d_med, 1) +
+					" p90=" + doubleToStringNDecimalPlaces(gs.d_p90, 1) +
+					" max=" + doubleToStringNDecimalPlaces(gs.d_max, 1) +
+					// The contrast block - the field's shape. See GsSatGridStats for how to read adj_* and flat=.
+					" | adj p50=" + doubleToStringNDecimalPlaces(gs.adj_p50, 2) +
+					" p90=" + doubleToStringNDecimalPlaces(gs.adj_p90, 2) +
+					" max=" + doubleToStringNDecimalPlaces(gs.adj_max, 1) +
+					" >2x=" + doubleToStringNDecimalPlaces(gs.num_both_finite > 0 ? (100.0 * (double)gs.num_adj_gt2 / (double)gs.num_both_finite) : 0.0, 1) + "%" +
+					" >4x=" + doubleToStringNDecimalPlaces(gs.num_both_finite > 0 ? (100.0 * (double)gs.num_adj_gt4 / (double)gs.num_both_finite) : 0.0, 1) + "%" +
+					" flat=" + doubleToStringNDecimalPlaces(100.0 * gs.max_window_frac, 1) + "%" +
+					" edge=" + doubleToStringNDecimalPlaces(gs.num_pairs > 0 ? (100.0 * (double)gs.num_edge_pairs / (double)gs.num_pairs) : 0.0, 1) + "%" +
+					// What the camera is actually pointed at.
+					" | fwd tile=" + toString(centre_tile) +
+					" d=" + (std::isfinite(centre_depth) ? doubleToStringNDecimalPlaces(centre_depth, 1) : std::string("inf")) +
+					" bias " + bias_str +
+					"| 3x3 " + nbr_str);
+			}
+		}
 	}
 
 	kickOffSorts();

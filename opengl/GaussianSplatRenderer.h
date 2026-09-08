@@ -467,7 +467,7 @@ public:
 	bool getCoarseFloorEnabled() const { return split_coarse_floor_enabled; }
 	void setCoarseFloorEnabled(bool v); // SESSION076: out-of-line - toggling this now has to drop cached frontiers, see the .cpp.
 	float getCoarsePixelScale() const { return split_coarse_pixel_scale; }
-	void setCoarsePixelScale(float v) { split_coarse_pixel_scale = v; }
+	void setCoarsePixelScale(float v); // SESSION088: out-of-line - see the .cpp. Session076 gave this a second job, sizing the saturation grid (gsSatGridResForFocal()), and the inline version invalidated nothing at all.
 	float getFilterCoarseDilationLatency() const { return filter_coarse_dilation_latency; }
 	void setFilterCoarseDilationLatency(float v) { filter_coarse_dilation_latency = v; }
 
@@ -635,6 +635,29 @@ public:
 	// with the prune off.
 	float getSatBiasCeiling() const { return sat_bias_ceiling; }
 	void setSatBiasCeiling(float v);
+
+	// SESSION088 - HOW FAST THE BIAS CLIMBS TO ITS CEILING. The second half of the bias's shape, and the one that decides
+	// how much of the frontier is graded rather than pinned: satBiasFor()'s curve is
+	//
+	//   1 + (ceiling - 1) * (1 - 1/ratio^(2*exponent))
+	//
+	// 1 is the curve session085 shipped (the fixed 1/ratio^2 falloff), which reaches ~89% of the ceiling by ratio 3 -
+	// i.e. almost every buried node gets almost the whole ceiling, and the grading that was meant to live near the
+	// barrier barely exists. Below 1 the climb is stretched out: at 0.2 a node three times past the barrier is only ~36%
+	// of the way to the ceiling, so the multiplier tracks how buried a node actually is over a far wider range instead
+	// of saturating immediately.
+	//
+	// That is what the exponent buys against the far-field artifact. The tile-shaped LoD flicker in dense canopy is a
+	// small measurement wobble in sat_depth being amplified into a large jump in the multiplier, and the amplification
+	// is exactly the curve's slope: where the curve is steep, a few metres of depth noise moves a node most of the way
+	// to the ceiling and back. Flattening the curve does not remove the noise, it stops converting it into a visible
+	// LoD step. The cost is that deeply buried nodes no longer reach the ceiling, so some of the frontier saving the
+	// ceiling was set for is handed back - the two knobs trade against each other and are meant to be set together.
+	//
+	// Unlike the ceiling this changes nothing about the BARRIER - sat_depth is a property of the grid build, not of how
+	// a traversal reads it - so the setter drops cached frontiers and deliberately leaves cached_sat_barrier alone.
+	float getSatBiasExponent() const { return sat_bias_exponent; }
+	void setSatBiasExponent(float v);
 
 
 	// SESSION088: PREDICTIVE SATURATION ANCHOR (techdebt #12, recommended by session083 and never picked up).
@@ -1938,6 +1961,7 @@ private:
 	float sat_region_radius;                         // SESSION078 - see getSatRegionRadius().
 	int sat_region_closing_tiles;                    // SESSION081 - see getSatRegionClosingTiles().
 	float sat_bias_ceiling;                          // SESSION085 ETAP 3 - see getSatBiasCeiling().
+	float sat_bias_exponent;                         // SESSION088 - see getSatBiasExponent(). 1 = session085's fixed 1/ratio^2 curve.
 	float frontier_reuse_split_dist;                 // SESSION080 STEP B - see getFrontierReuseSplitDist(). 0 = disabled.
 	float frontier_reuse_drift_fraction;             // SESSION086 - see getFrontierReuseDriftFraction().
 	float sat_barrier_agree_tol;                     // SESSION088 - see getSatBarrierAgreeTol(). 1 = accept any barrier change, as before.

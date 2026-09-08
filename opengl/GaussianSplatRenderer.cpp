@@ -489,6 +489,7 @@ public:
 	// SESSION081 - are also what kickOffSaturationBuilds() compares against the CURRENT settings to decide whether a
 	// live-tuned knob has invalidated this barrier).
 	float threshold_used, subdiv_used, region_radius_used;
+	float coarse_pixel_scale_used; // SESSION088: "px" feeds sat_grid_res exactly like "sub" does (gsSatGridResForFocal()), so a change to it is exactly as stale-grid-shaped as a change to "sub" - and was never checked here. See setCoarsePixelScale().
 	int closing_tiles_used;
 
 	// DIAGNOSTIC, build-side - see [gsr-sat-build]. Same fields GaussianSplatUnculledFrontier used to carry for the
@@ -525,7 +526,7 @@ public:
 
 	GaussianSplatSaturationBarrier()
 	:	sat_grid_res(0), anchor_pos_ws(0.f), built_time_real_s(0.0),
-		threshold_used(0.f), subdiv_used(0.f), region_radius_used(0.f), closing_tiles_used(0),
+		threshold_used(0.f), subdiv_used(0.f), region_radius_used(0.f), coarse_pixel_scale_used(0.f), closing_tiles_used(0), // SESSION088: coarse_pixel_scale_used - see the field.
 		num_occluders(0), gather_ms(0.0), grid_build_ms(0.0),
 		frontier_n(0), rec_ms(0.0), dep_ms(0.0), close_ms(0.0), erode_ms(0.0), num_recs(0), num_strips(0), concurrency_used(0), num_blocks(0), gate1_survivors(0),
 		rec_task_ms_min(0.0), rec_task_ms_max(0.0), rec_task_ms_mean(0.0),
@@ -1460,6 +1461,7 @@ public:
 		barrier->built_time_real_s = Clock::getCurTimeRealSec();
 		barrier->threshold_used = saturation_threshold;
 		barrier->subdiv_used = grid_subdiv;
+		barrier->coarse_pixel_scale_used = coarse_pixel_scale; // SESSION088 - see the field's comment.
 		barrier->region_radius_used = region_radius;
 		barrier->closing_tiles_used = closing_tiles;
 
@@ -1921,7 +1923,8 @@ public:
 		float sat_bias_ceiling_ = 1.f, // SESSION085 ETAP 3: 1 = off - see GaussianSplatRenderer::getSatBiasCeiling().
 		float reuse_drift_fraction_ = 0.25f, // SESSION086: was a static const - see GaussianSplatRenderer::getFrontierReuseDriftFraction(). 0.25 is session080's original value.
 		size_t expand_seed_target_ = 0, // SESSION086: 0 = nothing measured yet, expandParallel() falls back to concurrency*16.
-		float sat_barrier_agree_tol_ = 1.f) // SESSION088: 1 = accept any barrier change, i.e. the pre-session088 behaviour - see GaussianSplatRenderer::getSatBarrierAgreeTol().
+		float sat_barrier_agree_tol_ = 1.f, // SESSION088: 1 = accept any barrier change, i.e. the pre-session088 behaviour - see GaussianSplatRenderer::getSatBarrierAgreeTol().
+		float sat_bias_exponent_ = 1.f) // SESSION088: 1 = session085's fixed 1/ratio^2 curve - see GaussianSplatRenderer::getSatBiasExponent().
 	:	cloud_id(cloud_id_), topology_generation(topology_generation_), scratch(scratch_), cam_pos_ws(cam_pos_ws_),
 		pixel_scale_limit(pixel_scale_limit_), max_splats_budget(max_splats_budget_), max_layer_density(max_layer_density_), max_tree_depth(max_tree_depth_), focal_px(focal_px_),
 		num_frustum_clip_planes(num_frustum_clip_planes_), frustum_cull_enabled(frustum_cull_enabled_),
@@ -1938,7 +1941,7 @@ public:
 		expand_seed_target(expand_seed_target_), // SESSION086 - see GaussianSplatRenderer::updateExpandSeedTarget().
 		expand_splice_reserve_ms(0.0), expand_splice_copy_ms(0.0), // SESSION080 DIAGNOSTIC (plan2 §4.1)
 		prev_frontier(prev_frontier_), sort_staleness_diag_enabled(sort_staleness_diag_enabled_), // SESSION080 DIAGNOSTIC
-		sat_barrier(sat_barrier_), sat_bias_ceiling(sat_bias_ceiling_), // SESSION085 ETAP 3
+		sat_barrier(sat_barrier_), sat_bias_ceiling(sat_bias_ceiling_), sat_bias_exponent(sat_bias_exponent_), // SESSION085 ETAP 3, SESSION088
 		// Precomputed here, not per node: the DFS asks this millions of times. A barrier with sat_grid_res 0 is the "no
 		// grid" convention (nothing saturated, or no barrier yet), and the bias would be inert for every node anyway.
 		sat_bias_active(sat_bias_ceiling_ > 1.f && sat_barrier_.nonNull() && sat_barrier_->sat_grid_res != 0),
@@ -2651,7 +2654,15 @@ private:
 		//
 		// Works on ratio_sq directly - 1/ratio^2 is 1/ratio_sq - so the sqrt the first cut needed is gone from a path the
 		// walk takes millions of times per traversal.
-		return 1.f + (sat_bias_ceiling - 1.f) * (1.f - 1.f / ratio_sq);
+		//
+		// SESSION088: the falloff's exponent is a knob now - 1/ratio_sq becomes 1/ratio_sq^exponent, i.e. 1/ratio^(2*e).
+		// At 1 this is exactly the line it replaced. See GaussianSplatRenderer::getSatBiasExponent() for why flattening
+		// it is what the far-field artifact responds to, and for what it costs. The == 1 branch is not an optimisation
+		// for the current default (0.2, which takes the pow) - it is there so that setting the knob back to 1 restores
+		// session085's arithmetic bit-for-bit rather than to within pow()'s rounding, which is what an A/B against the
+		// original curve needs.
+		const float denom = (sat_bias_exponent == 1.f) ? ratio_sq : std::pow(ratio_sq, sat_bias_exponent);
+		return 1.f + (sat_bias_ceiling - 1.f) * (1.f - 1.f / denom);
 	}
 
 
@@ -3258,6 +3269,7 @@ private:
 	// Note this is the PREVIOUS build's barrier - one traversal behind, exactly as the apply stage already consumes it.
 	Reference<GaussianSplatSaturationBarrier> sat_barrier;
 	float sat_bias_ceiling;  // Cap on the multiplier - see GaussianSplatRenderer::getSatBiasCeiling(). 1 = off.
+	float sat_bias_exponent; // How fast the multiplier climbs to that ceiling - see GaussianSplatRenderer::getSatBiasExponent(). 1 = session085's original curve.
 	bool sat_bias_active;    // Precomputed once at kick: ceiling > 1 AND a usable barrier exists. Keeps the DFS's per-node test to one bool.
 
 	// SESSION085 ETAP 3: the value this traversal answers to for reuse purposes - see
@@ -3359,6 +3371,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	filter_frustum_planes_enabled(true), // SESSION074 - see getFilterFrustumPlanesEnabled().
 	sat_prefilter_threshold(0.98f), // SESSION079 - see getSatPrefilterThreshold().
 	sat_diag_log(false), sat_probe_log(false), sat_probe_last_print_s(0.0), // SESSION088 DIAGNOSTIC: the probe is off by default like every other trace - see getSatProbeLog().
+	sat_bias_exponent(0.2f), // SESSION088: the owner's calibrated value - see getSatBiasExponent() for what it trades. 1 would be session085's original fixed curve.
 	sat_debug_overlay_mode(GaussianSplatSatDebugOverlayMode_Off), sat_grid_subdiv(0.3f), sat_region_radius(0.5f), sat_region_closing_tiles(0), sat_bias_ceiling(1.f), // SESSION076/078/081: diagnostics off by default - see getSatDiagLog()/getSatDebugOverlayMode(). SESSION085 ETAP 6: sat_bias_ceiling 1 = the LoD bias off, i.e. the pre-bias behaviour; the calibrated value is still owner-selected rather than a default. SESSION086: sat_region_radius frozen at 0.5 - it is no longer only a conservatism knob, it also sets how long a barrier survives camera motion, which is what keeps the barrier rebuild off the traversal's threads. See getSatRegionRadius().
 	// SESSION080 STEP B: 0 = walk everything, the pre-session080 behaviour, bit-for-bit. SESSION086 turned it on at 25,
 	// measured it against the LoD bias, and turned it back off - the mechanism is sound but incompatible with the bias
@@ -6760,6 +6773,30 @@ void GaussianSplatRenderer::setSatGridSubdiv(float v)
 }
 
 
+// SESSION088 FIX: was `split_coarse_pixel_scale = v;` inline in the header, invalidating nothing. That was correct for
+// the knob's original coarse-floor-cut role, which kickOffTraversals() reads live at kick time - but session076 gave it
+// a second job, feeding gsSatGridResForFocal() alongside sat_grid_subdiv, and nothing was ever told that had happened.
+// Owner-visible as the knob doing nothing whatsoever on a static camera: no fresh traversal, and no barrier rebuild
+// either, since the gate in kickOffSaturationBuilds() did not know this parameter existed. Both halves are fixed - here,
+// and by coarse_pixel_scale_used in that gate.
+//
+// Mirrors setSatGridSubdiv() above deliberately, including what it does NOT clear: a grid built at a different res has a
+// different sat_depth SIZE, which gsSatBarrierDisagreement() already treats as total disagreement, so the barrier does
+// not need dropping by hand the way setSatRegionRadius()'s same-size depth shift does.
+void GaussianSplatRenderer::setCoarsePixelScale(float v)
+{
+	if(v == split_coarse_pixel_scale)
+		return;
+	split_coarse_pixel_scale = v;
+
+	for(size_t i=0; i<clouds.size(); ++i)
+	{
+		clouds[i]->cached_ufrontier = NULL;
+		clouds[i]->have_last_traversal_cam_pos = false;
+	}
+}
+
+
 // SESSION078: alpha gain/gamma now feed the CPU saturation prefilter as well as the draw path - see getAlphaGain()'s
 // comment - so a change here has to drop cached frontiers, same reasoning as setSatGridSubdiv() just above. Cheap while
 // the "ignore" alpha-adjust switch is on, its default: MainWindow.cpp always passes 1/1 in that case, so these are
@@ -6796,6 +6833,14 @@ void GaussianSplatRenderer::setAlphaGamma(float v)
 // positions rather than the single one it was built from), so an existing frontier's sat_depth was derived under the old
 // value and cannot be reinterpreted under the new one. Drop the caches and force a fresh traversal. See
 // getSatRegionRadius().
+// SESSION088 FIX: the barrier and the inherited far block go too. The barrier itself always rebuilt correctly here -
+// region_radius_used is in kickOffSaturationBuilds()'s staleness gate - but the far-block reuse gate then ABSORBED the
+// result: its barrier-disagreement test is deliberately flip-only (saturated/unsaturated state changes, not depth
+// changes) so that organic depth churn between rebuilds does not force needless rebuilds, and R's effect is a
+// near-uniform depth shift that flips very few tiles. So the new barrier arrived, was judged "close enough", and the
+// far block kept its old LoD until camera motion invalidated it some other way. Dropping both here bypasses that
+// tolerance for a deliberate, manual change, exactly as setFrontierReuseSplitDist() already does; the tolerance itself
+// (gsSatBarrierDisagreement(), btol) is untouched and still governs camera-driven reuse.
 void GaussianSplatRenderer::setSatRegionRadius(float v)
 {
 	if(v == sat_region_radius)
@@ -6805,6 +6850,8 @@ void GaussianSplatRenderer::setSatRegionRadius(float v)
 	for(size_t i=0; i<clouds.size(); ++i)
 	{
 		clouds[i]->cached_ufrontier = NULL;
+		clouds[i]->cached_sat_barrier = NULL;
+		clouds[i]->last_unpruned_ufrontier = NULL;
 		clouds[i]->have_last_traversal_cam_pos = false;
 	}
 }
@@ -6834,6 +6881,11 @@ void GaussianSplatRenderer::setSatRegionClosingTiles(int v)
 // SESSION085 ETAP 3 - see getSatBiasCeiling(). Unlike setSatMinRatio() this changes what a TRAVERSAL produces (which
 // nodes the walk stops at), not merely what the apply decides - so cached frontiers built under the old value are not
 // valid under the new one, exactly like the four setters above it.
+// SESSION088 FIX: last_unpruned_ufrontier as well. Clearing only cached_ufrontier forces a fresh traversal but does not
+// stop that traversal INHERITING its far block from the previous one (see the reuse gate in the task's ctor) - and the
+// reuse key is topology/pixel scale/budget, none of which the ceiling touches, so the inherited block keeps the LoD it
+// was selected with under the old ceiling. The near field then re-biases and the far field does not, which is
+// owner-visible as "changing bias does nothing until I move".
 void GaussianSplatRenderer::setSatBiasCeiling(float v)
 {
 	if(v == sat_bias_ceiling)
@@ -6843,6 +6895,30 @@ void GaussianSplatRenderer::setSatBiasCeiling(float v)
 	for(size_t i=0; i<clouds.size(); ++i)
 	{
 		clouds[i]->cached_ufrontier = NULL;
+		clouds[i]->last_unpruned_ufrontier = NULL;
+		clouds[i]->have_last_traversal_cam_pos = false;
+	}
+}
+
+
+// SESSION088 - see getSatBiasExponent(). Same class of knob as setSatBiasCeiling() above: it changes what a TRAVERSAL
+// produces, never what the barrier measures, so cached frontiers go and cached_sat_barrier deliberately stays.
+//
+// last_unpruned_ufrontier is dropped as well, which the ceiling's setter does not do. Without it the forced re-kick
+// below still INHERITS the far block the previous traversal selected under the old exponent - the reuse key sees a
+// matching topology and pixel scale and has no idea the curve moved underneath it - so the far field, which is the
+// half this knob exists to change, keeps its old LoD until camera motion happens to rebuild that block. The knob then
+// reads as working on the near field only, or as not working at all on a stationary camera.
+void GaussianSplatRenderer::setSatBiasExponent(float v)
+{
+	if(v == sat_bias_exponent)
+		return;
+	sat_bias_exponent = v;
+
+	for(size_t i=0; i<clouds.size(); ++i)
+	{
+		clouds[i]->cached_ufrontier = NULL;
+		clouds[i]->last_unpruned_ufrontier = NULL;
 		clouds[i]->have_last_traversal_cam_pos = false;
 	}
 }
@@ -8748,6 +8824,7 @@ void GaussianSplatRenderer::kickOffSaturationBuilds()
 			// A live-tuned knob has moved since this barrier was built - it must take effect on the next opportunity,
 			// not silently keep serving a stale barrier indefinitely.
 			if(barrier->threshold_used != sat_prefilter_threshold || barrier->subdiv_used != sat_grid_subdiv ||
+				barrier->coarse_pixel_scale_used != split_coarse_pixel_scale || // SESSION088: "px" sizes the grid exactly like "sub" does but was missing here, so the knob was completely inert on a static camera - see setCoarsePixelScale().
 				barrier->region_radius_used != sat_region_radius || barrier->closing_tiles_used != sat_region_closing_tiles)
 				needs_build = true;
 			// SESSION081: the ball guarantee itself - see GaussianSplatSaturationBarrier. > not >=: at R=0 (point-anchored)
@@ -9068,7 +9145,8 @@ void GaussianSplatRenderer::kickOffTraversals()
 			/*sat_bias_ceiling=*/sat_bias_ceiling, // SESSION085 ETAP 3 - see getSatBiasCeiling(). 1 = off.
 			/*reuse_drift_fraction=*/frontier_reuse_drift_fraction, // SESSION086 - see getFrontierReuseDriftFraction().
 			/*expand_seed_target=*/expand_seed_target, // SESSION086 - see updateExpandSeedTarget().
-			/*sat_barrier_agree_tol=*/sat_barrier_agree_tol)); // SESSION088 - see getSatBarrierAgreeTol(). 1 = accept any barrier change, as before.
+			/*sat_barrier_agree_tol=*/sat_barrier_agree_tol, // SESSION088 - see getSatBarrierAgreeTol(). 1 = accept any barrier change, as before.
+			/*sat_bias_exponent=*/sat_bias_exponent)); // SESSION088 - see getSatBiasExponent(). 1 = session085's original curve.
 	}
 
 	// SESSION055 diag: after the while-loop, detect *unmet* rotation demand - a cloud whose forward has shifted past the
@@ -9422,7 +9500,10 @@ void GaussianSplatRenderer::think()
 					const Vec4f node_offset = anchor_to_cam + probe_fwd * probe_dists_m[k]; // Node at that distance ahead of the CAMERA, expressed from the anchor.
 					const float dist_sq = node_offset[0]*node_offset[0] + node_offset[1]*node_offset[1] + node_offset[2]*node_offset[2]; // Same form satBiasFor() uses, so the probe's arithmetic matches the walk's bit for bit.
 					const float ratio_sq = gsSatBuriedRatioSq(node_offset, dist_sq, b.sat_depth, res);
-					const float bias = (ratio_sq <= 1.f) ? 1.f : (1.f + (sat_bias_ceiling - 1.f) * (1.f - 1.f / ratio_sq));
+					// SESSION088: the same denominator satBiasFor() forms, exponent included - the probe must not keep
+					// reporting session085's curve once the walk is running a different one.
+					const float denom = (ratio_sq <= 1.f) ? 1.f : ((sat_bias_exponent == 1.f) ? ratio_sq : std::pow(ratio_sq, sat_bias_exponent));
+					const float bias = (ratio_sq <= 1.f) ? 1.f : (1.f + (sat_bias_ceiling - 1.f) * (1.f - 1.f / denom));
 					bias_str += doubleToStringNDecimalPlaces(probe_dists_m[k], 0) + "m=x" + doubleToStringNDecimalPlaces(bias, 2) + " ";
 				}
 
@@ -9430,6 +9511,7 @@ void GaussianSplatRenderer::think()
 					"res=" + toString(res) +
 					" R=" + doubleToStringNDecimalPlaces(b.region_radius_used, 3) +
 					" ceil=" + doubleToStringNDecimalPlaces(sat_bias_ceiling, 1) +
+					" exp=" + doubleToStringNDecimalPlaces(sat_bias_exponent, 2) + // SESSION088 - see getSatBiasExponent(). The bias= readouts below are computed with it.
 					" anchor_d=" + doubleToStringNDecimalPlaces(probe_cam_pos.getDist(b.anchor_pos_ws), 2) + "m" +
 					" | sat=" + doubleToStringNDecimalPlaces(gs.num_tiles > 0 ? (100.0 * (double)gs.num_finite / (double)gs.num_tiles) : 0.0, 1) + "%" +
 					" depth p10=" + doubleToStringNDecimalPlaces(gs.d_p10, 1) +

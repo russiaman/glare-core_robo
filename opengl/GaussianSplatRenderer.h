@@ -542,18 +542,21 @@ public:
 	GaussianSplatSatDebugOverlayMode getSatDebugOverlayMode() const { return sat_debug_overlay_mode; }
 	void setSatDebugOverlayMode(GaussianSplatSatDebugOverlayMode v);
 
-	// SESSION076 CALIBRATION, temporary: the saturation grid's angular resolution. Divides the tile's angular size, so
-	// grid res scales with it. Silhouette accuracy is bounded by tile size - at subdiv 1 a tile spans coarse_pixel_scale
-	// (30 px at the owner's settings), too coarse to separate a 30-50 px feature from the geometry beside it.
+	// SESSION088: the saturation grid's resolution, stated as HOW MANY SCREEN PIXELS ONE TILE SPANS. Default 100.
 	//
-	// A live knob only to find the working point on a real scene; to be frozen back into a code constant and the UI
-	// removed once found (project rule: no manual per-scene tuning - a knob used to MEASURE is fine, a knob the scene
-	// depends on is not). The coverage-entitlement knob that sat beside it is gone with the coarse source it existed
-	// for - see gsBuildSaturationGrid().
+	// This is the session076 "sub" knob and the coarse-floor "px" knob collapsed into the single quantity that was ever
+	// real: the two only ever appeared as the ratio coarse_pixel_scale/tile_subdiv, and that ratio is a pixel count. The
+	// owner's calibrated 30/0.3 is exactly 100, so the collapse is behaviour-preserving. See gsSatGridResForFocal() for
+	// the derivation and for why pixels (rather than an angle, or res itself) is the unit that keeps the grid adaptive
+	// to the display.
+	//
+	// Lower = finer grid = better silhouette separation, at res^2 cost. Silhouette accuracy is what it buys: at 100 px a
+	// tile cannot separate a 30-50 px feature - a chair back protruding above a table - from the geometry beside it,
+	// because one scalar barrier per tile has to answer for both.
 	//
 	// Changes what a traversal PRODUCES, so the setter drops cached frontiers, as setSatPrefilterMode() does.
-	float getSatGridSubdiv() const { return sat_grid_subdiv; }
-	void setSatGridSubdiv(float v);
+	float getSatTilePx() const { return sat_tile_px; }
+	void setSatTilePx(float v);
 
 
 	// SESSION078: REGION ANCHORING. Radius of the ball of camera positions the saturation barrier is made valid for, in
@@ -577,7 +580,7 @@ public:
 	// the read side deliberately does not dilate by R, that was prune-era strictness. So raising it is safe in kind;
 	// the only question is how much bias is left, never whether geometry survives.
 	//
-	// Changes what a traversal PRODUCES, so the setter drops cached frontiers, as setSatGridSubdiv() does.
+	// Changes what a traversal PRODUCES, so the setter drops cached frontiers, as setSatTilePx() does.
 	float getSatRegionRadius() const { return sat_region_radius; }
 	void setSatRegionRadius(float v);
 
@@ -961,7 +964,7 @@ public:
 	// gsBuildSaturationGrid()'s header). The intended use: raising alpha in a translucent region (gain > 1 or
 	// gamma < 1) genuinely raises how much that region can prune, since the prefilter now sees the same opacity the
 	// renderer draws rather than the raw stored one. Because of this the setters drop cached frontiers, same as
-	// setSatGridSubdiv() - a value change here is no longer purely a draw-time knob.
+	// setSatTilePx() - a value change here is no longer purely a draw-time knob.
 	//
 	// What it does not reach is the LoD tree, whose merged splats were built from the stored alpha when the cloud was
 	// loaded - a tree rebuild is what folds a setting in permanently. 1 and 1 is the cloud as captured.
@@ -1957,7 +1960,7 @@ private:
 	bool sat_probe_log;                              // SESSION088 DIAGNOSTIC - see getSatProbeLog(). Read-only, so unlike sat_diag_log it needs no cache invalidation when it changes.
 	double sat_probe_last_print_s;                   // SESSION088 DIAGNOSTIC: diag_timer stamp of the last [gsr-sat-probe], rate-limiting it to twice a second - see think().
 	GaussianSplatSatDebugOverlayMode sat_debug_overlay_mode; // SESSION078 - see getSatDebugOverlayMode().
-	float sat_grid_subdiv;                           // SESSION076 CALIBRATION - see getSatGridSubdiv().
+	float sat_tile_px;                               // SESSION088 - see getSatTilePx(). Screen pixels per grid tile; was "sub" x "px" until those collapsed into their ratio.
 	float sat_region_radius;                         // SESSION078 - see getSatRegionRadius().
 	int sat_region_closing_tiles;                    // SESSION081 - see getSatRegionClosingTiles().
 	float sat_bias_ceiling;                          // SESSION085 ETAP 3 - see getSatBiasCeiling().

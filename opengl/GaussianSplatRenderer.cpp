@@ -488,8 +488,7 @@ public:
 	// these are snapshotted rather than re-read from the live renderer settings (which may have moved on since, and -
 	// SESSION081 - are also what kickOffSaturationBuilds() compares against the CURRENT settings to decide whether a
 	// live-tuned knob has invalidated this barrier).
-	float threshold_used, subdiv_used, region_radius_used;
-	float coarse_pixel_scale_used; // SESSION088: "px" feeds sat_grid_res exactly like "sub" does (gsSatGridResForFocal()), so a change to it is exactly as stale-grid-shaped as a change to "sub" - and was never checked here. See setCoarsePixelScale().
+	float threshold_used, tile_px_used, region_radius_used; // SESSION088: tile_px_used was subdiv_used, and there was a coarse_pixel_scale_used beside it - the two collapsed into the one quantity that was ever real, see gsSatGridResForFocal().
 	int closing_tiles_used;
 
 	// DIAGNOSTIC, build-side - see [gsr-sat-build]. Same fields GaussianSplatUnculledFrontier used to carry for the
@@ -526,7 +525,7 @@ public:
 
 	GaussianSplatSaturationBarrier()
 	:	sat_grid_res(0), anchor_pos_ws(0.f), built_time_real_s(0.0),
-		threshold_used(0.f), subdiv_used(0.f), region_radius_used(0.f), coarse_pixel_scale_used(0.f), closing_tiles_used(0), // SESSION088: coarse_pixel_scale_used - see the field.
+		threshold_used(0.f), tile_px_used(0.f), region_radius_used(0.f), closing_tiles_used(0),
 		num_occluders(0), gather_ms(0.0), grid_build_ms(0.0),
 		frontier_n(0), rec_ms(0.0), dep_ms(0.0), close_ms(0.0), erode_ms(0.0), num_recs(0), num_strips(0), concurrency_used(0), num_blocks(0), gate1_survivors(0),
 		rec_task_ms_min(0.0), rec_task_ms_max(0.0), rec_task_ms_mean(0.0),
@@ -1460,8 +1459,7 @@ public:
 		barrier->anchor_pos_ws = anchor_pos_ws;
 		barrier->built_time_real_s = Clock::getCurTimeRealSec();
 		barrier->threshold_used = saturation_threshold;
-		barrier->subdiv_used = grid_subdiv;
-		barrier->coarse_pixel_scale_used = coarse_pixel_scale; // SESSION088 - see the field's comment.
+		barrier->tile_px_used = tile_px;
 		barrier->region_radius_used = region_radius;
 		barrier->closing_tiles_used = closing_tiles;
 
@@ -1480,7 +1478,7 @@ public:
 		// kickOffSaturationBuilds() does not re-kick every single frame trying to build one from the same empty input. ----
 		if(!occl_px.empty())
 		{
-			barrier->sat_grid_res = gsSatGridResForFocal(focal_px, coarse_pixel_scale, grid_subdiv);
+			barrier->sat_grid_res = gsSatGridResForFocal(focal_px, tile_px);
 			Timer sat_grid_timer;
 
 			if(task_manager != NULL && !overlay_requested)
@@ -1624,7 +1622,7 @@ public:
 
 		// The resolution this barrier is about to be built at - the same call run() makes below, so the walk's stop
 		// rule and the grid's tile size cannot drift apart.
-		const int res = gsSatGridResForFocal(focal_px, coarse_pixel_scale, grid_subdiv);
+		const int res = gsSatGridResForFocal(focal_px, tile_px);
 		walk_tile_ang = myMax(gsSatGridTileAngle(res), 1.0e-6f); // Stored, not local: every walk task reads it - see walkStack().
 		walk_verify_ms = 0.0; // SESSION085: set only if the self-check below runs, and the caller subtracts it unconditionally.
 
@@ -1788,9 +1786,9 @@ public:
 	Reference<GaussianSplatCachedGeom> geom;
 	Reference<GaussianSplatSaturationBuildScratch> build_scratch; // SESSION081 - see GsSatBuildScratch. Held by reference so it survives its cloud being removed mid-build.
 	Vec4f anchor_pos_ws;
-	float saturation_threshold, grid_subdiv, region_radius;
+	float saturation_threshold, tile_px, region_radius;
 	int closing_tiles;
-	float focal_px, coarse_pixel_scale; // Needed for gsSatGridResForFocal() - see GaussianSplatRenderer::kickOffSaturationBuilds().
+	float focal_px; // Needed for gsSatGridResForFocal() - see GaussianSplatRenderer::kickOffSaturationBuilds().
 	float alpha_gain, alpha_gamma;
 	bool diag_log, overlay_requested;
 	// SESSION082: the cloud's members as of kick time, so the tree walk can run here without a frontier and without the
@@ -3372,7 +3370,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	sat_prefilter_threshold(0.98f), // SESSION079 - see getSatPrefilterThreshold().
 	sat_diag_log(false), sat_probe_log(false), sat_probe_last_print_s(0.0), // SESSION088 DIAGNOSTIC: the probe is off by default like every other trace - see getSatProbeLog().
 	sat_bias_exponent(0.2f), // SESSION088: the owner's calibrated value - see getSatBiasExponent() for what it trades. 1 would be session085's original fixed curve.
-	sat_debug_overlay_mode(GaussianSplatSatDebugOverlayMode_Off), sat_grid_subdiv(0.3f), sat_region_radius(0.5f), sat_region_closing_tiles(0), sat_bias_ceiling(1.f), // SESSION076/078/081: diagnostics off by default - see getSatDiagLog()/getSatDebugOverlayMode(). SESSION085 ETAP 6: sat_bias_ceiling 1 = the LoD bias off, i.e. the pre-bias behaviour; the calibrated value is still owner-selected rather than a default. SESSION086: sat_region_radius frozen at 0.5 - it is no longer only a conservatism knob, it also sets how long a barrier survives camera motion, which is what keeps the barrier rebuild off the traversal's threads. See getSatRegionRadius().
+	sat_debug_overlay_mode(GaussianSplatSatDebugOverlayMode_Off), sat_tile_px(100.f), sat_region_radius(0.5f), sat_region_closing_tiles(0), sat_bias_ceiling(1.f), // SESSION076/078/081: diagnostics off by default - see getSatDiagLog()/getSatDebugOverlayMode(). SESSION085 ETAP 6: sat_bias_ceiling 1 = the LoD bias off, i.e. the pre-bias behaviour; the calibrated value is still owner-selected rather than a default. SESSION086: sat_region_radius frozen at 0.5 - it is no longer only a conservatism knob, it also sets how long a barrier survives camera motion, which is what keeps the barrier rebuild off the traversal's threads. See getSatRegionRadius().
 	// SESSION080 STEP B: 0 = walk everything, the pre-session080 behaviour, bit-for-bit. SESSION086 turned it on at 25,
 	// measured it against the LoD bias, and turned it back off - the mechanism is sound but incompatible with the bias
 	// as cut. The measurement and the verdict are in getFrontierReuseSplitDist(); the drift fraction that measured it
@@ -6758,12 +6756,16 @@ void GaussianSplatRenderer::setSatDebugOverlayMode(GaussianSplatSatDebugOverlayM
 
 // SESSION076 CALIBRATION: rebuilds the saturation grid from scratch, so like setSatPrefilterMode() it must force a
 // fresh traversal - otherwise a live change sits invisible until the camera happens to move, which during pure rotation
-// is never. See getSatGridSubdiv().
-void GaussianSplatRenderer::setSatGridSubdiv(float v)
+// is never. See getSatTilePx().
+//
+// What it does NOT clear, deliberately: the barrier. A grid built at a different tile_px has a different res, hence a
+// different sat_depth SIZE, which gsSatBarrierDisagreement() already treats as total disagreement - so the reuse gate
+// cannot mistake the old barrier for the new one the way setSatRegionRadius()'s same-size depth shift could.
+void GaussianSplatRenderer::setSatTilePx(float v)
 {
-	if(v == sat_grid_subdiv)
+	if(v == sat_tile_px)
 		return;
-	sat_grid_subdiv = v;
+	sat_tile_px = v;
 
 	for(size_t i=0; i<clouds.size(); ++i)
 	{
@@ -6773,16 +6775,10 @@ void GaussianSplatRenderer::setSatGridSubdiv(float v)
 }
 
 
-// SESSION088 FIX: was `split_coarse_pixel_scale = v;` inline in the header, invalidating nothing. That was correct for
-// the knob's original coarse-floor-cut role, which kickOffTraversals() reads live at kick time - but session076 gave it
-// a second job, feeding gsSatGridResForFocal() alongside sat_grid_subdiv, and nothing was ever told that had happened.
-// Owner-visible as the knob doing nothing whatsoever on a static camera: no fresh traversal, and no barrier rebuild
-// either, since the gate in kickOffSaturationBuilds() did not know this parameter existed. Both halves are fixed - here,
-// and by coarse_pixel_scale_used in that gate.
-//
-// Mirrors setSatGridSubdiv() above deliberately, including what it does NOT clear: a grid built at a different res has a
-// different sat_depth SIZE, which gsSatBarrierDisagreement() already treats as total disagreement, so the barrier does
-// not need dropping by hand the way setSatRegionRadius()'s same-size depth shift does.
+// SESSION088: back to one job. Session076 had given this a second one - sizing the saturation grid alongside "sub" -
+// which is why it needed cache invalidation at all (and why it was a bug that the inline version had none). That job is
+// gone: the grid is sized by sat_tile_px, which absorbed the ratio the two of them expressed. What is left is the
+// original coarse-floor cut, and a changed cut means a differently-captured frontier, so the cached one still goes.
 void GaussianSplatRenderer::setCoarsePixelScale(float v)
 {
 	if(v == split_coarse_pixel_scale)
@@ -6798,7 +6794,7 @@ void GaussianSplatRenderer::setCoarsePixelScale(float v)
 
 
 // SESSION078: alpha gain/gamma now feed the CPU saturation prefilter as well as the draw path - see getAlphaGain()'s
-// comment - so a change here has to drop cached frontiers, same reasoning as setSatGridSubdiv() just above. Cheap while
+// comment - so a change here has to drop cached frontiers, same reasoning as setSatTilePx() just above. Cheap while
 // the "ignore" alpha-adjust switch is on, its default: MainWindow.cpp always passes 1/1 in that case, so these are
 // no-ops (the early-out below fires) unless the owner has deliberately turned adjustment on.
 void GaussianSplatRenderer::setAlphaGain(float v)
@@ -6829,7 +6825,7 @@ void GaussianSplatRenderer::setAlphaGamma(float v)
 }
 
 
-// SESSION078: same reasoning as setSatGridSubdiv() just above - this changes what the grid ASSERTS (a ball of camera
+// SESSION078: same reasoning as setSatTilePx() just above - this changes what the grid ASSERTS (a ball of camera
 // positions rather than the single one it was built from), so an existing frontier's sat_depth was derived under the old
 // value and cannot be reinterpreted under the new one. Drop the caches and force a fresh traversal. See
 // getSatRegionRadius().
@@ -7938,7 +7934,7 @@ void GaussianSplatRenderer::kickOffSorts()
 // accumulators - see drainSaturationBuildResults()'s call site and GaussianSplatRenderer::getSatGridDebugInfo().
 // Always allocates fresh textures rather than updating in place: this only runs once per BUILD while the overlay is
 // requested, so the extra allocation cost is not worth avoiding, and fresh textures mean a resolution change
-// (sat_grid_subdiv) can never be applied to a texture sized for the old resolution.
+// (sat_tile_px) can never be applied to a texture sized for the old resolution.
 void GaussianSplatRenderer::updateSatGridDebugTexture(SplatCloud& cloud, const GaussianSplatSaturationBarrier& barrier)
 {
 	const size_t res = (size_t)barrier.sat_grid_res;
@@ -8082,7 +8078,7 @@ void GaussianSplatRenderer::drainSaturationBuildResults()
 					" walk_ms=" + doubleToStringNDecimalPlaces(b.walk_ms, 2) +
 					" walk_sort_ms=" + doubleToStringNDecimalPlaces(b.walk_sort_ms, 2) + " " +
 					"thr=" + doubleToStringNDecimalPlaces(b.threshold_used, 3) + // SESSION080: the knobs THIS barrier was built with, not the live settings - see the field's old comment on GaussianSplatUnculledFrontier.
-					" sub=" + doubleToStringNDecimalPlaces(b.subdiv_used, 3) +
+					" tile_px=" + doubleToStringNDecimalPlaces(b.tile_px_used, 1) +
 					" R=" + doubleToStringNDecimalPlaces(b.region_radius_used, 3) +
 					" close=" + toString(b.closing_tiles_used) + // SESSION081
 					" occl=" + uInt64ToStringCommaSeparated(b.num_occluders) +
@@ -8744,7 +8740,7 @@ static const double rot_blocked_min_gap_ms = 250.0;
 // the live settings. Independent of kickOffTraversals() entirely - see GaussianSplatSaturationBarrier for why the
 // two no longer need to move in lockstep.
 //
-// NOTE: setSatRegionRadius()/setSatGridSubdiv()/setSatPrefilterThreshold()/setSatRegionClosingTiles() still drop
+// NOTE: setSatRegionRadius()/setSatTilePx()/setSatPrefilterThreshold()/setSatRegionClosingTiles() still drop
 // cached_ufrontier and force a fresh TRAVERSAL when dragged, which is more than strictly needed now - the "knobs
 // changed" check below would catch a mismatch and rebuild just the BARRIER from the cloud's existing
 // last_unpruned_ufrontier, no fresh traversal required. Left as is: those are rare, owner-driven spinbox edits, not a
@@ -8823,8 +8819,7 @@ void GaussianSplatRenderer::kickOffSaturationBuilds()
 		{
 			// A live-tuned knob has moved since this barrier was built - it must take effect on the next opportunity,
 			// not silently keep serving a stale barrier indefinitely.
-			if(barrier->threshold_used != sat_prefilter_threshold || barrier->subdiv_used != sat_grid_subdiv ||
-				barrier->coarse_pixel_scale_used != split_coarse_pixel_scale || // SESSION088: "px" sizes the grid exactly like "sub" does but was missing here, so the knob was completely inert on a static camera - see setCoarsePixelScale().
+			if(barrier->threshold_used != sat_prefilter_threshold || barrier->tile_px_used != sat_tile_px ||
 				barrier->region_radius_used != sat_region_radius || barrier->closing_tiles_used != sat_region_closing_tiles)
 				needs_build = true;
 			// SESSION081: the ball guarantee itself - see GaussianSplatSaturationBarrier. > not >=: at R=0 (point-anchored)
@@ -8852,11 +8847,10 @@ void GaussianSplatRenderer::kickOffSaturationBuilds()
 		t->build_scratch = cloud.sat_build_scratch;
 		t->anchor_pos_ws = predicted_cam_pos_ws; // SESSION088: the predicted camera position, = cam_pos_ws when the gain is 0 - see the lead's computation above.
 		t->saturation_threshold = sat_prefilter_threshold;
-		t->grid_subdiv = sat_grid_subdiv;
+		t->tile_px = sat_tile_px;
 		t->region_radius = sat_region_radius;
 		t->closing_tiles = sat_region_closing_tiles;
 		t->focal_px = focal_px;
-		t->coarse_pixel_scale = split_coarse_pixel_scale;
 		t->alpha_gain = splat_alpha_gain; t->alpha_gamma = splat_alpha_gamma;
 		t->diag_log = sat_diag_log;
 		t->overlay_requested = sat_debug_overlay_mode != GaussianSplatSatDebugOverlayMode_Off;

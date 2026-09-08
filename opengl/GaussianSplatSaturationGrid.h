@@ -251,14 +251,14 @@ static inline float gsSatRegionErosionTiles(float region_radius, float barrier_d
 Vec2f gsDirToOct(const Vec4f& dir);
 
 // Grid resolution (grid is res x res, covering the WHOLE sphere in one octahedral square - see gsDirToOct()) derived
-// from the existing coarse_pixel_scale/focal_px knobs, no new UI parameter - see the .cpp for the derivation.
+// from how many SCREEN PIXELS one tile is to span - see the .cpp for why the parameter is in pixels rather than in
+// angle, and for what it replaced.
 //
-// SESSION076 CALIBRATION: tile_subdiv divides the tile's angular size, i.e. res scales with it. It exists because the
-// grid's angular resolution turned out to be the binding constraint on silhouette accuracy: a tile spans
-// coarse_pixel_scale (30 px at the owner's settings), so a 30-50 px feature - a chair back protruding above a table -
-// lands inside a single tile together with the near geometry beside it, and one scalar barrier per tile cannot keep one
-// and drop the other. Live knob while the working point is found; to be frozen as a constant afterwards.
-int gsSatGridResForFocal(float focal_px, float coarse_pixel_scale, float tile_subdiv);
+// Why the grid's resolution is the binding constraint at all, kept from the session076 calibration note: a tile spanning
+// 100 px means a 30-50 px feature - a chair back protruding above a table - lands inside a single tile together with the
+// near geometry beside it, and one scalar barrier per tile cannot keep one and drop the other. Lowering tile_px is what
+// buys that separation, at res^2 cost.
+int gsSatGridResForFocal(float focal_px, float tile_px);
 
 // Tile index (row-major, [0, res*res)) for a direction (any positive length - see gsDirToOct()).
 int gsSatGridTileForDir(const Vec4f& dir, int res);

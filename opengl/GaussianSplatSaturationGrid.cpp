@@ -66,14 +66,21 @@ float gsSatGridTileAngle(int res)
 }
 
 
-int gsSatGridResForFocal(float focal_px, float coarse_pixel_scale, float tile_subdiv)
+int gsSatGridResForFocal(float focal_px, float tile_px)
 {
-	// SESSION074: derive tile angular size from the existing coarse_pixel_scale/focal_px knobs rather than exposing a
-	// new UI parameter - project rule, no manual per-scene tuning. A coarse node subtends about
-	// coarse_pixel_scale/focal_px radians; the subdivision sizes the tile against that.
-	// SESSION076 CALIBRATION: tile_subdiv replaces the fixed K - see the header.
+	// SESSION088: one knob, in pixels. This used to be coarse_pixel_scale/(focal * tile_subdiv) - two knobs that never
+	// appeared anywhere except as that ratio, so only their quotient was ever real. That quotient has units of PIXELS
+	// (it is coarse_pixel_scale/tile_subdiv), i.e. "how many screen pixels one grid tile spans", which is what the pair
+	// was always jointly expressing and is the same unit the rest of the LoD stage is stated in (pixel_scale_limit).
+	// The owner's calibrated 30/0.3 is exactly tile_px = 100.
+	//
+	// Keeping it in PIXELS rather than in angle (or fixing res outright) is what keeps the grid adaptive: focal_px is
+	// linear in viewport width, so a tile holds a constant SCREEN size and the resolution follows the display - a phone
+	// builds a proportionally cheaper grid, a 4K display a finer one, both with the same visual coarseness. Stating it
+	// as an angle or as res would invert that: the tile's pixel size would then grow with the display, giving the
+	// largest screen the coarsest barrier while a phone paid desktop cost for accuracy it cannot show.
 	const float safe_focal = myMax(focal_px, 1.f);
-	const float tile_ang = myMax(coarse_pixel_scale, 1.0e-3f) / (safe_focal * myMax(tile_subdiv, 0.01f));
+	const float tile_ang = myMax(tile_px, 1.0e-3f) / safe_focal;
 
 	// Inverse of gsSatGridTileAngle(), including its distortion margin, so that the res chosen here and the tile size
 	// reported there are consistent with each other rather than two independent approximations.

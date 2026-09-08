@@ -225,12 +225,9 @@ public:
 	js::Vector<float, 16> px, py, pz;     // SoA world positions parallel to indices.
 	js::Vector<float, 16> radius;         // Per-node cull_radius (world space), the filter's per-node plane margin.
 
-	// SESSION063 K4: 1.0 for a coarse-floor node, 0.0 for a fine node - parallel to indices. Fine and coarse are merged
-	// into ONE globally distance-sorted list (see the traversal), so the draw is front-to-back across both layers and a
-	// near coarse node correctly occludes a far fine one. The filter reads this per node to dilate coarse nodes wider than
-	// fine (coarse nodes are few/cheap, so a wide edge margin costs little) - which lets the dense fine set stay at a
-	// tight, cheap dilation without leaving holes on motion. See filterUnculledFrontier() / kickOffFilters().
-	js::Vector<float, 16> is_coarse;
+	// SESSION088: is_coarse (1.0 per coarse-floor node, parallel to indices) went with the coarse floor itself - see
+	// GaussianSplatRenderer's note on why that feature was removed. It cost 4 bytes per node here plus its own lane
+	// through the sort's unpack, the SoA gather and every partition, to feed a per-node blend in the filter's hot loop.
 
 	// SESSION085 ETAP 6: the prune's diagnostics (tested/dropped/aggr, the graded-read counters, apply timing and
 	// concurrency) went with the prune. What the saturation stage does now is visible on [gsr-traversal]'s sat_bias=
@@ -275,7 +272,7 @@ public:
 	// re: the region-radius topology) is worth it for the walk, the sort, or both - session054's own note that the sort
 	// was ~76% of traversal time predates the switch from std::sort to radix and was never re-measured after.
 	double expand_ms; // The DFS/selection loop: frustum cull, coarse capture, pixel_scale convergence checks, cap tests.
-	double sort_ms;   // Sort::floatKeyAscendingSort() over the selection, plus unpacking into output/coarse_flags.
+	double sort_ms;   // Sort::floatKeyAscendingSort() over the selection, plus unpacking into the output index array.
 	// SESSION080 DIAGNOSTIC (plan2 §4.1): the share of sort_ms that is just allocating the sort's scratch buffer, which
 	// is a local sized to the selection - so a fresh ~106MB allocation per traversal at full frontier size, first-touch
 	// page faults included. Same question, and the same candidate fix (pool it on the traversal scratch), as
@@ -287,7 +284,7 @@ public:
 	// that session's other diagnostics, because the sort block is an active work area and this is the split that makes
 	// its cost readable: an interleaved A/B over these two measured -18 ms interior / -23 ms exterior per traversal.
 	double sort_radix_ms;        // The sort call itself, nothing else.
-	double sort_unpack_ms;       // Splitting the packed idx into output/coarse_flags. Parallel since session087.
+	double sort_unpack_ms;       // Reading the sorted stream's idx out into the output array. Parallel since session087.
 	// SESSION080 DIAGNOSTIC: why the parallel expand did or did not pay off - see expandParallel(). The pair that matters
 	// is sum vs max: task_sum_ms is the total work the tasks did, task_max_ms the longest single one, i.e. the critical
 	// path. sum/max is the parallelism actually available in the seed split. If max ~= expand_ms one subtree dominates
@@ -331,7 +328,7 @@ public:
 	double expand_splice_reserve_ms;
 	double expand_splice_copy_ms;
 
-	// SESSION080 DIAGNOSTIC: building this frontier's SoA (indices/px/py/pz/radius/is_coarse) from the sorted selection.
+	// SESSION080 DIAGNOSTIC: building this frontier's SoA (indices/px/py/pz/radius) from the sorted selection.
 	// Sat between sort_ms and sat_gather_ms and was covered by NEITHER, so the stage timings did not sum to the traversal
 	// task's real duration. It is a scattered read of positions[idx]/cull_radius[idx] over the whole selection - the same
 	// shape as, and over the same indices as, the occluder gather that follows it.
@@ -869,7 +866,6 @@ public:
 	// SESSION080 §4.3: scratch for the near/far partition of a sorted selection, used only by the traversal that BUILDS
 	// a far block (roughly one in ten - see reuse_max_drift_fraction). Pooled for the same reason as the two above.
 	js::Vector<uint32, 16> partition_near, partition_far;
-	js::Vector<float, 16> partition_near_coarse, partition_far_coarse;
 };
 
 
@@ -1301,15 +1297,14 @@ public:
 			out_indices[i] = idx;
 			out_px[i] = p.x; out_py[i] = p.y; out_pz[i] = p.z;
 			out_radius[i] = cull_radii[idx];
-			out_is_coarse[i] = coarse_flags[i];
 		}
 	}
 
 	size_t i_begin, i_end;
-	const uint32* output; const float* coarse_flags;
+	const uint32* output;
 	const Vec3f* positions; const float* cull_radii;
 	uint32* out_indices;
-	float* out_px; float* out_py; float* out_pz; float* out_radius; float* out_is_coarse;
+	float* out_px; float* out_py; float* out_pz; float* out_radius;
 };
 
 
@@ -1324,15 +1319,13 @@ public:
 	{
 		for(size_t i=i_begin; i<i_end; ++i)
 		{
-			const uint32 packed = sorted[i].idx;
-			out_indices[i] = packed & 0x7FFFFFFFu;             // Real cloud index (bit 31 stripped).
-			out_coarse_flags[i] = (packed >> 31) ? 1.f : 0.f;  // 1 = coarse-floor node, for the filter's per-node dilation.
+			out_indices[i] = sorted[i].idx; // SESSION088: bit 31 used to carry the coarse-floor flag and was masked off here; nothing sets it now.
 		}
 	}
 
 	size_t i_begin, i_end;
 	const GsDistIdx* sorted;
-	uint32* out_indices; float* out_coarse_flags;
+	uint32* out_indices;
 };
 
 
@@ -1909,10 +1902,8 @@ public:
 		ThreadSafeQueue<Reference<ThreadMessage> >* result_queue_,
 		js::Vector<FrontierNodeRecord, 16>* frontier_record_ = NULL,
 		bool build_unculled_frontier_ = false, // SESSION063: also emit the SoA U(P) into the result msg, for the split filter path.
-		bool coarse_floor_enabled_ = false, float coarse_pixel_scale_ = 20.f, // SESSION063 K4: also capture a coarse floor into U(P) - see GaussianSplatUnculledFrontier::is_coarse.
 		bool dist_clamp_enabled_ = false, float dist_clamp_min_ = 0.f, float dist_clamp_max_ = 0.f, bool dist_clamp_invert_ = false, // SESSION072: distance-slice early-cull, mirrors the frustum-cull block below - see GaussianSplatRenderer::getDistClampEnabled(). Defaults off, so getFrustumStructureReport()'s call site (which omits these) always sees the whole tree.
 		bool sat_diag_log_ = false, // SESSION076 DIAGNOSTIC: gated by its own "sat diag" checkbox.
-		bool coarse_layer_drawn_ = true, // SESSION076: whether anything will actually DRAW the captured coarse layer (the "coarse" checkbox). False means it was captured solely to feed the saturation grid, which lets this task both skip capturing nodes the grid cannot use and evict the rest once the grid is built - see the capture block and the compaction loop in run(). Defaults true, i.e. the pre-session076 behaviour, so callers that don't care are unaffected.
 		glare::TaskManager* task_manager_ = NULL, // SESSION079: the pool this task is itself running on.
 		const Reference<GaussianSplatUnculledFrontier>& prev_frontier_ = Reference<GaussianSplatUnculledFrontier>(), // SESSION080 DIAGNOSTIC (plan doc STEP A) - see the field's comment.
 		bool sort_staleness_diag_enabled_ = false,
@@ -1930,9 +1921,8 @@ public:
 		result_queue(result_queue_),
 		frontier_record(frontier_record_),
 		build_unculled_frontier(build_unculled_frontier_),
-		coarse_floor_enabled(coarse_floor_enabled_), coarse_pixel_scale(coarse_pixel_scale_),
 		dist_clamp_enabled(dist_clamp_enabled_), dist_clamp_min(dist_clamp_min_), dist_clamp_max(dist_clamp_max_), dist_clamp_invert(dist_clamp_invert_),
-		sat_diag_log(sat_diag_log_), coarse_layer_drawn(coarse_layer_drawn_),
+		sat_diag_log(sat_diag_log_),
 		task_manager(task_manager_), // SESSION079
 		expand_seeds(0), expand_num_tasks(0), expand_prologue_ms(0.0), expand_task_max_ms(0.0), expand_task_sum_ms(0.0), // SESSION080 DIAGNOSTIC
 		expand_workers(0), expand_seed_max_ms(0.0), // SESSION086
@@ -1971,7 +1961,7 @@ public:
 			// The cut's geometry is defined on the unculled tree. With any of these on, the walk prunes for reasons the
 			// frozen predicate knows nothing about, so a later traversal's near part and the block would no longer be
 			// complementary.
-			!frustum_cull_enabled && !dist_clamp_enabled && !coarse_floor_enabled)
+			!frustum_cull_enabled && !dist_clamp_enabled)
 		{
 			reuse_enabled = true;
 			reuse_split_dist = reuse_split_dist_;
@@ -2075,12 +2065,12 @@ public:
 	// from each other and the result is bit-identical to the serial loop. Chunked like the occluder gather, and for the
 	// same reason: the cost is DRAM miss latency on the scattered reads into the 30M-entry geometry arrays, not
 	// arithmetic, so what threads buy is outstanding misses.
-	void buildFrontierSoA(GaussianSplatUnculledFrontier& out, const uint32* src, const float* src_coarse, size_t count,
+	void buildFrontierSoA(GaussianSplatUnculledFrontier& out, const uint32* src, size_t count,
 		const js::Vector<Vec3f, 16>& positions, const js::Vector<float, 16>& cull_radii)
 	{
 		out.indices.resizeNoCopy(count);
 		out.px.resizeNoCopy(count); out.py.resizeNoCopy(count); out.pz.resizeNoCopy(count);
-		out.radius.resizeNoCopy(count); out.is_coarse.resizeNoCopy(count);
+		out.radius.resizeNoCopy(count);
 		if(count == 0)
 			return;
 
@@ -2095,11 +2085,11 @@ public:
 				Reference<GsFrontierSoATask> t = new GsFrontierSoATask();
 				t->i_begin = (count * c)       / num_chunks;
 				t->i_end   = (count * (c + 1)) / num_chunks;
-				t->output = src; t->coarse_flags = src_coarse;
+				t->output = src;
 				t->positions = positions.data(); t->cull_radii = cull_radii.data();
 				t->out_indices = out.indices.data();
 				t->out_px = out.px.data(); t->out_py = out.py.data(); t->out_pz = out.pz.data();
-				t->out_radius = out.radius.data(); t->out_is_coarse = out.is_coarse.data();
+				t->out_radius = out.radius.data();
 				group->tasks[c] = t;
 			}
 			task_manager->runTaskGroup(group);
@@ -2112,7 +2102,6 @@ public:
 				out.indices[i] = idx;
 				out.px[i] = p.x; out.py[i] = p.y; out.pz[i] = p.z;
 				out.radius[i] = cull_radii[idx];
-				out.is_coarse[i] = src_coarse[i];
 			}
 	}
 
@@ -2142,21 +2131,11 @@ public:
 		std::vector<HeapItem> stack;
 		stack.reserve(4096); // Peak is O(depth * branching); 4096 covers deep trees comfortably without reallocating.
 
-		// SESSION063 K4: fine frontier nodes (is_coarse bit 0) and coarse-floor nodes (bit 31 of idx set) go into the SAME
-		// list and are sorted together by distance, so the draw is globally front-to-back across both layers - a near coarse
-		// node correctly occludes a far fine one. The bit is packed into the top of idx (cloud indices are well under 2^31)
-		// so the radix sort, which keys only on dist_sq, carries it for free; it's unpacked when the output is built.
-		//
 		// SESSION080 (plan2 §4.1): pooled on the scratch rather than a local - see the field's comment. clear() keeps the
 		// capacity, so a steady-state traversal writes into pages that are already faulted in.
 		js::Vector<DistIdx, 16>& decorated = scratch->decorated;
 		decorated.clear();
-		js::Vector<float, 16> coarse_flags; // SESSION063 K4: parallel to output after the sort - 1 per coarse-floor node, 0 per fine node.
 
-		// SESSION076 DIAGNOSTIC: coarse-capture breakdown, counted inline in the DFS below (the only place that still
-		// knows WHY each node was captured - the flag array downstream records only that it was). All three stay zero
-		// unless the "sat diag" checkbox is on. See GaussianSplatUnculledFrontier::sat_diag_coarse_a.
-		size_t diag_coarse_a = 0, diag_coarse_b = 0;
 		size_t diag_reuse_roots = 0; // SESSION080 STEP B DIAGNOSTIC: subtrees inherited whole from the previous frontier - see GaussianSplatUnculledFrontier::reuse_roots.
 
 		Timer expand_timer; // SESSION080 DIAGNOSTIC - see GaussianSplatUnculledFrontier::expand_ms.
@@ -2194,7 +2173,7 @@ public:
 		// parallelised gather/grid/test and session080 the sort - by some distance the largest remaining serial stage.
 		//
 		// The branches are independent by construction: positions/feature_sizes/cull_radii are read-only snapshots,
-		// `stack` is per-walk, coarse_captured propagates only downwards inside one branch, and the density/depth caps are
+		// `stack` is per-walk, the far-cut mark propagates only downwards inside one branch, and the density/depth caps are
 		// per-node. The ONE thing that couples them is the budget cap, whose test reads the running decorated.size() +
 		// stack.size(); that is handled below rather than approximated - see expandParallel()'s comment.
 		//
@@ -2202,11 +2181,11 @@ public:
 		// path's per-node records are pushed to one shared vector and it is a debug report, not a hot path).
 		const bool expand_in_parallel = (task_manager != NULL) && (frontier_record == NULL);
 		if(expand_in_parallel && !stack.empty())
-			expandParallel(stack, decorated, positions, feature_sizes, cull_radii, diag_coarse_a, diag_coarse_b, diag_reuse_roots,
+			expandParallel(stack, decorated, positions, feature_sizes, cull_radii, diag_reuse_roots,
 				hit_budget_cap, hit_density_cap, hit_depth_cap, num_sat_bias_stops, num_sat_bias_tested);
 		else
 			expandStack(stack, decorated, positions, feature_sizes, cull_radii, /*enforce_budget=*/true, /*breadth_first=*/false, /*pause_at_stack_size=*/0,
-				diag_coarse_a, diag_coarse_b, diag_reuse_roots, hit_budget_cap, hit_density_cap, hit_depth_cap, num_sat_bias_stops, num_sat_bias_tested);
+				diag_reuse_roots, hit_budget_cap, hit_density_cap, hit_depth_cap, num_sat_bias_stops, num_sat_bias_tested);
 
 		const double expand_ms = expand_timer.elapsed() * 1.0e3; // SESSION080 DIAGNOSTIC - stops here, before the sort.
 
@@ -2261,7 +2240,6 @@ public:
 		const size_t sorted_n = decorated.size();
 
 		output.resizeNoCopy(sorted_n);
-		coarse_flags.resizeNoCopy(sorted_n);
 
 		// SESSION087: was a serial loop, measured at 12-16 ms - a quarter of sort_ms and the last unsplit pass in this
 		// block. Chunked exactly like buildFrontierSoA() (same pure-map argument: slot i depends on element i alone, so the
@@ -2279,7 +2257,7 @@ public:
 				t->i_begin = (sorted_n * c)       / unpack_chunks;
 				t->i_end   = (sorted_n * (c + 1)) / unpack_chunks;
 				t->sorted = sorted;
-				t->out_indices = output.data(); t->out_coarse_flags = coarse_flags.data();
+				t->out_indices = output.data();
 				unpack_group->tasks[c] = t;
 			}
 			task_manager->runTaskGroup(unpack_group);
@@ -2287,9 +2265,7 @@ public:
 		else
 			for(size_t i=0; i<sorted_n; ++i)
 			{
-				const uint32 packed = sorted[i].idx;
-				output[i] = packed & 0x7FFFFFFFu;                  // Real cloud index (bit 31 stripped).
-				coarse_flags[i] = (packed >> 31) ? 1.f : 0.f;      // 1 = coarse-floor node, for the filter's per-node dilation.
+				output[i] = sorted[i].idx; // SESSION088: bit 31 used to carry the coarse-floor flag and was masked off here; nothing sets it now.
 			}
 		const double sort_unpack_ms = sort_unpack_timer.elapsed() * 1.0e3; // SESSION087 DIAGNOSTIC
 		const double sort_ms = sort_timer.elapsed() * 1.0e3; // SESSION080 DIAGNOSTIC - includes the unpack loop above, not just the sort call.
@@ -2358,13 +2334,13 @@ public:
 
 				if(far_n > 0) // Building a block: compact the two halves into [near][far], stripping the mark.
 				{
-					scratch->partition_near.resizeNoCopy(near_n); scratch->partition_near_coarse.resizeNoCopy(near_n);
-					scratch->partition_far.resizeNoCopy(far_n);   scratch->partition_far_coarse.resizeNoCopy(far_n);
+					scratch->partition_near.resizeNoCopy(near_n);
+					scratch->partition_far.resizeNoCopy(far_n);
 					size_t wn = 0, wf = 0;
 					for(size_t i=0; i<n; ++i)
 					{
-						if(output[i] & 0x40000000u) { scratch->partition_far[wf] = output[i] & ~0x40000000u; scratch->partition_far_coarse[wf] = coarse_flags[i]; ++wf; }
-						else                        { scratch->partition_near[wn] = output[i];                scratch->partition_near_coarse[wn] = coarse_flags[i]; ++wn; }
+						if(output[i] & 0x40000000u) { scratch->partition_far[wf] = output[i] & ~0x40000000u; ++wf; }
+						else                        { scratch->partition_near[wn] = output[i];                ++wn; }
 					}
 					assert(wn == near_n && wf == far_n);
 				}
@@ -2372,16 +2348,15 @@ public:
 
 				// The near segment - this frontier's own arrays. When no block is being built this is the whole selection and
 				// `output` is used directly, so the common path allocates and copies nothing extra.
-				const uint32* const near_src       = (far_n > 0) ? scratch->partition_near.data()        : output.data();
-				const float*  const near_src_coarse = (far_n > 0) ? scratch->partition_near_coarse.data() : coarse_flags.data();
-				buildFrontierSoA(*uf, near_src, near_src_coarse, near_n, positions, cull_radii);
+				const uint32* const near_src = (far_n > 0) ? scratch->partition_near.data() : output.data();
+				buildFrontierSoA(*uf, near_src, near_n, positions, cull_radii);
 
 				if(far_n > 0)
 				{
 					// The far segment, materialised ONCE here and then referenced by every traversal of this generation.
 					Timer far_soa_timer;
 					Reference<GaussianSplatUnculledFrontier> block = new GaussianSplatUnculledFrontier();
-					buildFrontierSoA(*block, scratch->partition_far.data(), scratch->partition_far_coarse.data(), far_n, positions, cull_radii);
+					buildFrontierSoA(*block, scratch->partition_far.data(), far_n, positions, cull_radii);
 					// The frozen pair the cut was made at, which every later traversal re-evaluates its predicate against, and
 					// which the drift trigger measures from. reuse_prev_anchor_ws is cam_pos_ws in this mode - see the ctor.
 					block->anchor_pos_ws = reuse_prev_anchor_ws;
@@ -2493,18 +2468,15 @@ public:
 				const GaussianSplatUnculledFrontier& prev_uf = *prev_frontier; // Not `prev` - that name shadows glare::Task::prev, the intrusive task-list link.
 				staleness_prev_n = prev_uf.indices.size();
 
-				// Coarse-floor nodes are excluded from BOTH sides. A coarse node re-uses the cloud_idx of the fine node
-				// it stands for whenever its branch is terminal (see the capture block in expandStack()), so including
-				// them would make cloud_idx ambiguous as a key; and excluding them also makes this measurement
-				// independent of the "coarse" checkbox, which changes the captured set but never the fine selection.
+				// SESSION088: this used to skip coarse-floor nodes on both sides - they re-used the cloud_idx of the fine
+				// node they stood for, which made the key ambiguous. With the coarse floor gone every entry is a fine node
+				// and cloud_idx is unique again, so the two loops below just walk the whole frontier.
 				js::Vector<uint32, 16> old_rank;
 				old_rank.resizeNoCopy(positions.size());
 				std::memset(old_rank.data(), 0xFF, old_rank.size() * sizeof(uint32)); // 0xFFFFFFFF = "not in the previous frontier".
 				uint32 prev_fine_rank = 0;
 				for(size_t i=0; i<staleness_prev_n; ++i)
 				{
-					if(prev_uf.is_coarse[i] != 0.f)
-						continue;
 					const uint32 idx = prev_uf.indices[i];
 					if(idx < old_rank.size()) // Defensive only - the topology_generation match above already means the two frontiers index the same cloud.
 						old_rank[idx] = prev_fine_rank;
@@ -2516,8 +2488,6 @@ public:
 				uint32 new_fine_rank = 0;
 				for(size_t i=0; i<new_n; ++i)
 				{
-					if(uf->is_coarse[i] != 0.f)
-						continue;
 					const uint32 idx = uf->indices[i];
 					const uint32 rank = new_fine_rank++;
 					if(idx >= old_rank.size())
@@ -2567,10 +2537,9 @@ private:
 		uint32 member_idx;
 		uint32 tree_local_idx;
 		uint32 depth; // 0 for a tree root, parent's depth + 1 for each expansion - see max_tree_depth's use in run().
-		bool coarse_captured; // SESSION063 K4: true once some ancestor on this branch was recorded into the coarse floor, so it's captured once per branch (the first node fine enough at the coarse pixel_scale). Set false at the root by makeHeapItem, propagated to children in run().
 
 		// SESSION080 §4.3: true once this node or an ancestor satisfied the frozen far-cut predicate, i.e. this node
-		// belongs to the far block rather than to the walked near part. Propagated exactly like coarse_captured above.
+		// belongs to the far block rather than to the walked near part. Propagated down a branch, never across branches.
 		// Only ever set while a block is being BUILT: in frozen mode the walk stops at the cut instead of descending
 		// past it, so nothing below it is ever reached. See the classification block in expandStack().
 		bool below_far_cut;
@@ -2593,7 +2562,6 @@ private:
 		item.member_idx = member_idx;
 		item.tree_local_idx = tree_local_idx;
 		item.depth = depth;
-		item.coarse_captured = false; // SESSION063 K4: set by the caller for children; false at the root.
 		item.below_far_cut = false; // SESSION080 §4.3: a root is never below the cut - see the field.
 		return item;
 	}
@@ -2676,12 +2644,12 @@ private:
 	// stays at O(depth * branching) - ~100 entries, per session054's note above - and can never accumulate the breadth a
 	// seed split needs. Only the prologue uses it; the walks that do the actual work stay depth-first, which is what
 	// keeps their stacks small and cache-friendly. Order does not change the result - every decision in the loop below
-	// depends on the node itself and on coarse_captured inherited down its own branch, never on what was visited before -
+	// depends on the node itself and on the far-cut mark inherited down its own branch, never on what was visited before -
 	// with the single exception of the budget cap, which is why breadth_first is only ever paired with enforce_budget=false.
 	void expandStack(std::vector<HeapItem>& stack, js::Vector<DistIdx, 16>& decorated,
 		const js::Vector<Vec3f, 16>& positions, const js::Vector<float, 16>& feature_sizes, const js::Vector<float, 16>& cull_radii,
 		bool enforce_budget, bool breadth_first, size_t pause_at_stack_size,
-		size_t& diag_coarse_a, size_t& diag_coarse_b, size_t& diag_reuse_roots,
+		size_t& diag_reuse_roots,
 		bool& hit_budget_cap, bool& hit_density_cap, bool& hit_depth_cap, size_t& num_sat_bias_stops, size_t& num_sat_bias_tested)
 	{
 		size_t head = 0; // Read cursor; breadth-first only.
@@ -2838,49 +2806,11 @@ private:
 			}
 
 			// SESSION080 §4.3: which segment a node emitted at THIS point belongs to, packed into bit 30 of idx so it
-			// survives the sort the way the coarse flag survives it in bit 31 (cloud indices are far below 2^30). Only
-			// ever set while building a block; in frozen mode the walk emits nothing below the cut, so it stays 0 and
-			// the partition after the sort is a no-op. Unpacked, and the bit cleared, in run()'s partition pass.
+			// survives the sort. (Bit 31 used to carry the coarse-floor flag the same way; it is free since session088
+			// removed that feature.) Cloud indices are far below 2^30. Only ever set while building a block; in frozen
+			// mode the walk emits nothing below the cut, so it stays 0 and the partition after the sort is a no-op.
+			// Unpacked, and the bit cleared, in run()'s partition pass.
 			const uint32 far_bit = child_below_far_cut ? 0x40000000u : 0u;
-
-			// SESSION063 K4: complete coarse-floor cut. A node becomes its branch's single coarse representative if no
-			// ancestor already took the role AND it is either coarse enough (pixel_scale <= coarse_pixel_scale) or terminal
-			// (the branch stops here - converged/leaf/capped). So every branch contributes exactly one coarse node and the
-			// coarse layer covers the scene as fully as the fine set, only coarser. A branch that terminates finer than
-			// coarse_pixel_scale takes its own (coarsest-available) terminal node, duplicating the fine node there - fine:
-			// drawn after the fine set, the duplicate is gated wherever the fine node already covered. The terminal test
-			// mirrors the stop checks below (read-only, no side effects; the real branches still set the hit_*_cap flags).
-			bool captured_here = false;
-			if(coarse_floor_enabled && !top.coarse_captured)
-			{
-				const bool terminal =
-					(top.pixel_scale <= pixel_scale_limit) ||
-					(node.child_count == 0) ||
-					(max_layer_density > 0.f && node.layer_density > max_layer_density) ||
-					(max_tree_depth > 0 && top.depth >= (uint32)max_tree_depth) ||
-					(enforce_budget && (decorated.size() + stack.size() + node.child_count > max_splats_budget));
-				const bool by_threshold = top.pixel_scale <= coarse_pixel_scale;
-
-				// SESSION076: the capture-time skip that used to sit here is gone with the binary write rule it depended
-				// on - see gsSatGridMinWritingPixelScaleFactor's removal note in GaussianSplatSaturationGrid.h. Under the
-				// Gaussian model every node contributes in proportion to its integrated occlusion, so there is no
-				// pixel_scale below which a node is provably useless to the grid.
-				if(by_threshold || terminal)
-				{
-					DistIdx cd; cd.dist_sq = top.dist_sq; cd.idx = cloud_idx_u32 | 0x80000000u | far_bit; // Bit 31 marks a coarse-floor node; bit 30 the far segment - see far_bit.
-					decorated.push_back(cd);
-					captured_here = true;
-
-					// SESSION076 DIAGNOSTIC: split the capture into its two populations and predict, from pixel_scale
-					// alone, whether the grid will accept this node - see GaussianSplatUnculledFrontier::sat_diag_coarse_a
-					// for what the split means and why the prediction is printed next to the measured count.
-					if(sat_diag_log)
-					{
-						if(by_threshold) ++diag_coarse_a; else ++diag_coarse_b;
-					}
-				}
-			}
-			const bool child_coarse_captured = top.coarse_captured || captured_here;
 
 			// Converged - already fine enough, no need to expand further.
 			// SESSION080 STEP B: force_descend suppresses this and the two caps below - see the STRADDLE case above. The
@@ -2968,7 +2898,6 @@ private:
 			for(uint32 c = node.child_start; c < (uint32)node.child_start + node.child_count; ++c)
 			{
 				HeapItem child = makeHeapItem(top.member_idx, c, m.offset, top.depth + 1, positions, feature_sizes);
-				child.coarse_captured = child_coarse_captured; // SESSION063 K4: propagate the once-per-branch capture flag.
 				child.below_far_cut = child_below_far_cut;     // SESSION080 §4.3: likewise, once-per-branch - see the field.
 				stack.push_back(child);
 			}
@@ -2998,7 +2927,7 @@ private:
 	class GsExpandTask : public glare::Task
 	{
 	public:
-		GsExpandTask() : diag_coarse_a(0), diag_coarse_b(0), diag_reuse_roots(0), hit_density_cap(false), hit_depth_cap(false), num_sat_bias_stops(0), num_sat_bias_tested(0), run_ms(0.0), seeds_taken(0), seed_max_ms(0.0) {}
+		GsExpandTask() : diag_reuse_roots(0), hit_density_cap(false), hit_depth_cap(false), num_sat_bias_stops(0), num_sat_bias_tested(0), run_ms(0.0), seeds_taken(0), seed_max_ms(0.0) {}
 
 		virtual void run(size_t /*thread_index*/) override
 		{
@@ -3017,7 +2946,7 @@ private:
 				stack.push_back((*seeds)[(size_t)seed_i]);
 				parent->expandStack(stack, decorated, *positions, *feature_sizes, *cull_radii,
 					/*enforce_budget=*/false, /*breadth_first=*/false, /*pause_at_stack_size=*/0,
-					diag_coarse_a, diag_coarse_b, diag_reuse_roots, unused_budget_cap, hit_density_cap, hit_depth_cap, num_sat_bias_stops, num_sat_bias_tested);
+					diag_reuse_roots, unused_budget_cap, hit_density_cap, hit_depth_cap, num_sat_bias_stops, num_sat_bias_tested);
 				seed_max_ms = myMax(seed_max_ms, seed_timer.elapsed() * 1.0e3);
 			}
 			run_ms = task_timer.elapsed() * 1.0e3;
@@ -3031,7 +2960,7 @@ private:
 		glare::AtomicInt* next_seed;        // SESSION086: the shared cursor into `seeds`.
 		std::vector<HeapItem> stack; // This task's working stack - empty between seeds.
 		js::Vector<DistIdx, 16> decorated;
-		size_t diag_coarse_a, diag_coarse_b, diag_reuse_roots;
+		size_t diag_reuse_roots;
 		bool hit_density_cap, hit_depth_cap;
 		size_t num_sat_bias_stops, num_sat_bias_tested; // SESSION085 ETAP 3 - see the parent's.
 		double run_ms; // SESSION080 DIAGNOSTIC
@@ -3055,7 +2984,7 @@ private:
 	// measured false in every capture - see [gsr-traversal]), so its cost is theoretical.
 	void expandParallel(std::vector<HeapItem>& stack, js::Vector<DistIdx, 16>& decorated,
 		const js::Vector<Vec3f, 16>& positions, const js::Vector<float, 16>& feature_sizes, const js::Vector<float, 16>& cull_radii,
-		size_t& diag_coarse_a, size_t& diag_coarse_b, size_t& diag_reuse_roots,
+		size_t& diag_reuse_roots,
 		bool& hit_budget_cap, bool& hit_density_cap, bool& hit_depth_cap, size_t& num_sat_bias_stops, size_t& num_sat_bias_tested)
 	{
 		// SESSION080/086: the seed set the pool pulls from. Two numbers, meaning different things: `spread_seeds` is how
@@ -3078,7 +3007,7 @@ private:
 		// simply the first part of the identical DFS, and anything it finishes on the way lands in `decorated` directly.
 		Timer prologue_timer; // SESSION080 DIAGNOSTIC
 		expandStack(stack, decorated, positions, feature_sizes, cull_radii, /*enforce_budget=*/false, /*breadth_first=*/true, /*pause_at_stack_size=*/spread_seeds,
-			diag_coarse_a, diag_coarse_b, diag_reuse_roots, hit_budget_cap, hit_density_cap, hit_depth_cap, num_sat_bias_stops, num_sat_bias_tested);
+			diag_reuse_roots, hit_budget_cap, hit_density_cap, hit_depth_cap, num_sat_bias_stops, num_sat_bias_tested);
 
 		// SESSION086: TARGETED SPLITTING. Keep expanding whichever seed has the largest pixel_scale until there are enough
 		// of them, instead of expanding everything uniformly and stopping on a global count.
@@ -3122,7 +3051,7 @@ private:
 				// One level. If the node stops here instead (converged, leaf, capped) it is emitted into `decorated` by the very
 				// same code that would have emitted it during the walk, and split_tmp comes back empty - nothing to re-add.
 				expandStack(split_tmp, decorated, positions, feature_sizes, cull_radii, /*enforce_budget=*/false, /*breadth_first=*/true, /*pause_at_stack_size=*/2,
-					diag_coarse_a, diag_coarse_b, diag_reuse_roots, hit_budget_cap, hit_density_cap, hit_depth_cap, num_sat_bias_stops, num_sat_bias_tested);
+					diag_reuse_roots, hit_budget_cap, hit_density_cap, hit_depth_cap, num_sat_bias_stops, num_sat_bias_tested);
 
 				for(size_t i=0; i<split_tmp.size(); ++i)
 				{
@@ -3180,7 +3109,7 @@ private:
 		if(total > max_splats_budget)
 		{
 			decorated.resize(initial_decorated); // NOT 0 - see initial_decorated's comment.
-			diag_coarse_a = diag_coarse_b = diag_reuse_roots = 0;
+			diag_reuse_roots = 0;
 			hit_density_cap = hit_depth_cap = false;
 			num_sat_bias_stops = num_sat_bias_tested = 0; // SESSION085 ETAP 3
 			stack.clear();
@@ -3192,7 +3121,7 @@ private:
 				stack.push_back(makeHeapItem((uint32)mi, /*tree_local_idx=*/0, m.offset, /*depth=*/0, positions, feature_sizes));
 			}
 			expandStack(stack, decorated, positions, feature_sizes, cull_radii, /*enforce_budget=*/true, /*breadth_first=*/false, /*pause_at_stack_size=*/0,
-				diag_coarse_a, diag_coarse_b, diag_reuse_roots, hit_budget_cap, hit_density_cap, hit_depth_cap, num_sat_bias_stops, num_sat_bias_tested);
+				diag_reuse_roots, hit_budget_cap, hit_density_cap, hit_depth_cap, num_sat_bias_stops, num_sat_bias_tested);
 			return;
 		}
 
@@ -3225,8 +3154,6 @@ private:
 				std::memcpy(decorated.data() + write_pos, task->decorated.data(), task_n * sizeof(DistIdx));
 				write_pos += task_n;
 			}
-			diag_coarse_a += task->diag_coarse_a;
-			diag_coarse_b += task->diag_coarse_b;
 			diag_reuse_roots += task->diag_reuse_roots; // SESSION080 STEP B
 			hit_density_cap = hit_density_cap || task->hit_density_cap;
 			hit_depth_cap   = hit_depth_cap   || task->hit_depth_cap;
@@ -3254,13 +3181,10 @@ private:
 	ThreadSafeQueue<Reference<ThreadMessage> >* result_queue;
 	js::Vector<FrontierNodeRecord, 16>* frontier_record; // Null (the normal case) means don't record anything - see recordFrontierNode().
 	bool build_unculled_frontier; // SESSION063: gather the SoA U(P) at the end of run() and hand it back on the result msg.
-	bool coarse_floor_enabled;    // SESSION063 K4: also capture the coarse floor.
-	float coarse_pixel_scale;     // SESSION063 K4: pixel_scale threshold for the coarse floor cut (>> pixel_scale_limit).
 	bool dist_clamp_enabled;      // SESSION072: distance-slice early-cull toggle - see GaussianSplatRenderer::getDistClampEnabled().
 	float dist_clamp_min, dist_clamp_max;
 	bool dist_clamp_invert;
 	bool sat_diag_log;               // SESSION076 DIAGNOSTIC: see the ctor param.
-	bool coarse_layer_drawn;         // SESSION076: see the ctor param.
 
 	// SESSION085 ETAP 3 - the saturation LoD bias. The barrier the cloud had at kick time (may be NULL: a cloud's first
 	// traversal, or the stage off), used READ-ONLY and immutable once built, so sharing it with a worker is safe.
@@ -3364,7 +3288,6 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	// the envelope to cover is roughly twice the round trip, ~170ms over the forest. See [gsr-filter-drain]'s deficit=,
 	// which is exactly stale minus band and goes positive precisely when a hole is visible.
 	filter_dilation_latency(0.2f), filter_min_rot_rate_deg_per_s(50.f), filter_max_rot_rate_deg_per_s(200.f), filter_min_trans_rate_m_per_s(2.0f), // SESSION063 K3, SESSION072, SESSION079 - see above.
-	split_coarse_floor_enabled(true), split_coarse_pixel_scale(30.f), filter_coarse_dilation_latency(0.9f), coarse_layer_debug(false), // SESSION063 K4
 	filter_debug_log(false), kick_debug_log(false), cpu_prof_log(false), // SESSION072: default off - see getFilterDebugLog()'s comment.
 	filter_frustum_planes_enabled(true), // SESSION074 - see getFilterFrustumPlanesEnabled().
 	sat_prefilter_threshold(0.98f), // SESSION079 - see getSatPrefilterThreshold().
@@ -4130,11 +4053,11 @@ static inline bool pointInFrustum(const Planef* frustum_clip_planes, int num_fru
 // SESSION072: anisotropic rotational dilation (session067 §8/§15 plan A). The isotropic rate*dist margin assumed the
 // worst case (a node exactly perpendicular to the rotation axis) on EVERY plane at once, which is what let a violent
 // flick multiply the whole draw list regardless of which edge it actually threatened. Replaced by max() of:
-//   - rate_*_baseline * dist : isotropic FLOOR only now - covers the static->moving transition, where nothing has
+//   - rate_baseline * dist   : isotropic FLOOR only now - covers the static->moving transition, where nothing has
 //                              rotated yet in any direction, so there is no axis to be anisotropic about.
 //   - dot(d, cn[pl]) * mag   : the measured term. The camera's rotation over the latency window is an axis-aligned
-//                              swept-angle vector: direction rotation_axis (unit), magnitude swept_fine/swept_coarse
-//                              (the angle swept during the fine/coarse latency window). The tangential displacement a
+//                              swept-angle vector: direction rotation_axis (unit), magnitude `swept` (the angle swept
+//                              during the dilation latency window). The tangential displacement a
 //                              node at offset d = node_pos - cam_pos picks up from that rotation is swept x d; the
 //                              component that threatens plane i is dot(n_i, swept x d). Precomputing cn_i = n_i x axis
 //                              ONCE per plane (below, outside the node loop) turns this per-node-per-plane into a plain
@@ -4145,62 +4068,55 @@ static inline bool pointInFrustum(const Planef* frustum_clip_planes, int num_fru
 //
 // SESSION072 measured cost (owner's A/B, [gsr-filter-drain] compute= vs iso=): the first cut of this took ~2.5x the
 // isotropic pass (~150ms vs ~60ms on a 15.5M-node U(P)) because it did TWO dot products per plane per node - one for
-// the fine swept vector, one for the coarse-minus-fine difference. Only one is needed: the fine and coarse swept
-// vectors share the rotation axis and differ only in magnitude (both are axis * w_eff * their own latency), and the
-// cross product is linear in its second argument, so n x swept_coarse is just a scalar multiple of n x swept_fine.
-// Passing the unit axis plus the two magnitudes separately (rather than two pre-scaled vectors) makes that explicit:
-// one cross product per plane, one dot product per plane per node, and the per-node fine/coarse magnitude blend hoists
-// entirely OUT of the plane loop. Also handles a zero fine latency cleanly, which a ratio between the two would not.
+// the fine swept vector, one for the coarse-minus-fine difference, back when the coarse floor gave each node its own
+// latency. Only one was ever needed: the two swept vectors shared the rotation axis and differed only in magnitude, and
+// the cross product is linear in its second argument. Passing the unit axis plus the magnitude separately (rather than
+// a pre-scaled vector) keeps that shape - one cross product per plane, one dot product per plane per node - and since
+// session088 removed the coarse floor there is only one magnitude left to pass.
 //
-// SESSION063 K4: fine vs coarse is still chosen PER NODE from uf.is_coarse - coarse-floor nodes get the wider _coarse
-// terms so their big cheap splats catch motion-revealed edges, while the dense fine set stays tight. Because fine and
-// coarse are one globally sorted list, survivors come out globally front-to-back (a near coarse node correctly occludes a
-// far fine one - the fix for the green bleed of the old draw-coarse-last approach). coarse_only_debug keeps only coarse
-// nodes, for the isolation view. Writes survivor indices in input order (no re-sort); shrinks out_indices to the count.
+// Writes survivor indices in input order (no re-sort); shrinks out_indices to the count.
 // SESSION080 §4.3: a frontier is now two segments - its own arrays followed by its far block's - so the streaming pass
 // below runs once per segment, appending into the same output. Split out of filterUnculledFrontier(), which became the
 // two-call wrapper; the body is unchanged from the single-segment version it replaces.
 static size_t filterFrontierSegment(const GaussianSplatUnculledFrontier& uf, const Planef* planes, int num_planes,
-	const Vec4f& cam_pos_ws, float rate_fine_baseline, float rate_coarse_baseline,
-	const Vec4f& rotation_axis, float swept_fine, float swept_coarse, // SESSION072: unit rotation axis + the angle swept during each layer's latency window - see above.
-	const float* trans_dilation, bool coarse_only_debug,
-	bool draw_coarse_layer, // SESSION075: whether coarse-floor nodes may survive at all - see kickOffFilters()'s call site. Independent of whether U(P) captured them (see kickOffTraversals()'s coarse_capture_needed): captured-but-not-drawn is now a valid state, for saturation-only measurement.
-	uint32* const out, // SESSION080 §4.3: caller-owned, pre-sized for both segments - see filterUnculledFrontier().
-	size_t* out_num_coarse) // SESSION072 DIAGNOSTIC: accumulates how many of the survivors were coarse-floor nodes - see [gsr-filter-drain].
+	const Vec4f& cam_pos_ws, float rate_baseline,
+	const Vec4f& rotation_axis, float swept, // SESSION072: unit rotation axis + the angle swept during the dilation latency window - see above.
+	const float* trans_dilation,
+	uint32* const out) // SESSION080 §4.3: caller-owned, pre-sized for both segments - see filterUnculledFrontier().
 {
 	// SESSION074: no saturation work happens here any more. The verdict is orientation-independent, so it is applied
 	// once when the frontier is built and this function simply streams whatever survived - see
 	// GaussianSplatUnculledFrontier::sat_num_occluders's block comment for why that move mattered.
-	size_t num_coarse_out = 0;
+	//
+	// SESSION088: nor is there a per-node layer any more. The coarse floor gave every node a flag selecting between a
+	// fine and a coarse dilation, plus a second (tight, undilated) frustum test to confine coarse nodes to the band
+	// outside it - a load, two blends and six extra compares per four nodes, in the one loop that runs over the whole
+	// frontier on every filter kick. With one layer left, the rate and the swept magnitude are loop constants.
 	const size_t n = uf.indices.size();
 	const int npl = myMin(num_planes, 6);
 
-	__m128 pl_nx[6], pl_ny[6], pl_nz[6], pl_d[6], pl_d_raw[6];
+	__m128 pl_nx[6], pl_ny[6], pl_nz[6], pl_d[6];
 	__m128 cn_x[6], cn_y[6], cn_z[6]; // SESSION072: SoA broadcasts of cn[pl] below, for the SIMD node loop.
 	Vec4f cn[6];                      // Same values, kept as plain Vec4f for the scalar tail loop.
 	for(int pl=0; pl<npl; ++pl)
 	{
 		const Vec4f& nrm = planes[pl].getNormal();
 		pl_nx[pl] = _mm_set1_ps(nrm.x[0]); pl_ny[pl] = _mm_set1_ps(nrm.x[1]); pl_nz[pl] = _mm_set1_ps(nrm.x[2]);
-		pl_d[pl]     = _mm_set1_ps(planes[pl].getD() + (trans_dilation ? trans_dilation[pl] : 0.f)); // Dilated plane (translation dilation folds into d).
-		pl_d_raw[pl] = _mm_set1_ps(planes[pl].getD()); // SESSION063 K4: the tight (undilated) plane, for confining the coarse floor to the dilation band - see below.
+		pl_d[pl]  = _mm_set1_ps(planes[pl].getD() + (trans_dilation ? trans_dilation[pl] : 0.f)); // Dilated plane (translation dilation folds into d).
 
-		cn[pl] = crossProduct(nrm, rotation_axis); // Unit axis, so this carries direction only - the swept magnitude is applied per node below.
+		cn[pl] = crossProduct(nrm, rotation_axis); // Unit axis, so this carries direction only - the swept magnitude is applied below.
 		cn_x[pl] = _mm_set1_ps(cn[pl].x[0]); cn_y[pl] = _mm_set1_ps(cn[pl].x[1]); cn_z[pl] = _mm_set1_ps(cn[pl].x[2]);
 	}
-	const __m128 swept_fine_v = _mm_set1_ps(swept_fine);
-	const __m128 swept_diff_v = _mm_set1_ps(swept_coarse - swept_fine); // mag = swept_fine + is_coarse * (swept_coarse - swept_fine).
+	const __m128 swept_v = _mm_set1_ps(swept);
 	const __m128 cam_x = _mm_set1_ps(cam_pos_ws.x[0]);
 	const __m128 cam_y = _mm_set1_ps(cam_pos_ws.x[1]);
 	const __m128 cam_z = _mm_set1_ps(cam_pos_ws.x[2]);
-	const __m128 rate_fine_baseline_v = _mm_set1_ps(rate_fine_baseline);
-	const __m128 rate_baseline_diff_v = _mm_set1_ps(rate_coarse_baseline - rate_fine_baseline); // baseline_rate = rate_fine_baseline + is_coarse * (rate_coarse_baseline - rate_fine_baseline).
+	const __m128 rate_baseline_v = _mm_set1_ps(rate_baseline);
 
 	const float* const px = uf.px.data();
 	const float* const py = uf.py.data();
 	const float* const pz = uf.pz.data();
 	const float* const rad = uf.radius.data();
-	const float* const isc = uf.is_coarse.data();
 	const uint32* const idx = uf.indices.data();
 	size_t num_out = 0;
 
@@ -4211,74 +4127,44 @@ static size_t filterFrontierSegment(const GaussianSplatUnculledFrontier& uf, con
 		const __m128 Y = _mm_loadu_ps(py + i);
 		const __m128 Z = _mm_loadu_ps(pz + i);
 		const __m128 R = _mm_loadu_ps(rad + i);
-		const __m128 IC = _mm_loadu_ps(isc + i); // 1.0 for coarse nodes, 0.0 for fine.
-		const __m128 baseline_rate = _mm_add_ps(rate_fine_baseline_v, _mm_mul_ps(IC, rate_baseline_diff_v));
 		const __m128 dx = _mm_sub_ps(X, cam_x), dy = _mm_sub_ps(Y, cam_y), dz = _mm_sub_ps(Z, cam_z);
 		const __m128 dist = _mm_sqrt_ps(_mm_add_ps(_mm_add_ps(_mm_mul_ps(dx, dx), _mm_mul_ps(dy, dy)), _mm_mul_ps(dz, dz)));
-		const __m128 baseline_pad = _mm_mul_ps(baseline_rate, dist); // SESSION072: isotropic floor only now - see the function comment.
-		// SESSION072: the swept magnitude this node's layer uses. Hoisted out of the plane loop - it depends only on
-		// is_coarse, not on which plane, which is exactly what makes the single-cross-product form above worth having.
-		const __m128 swept_mag = _mm_add_ps(swept_fine_v, _mm_mul_ps(IC, swept_diff_v));
-		__m128 outside = _mm_setzero_ps();      // Outside the DILATED frustum (the keep test).
-		__m128 outside_tight = _mm_setzero_ps(); // Outside the TIGHT (undilated, radius-only) frustum - for the coarse band test.
+		const __m128 baseline_pad = _mm_mul_ps(rate_baseline_v, dist); // SESSION072: isotropic floor only now - see the function comment.
+		__m128 outside = _mm_setzero_ps(); // Outside the DILATED frustum (the keep test).
 		for(int pl=0; pl<npl; ++pl)
 		{
 			const __m128 dotv = _mm_add_ps(_mm_add_ps(_mm_mul_ps(X, pl_nx[pl]), _mm_mul_ps(Y, pl_ny[pl])), _mm_mul_ps(Z, pl_nz[pl]));
 			// SESSION072: anisotropic rotational pad for this plane - see the function comment. One dot product against
-			// the axis-only cn[pl], scaled by the per-node swept magnitude computed above.
+			// the axis-only cn[pl], scaled by the swept magnitude.
 			const __m128 measured_dir = _mm_add_ps(_mm_add_ps(_mm_mul_ps(dx, cn_x[pl]), _mm_mul_ps(dy, cn_y[pl])), _mm_mul_ps(dz, cn_z[pl]));
-			const __m128 measured = _mm_mul_ps(measured_dir, swept_mag);
+			const __m128 measured = _mm_mul_ps(measured_dir, swept_v);
 			const __m128 sub = _mm_add_ps(R, _mm_max_ps(baseline_pad, measured)); // max(), not sum - see the function comment.
-			outside       = _mm_or_ps(outside,       _mm_cmpge_ps(_mm_sub_ps(dotv, sub), pl_d[pl]));     // dot - (radius + pad) >= d + trans.
-			outside_tight = _mm_or_ps(outside_tight, _mm_cmpge_ps(_mm_sub_ps(dotv, R),   pl_d_raw[pl])); // dot - radius >= d.
+			outside = _mm_or_ps(outside, _mm_cmpge_ps(_mm_sub_ps(dotv, sub), pl_d[pl])); // dot - (radius + pad) >= d + trans.
 		}
-		if(coarse_only_debug)
-			outside = _mm_or_ps(outside, _mm_cmpeq_ps(IC, _mm_setzero_ps())); // Debug: keep only coarse nodes (show full coarse coverage, band restriction off).
-		else if(!draw_coarse_layer)
-			// SESSION075: coarse layer captured (for saturation) but not meant to draw - reject every coarse node
-			// outright, regardless of the band test below. See this function's draw_coarse_layer parameter comment.
-			outside = _mm_or_ps(outside, _mm_cmpgt_ps(IC, _mm_setzero_ps()));
-		else
-			// SESSION063 K4: confine the coarse floor to the dilation band. A coarse node INSIDE the tight frustum is
-			// rejected - there the fine set already covers, and letting the coarse layer draw over the whole visible frame
-			// slightly changed the image everywhere fine wasn't fully saturated. Coarse now survives only in the margin
-			// beyond the tight frustum (off-screen until motion reveals it), which is where it's actually needed.
-			outside = _mm_or_ps(outside, _mm_and_ps(_mm_cmpgt_ps(IC, _mm_setzero_ps()), _mm_cmpeq_ps(outside_tight, _mm_setzero_ps())));
 		const int m = _mm_movemask_ps(outside) & 0xF; // bit j set = point i+j is outside/rejected.
-		if((m & 1) == 0) { out[num_out++] = idx[i+0]; if(isc[i+0] != 0.f) ++num_coarse_out; } // SESSION072 DIAGNOSTIC counting - see out_num_coarse.
-		if((m & 2) == 0) { out[num_out++] = idx[i+1]; if(isc[i+1] != 0.f) ++num_coarse_out; }
-		if((m & 4) == 0) { out[num_out++] = idx[i+2]; if(isc[i+2] != 0.f) ++num_coarse_out; }
-		if((m & 8) == 0) { out[num_out++] = idx[i+3]; if(isc[i+3] != 0.f) ++num_coarse_out; }
+		if((m & 1) == 0) out[num_out++] = idx[i+0];
+		if((m & 2) == 0) out[num_out++] = idx[i+1];
+		if((m & 4) == 0) out[num_out++] = idx[i+2];
+		if((m & 8) == 0) out[num_out++] = idx[i+3];
 	}
 	for(size_t i=n4; i<n; ++i) // Tail (n not a multiple of 4).
 	{
-		const bool is_coarse = isc[i] != 0.f;
-		if(coarse_only_debug && !is_coarse) continue;
-		const float baseline_rate = rate_fine_baseline + isc[i] * (rate_coarse_baseline - rate_fine_baseline);
 		const float ddx = px[i]-cam_pos_ws.x[0], ddy = py[i]-cam_pos_ws.x[1], ddz = pz[i]-cam_pos_ws.x[2];
-		const float baseline_pad = baseline_rate * std::sqrt(ddx*ddx + ddy*ddy + ddz*ddz);
-		const float swept_mag = swept_fine + isc[i] * (swept_coarse - swept_fine); // SESSION072: as in the SIMD loop - depends only on is_coarse, so it is hoisted out of the plane loop.
-		bool inside = true, inside_tight = true;
+		const float baseline_pad = rate_baseline * std::sqrt(ddx*ddx + ddy*ddy + ddz*ddz);
+		bool inside = true;
 		for(int pl=0; pl<npl; ++pl)
 		{
 			const Vec4f& nrm = planes[pl].getNormal();
 			const float dpn = nrm.x[0]*px[i] + nrm.x[1]*py[i] + nrm.x[2]*pz[i];
 			// SESSION072: same anisotropic pad as the SIMD loop above, scalar form.
-			const float measured = (cn[pl].x[0]*ddx + cn[pl].x[1]*ddy + cn[pl].x[2]*ddz) * swept_mag;
+			const float measured = (cn[pl].x[0]*ddx + cn[pl].x[1]*ddy + cn[pl].x[2]*ddz) * swept;
 			const float sub = rad[i] + myMax(baseline_pad, measured);
 			const float d_dil = planes[pl].getD() + (trans_dilation ? trans_dilation[pl] : 0.f);
-			if(dpn - sub    >= d_dil)              inside = false;
-			if(dpn - rad[i] >= planes[pl].getD())  inside_tight = false;
-			if(!inside) break;
+			if(dpn - sub >= d_dil) { inside = false; break; }
 		}
 		if(!inside) continue;
-		if(!coarse_only_debug && is_coarse && !draw_coarse_layer) continue; // SESSION075: captured-but-not-drawn coarse - see draw_coarse_layer's comment.
-		if(!coarse_only_debug && is_coarse && inside_tight) continue; // Band restriction: coarse only survives beyond the tight frustum.
 		out[num_out++] = idx[i];
-		if(is_coarse) ++num_coarse_out; // SESSION072 DIAGNOSTIC counting - see out_num_coarse.
 	}
-	if(out_num_coarse)
-		*out_num_coarse += num_coarse_out; // Accumulates: the caller runs this once per segment.
 	return num_out;
 }
 
@@ -4291,26 +4177,21 @@ static size_t filterFrontierSegment(const GaussianSplatUnculledFrontier& uf, con
 // drawn was always built for where the camera was a traversal ago). Same property the single-array frontier relied on
 // when its far tail was a copy rather than a reference; only the storage changed.
 static size_t filterUnculledFrontier(const GaussianSplatUnculledFrontier& uf, const Planef* planes, int num_planes,
-	const Vec4f& cam_pos_ws, float rate_fine_baseline, float rate_coarse_baseline,
-	const Vec4f& rotation_axis, float swept_fine, float swept_coarse,
-	const float* trans_dilation, bool coarse_only_debug, bool draw_coarse_layer,
-	js::Vector<uint32, 16>& out_indices,
-	size_t* out_num_coarse = NULL)
+	const Vec4f& cam_pos_ws, float rate_baseline,
+	const Vec4f& rotation_axis, float swept,
+	const float* trans_dilation,
+	js::Vector<uint32, 16>& out_indices)
 {
 	const GaussianSplatUnculledFrontier* const far_seg = uf.far_block.ptr(); // Not `far`: that is still a macro in the Windows headers.
 	const size_t total_in = uf.indices.size() + (far_seg ? far_seg->indices.size() : 0);
 	out_indices.resizeNoCopy(total_in); // Worst case every node survives.
-	if(out_num_coarse)
-		*out_num_coarse = 0;
 
-	size_t num_out = filterFrontierSegment(uf, planes, num_planes, cam_pos_ws, rate_fine_baseline, rate_coarse_baseline,
-		rotation_axis, swept_fine, swept_coarse, trans_dilation, coarse_only_debug, draw_coarse_layer,
-		out_indices.data(), out_num_coarse);
+	size_t num_out = filterFrontierSegment(uf, planes, num_planes, cam_pos_ws, rate_baseline,
+		rotation_axis, swept, trans_dilation, out_indices.data());
 
 	if(far_seg)
-		num_out += filterFrontierSegment(*far_seg, planes, num_planes, cam_pos_ws, rate_fine_baseline, rate_coarse_baseline,
-			rotation_axis, swept_fine, swept_coarse, trans_dilation, coarse_only_debug, draw_coarse_layer,
-			out_indices.data() + num_out, out_num_coarse);
+		num_out += filterFrontierSegment(*far_seg, planes, num_planes, cam_pos_ws, rate_baseline,
+			rotation_axis, swept, trans_dilation, out_indices.data() + num_out);
 
 	out_indices.resize(num_out); // Shrink to survivor count (keeps prefix, no realloc) so .size() is authoritative.
 	return num_out;
@@ -4324,8 +4205,7 @@ class GaussianSplatFilterResultMsg : public ThreadMessage
 public:
 	uint64 cloud_id;
 	Reference<GaussianSplatUnculledFrontier> frontier; // The U(P) this result was filtered from - staleness check on drain.
-	js::Vector<uint32, 16> survivors; // The draw list S(P,R), globally front-to-back (fine + coarse interleaved by depth).
-	size_t num_coarse_survivors; // SESSION072 DIAGNOSTIC - see [gsr-filter-drain].
+	js::Vector<uint32, 16> survivors; // The draw list S(P,R), globally front-to-back.
 	double filter_compute_ms; // SESSION072 DIAGNOSTIC: pure filterUnculledFrontier() time on the worker thread - excludes task scheduling/queueing, unlike the kick-to-drain gap in the logs. See [gsr-filter-drain].
 };
 
@@ -4338,14 +4218,13 @@ class GaussianSplatFilterTask : public glare::Task
 {
 public:
 	GaussianSplatFilterTask(uint64 cloud_id_, const Reference<GaussianSplatUnculledFrontier>& frontier_,
-		const Planef* planes_, int num_planes_, const Vec4f& cam_pos_ws_, float rate_fine_baseline_, float rate_coarse_baseline_,
-		const Vec4f& rotation_axis_, float swept_fine_, float swept_coarse_, // SESSION072: anisotropic rotational dilation - see kickOffFilters().
-		const float* trans_dilation_, bool coarse_only_debug_, bool draw_coarse_layer_, // SESSION075
-		ThreadSafeQueue<Reference<ThreadMessage> >* result_queue_)
+		const Planef* planes_, int num_planes_, const Vec4f& cam_pos_ws_, float rate_baseline_,
+		const Vec4f& rotation_axis_, float swept_, // SESSION072: anisotropic rotational dilation - see kickOffFilters().
+		ThreadSafeQueue<Reference<ThreadMessage> >* result_queue_, const float* trans_dilation_)
 	:	cloud_id(cloud_id_), frontier(frontier_), num_planes(num_planes_), cam_pos_ws(cam_pos_ws_),
-		rate_fine_baseline(rate_fine_baseline_), rate_coarse_baseline(rate_coarse_baseline_),
-		rotation_axis(rotation_axis_), swept_fine(swept_fine_), swept_coarse(swept_coarse_),
-		coarse_only_debug(coarse_only_debug_), draw_coarse_layer(draw_coarse_layer_), result_queue(result_queue_)
+		rate_baseline(rate_baseline_),
+		rotation_axis(rotation_axis_), swept(swept_),
+		result_queue(result_queue_)
 	{
 		if(num_planes < 0) num_planes = 0;
 		if(num_planes > (int)staticArrayNumElems(planes)) num_planes = (int)staticArrayNumElems(planes);
@@ -4361,9 +4240,8 @@ public:
 		msg->cloud_id = cloud_id;
 		msg->frontier = frontier;
 		Timer filter_compute_timer; // SESSION072 DIAGNOSTIC: isolates filterUnculledFrontier()'s own cost from task scheduling - see msg->filter_compute_ms.
-		filterUnculledFrontier(*frontier, planes, num_planes, cam_pos_ws, rate_fine_baseline, rate_coarse_baseline,
-			rotation_axis, swept_fine, swept_coarse, trans_dilation, coarse_only_debug, draw_coarse_layer,
-			msg->survivors, &msg->num_coarse_survivors);
+		filterUnculledFrontier(*frontier, planes, num_planes, cam_pos_ws, rate_baseline,
+			rotation_axis, swept, trans_dilation, msg->survivors);
 		msg->filter_compute_ms = filter_compute_timer.elapsed() * 1.0e3;
 		result_queue->enqueue(msg);
 	}
@@ -4374,11 +4252,9 @@ private:
 	Planef planes[6];
 	int num_planes;
 	Vec4f cam_pos_ws;                                 // SESSION063 K3: for the per-node rotation dilation (rate * dist-to-camera).
-	float rate_fine_baseline, rate_coarse_baseline;   // SESSION063 K4/SESSION072: isotropic floor only now - see rotation_axis/swept_* for the measured (anisotropic) component.
+	float rate_baseline;                              // SESSION063 K3/SESSION072: isotropic floor only - see rotation_axis/swept for the measured (anisotropic) component.
 	Vec4f rotation_axis;                              // SESSION072: unit rotation axis (world space) - anisotropic rotational dilation, see kickOffFilters().
-	float swept_fine, swept_coarse;                   // SESSION072: angle swept about that axis during the fine/coarse dilation latency window. Kept separate from the axis (rather than as two pre-scaled vectors) so the filter needs one cross product per plane instead of two - see filterUnculledFrontier().
-	bool coarse_only_debug;                           // SESSION063 K4: keep only coarse nodes (isolation view).
-	bool draw_coarse_layer;                           // SESSION075: whether captured coarse nodes may survive at all - see filterUnculledFrontier()'s parameter comment.
+	float swept;                                      // SESSION072: angle swept about that axis during the dilation latency window. Kept separate from the axis (rather than as a pre-scaled vector) so the filter needs one cross product per plane - see filterUnculledFrontier().
 	float trans_dilation[6];                          // per-plane translation margin (metres).
 	ThreadSafeQueue<Reference<ThreadMessage> >* result_queue;
 };
@@ -6697,25 +6573,6 @@ void GaussianSplatRenderer::setSatPrefilterThreshold(float v)
 }
 
 
-// SESSION076: the "coarse" checkbox now changes what a traversal PRODUCES, not just what the filter is allowed to draw
-// from it - with the layer undrawn, the traversal skips capturing grid-useless coarse nodes and evicts the rest once the
-// grid is built. So a cached U(P) built while this was off physically has no coarse layer left in it, and turning the
-// checkbox back on could not restore the edge-filling patch until something else happened to force a fresh traversal -
-// during pure rotation, nothing does. Dropping the cached frontiers here forces one, exactly as setSatPrefilterMode() does.
-void GaussianSplatRenderer::setCoarseFloorEnabled(bool v)
-{
-	if(v == split_coarse_floor_enabled)
-		return;
-	split_coarse_floor_enabled = v;
-
-	for(size_t i=0; i<clouds.size(); ++i)
-	{
-		clouds[i]->cached_ufrontier = NULL;
-		clouds[i]->have_last_traversal_cam_pos = false;
-	}
-}
-
-
 // SESSION076: same cached-frontier drop as setSatPrefilterMode() above, for the same reason - the sat_diag_* counters
 // are filled when a frontier is BUILT, so without forcing a fresh traversal the checkbox would appear to do nothing
 // until the camera happened to move.
@@ -6766,24 +6623,6 @@ void GaussianSplatRenderer::setSatTilePx(float v)
 	if(v == sat_tile_px)
 		return;
 	sat_tile_px = v;
-
-	for(size_t i=0; i<clouds.size(); ++i)
-	{
-		clouds[i]->cached_ufrontier = NULL;
-		clouds[i]->have_last_traversal_cam_pos = false;
-	}
-}
-
-
-// SESSION088: back to one job. Session076 had given this a second one - sizing the saturation grid alongside "sub" -
-// which is why it needed cache invalidation at all (and why it was a bug that the inline version had none). That job is
-// gone: the grid is sized by sat_tile_px, which absorbed the ratio the two of them expressed. What is left is the
-// original coarse-floor cut, and a changed cut means a differently-captured frontier, so the cached one still goes.
-void GaussianSplatRenderer::setCoarsePixelScale(float v)
-{
-	if(v == split_coarse_pixel_scale)
-		return;
-	split_coarse_pixel_scale = v;
 
 	for(size_t i=0; i<clouds.size(); ++i)
 	{
@@ -8525,7 +8364,7 @@ void GaussianSplatRenderer::kickOffFilters()
 	// nor holes (the in-motion band stays predictive until this point). This is session059's traversal "settle" ported to
 	// the filter - see SplatCloud::last_traversal_dilation_elevated's comment.
 	const bool motion_calmed = w_effective <= min_rot_rate_rad_s;
-	// SESSION072: anisotropic rotational dilation (session067 §8/§15 plan A). Previously rate_fine/rate_coarse were
+	// SESSION072: anisotropic rotational dilation (session067 §8/§15 plan A). Previously the baseline rates were
 	// isotropic - w_floored (= max(w_effective, min_rot_rate_rad_s)) applied identically to all 6 planes via rate*dist
 	// inside filterUnculledFrontier(), so a violent flick multiplied the whole draw list regardless of which edge it
 	// actually threatened. Split into two additive-by-max components instead:
@@ -8541,13 +8380,10 @@ void GaussianSplatRenderer::kickOffFilters()
 	// The two are combined with max(), not sum, at the per-node/per-plane site in filterUnculledFrontier() - mirrors
 	// exactly how translation_dilation[] above already floors its per-plane EMA/empirical shift against
 	// min_trans_dilation_m.
-	const float rate_fine_baseline   = min_rot_rate_rad_s * dilation_latency_eff;           // SESSION063 K4 tight window, SESSION072: baseline-only now. SESSION088: measured window when enabled - see dilation_latency_eff.
-	const float rate_coarse_baseline = min_rot_rate_rad_s * filter_coarse_dilation_latency;  // wider coarse window, baseline-only.
-	// SESSION072: axis and swept magnitudes passed separately rather than as two pre-scaled vectors - the two swept
-	// vectors are parallel (same axis, different latency), so the filter can do one cross product per plane instead of
-	// two and hoist the fine/coarse blend out of its plane loop. See filterUnculledFrontier().
-	const float swept_fine   = w_effective * dilation_latency_eff; // SESSION088 - see dilation_latency_eff.
-	const float swept_coarse = w_effective * filter_coarse_dilation_latency;
+	const float rate_fine_baseline = min_rot_rate_rad_s * dilation_latency_eff; // SESSION063 K3 window, SESSION072: baseline-only now. SESSION088: measured window when enabled - see dilation_latency_eff. The coarse floor had a second, wider window beside this one; it went with the feature.
+	// SESSION072: axis and swept magnitude passed separately rather than as a pre-scaled vector, so the filter can do one
+	// cross product per plane. See filterUnculledFrontier().
+	const float swept_fine = w_effective * dilation_latency_eff; // SESSION088 - see dilation_latency_eff.
 
 	const char* filter_kick_reason = "?"; // SESSION064 DIAG
 	while(num_filters_in_flight < max_concurrent_filters)
@@ -8595,9 +8431,8 @@ void GaussianSplatRenderer::kickOffFilters()
 		const int filter_num_planes = filter_frustum_planes_enabled ? scene->num_frustum_clip_planes : 0;
 
 		task_manager->addTask(new GaussianSplatFilterTask(best_cloud->cloud_id, best_cloud->cached_ufrontier,
-			scene->frustum_clip_planes, filter_num_planes, cam_pos_ws, rate_fine_baseline, rate_coarse_baseline,
-			cam_angular_axis_ema_ws, swept_fine, swept_coarse, trans_dilation, coarse_layer_debug,
-			split_coarse_floor_enabled, &filter_result_queue)); // SESSION075: "coarse" checkbox now controls only whether the (possibly sat-only-captured) coarse layer is allowed to draw - see filterUnculledFrontier()'s draw_coarse_layer.
+			scene->frustum_clip_planes, filter_num_planes, cam_pos_ws, rate_fine_baseline,
+			cam_angular_axis_ema_ws, swept_fine, &filter_result_queue, trans_dilation));
 
 		if(filter_debug_log) // SESSION064 DIAG: how long do filter kicks continue after the camera stops, and with what band?
 			conPrint("[gsr-filter-kick] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms reason=" + std::string(filter_kick_reason) +
@@ -8697,8 +8532,6 @@ void GaussianSplatRenderer::drainFilterResults()
 				(std::acos(myClamp(dot(cur_forward_diag, prev_applied_forward), -1.f, 1.f)) * (180.f / 3.14159265f)) : 0.f;
 			const float band_deg = cloud->diag_filter_band_fine_rad * (180.f / 3.14159265f);
 			conPrint("[gsr-filter-drain] t" + doubleToStringNDecimalPlaces(now_s_diag * 1000.0, 0) + "ms surv=" + uInt64ToStringCommaSeparated(survivors.size()) +
-				" coarse=" + uInt64ToStringCommaSeparated(msg->num_coarse_survivors) + // SESSION072 DIAGNOSTIC
-				" fine=" + uInt64ToStringCommaSeparated(survivors.size() - msg->num_coarse_survivors) +
 				" pool=" + uInt64ToStringCommaSeparated(msg->frontier->indices.size() +
 					(msg->frontier->far_block.nonNull() ? msg->frontier->far_block->indices.size() : 0)) + // SESSION080 §4.3: both segments - indices.size() alone is just the near one, which read as pool < surv.
 
@@ -9103,27 +8936,17 @@ void GaussianSplatRenderer::kickOffTraversals()
 
 		// SESSION055: pass frustum planes (copied into task, see its ctor) and the anisotropic dilation numbers computed
 		// once above per kickOffTraversals() call.
-		// SESSION075: coarse-floor DATA capture (feeds both the edge-filling draw layer AND the saturation grid) is now
-		// requested by EITHER consumer wanting it - previously a single flag conflated "capture the coarse floor" with
-		// "draw it as edge-filling", so turning "coarse" off (wanted only to skip the draw) also starved the saturation
-		// grid of its only data source. The "coarse" checkbox (split_coarse_floor_enabled) now controls solely whether
-		// the captured layer is later allowed to survive the filter - see kickOffFilters()'s draw_coarse_layer.
-		// SESSION076: the saturation grid no longer needs the coarse floor - it accumulates the fine frontier instead
-		// (see the traversal task's saturation phase). So capture is back to being requested by its one real consumer,
-		// the drawn edge-filling patch. With the "coarse" checkbox off, the ~1.7M coarse nodes that session075 started
-		// capturing for the grid's sake are simply never produced: no push_backs in the DFS, no ~56% growth of the radix
-		// sort's array, no SoA gather, no inflated pool for the filter to stream.
-		const bool coarse_capture_needed = split_coarse_floor_enabled;
+		// SESSION088: the coarse-floor capture that used to be requested here is gone - see GaussianSplatRenderer's note
+		// on the feature's removal. The ~1.7M coarse nodes it produced are simply never made: no push_backs in the DFS,
+		// no ~56% growth of the radix sort's array, no SoA gather, no inflated pool for the filter to stream.
 		task_manager->addTask(new GaussianSplatLodTraversalTask(best_cloud->cloud_id, best_cloud->topology_generation, scratch, cam_pos_ws,
 			lod_pixel_scale_limit, lod_max_splats_budget, lod_max_layer_density, lod_max_tree_depth, focal_px,
 			scene->frustum_clip_planes, scene->num_frustum_clip_planes, cull_active,
 			translation_dilation, rotation_dilation_rate,
 			&traversal_result_queue,
 			/*frontier_record=*/NULL, /*build_unculled_frontier=*/split_filter_enabled, // SESSION063: cull-off traversal builds U(P) for the split filter.
-			/*coarse_floor_enabled=*/split_filter_enabled && coarse_capture_needed, /*coarse_pixel_scale=*/split_coarse_pixel_scale, // SESSION063 K4, SESSION075.
 			/*dist_clamp_enabled=*/splat_dist_clamp_enabled, splat_dist_clamp_min, splat_dist_clamp_max, splat_dist_clamp_invert, // SESSION072.
 			/*sat_diag_log=*/sat_diag_log, // SESSION076 DIAGNOSTIC.
-			/*coarse_layer_drawn=*/split_coarse_floor_enabled, // SESSION076: lets the task skip/evict coarse nodes when the layer is captured only to feed the saturation grid - see its ctor param.
 			/*task_manager=*/task_manager, // SESSION079
 			/*prev_frontier=*/best_cloud->last_unpruned_ufrontier, // SESSION080: the previous traversal's UNPRUNED output, for STEP A's diagnostic and STEP B's reuse - NOT cached_ufrontier, see that field's comment.
 			/*sort_staleness_diag_enabled=*/sat_diag_log, // SESSION080: the "diag" checkbox, NOT the filter log that prints the line.

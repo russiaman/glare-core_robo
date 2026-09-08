@@ -456,25 +456,26 @@ public:
 	void setFilterMinTransRateMPerS(float v) { filter_min_trans_rate_m_per_s = v; }
 	// SESSION071: measurement knob - the rotational dilation is currently isotropic (same rate*dist margin on all 6
 	// frustum planes), so a violent flick can multiply the draw list several-fold (session067 §8/§15). Clamping
-	// w_effective before it feeds rate_fine/rate_coarse bounds that cost, at the price of edge holes on the fastest
+	// w_effective before it feeds the baseline rate bounds that cost, at the price of edge holes on the fastest
 	// flicks - see kickOffFilters(). A large value (e.g. 100000) is effectively "no cap" (today's behaviour).
 	float getFilterMaxRotRateDegPerS() const { return filter_max_rot_rate_deg_per_s; }
 	void setFilterMaxRotRateDegPerS(float v) { filter_max_rot_rate_deg_per_s = v; }
 
-	// SESSION063 K4: coarse floor. The traversal also captures a low-detail cut (first node per branch at
-	// coarse_pixel_scale), drawn after the fine set; the filter dilates this cut with its own (wider) latency so cheap big
-	// splats plug motion-revealed edges/holes without the fine set paying for a wide dilation. See GaussianSplatUnculledFrontier.
-	bool getCoarseFloorEnabled() const { return split_coarse_floor_enabled; }
-	void setCoarseFloorEnabled(bool v); // SESSION076: out-of-line - toggling this now has to drop cached frontiers, see the .cpp.
-	float getCoarsePixelScale() const { return split_coarse_pixel_scale; }
-	void setCoarsePixelScale(float v); // SESSION088: out-of-line - see the .cpp. Session076 gave this a second job, sizing the saturation grid (gsSatGridResForFocal()), and the inline version invalidated nothing at all.
-	float getFilterCoarseDilationLatency() const { return filter_coarse_dilation_latency; }
-	void setFilterCoarseDilationLatency(float v) { filter_coarse_dilation_latency = v; }
-
-	// SESSION063 K4 debug: draw ONLY the coarse floor (skip the fine set), so its screen coverage can be inspected in
-	// isolation - see drainFilterResults(). Off = normal (fine + coarse).
-	bool getCoarseLayerDebug() const { return coarse_layer_debug; }
-	void setCoarseLayerDebug(bool v) { coarse_layer_debug = v; }
+	// SESSION088: the coarse floor is gone. It was session063's K4 - the traversal captured a second, low-detail cut
+	// (one node per branch at coarse_pixel_scale) which the filter dilated with its own wider latency, so cheap big
+	// splats could plug edges and holes revealed by motion without the fine set paying for a wide dilation.
+	//
+	// It went because its last consumer went. Session075 had it feeding the saturation grid as well; session076 moved
+	// the grid to the fine frontier, and session085 moved it again to the tree walk (occluderTreeWalk()), leaving the
+	// drawn patch as the only thing that read it - and the owner has been running with that patch off. What is left is
+	// the removal of its cost: a per-node flag through the DFS, a parallel is_coarse array through the sort, the SoA
+	// gather and every frontier partition, and a per-node fine/coarse blend plus a tight-frustum band test inside the
+	// filter's hot SIMD loop. It also dropped one of frontier reuse's preconditions - the two were mutually exclusive,
+	// so reuse silently did nothing whenever the coarse floor was on.
+	//
+	// The knobs that went with it: "coarse" (enable), "px" (the cut's pixel scale - its second job, sizing the
+	// saturation grid, had already been taken over by sat_tile_px), the coarse dilation latency, and the
+	// coarse-layer-only debug view.
 
 	// SESSION079: this stage's OWN saturation threshold - "thr" in the "Saturation filter" row. Used to share
 	// getSaturationThreshold()/splat_saturation_threshold with the GPU-side "Saturation gate" (session072), on the
@@ -1949,10 +1950,6 @@ private:
 	float splat_merge_spread_widen;                           // SESSION071 - see getMergeSpreadWiden() above.
 
 	// SESSION063 K4: coarse floor knobs - see the getters above.
-	bool split_coarse_floor_enabled;
-	float split_coarse_pixel_scale;         // pixel_scale threshold for the coarse cut (>> pixel_scale_limit).
-	float filter_coarse_dilation_latency;   // s - the coarse tail's (wider) dilation window.
-	bool coarse_layer_debug;                // Draw only the coarse floor - see getCoarseLayerDebug().
 	bool filter_debug_log, kick_debug_log, cpu_prof_log; // SESSION072: live log toggles - see getFilterDebugLog() etc.
 	float sat_prefilter_threshold;                    // SESSION079 - see getSatPrefilterThreshold(). This stage's own threshold, independent of splat_saturation_threshold (the GPU gate's).
 	bool filter_frustum_planes_enabled;              // SESSION074 - see getFilterFrustumPlanesEnabled().

@@ -4072,10 +4072,16 @@ static inline bool pointInFrustum(const Planef* frustum_clip_planes, int num_fru
 // SESSION080 §4.3: a frontier is now two segments - its own arrays followed by its far block's - so the streaming pass
 // below runs once per segment, appending into the same output. Split out of filterUnculledFrontier(), which became the
 // two-call wrapper; the body is unchanged from the single-segment version it replaces.
+//
+// SESSION091: takes a [i_begin, i_end) range rather than always the whole segment, so filterUnculledFrontier() can hand
+// disjoint slices of it to several workers. The body is otherwise unchanged - each element's verdict was already a pure
+// function of that element, so a slice needs nothing from its neighbours and the result is bit-identical to the serial
+// pass. Slice boundaries are 4-aligned by the caller, so only the last slice of a segment runs the scalar tail.
 static size_t filterFrontierSegment(const GaussianSplatUnculledFrontier& uf, const Planef* planes, int num_planes,
 	const Vec4f& cam_pos_ws, float rate_baseline,
 	const Vec4f& rotation_axis, float swept, // SESSION072: unit rotation axis + the angle swept during the dilation latency window - see above.
 	const float* trans_dilation,
+	size_t i_begin, size_t i_end, // SESSION091: this slice of the segment - see above.
 	uint32* const out) // SESSION080 §4.3: caller-owned, pre-sized for both segments - see filterUnculledFrontier().
 {
 	// SESSION074: no saturation work happens here any more. The verdict is orientation-independent, so it is applied
@@ -4086,7 +4092,6 @@ static size_t filterFrontierSegment(const GaussianSplatUnculledFrontier& uf, con
 	// fine and a coarse dilation, plus a second (tight, undilated) frustum test to confine coarse nodes to the band
 	// outside it - a load, two blends and six extra compares per four nodes, in the one loop that runs over the whole
 	// frontier on every filter kick. With one layer left, the rate and the swept magnitude are loop constants.
-	const size_t n = uf.indices.size();
 	const int npl = myMin(num_planes, 6);
 
 	__m128 pl_nx[6], pl_ny[6], pl_nz[6], pl_d[6];
@@ -4114,8 +4119,8 @@ static size_t filterFrontierSegment(const GaussianSplatUnculledFrontier& uf, con
 	const uint32* const idx = uf.indices.data();
 	size_t num_out = 0;
 
-	const size_t n4 = n & ~size_t(3);
-	for(size_t i=0; i<n4; i+=4)
+	const size_t n4 = i_begin + ((i_end - i_begin) & ~size_t(3));
+	for(size_t i=i_begin; i<n4; i+=4)
 	{
 		const __m128 X = _mm_loadu_ps(px + i);
 		const __m128 Y = _mm_loadu_ps(py + i);
@@ -4141,7 +4146,7 @@ static size_t filterFrontierSegment(const GaussianSplatUnculledFrontier& uf, con
 		if((m & 4) == 0) out[num_out++] = idx[i+2];
 		if((m & 8) == 0) out[num_out++] = idx[i+3];
 	}
-	for(size_t i=n4; i<n; ++i) // Tail (n not a multiple of 4).
+	for(size_t i=n4; i<i_end; ++i) // Tail (slice length not a multiple of 4).
 	{
 		const float ddx = px[i]-cam_pos_ws.x[0], ddy = py[i]-cam_pos_ws.x[1], ddz = pz[i]-cam_pos_ws.x[2];
 		const float baseline_pad = rate_baseline * std::sqrt(ddx*ddx + ddy*ddy + ddz*ddz);
@@ -4163,6 +4168,72 @@ static size_t filterFrontierSegment(const GaussianSplatUnculledFrontier& uf, con
 }
 
 
+// SESSION091: one slice of the frustum filter - see filterUnculledFrontier(), which owns the slicing and the compaction
+// that follows. Each slice writes into the output at the offset its own INPUT range starts at, which is a range no other
+// slice can reach: survivors are never more numerous than the elements they came from, so slice c's output cannot run
+// past where slice c+1's begins. That is what makes the write ranges disjoint without a counting pass first - which
+// matters here and not in buildFrontierSoA(), where the equivalent prefix sum is cheap because counting a mark bit is
+// nothing like re-running the filter. Doing it that way here would have cost a second full SIMD pass over the frontier,
+// i.e. exactly the work being parallelised.
+// The dilation parameters, identical for every slice of both segments. The two pointers are owned by the parent
+// GaussianSplatFilterTask, which blocks until the group finishes, so a slice can hold them rather than copy six planes.
+struct GsFilterSliceParams
+{
+	const Planef* planes;
+	int num_planes;
+	Vec4f cam_pos_ws;
+	float rate_baseline;
+	Vec4f rotation_axis;
+	float swept;
+	const float* trans_dilation;
+};
+
+
+class GaussianSplatFilterSliceTask : public glare::Task
+{
+public:
+	virtual void run(size_t /*thread_index*/)
+	{
+		num_out = filterFrontierSegment(*seg, p.planes, p.num_planes, p.cam_pos_ws, p.rate_baseline,
+			p.rotation_axis, p.swept, p.trans_dilation, i_begin, i_end, out);
+	}
+
+	GsFilterSliceParams p;
+	const GaussianSplatUnculledFrontier* seg;
+	size_t i_begin, i_end;         // This slice of `seg`, 4-aligned so only the segment's last slice runs the scalar tail.
+	uint32* out;                   // This slice's own write range within the caller's output - see above.
+	size_t num_out;                // Out: how much of that range was filled.
+};
+
+
+// SESSION091: append one segment's slices to `tasks`, and record where each slice's output range starts in `out_begin`.
+// Sliced 4-aligned (the filter's SIMD stride) so that the scalar tail runs once per segment rather than once per slice.
+static void addFilterSliceTasks(const GsFilterSliceParams& p, const GaussianSplatUnculledFrontier& seg,
+	size_t num_slices, size_t out_offset, uint32* const out,
+	std::vector<glare::TaskRef>& tasks, js::Vector<size_t, 16>& out_begin)
+{
+	const size_t n = seg.indices.size();
+	for(size_t c=0; c<num_slices; ++c)
+	{
+		const size_t raw_begin = (n * c)       / num_slices;
+		const size_t raw_end   = (n * (c + 1)) / num_slices;
+		const size_t i_begin = raw_begin & ~size_t(3);
+		const size_t i_end   = (c + 1 == num_slices) ? n : (raw_end & ~size_t(3)); // Last slice takes whatever the alignment left over.
+		if(i_begin >= i_end)
+			continue;
+
+		Reference<GaussianSplatFilterSliceTask> t = new GaussianSplatFilterSliceTask();
+		t->p = p;
+		t->seg = &seg;
+		t->i_begin = i_begin; t->i_end = i_end;
+		t->out = out + out_offset + i_begin; // Offset by the INPUT position - see the class comment for why that is enough.
+		t->num_out = 0;
+		out_begin.push_back(out_offset + i_begin);
+		tasks.push_back(t);
+	}
+}
+
+
 // SESSION080 §4.3: filter a whole frontier - its own arrays, then its far block's, appending both into one draw list.
 //
 // The two segments are streamed back to back rather than merged, and that needs no re-sort: each is sorted, and the cut
@@ -4170,25 +4241,88 @@ static size_t filterFrontierSegment(const GaussianSplatUnculledFrontier& uf, con
 // front-to-back to within the same one-traversal tolerance everything on screen already carries (the selection being
 // drawn was always built for where the camera was a traversal ago). Same property the single-array frontier relied on
 // when its far tail was a copy rather than a reference; only the storage changed.
+//
+// SESSION091: the streaming pass runs on several workers instead of one. This is the stage the whole per-orientation
+// half of the split architecture is made of, and it was the only part of it left on a single thread - measured (owner's
+// four-run capture, stage 0 and ablation stage 2) at 72-84% of the filter's entire kick-to-drain round trip, so nothing
+// else in that round trip is worth touching until this is off one core.
+//
+// What that buys is NOT a narrower dilation band - the band is filter_dilation_latency (or, with `lat auto` on, the
+// measured round trip) times the camera's angular speed, and this changes neither knob. It is a shorter round trip, and
+// therefore a smaller `stale`: the angle the camera turns through while a draw list is on screen. A frustum-edge hole is
+// exactly `stale > band` (see drainFilterResults()'s deficit=), and the same capture found 43% of drains over the forest
+// already on the wrong side of that, with `band` pinned at its own ceiling (filter_max_rot_rate_deg_per_s x the latency)
+// and unable to widen further to cover it. Shrinking `stale` is the only lever left there, and it is a one-sided one:
+// the band it is measured against does not move, so this cannot open a hole it did not already have.
+//
+// Slicing is by input position and needs no prefix sum first - see GaussianSplatFilterSliceTask's comment. The order the
+// survivors come out in is unchanged: slices are consecutive, each keeps its own elements' relative order, and the
+// compaction below walks them in that same order.
 static size_t filterUnculledFrontier(const GaussianSplatUnculledFrontier& uf, const Planef* planes, int num_planes,
 	const Vec4f& cam_pos_ws, float rate_baseline,
 	const Vec4f& rotation_axis, float swept,
 	const float* trans_dilation,
+	glare::TaskManager* task_manager, // SESSION091: NULL falls back to the serial pass below.
 	js::Vector<uint32, 16>& out_indices)
 {
 	const GaussianSplatUnculledFrontier* const far_seg = uf.far_block.ptr(); // Not `far`: that is still a macro in the Windows headers.
-	const size_t total_in = uf.indices.size() + (far_seg ? far_seg->indices.size() : 0);
+	const size_t near_n = uf.indices.size();
+	const size_t far_n = far_seg ? far_seg->indices.size() : 0;
+	const size_t total_in = near_n + far_n;
 	out_indices.resizeNoCopy(total_in); // Worst case every node survives.
+	uint32* const out = out_indices.data();
 
-	size_t num_out = filterFrontierSegment(uf, planes, num_planes, cam_pos_ws, rate_baseline,
-		rotation_axis, swept, trans_dilation, out_indices.data());
+	// Same shape as buildFrontierSoA()'s: 4x the worker count so a slice that finishes early can pick up another, and a
+	// floor on slice size so a small frontier is not carved into pieces that cost more to schedule than to filter.
+	const size_t concurrency = (task_manager != NULL) ? myMax<size_t>(1, (size_t)task_manager->getConcurrency()) : 1;
+	const size_t num_slices = myMax<size_t>(1, myMin(concurrency * 4, total_in / 16384));
 
+	if(task_manager == NULL || num_slices <= 1)
+	{
+		size_t num_out = filterFrontierSegment(uf, planes, num_planes, cam_pos_ws, rate_baseline,
+			rotation_axis, swept, trans_dilation, 0, near_n, out);
+
+		if(far_seg)
+			num_out += filterFrontierSegment(*far_seg, planes, num_planes, cam_pos_ws, rate_baseline,
+				rotation_axis, swept, trans_dilation, 0, far_n, out + num_out);
+
+		out_indices.resize(num_out); // Shrink to survivor count (keeps prefix, no realloc) so .size() is authoritative.
+		return num_out;
+	}
+
+	// Both segments in ONE group: the far block is a third of the pool in the owner's captures, and finishing the near
+	// one before starting it would leave that third on however many workers the tail of the near segment still occupies.
+	GsFilterSliceParams p;
+	p.planes = planes; p.num_planes = num_planes;
+	p.cam_pos_ws = cam_pos_ws; p.rate_baseline = rate_baseline;
+	p.rotation_axis = rotation_axis; p.swept = swept;
+	p.trans_dilation = trans_dilation;
+
+	glare::TaskGroupRef group = new glare::TaskGroup();
+	js::Vector<size_t, 16> out_begin; // Parallel to group->tasks: where each slice's range starts in `out`.
+	out_begin.reserve(num_slices * 2);
+	group->tasks.reserve(num_slices * 2);
+	addFilterSliceTasks(p, uf, myMax<size_t>(1, (num_slices * near_n) / total_in), 0, out, group->tasks, out_begin);
 	if(far_seg)
-		num_out += filterFrontierSegment(*far_seg, planes, num_planes, cam_pos_ws, rate_baseline,
-			rotation_axis, swept, trans_dilation, out_indices.data() + num_out);
+		addFilterSliceTasks(p, *far_seg, myMax<size_t>(1, (num_slices * far_n) / total_in), near_n, out, group->tasks, out_begin);
 
-	out_indices.resize(num_out); // Shrink to survivor count (keeps prefix, no realloc) so .size() is authoritative.
-	return num_out;
+	task_manager->runTaskGroup(group); // Blocks, and the calling worker takes a slice itself rather than idling.
+
+	// Close the gaps the slices left. Each slice wrote from the start of its own input range, so the survivors sit in
+	// order but with a hole after each. Walking left to right, the destination is always at or behind the source (the
+	// survivor total up to slice c is never more than c's input start), so this only ever moves data backwards - hence
+	// memmove for the overlap, and hence the first slice, which already begins at 0, needs no move at all.
+	size_t w = 0;
+	for(size_t i=0; i<group->tasks.size(); ++i)
+	{
+		const size_t n_i = static_cast<const GaussianSplatFilterSliceTask*>(group->tasks[i].ptr())->num_out;
+		if(n_i > 0 && w != out_begin[i])
+			std::memmove(out + w, out + out_begin[i], n_i * sizeof(uint32));
+		w += n_i;
+	}
+
+	out_indices.resize(w); // Shrink to survivor count (keeps prefix, no realloc) so .size() is authoritative.
+	return w;
 }
 
 
@@ -4214,11 +4348,12 @@ public:
 	GaussianSplatFilterTask(uint64 cloud_id_, const Reference<GaussianSplatUnculledFrontier>& frontier_,
 		const Planef* planes_, int num_planes_, const Vec4f& cam_pos_ws_, float rate_baseline_,
 		const Vec4f& rotation_axis_, float swept_, // SESSION072: anisotropic rotational dilation - see kickOffFilters().
-		ThreadSafeQueue<Reference<ThreadMessage> >* result_queue_, const float* trans_dilation_)
+		ThreadSafeQueue<Reference<ThreadMessage> >* result_queue_, const float* trans_dilation_,
+		glare::TaskManager* task_manager_) // SESSION091: the filter fans its own streaming pass out over the pool - see filterUnculledFrontier().
 	:	cloud_id(cloud_id_), frontier(frontier_), num_planes(num_planes_), cam_pos_ws(cam_pos_ws_),
 		rate_baseline(rate_baseline_),
 		rotation_axis(rotation_axis_), swept(swept_),
-		result_queue(result_queue_)
+		result_queue(result_queue_), task_manager(task_manager_)
 	{
 		if(num_planes < 0) num_planes = 0;
 		if(num_planes > (int)staticArrayNumElems(planes)) num_planes = (int)staticArrayNumElems(planes);
@@ -4235,7 +4370,7 @@ public:
 		msg->frontier = frontier;
 		Timer filter_compute_timer; // SESSION072 DIAGNOSTIC: isolates filterUnculledFrontier()'s own cost from task scheduling - see msg->filter_compute_ms.
 		filterUnculledFrontier(*frontier, planes, num_planes, cam_pos_ws, rate_baseline,
-			rotation_axis, swept, trans_dilation, msg->survivors);
+			rotation_axis, swept, trans_dilation, task_manager, msg->survivors);
 		msg->filter_compute_ms = filter_compute_timer.elapsed() * 1.0e3;
 		result_queue->enqueue(msg);
 	}
@@ -4251,6 +4386,7 @@ private:
 	float swept;                                      // SESSION072: angle swept about that axis during the dilation latency window. Kept separate from the axis (rather than as a pre-scaled vector) so the filter needs one cross product per plane - see filterUnculledFrontier().
 	float trans_dilation[6];                          // per-plane translation margin (metres).
 	ThreadSafeQueue<Reference<ThreadMessage> >* result_queue;
+	glare::TaskManager* task_manager;                 // SESSION091: the pool this task fans its own slices out over - see filterUnculledFrontier().
 };
 
 
@@ -8409,7 +8545,7 @@ void GaussianSplatRenderer::kickOffFilters()
 
 		task_manager->addTask(new GaussianSplatFilterTask(best_cloud->cloud_id, best_cloud->cached_ufrontier,
 			scene->frustum_clip_planes, filter_num_planes, cam_pos_ws, rate_fine_baseline,
-			cam_angular_axis_ema_ws, swept_fine, &filter_result_queue, trans_dilation));
+			cam_angular_axis_ema_ws, swept_fine, &filter_result_queue, trans_dilation, task_manager));
 
 		if(filter_debug_log) // SESSION064 DIAG: how long do filter kicks continue after the camera stops, and with what band?
 			conPrint("[gsr-filter-kick] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms reason=" + std::string(filter_kick_reason) +

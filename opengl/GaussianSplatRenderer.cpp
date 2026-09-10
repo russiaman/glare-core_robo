@@ -62,8 +62,8 @@ static const int max_concurrent_sorts = 2;
 // four-thousandth of the draw order, which is far finer than a handful of slice boundaries can use.
 static const int max_slice_samples = 4096;
 
-// SESSION055/058: one shared Timer for ALL traversal-pipeline diagnostic prints in this file (kick log, rot-blocked
-// log, session058 CPU-cost profiling) - see [[feedback_shared_diag_timer]]. Declared at file scope, above every diag
+// SESSION055/058: one shared Timer for ALL traversal-pipeline diagnostic prints in this file (kick log, filter logs,
+// session058 CPU-cost profiling) - see [[feedback_shared_diag_timer]]. Declared at file scope, above every diag
 // print site (some of which - e.g. fillTraversalScratch() - are defined earlier in the file than kickOffTraversals()),
 // so every timestamp shares the same zero point and lines from different sites stay chronologically comparable.
 static Timer diag_timer;
@@ -210,8 +210,8 @@ public:
 // SESSION063: the orientation-independent unculled LoD frontier U(P), cached so a pure rotation can derive its draw list
 // with a cheap per-orientation frustum filter instead of a fresh ~450ms traversal (session062 §9.3 - the split follows
 // from S(P,R) = stable_frustum_filter(U(P), R), the traversal's split/keep decision and sort key depending only on
-// camera position P, orientation R only on the frustum test). Built by GaussianSplatLodTraversalTask with
-// frustum_cull_enabled = false, so `indices` is the full unculled frontier in front-to-back order; px/py/pz are the
+// camera position P, orientation R only on the frustum test). Built by GaussianSplatLodTraversalTask, whose walk applies
+// no frustum test at all, so `indices` is the full unculled frontier in front-to-back order; px/py/pz are the
 // parallel SoA world positions and `radius` the per-node cull_radius, both gathered on the worker (the scattered read
 // into the cloud's 30M-entry arrays costs ~50ms - measured session063 - and must stay off the main thread). The filter
 // tests each node's centre against the current frustum with its own radius as the only margin (mr.S point 5: an already
@@ -257,9 +257,9 @@ public:
 
 	// SESSION080 DIAGNOSTIC: Clock::getCurTimeRealSec() at the moment this frontier was built on the worker thread (set
 	// alongside anchor_pos_ws below) - answers "how stale is the prune drainTraversalResults() is about to apply", which
-	// cloud->last_traversal_kick_time_s cannot: that field gets overwritten by kickOffTraversals() the moment message 1
-	// clears traversal_in_flight, which can happen (a new kick for the same cloud) before message 2 - the saturation
-	// follow-up carrying THIS frontier - has even arrived. See [gsr-sat-apply] in drainTraversalResults().
+	// no per-cloud kick timestamp could: any such field is overwritten by kickOffTraversals() the moment message 1 clears
+	// traversal_in_flight, which can happen (a new kick for the same cloud) before message 2 - the saturation follow-up
+	// carrying THIS frontier - has even arrived. See [gsr-sat-apply] in drainTraversalResults().
 	double built_time_real_s;
 
 	// SESSION081: the calibration knobs (thr/sub/R/close) and erosion stats (er_ceil/er_win/er_radmax/cl) moved to
@@ -271,20 +271,16 @@ public:
 	// [gsr-traversal]. Answers whether a "keep the far frontier, only re-walk/re-sort the near shell" scheme (discussed
 	// re: the region-radius topology) is worth it for the walk, the sort, or both - session054's own note that the sort
 	// was ~76% of traversal time predates the switch from std::sort to radix and was never re-measured after.
-	double expand_ms; // The DFS/selection loop: frustum cull, coarse capture, pixel_scale convergence checks, cap tests.
-	double sort_ms;   // Sort::floatKeyAscendingSort() over the selection, plus unpacking into the output index array.
+	double expand_ms; // The DFS/selection loop: pixel_scale convergence checks, the far-block cut, the saturation bias, cap tests.
+	double sort_ms;   // Sort::floatKeyAscendingSort() over the selection. SESSION090: the sort alone - the unpack that used to follow it inside this number is gone, folded into the SoA gather (soa_ms).
 	// SESSION080 DIAGNOSTIC (plan2 §4.1): the share of sort_ms that is just allocating the sort's scratch buffer, which
 	// is a local sized to the selection - so a fresh ~106MB allocation per traversal at full frontier size, first-touch
 	// page faults included. Same question, and the same candidate fix (pool it on the traversal scratch), as
 	// expand_splice_reserve_ms - measured together because one rebuild answers both.
 	double sort_alloc_ms;
-	// SESSION087: sort_ms is not one thing. Session086 recorded it as a serial radix that "was never parallelised", which
-	// the code contradicted - the parallel branch has been taken since session080 - and reading the total as if it were
-	// only the sort hid that a quarter of it was a serial unpack loop, plus a copy-back that bought nothing. Kept, unlike
-	// that session's other diagnostics, because the sort block is an active work area and this is the split that makes
-	// its cost readable: an interleaved A/B over these two measured -18 ms interior / -23 ms exterior per traversal.
-	double sort_radix_ms;        // The sort call itself, nothing else.
-	double sort_unpack_ms;       // Reading the sorted stream's idx out into the output array. Parallel since session087.
+	// SESSION087 split sort_ms into radix vs. unpack, having found a quarter of it was a serial unpack loop nobody had
+	// noticed. SESSION090 removed the unpack itself - it is part of the SoA gather now - so the two halves are back to
+	// being one number and the split has nothing left to report.
 	// SESSION080 DIAGNOSTIC: why the parallel expand did or did not pay off - see expandParallel(). The pair that matters
 	// is sum vs max: task_sum_ms is the total work the tasks did, task_max_ms the longest single one, i.e. the critical
 	// path. sum/max is the parallelism actually available in the seed split. If max ~= expand_ms one subtree dominates
@@ -321,7 +317,7 @@ public:
 	//     consumed before result_queue->enqueue() publishes the frontier (like `decorated` here). sat_occluder_recs
 	//     and sat_keep_mask are read by the LATER saturation phase, which runs after that enqueue - once scratch is
 	//     back in the free pool a faster/second traversal can resize the same buffer out from under the first one's
-	//     still-running saturation phase. See selected_indices/sort_scratch's own comment on the same struct for the
+	//     still-running saturation phase. See decorated/sort_scratch's own comment on the same struct for the
 	//     line that still correctly distinguishes the two cases, and the sat_phase_scope comment at this bug's fix site.
 	//   copy_ms - the element-by-element push_back loop itself. If THIS dominates, the fix is a memcpy per task block
 	//     (offsets are known from the same prefix pass that computes `total`), optionally dispatched across the pool.
@@ -332,6 +328,7 @@ public:
 	// Sat between sort_ms and sat_gather_ms and was covered by NEITHER, so the stage timings did not sum to the traversal
 	// task's real duration. It is a scattered read of positions[idx]/cull_radius[idx] over the whole selection - the same
 	// shape as, and over the same indices as, the occluder gather that follows it.
+	// SESSION090: covers the near/far split as well, which is no longer a pass of its own - see buildFrontierSoA().
 	double soa_ms;
 
 	// SESSION080 DIAGNOSTIC: camera-distance at the 10/25/50/75/90th percentile of this frontier, in metres. Read
@@ -409,7 +406,7 @@ public:
 	// line describes the whole frontier without dereferencing anything.
 	size_t reuse_roots;          // Subtrees this walk stopped at and left to the far block.
 	size_t reuse_n;              // Nodes the far block contributes, i.e. how much of the frontier was not walked.
-	double reuse_ms;             // Cost of producing the far segment: 0 when it was inherited, the partition+SoA cost when it was built.
+	double reuse_ms;             // SESSION090: the mark-count pass, i.e. the separable part of what BUILDING the far segment costs - see buildFrontierSoA()'s out_split_ms. 0 exactly when the segment was inherited instead.
 	float reuse_split_dist_used; // The frozen split distance this frontier's cut was made at - see far_block.
 	float barrier_disagreement;  // SESSION088 DIAGNOSTIC: flip + depth, what the acceptance clause gates on - see gsSatBarrierDisagreement().
 	float barrier_flip, barrier_depth, barrier_mean_rel_depth; // SESSION088: its two components, and the mean relative depth move behind the second.
@@ -433,7 +430,6 @@ public:
 		expand_seeds(0), expand_num_tasks(0), expand_prologue_ms(0.0), expand_task_max_ms(0.0), expand_task_sum_ms(0.0), // SESSION080
 		expand_workers(0), expand_seed_max_ms(0.0), expand_seed_target(0), // SESSION086
 		expand_splice_reserve_ms(0.0), expand_splice_copy_ms(0.0), sort_alloc_ms(0.0), soa_ms(0.0), // SESSION080 (plan2 §4.1)
-		sort_radix_ms(0.0), sort_unpack_ms(0.0), // SESSION087
 		traversal_output_n(0), // SESSION080
 		sat_bias_barrier_time(0.0), // SESSION085
 		sort_staleness_delta_ws(0.0), sort_staleness_prev_n(0), sort_staleness_common_n(0), sort_staleness_max_disp(0), // SESSION080
@@ -576,8 +572,8 @@ public:
 	:	cloud_id(0), gpu_capacity_splats(0), total_splats(0), structure_generation(0), sort_in_flight(false),
 		importance_layout_fingerprint(0), slice_sample_draw_count(0),
 		have_last_sort_cam_pos(false), last_sort_cam_pos_ws(0.f), aabb_ws(js::AABBox::emptyAABBox()), added_to_engine(false),
-		topology_generation(0), traversal_in_flight(false), have_last_traversal_cam_pos(false), last_traversal_cam_pos_ws(0.f), last_traversal_cam_forward_ws(0.f), last_traversal_kick_time_s(0.0),
-		last_traversal_kicked_topology_generation(0), last_traversal_hit_budget_cap(false), last_traversal_hit_density_cap(false), last_traversal_hit_depth_cap(false), last_traversal_sat_bias_stops(0), last_traversal_sat_bias_tested(0), last_traversal_sat_bias_ceiling(1.f), last_traversal_dilation_elevated(false),
+		topology_generation(0), traversal_in_flight(false), have_last_traversal_cam_pos(false), last_traversal_cam_pos_ws(0.f),
+		last_traversal_kicked_topology_generation(0), last_traversal_hit_budget_cap(false), last_traversal_hit_density_cap(false), last_traversal_hit_depth_cap(false), last_traversal_sat_bias_stops(0), last_traversal_sat_bias_tested(0), last_traversal_sat_bias_ceiling(1.f),
 		cached_traversal_geom_generation(0), importance_num_views(0),
 		sat_grid_debug_anchor_ws(0.f), // SESSION076 §9
 		filter_in_flight(false), ufrontier_needs_filter(false), have_last_filter_cam_forward(false), last_filter_cam_forward_ws(0.f), // SESSION063
@@ -627,9 +623,7 @@ public:
 	uint64 topology_generation;
 	bool traversal_in_flight; // True from when a traversal is kicked off until its result is applied (or dropped as stale).
 	bool have_last_traversal_cam_pos;
-	Vec4f last_traversal_cam_pos_ws; // Camera position as of the last traversal kicked off (not necessarily completed).
-	Vec4f last_traversal_cam_forward_ws; // SESSION055: camera forward at that kick, so kickOffTraversals() can re-trigger on rotation now that the traversal is view-dependent - see lod_frustum_cull_enabled.
-	double last_traversal_kick_time_s; // SESSION055: timestamp of that kick (diag_timer.elapsed()) so the next kick can compute the *empirical* rotation/translation rate since - see the dilation block in kickOffTraversals().
+	Vec4f last_traversal_cam_pos_ws; // Camera position as of the last traversal kicked off (not necessarily completed). SESSION090: the only camera state a traversal's staleness depends on, now that the walk is orientation-independent - the forward vector and kick timestamp kept alongside it existed for the walk's own frustum dilation and went with it.
 	uint64 last_traversal_kicked_topology_generation; // topology_generation as of the last traversal kicked off - a mismatch against the live value means the cloud's structure has changed since, so it's unconditionally overdue for a fresh one (see kickOffTraversals()), the same idea as !have_last_sort_cam_pos for the sort.
 	bool last_traversal_hit_budget_cap; // Copied from the most recently applied traversal result's GaussianSplatLodTraversalScratch::hit_budget_cap (which itself doesn't persist - the scratch goes back to the pool) - surfaced in getDiagnostics() as a "detail is being truncated by the budget" warning.
 	bool last_traversal_hit_density_cap; // As above, for GaussianSplatLodTraversalScratch::hit_density_cap.
@@ -637,9 +631,9 @@ public:
 	size_t last_traversal_sat_bias_stops, last_traversal_sat_bias_tested; // SESSION085 ETAP 3: as above, for the scratch's counters of the same name.
 	float last_traversal_sat_bias_ceiling;  // SESSION085 ETAP 6: as above, for GaussianSplatLodTraversalScratch::sat_bias_ceiling_used.
 
-	// SESSION063: the cached unculled frontier U(P) for the split filter architecture, when split_filter_enabled. Set by
-	// drainTraversalResults() from a cull-off traversal; a rotation re-filters this instead of re-traversing. Null until
-	// the first split-mode traversal for this cloud lands. See GaussianSplatUnculledFrontier.
+	// SESSION063: the cached unculled frontier U(P). Set by drainTraversalResults() from the traversal that built it; a
+	// rotation re-filters this instead of re-traversing. Null until this cloud's first traversal lands.
+	// See GaussianSplatUnculledFrontier.
 	Reference<GaussianSplatUnculledFrontier> cached_ufrontier;
 
 	// SESSION080 DIAGNOSTIC (plan doc STEP A), debug-only: the last UNPRUNED frontier this cloud received - i.e. what
@@ -693,7 +687,7 @@ public:
 	double last_applied_filter_frontier_time_s;
 	bool have_last_filter_cam_forward;
 	Vec4f last_filter_cam_forward_ws;      // Camera forward at the last filter kick, so a rotation past threshold re-filters - see kickOffFilters().
-	bool filter_dilation_elevated;         // SESSION066: true if the last filter kick for this cloud used an above-floor dilation band, so kickOffFilters() knows to fire one tight "settle" re-filter once the slow-decay peak falls back to the floor - the filter analogue of last_traversal_dilation_elevated. Without it a wide band from an in-motion kick would stay applied after the camera stops (the observed stall).
+	bool filter_dilation_elevated;         // SESSION066: true if the last filter kick for this cloud used an above-floor dilation band, so kickOffFilters() knows to fire one tight "settle" re-filter once the slow-decay peak falls back to the floor. Without it a wide band from an in-motion kick would stay applied after the camera stops (the observed stall).
 
 	// SESSION073 DIAGNOSTIC (temporary - remove once the rotational-hole question is settled). Measures the dilation band's
 	// ADEQUACY directly, in degrees, rather than inferring it from compute times: a hole appears exactly when the camera
@@ -711,16 +705,10 @@ public:
 	Vec4f diag_applied_kick_forward_ws;    // Camera forward at the kick of the list CURRENTLY on screen, so the next drain can report the total angle that list went stale by before being replaced (the worst-case deficit, roughly double the kick->drain figure).
 	bool diag_have_applied_filter;         // False until the first result has been applied, so the first drain doesn't report a bogus staleness against a zero vector.
 
-	// SESSION059: true if the traversal just kicked for this cloud used a rotation_dilation_rate above the baseline
-	// floor (i.e. cam_angular_speed_ema/peak was elevated at kick time) - see kickOffTraversals()'s "settle" re-kick.
-	// A rotation past the 5deg re-kick threshold naturally corrects an over-wide selection on the next real kick, but a
-	// single violent mouse flick can leave cam_angular_speed_peak elevated for ~1-3s (its decay is slow by design - see
-	// think()) with NO further rotation happening at all: nothing re-triggers, so the over-dilated selection from the
-	// flick's own kick stays applied indefinitely - session059 found this stuck at ~2x the GPU cost of a settled scene,
-	// on a real-world (km-scale) capture where rotation_dilation_rate's distance-proportional term amplifies the effect.
-	// This flag lets kickOffTraversals() notice, once w_effective has decayed back to baseline, that this cloud is
-	// still carrying a stale wide margin and deserves one more kick to tighten it back up.
-	bool last_traversal_dilation_elevated;
+	// SESSION090: last_traversal_dilation_elevated stood here - the traversal-side analogue of filter_dilation_elevated
+	// above, driving a "settle" re-kick once a mouse flick's slow-decaying peak had left the WALK carrying a stale wide
+	// frustum margin. The walk has no frustum margin any more, so nothing can be stale in that way; the filter's own
+	// version of the flag, and of the settle re-kick, is untouched.
 
 	// Per-splat importance, accumulated across getFrustumStructureReport() runs so that "does this splat matter from
 	// anywhere?" can be asked of several viewpoints instead of one.  The pruning ceiling in that report is a single-camera
@@ -808,15 +796,22 @@ public:
 // carries. SESSION080: hoisted to file scope out of GaussianSplatLodTraversalTask so the buffers of these can be pooled
 // on the scratch below, which is declared before that task - see the scratch's `decorated`/`sort_scratch`.
 //
-// SESSION063 K4: bit 31 of idx flags a coarse-floor node. Cloud indices are well under 2^31, and the radix sort keys
-// only on dist_sq, so the flag rides along for free and is unpacked after the sort.
+// The radix sort keys only on dist_sq, so a flag packed into the high bits of idx rides through it for free. Cloud
+// indices are well under 2^30, which leaves the top two bits available.
+// SESSION090: bit 31 (session063 K4's coarse-floor flag) has been unused since session088 removed that feature; bit 30
+// is the far-segment mark below, and is the only one still in use.
 struct GsDistIdx { float dist_sq; uint32 idx; };
+
+// SESSION080 §4.3: which segment of a split frontier a selected node belongs to - set on the way into `decorated` by
+// expandStack(), read back by the frontier SoA build once the sort has carried it along. Named here rather than spelled
+// out at each of its three uses, which drifted apart while it was a literal.
+const uint32 gs_far_segment_mark = 0x40000000u;
 
 
 // Reusable working buffers for the background LoD traversals - pooled the same way GaussianSplatSortScratch is, and for
-// the same reason (selected_indices can run to a non-trivial size for a large tree, so N clouds shouldn't mean N sets of
-// these). SESSION058: geom below is no longer one of these per-scratch allocations - it's a Reference<> into a shared,
-// per-cloud cache (see GaussianSplatCachedGeom), so it costs nothing extra to pool.
+// the same reason (`decorated`/`sort_scratch` below can run to a non-trivial size for a large tree, so N clouds
+// shouldn't mean N sets of these). SESSION058: geom below is no longer one of these per-scratch allocations - it's a
+// Reference<> into a shared, per-cloud cache (see GaussianSplatCachedGeom), so it costs nothing extra to pool.
 class GaussianSplatLodTraversalScratch : public ThreadSafeRefCounted
 {
 public:
@@ -832,7 +827,6 @@ public:
 	Reference<GaussianSplatCachedGeom> geom; // SESSION058: shared, cloud-topology-generation-scoped snapshot of positions/feature_size - see GaussianSplatCachedGeom. Replaces the old per-kick positions_snapshot/feature_size_snapshot copies.
 	std::vector<MemberSnapshot> members_snapshot;
 
-	js::Vector<uint32, 16> selected_indices; // Output: this frame's frontier, as cloud-array indices.  Unsorted (heap-pop order) until stage 5 wires the depth-sort up to the selection - see kickOffSorts()'s use of cloudHasLodTree().
 	bool hit_budget_cap; // True if max_splats_budget stopped further expansion before pixel_scale converged - i.e. detail is being truncated by the budget, not just naturally coarse at this distance. Consumed by the diagnostics display from stage 6 onward.
 	bool hit_density_cap; // True if getMaxLayerDensity() stopped at least one node's expansion this traversal - see GaussianSplatLodNode::layer_density.
 	bool hit_depth_cap; // True if getMaxTreeDepth() stopped at least one node's expansion this traversal.
@@ -861,11 +855,7 @@ public:
 	// Scratches are pooled globally rather than per cloud, so a differently-sized cloud may inherit these; that is
 	// harmless, since both are grown on demand and never read past the size the current traversal sets.
 	js::Vector<GsDistIdx, 16> decorated;
-	js::Vector<GsDistIdx, 16> sort_scratch;
-
-	// SESSION080 §4.3: scratch for the near/far partition of a sorted selection, used only by the traversal that BUILDS
-	// a far block (roughly one in ten - see reuse_max_drift_fraction). Pooled for the same reason as the two above.
-	js::Vector<uint32, 16> partition_near, partition_far;
+	js::Vector<GsDistIdx, 16> sort_scratch; // Also the traversal's OUTPUT: the sorted stream lives here - see the sort call's put_result_in_working_space note.
 };
 
 
@@ -1169,8 +1159,9 @@ public:
 	uint64 topology_generation;
 	Reference<GaussianSplatLodTraversalScratch> scratch; // Holds the result buffer, and keeps it alive even if the renderer was torn down while the traversal ran.
 
-	// SESSION063: non-null when the task was asked to build the unculled frontier U(P) (split_filter_enabled). Carries the
-	// SoA copy the worker gathered, so drainTraversalResults() can adopt it as the cloud's cache with no main-thread copy.
+	// SESSION063: non-null when the task was asked to build the unculled frontier U(P) - every per-frame traversal is, and
+	// only getFrustumStructureReport()'s synchronous one is not. Carries the SoA copy the worker gathered, so
+	// drainTraversalResults() can adopt it as the cloud's cache with no main-thread copy.
 	//
 	// SESSION081: this is now the ONLY message a traversal sends - saturation build and apply both moved out to their
 	// own fully independent, differently-throttled pipelines (see GaussianSplatSaturationBuildTask and
@@ -1215,8 +1206,7 @@ enum FrontierStopReason
 	FrontierStop_BudgetCap,  // max_splats_budget stopped expansion, and this node was drained from the heap as-is.
 	FrontierStop_NoTree,     // The member has no LoD tree at all, so every one of its splats is always selected.
 	FrontierStop_SatBias,        // SESSION085 ETAP 3: the saturation barrier's LoD bias stopped expansion here - the node is behind saturated geometry, so its own merged stand-in is drawn instead of its subtree. Only produced when the bias ceiling is above 1.
-	FrontierStop_OutOfFrustum, // SESSION055: the node's centre is outside the frustum (dilated by 1.5*feature_size to keep large nodes whose centre is just past a plane), so it and its subtree were skipped. Only produced when frustum-cull is on (see GaussianSplatRenderer::setFrustumCullEnabled). getFrustumStructureReport() disables cull, so this bucket stays 0 there - it exists so the runtime path can bucket cheaply and so the count matches what the fast path actually did.
-	FrontierStop_OutOfDistRange, // SESSION072: the node's whole bounding sphere is outside the distance-slice shell (or, inverted, entirely inside it) - see GaussianSplatRenderer::getDistClampEnabled(). Only produced when the dist-clamp checkbox is on; getFrustumStructureReport() always leaves it off, same reasoning as FrontierStop_OutOfFrustum above.
+	FrontierStop_OutOfDistRange, // SESSION072: the node's whole bounding sphere is outside the distance-slice shell (or, inverted, entirely inside it) - see GaussianSplatRenderer::getDistClampEnabled(). Only produced when the dist-clamp checkbox is on; getFrustumStructureReport() always leaves it off. (SESSION090 removed the sibling FrontierStop_OutOfFrustum bucket along with the walk's own frustum test.)
 	FrontierStop_NumReasons
 };
 
@@ -1224,9 +1214,9 @@ enum FrontierStopReason
 // One selected node, as recorded for the structure report.  Carries where the node came from rather than just its cloud
 // index, so the report can read the node's own tree fields (child_count, layer_density) without a reverse lookup.
 //
-// Recorded into a vector of its own rather than parallel to GaussianSplatLodTraversalScratch::selected_indices, because
-// run() re-sorts that one front-to-back at the end and a parallel array would have to be permuted with it.  These records
-// are self-describing, so their order doesn't matter.
+// Recorded into a vector of its own rather than parallel to the selection itself, because run() re-sorts that one
+// front-to-back at the end and a parallel array would have to be permuted with it.  These records are self-describing,
+// so their order doesn't matter.
 struct FrontierNodeRecord
 {
 	uint32 cloud_idx;      // Index into the cloud's world-space arrays: member offset + tree_local_idx.
@@ -1282,50 +1272,74 @@ struct FrontierNodeRecord
 // walks, which is the other half of why a per-node frustum test added now would be work thrown away.
 
 
-// SESSION080: one slice of the frontier SoA build - see the call site in GaussianSplatLodTraversalTask::run(). Carries no
-// chunk struct of its own because, unlike the occluder gather below, it reports nothing back: every slot it writes is
-// determined by its own index, so there is no count to return and no compaction afterwards.
+// SESSION090: how many of one slice's nodes carry the far-segment mark. Only ever run by the traversal that BUILDS a far
+// block; see buildFrontierSoA(), which needs the counts PER SLICE (not just the total) to hand each slice a disjoint
+// write range in the gather below.
+class GsFrontierFarCountTask : public glare::Task
+{
+public:
+	virtual void run(size_t /*thread_index*/)
+	{
+		size_t n = 0;
+		for(size_t i=i_begin; i<i_end; ++i)
+			n += (sorted[i].idx & gs_far_segment_mark) ? 1 : 0;
+		far_count = n;
+	}
+
+	size_t i_begin, i_end;
+	const GsDistIdx* sorted;
+	size_t far_count; // Out.
+};
+
+
+// SESSION080: one slice of the frontier SoA build - see buildFrontierSoA(), and the call site in
+// GaussianSplatLodTraversalTask::run().
+//
+// SESSION090: reads the sorted DistIdx stream directly, and splits the two segments on the way through. It used to read
+// a flat uint32 array that three earlier passes existed to produce - a parallel unpack of `sorted`, a serial count of the
+// mark, and a serial near/far compaction - all of which are now this one pass. That mattered for more than the passes'
+// own time: session087 measured the unpack costing soa_ms +16%/+6% when it was parallelised, because it left the array
+// it wrote dirty across every core and this gather read exactly that array next. Removing the array removes the cause.
+//
+// Still a pure function of the input per element, so the result is bit-identical to the serial version and the slices
+// need nothing from each other: the two write cursors start at ranges the caller's prefix sum made disjoint, and each
+// segment stays in sorted order because the slices are consecutive and each keeps its own elements' relative order.
 class GsFrontierSoATask : public glare::Task
 {
 public:
 	virtual void run(size_t /*thread_index*/)
 	{
+		// Indexed by the mark, so the per-element branch is an array lookup rather than a jump. seg 0 = near (the
+		// published frontier's own arrays), seg 1 = far (the block's). With no block being built out_*[1] is never
+		// reached, since nothing sets the mark then - see expandStack()'s far_bit.
+		uint32* const oi[2]   = { out_indices,  out_far_indices };
+		float* const opx[2]   = { out_px,       out_far_px };
+		float* const opy[2]   = { out_py,       out_far_py };
+		float* const opz[2]   = { out_pz,       out_far_pz };
+		float* const orad[2]  = { out_radius,   out_far_radius };
+		size_t w[2] = { near_begin, far_begin };
+
 		for(size_t i=i_begin; i<i_end; ++i)
 		{
-			const uint32 idx = output[i];
+			const uint32 raw = sorted[i].idx;
+			const int seg = (raw & gs_far_segment_mark) ? 1 : 0;
+			const uint32 idx = raw & ~gs_far_segment_mark;
 			const Vec3f& p = positions[idx];
-			out_indices[i] = idx;
-			out_px[i] = p.x; out_py[i] = p.y; out_pz[i] = p.z;
-			out_radius[i] = cull_radii[idx];
+			const size_t o = w[seg]++;
+			oi[seg][o] = idx;
+			opx[seg][o] = p.x; opy[seg][o] = p.y; opz[seg][o] = p.z;
+			orad[seg][o] = cull_radii[idx];
 		}
 	}
 
 	size_t i_begin, i_end;
-	const uint32* output;
+	size_t near_begin, far_begin; // Where this slice's own output starts in each segment - from the caller's prefix sum.
+	const GsDistIdx* sorted;
 	const Vec3f* positions; const float* cull_radii;
 	uint32* out_indices;
 	float* out_px; float* out_py; float* out_pz; float* out_radius;
-};
-
-
-// SESSION087: one slice of the post-sort unpack - see the call site in GaussianSplatLodTraversalTask::run(). Splits the
-// sorted DistIdx stream into the two arrays the rest of the pipeline consumes. Measured serial at 12-16 ms (a quarter of
-// sort_ms) purely because it was the one pass in the sort block nobody had split; it is the same pure map as
-// GsFrontierSoATask - slot i is written from element i alone - so it parallelises without any reasoning about order.
-class GsSortUnpackTask : public glare::Task
-{
-public:
-	virtual void run(size_t /*thread_index*/)
-	{
-		for(size_t i=i_begin; i<i_end; ++i)
-		{
-			out_indices[i] = sorted[i].idx; // SESSION088: bit 31 used to carry the coarse-floor flag and was masked off here; nothing sets it now.
-		}
-	}
-
-	size_t i_begin, i_end;
-	const GsDistIdx* sorted;
-	uint32* out_indices;
+	uint32* out_far_indices; // NULL when no far block is being built.
+	float* out_far_px; float* out_far_py; float* out_far_pz; float* out_far_radius;
 };
 
 
@@ -1897,8 +1911,6 @@ public:
 	// where the enqueued result is the whole point and nothing wants the per-node breakdown.
 	GaussianSplatLodTraversalTask(uint64 cloud_id_, uint64 topology_generation_, const Reference<GaussianSplatLodTraversalScratch>& scratch_,
 		const Vec4f& cam_pos_ws_, float pixel_scale_limit_, size_t max_splats_budget_, float max_layer_density_, int max_tree_depth_, float focal_px_,
-		const Planef* frustum_clip_planes_, int num_frustum_clip_planes_, bool frustum_cull_enabled_, // SESSION055: planes are copied into num_frustum_clip_planes below rather than pointed at, because OpenGLScene's own array is mutated by the draw path each frame and a worker running across a frame boundary would otherwise read torn values.
-		const float* translation_dilation_, float rotation_dilation_rate_, // SESSION055: per-plane translation dilation (metres) + rotation dilation rate (rad, multiplied by dist-to-node inside cull) - see kickOffTraversals()'s anisotropic dilation block.
 		ThreadSafeQueue<Reference<ThreadMessage> >* result_queue_,
 		js::Vector<FrontierNodeRecord, 16>* frontier_record_ = NULL,
 		bool build_unculled_frontier_ = false, // SESSION063: also emit the SoA U(P) into the result msg, for the split filter path.
@@ -1916,8 +1928,6 @@ public:
 		float sat_bias_exponent_ = 1.f) // SESSION088: 1 = session085's fixed 1/ratio^2 curve - see GaussianSplatRenderer::getSatBiasExponent().
 	:	cloud_id(cloud_id_), topology_generation(topology_generation_), scratch(scratch_), cam_pos_ws(cam_pos_ws_),
 		pixel_scale_limit(pixel_scale_limit_), max_splats_budget(max_splats_budget_), max_layer_density(max_layer_density_), max_tree_depth(max_tree_depth_), focal_px(focal_px_),
-		num_frustum_clip_planes(num_frustum_clip_planes_), frustum_cull_enabled(frustum_cull_enabled_),
-		rotation_dilation_rate(rotation_dilation_rate_),
 		result_queue(result_queue_),
 		frontier_record(frontier_record_),
 		build_unculled_frontier(build_unculled_frontier_),
@@ -1939,15 +1949,6 @@ public:
 		diag_live_barrier_time(0.0), diag_block_barrier_time(0.0),
 		reuse_enabled(false), far_cut_is_frozen(false), reuse_prev_anchor_ws(0.f), reuse_split_dist(0.f) // SESSION080 §4.3 - derived below.
 	{
-		if(num_frustum_clip_planes < 0)
-			num_frustum_clip_planes = 0;
-		if(num_frustum_clip_planes > (int)staticArrayNumElems(frustum_clip_planes))
-			num_frustum_clip_planes = (int)staticArrayNumElems(frustum_clip_planes); // Bounds guard against a scene ever growing past 6 planes; the cull just misses planes past the 6th, cannot false-cull.
-		for(int i=0; i<num_frustum_clip_planes; ++i)
-			frustum_clip_planes[i] = frustum_clip_planes_[i];
-		for(int i=0; i<(int)staticArrayNumElems(translation_dilation); ++i)
-			translation_dilation[i] = translation_dilation_ ? translation_dilation_[i] : 0.f;
-
 		// SESSION080 §4.3: decide once, here, which of the three modes this traversal runs in - see reuse_enabled and
 		// far_cut_is_frozen. Doing it in the constructor rather than in the walk keeps the per-node test down to two
 		// bools and keeps every precondition in one readable place.
@@ -1958,10 +1959,10 @@ public:
 		//                                        off into a fresh far block. The generation's first traversal.
 		//   frozen cut (frozen = true)         - walk only the near part and reference the existing block.
 		if(reuse_split_dist_ > 0.f && build_unculled_frontier &&
-			// The cut's geometry is defined on the unculled tree. With any of these on, the walk prunes for reasons the
-			// frozen predicate knows nothing about, so a later traversal's near part and the block would no longer be
-			// complementary.
-			!frustum_cull_enabled && !dist_clamp_enabled)
+			// The cut's geometry is defined on the unculled tree. With this on, the walk prunes for a reason the frozen
+			// predicate knows nothing about, so a later traversal's near part and the block would no longer be
+			// complementary. (Frustum cull was the other such condition until session090 removed it from the walk.)
+			!dist_clamp_enabled)
 		{
 			reuse_enabled = true;
 			reuse_split_dist = reuse_split_dist_;
@@ -2057,52 +2058,128 @@ public:
 		}
 	}
 
-	// SESSION080 §4.3: fill one frontier's SoA from a compacted index list. Both segments of a split frontier are built
-	// with this - the near one into the published frontier, the far one into the block it references - so there is a
-	// single copy of the gather rather than two that can drift apart.
+	// SESSION080 §4.3: turn the sorted selection into the SoA form the filter streams. A frontier that is splitting off a
+	// far block gets both of its segments filled here - the near one into the published frontier, the far one into the
+	// block it references - so there is a single copy of the gather rather than two that can drift apart.
 	//
-	// A pure map: element i reads positions[src[i]]/cull_radii[src[i]] and writes only slot i, so the chunks need nothing
-	// from each other and the result is bit-identical to the serial loop. Chunked like the occluder gather, and for the
-	// same reason: the cost is DRAM miss latency on the scattered reads into the 30M-entry geometry arrays, not
-	// arithmetic, so what threads buy is outstanding misses.
-	void buildFrontierSoA(GaussianSplatUnculledFrontier& out, const uint32* src, size_t count,
-		const js::Vector<Vec3f, 16>& positions, const js::Vector<float, 16>& cull_radii)
+	// SESSION090: this reads the sorted DistIdx stream itself and does the near/far split as part of the same pass. It
+	// used to take a flat, already-compacted uint32 array, which cost three further passes over the whole selection to
+	// produce (unpack, count, compact) - see GsFrontierSoATask's comment for why folding them in is worth more than those
+	// passes' own time.
+	//
+	// Chunked like the occluder gather, and for the same reason: the cost is DRAM miss latency on the scattered reads into
+	// the 30M-entry geometry arrays, not arithmetic, so what threads buy is outstanding misses. The split needs each slice
+	// to know where its own output starts, which is the one thing a pure map does not give for free - hence the count pass
+	// and prefix sum below, run ONLY when a block is actually being built.
+	//
+	// far_out is left null when nothing is marked, which is every traversal except the one that builds a block: with reuse
+	// off nothing sets the mark, and with the cut frozen the walk stops at the cut instead of descending past it.
+	//
+	// out_split_ms is the count pass's own duration, i.e. the only separately measurable part of what splitting costs -
+	// see GaussianSplatUnculledFrontier::reuse_ms, which is what reads it.
+	void buildFrontierSoA(GaussianSplatUnculledFrontier& near_out, Reference<GaussianSplatUnculledFrontier>& far_out,
+		bool split_wanted, const GsDistIdx* sorted, size_t n,
+		const js::Vector<Vec3f, 16>& positions, const js::Vector<float, 16>& cull_radii, double& out_split_ms)
 	{
-		out.indices.resizeNoCopy(count);
-		out.px.resizeNoCopy(count); out.py.resizeNoCopy(count); out.pz.resizeNoCopy(count);
-		out.radius.resizeNoCopy(count);
-		if(count == 0)
+		out_split_ms = 0.0;
+		const size_t concurrency = (task_manager != NULL) ? myMax<size_t>(1, (size_t)task_manager->getConcurrency()) : 1;
+		const size_t num_chunks = myMax<size_t>(1, myMin(concurrency * 4, n / 16384));
+		const bool parallel = (task_manager != NULL) && (num_chunks > 1);
+
+		// Exclusive prefix sum of the marked count over the slices: where slice c's far output starts. All-zero when no
+		// split is wanted, which is the common path, and which then makes every slice's near output start at its own
+		// i_begin. One entry per slice, so this is a handful of bytes either way.
+		js::Vector<size_t, 16> chunk_far_begin(num_chunks, (size_t)0);
+		size_t far_n = 0;
+		if(split_wanted && n > 0)
+		{
+			// Count the mark per slice. Skipped entirely when no block is being built: scanning the whole selection for a
+			// bit that is never set was measured at 15.9 ms over 13.2M nodes, which is pure waste on the common path.
+			Timer split_timer;
+			if(parallel)
+			{
+				glare::TaskGroupRef count_group = new glare::TaskGroup();
+				count_group->tasks.resize(num_chunks);
+				for(size_t c=0; c<num_chunks; ++c)
+				{
+					Reference<GsFrontierFarCountTask> t = new GsFrontierFarCountTask();
+					t->i_begin = (n * c)       / num_chunks;
+					t->i_end   = (n * (c + 1)) / num_chunks;
+					t->sorted = sorted;
+					t->far_count = 0;
+					count_group->tasks[c] = t;
+				}
+				task_manager->runTaskGroup(count_group);
+				for(size_t c=0; c<num_chunks; ++c) // In slice order, which is what keeps each segment sorted.
+				{
+					chunk_far_begin[c] = far_n;
+					far_n += static_cast<const GsFrontierFarCountTask*>(count_group->tasks[c].ptr())->far_count;
+				}
+			}
+			else
+				for(size_t i=0; i<n; ++i)
+					far_n += (sorted[i].idx & gs_far_segment_mark) ? 1 : 0;
+			out_split_ms = split_timer.elapsed() * 1.0e3;
+		}
+		const size_t near_n = n - far_n;
+
+		near_out.indices.resizeNoCopy(near_n);
+		near_out.px.resizeNoCopy(near_n); near_out.py.resizeNoCopy(near_n); near_out.pz.resizeNoCopy(near_n);
+		near_out.radius.resizeNoCopy(near_n);
+		if(far_n > 0)
+		{
+			far_out = new GaussianSplatUnculledFrontier();
+			far_out->indices.resizeNoCopy(far_n);
+			far_out->px.resizeNoCopy(far_n); far_out->py.resizeNoCopy(far_n); far_out->pz.resizeNoCopy(far_n);
+			far_out->radius.resizeNoCopy(far_n);
+		}
+		if(n == 0)
 			return;
 
-		const size_t concurrency = (task_manager != NULL) ? myMax<size_t>(1, (size_t)task_manager->getConcurrency()) : 1;
-		const size_t num_chunks = myMax<size_t>(1, myMin(concurrency * 4, count / 16384));
-		if(task_manager != NULL && num_chunks > 1)
+		if(parallel)
 		{
 			glare::TaskGroupRef group = new glare::TaskGroup();
 			group->tasks.resize(num_chunks);
 			for(size_t c=0; c<num_chunks; ++c)
 			{
+				const size_t i_begin = (n * c)       / num_chunks;
+				const size_t i_end   = (n * (c + 1)) / num_chunks;
 				Reference<GsFrontierSoATask> t = new GsFrontierSoATask();
-				t->i_begin = (count * c)       / num_chunks;
-				t->i_end   = (count * (c + 1)) / num_chunks;
-				t->output = src;
+				t->i_begin = i_begin; t->i_end = i_end;
+				// Every element ahead of this slice went to exactly one of the two segments, so the count of NEAR ones
+				// among them is just i_begin minus the count of far ones - which is what the prefix sum holds. No second
+				// scan needed, and with no split wanted (all-zero prefix) this collapses to near_begin == i_begin.
+				t->near_begin = i_begin - chunk_far_begin[c];
+				t->far_begin = chunk_far_begin[c];
+				t->sorted = sorted;
 				t->positions = positions.data(); t->cull_radii = cull_radii.data();
-				t->out_indices = out.indices.data();
-				t->out_px = out.px.data(); t->out_py = out.py.data(); t->out_pz = out.pz.data();
-				t->out_radius = out.radius.data();
+				t->out_indices = near_out.indices.data();
+				t->out_px = near_out.px.data(); t->out_py = near_out.py.data(); t->out_pz = near_out.pz.data();
+				t->out_radius = near_out.radius.data();
+				t->out_far_indices = far_out.nonNull() ? far_out->indices.data() : NULL;
+				t->out_far_px     = far_out.nonNull() ? far_out->px.data() : NULL;
+				t->out_far_py     = far_out.nonNull() ? far_out->py.data() : NULL;
+				t->out_far_pz     = far_out.nonNull() ? far_out->pz.data() : NULL;
+				t->out_far_radius = far_out.nonNull() ? far_out->radius.data() : NULL;
 				group->tasks[c] = t;
 			}
 			task_manager->runTaskGroup(group);
 		}
 		else
-			for(size_t i=0; i<count; ++i)
+		{
+			size_t wn = 0, wf = 0;
+			for(size_t i=0; i<n; ++i)
 			{
-				const uint32 idx = src[i];
+				const uint32 raw = sorted[i].idx;
+				const uint32 idx = raw & ~gs_far_segment_mark;
 				const Vec3f& p = positions[idx];
-				out.indices[i] = idx;
-				out.px[i] = p.x; out.py[i] = p.y; out.pz[i] = p.z;
-				out.radius[i] = cull_radii[idx];
+				GaussianSplatUnculledFrontier& out = (raw & gs_far_segment_mark) ? *far_out : near_out;
+				const size_t o = (raw & gs_far_segment_mark) ? wf++ : wn++;
+				out.indices[o] = idx;
+				out.px[o] = p.x; out.py[o] = p.y; out.pz[o] = p.z;
+				out.radius[o] = cull_radii[idx];
 			}
+		}
 	}
 
 
@@ -2116,9 +2193,7 @@ public:
 		const Reference<GaussianSplatCachedGeom> geom_ref = scratch->geom;
 		const js::Vector<Vec3f, 16>& positions = geom_ref->positions; // SESSION058: shared cached snapshot, never the live cloud arrays - see GaussianSplatCachedGeom.
 		const js::Vector<float, 16>& feature_sizes = geom_ref->feature_size; // SESSION054: replaces per-push Vec3f scales[] lookup + 3-way max in makeHeapItem.
-		const js::Vector<float, 16>& cull_radii = geom_ref->cull_radius; // SESSION059: enclosing-sphere bound for the frustum-cull margin below - NOT the same quantity as feature_size, see GaussianSplatLodNode::bounding_radius_os's comment.
-
-		js::Vector<uint32, 16>& output = scratch->selected_indices;
+		const js::Vector<float, 16>& cull_radii = geom_ref->cull_radius; // SESSION059: enclosing-sphere bound of a node's whole subtree - NOT the same quantity as feature_size, see GaussianSplatLodNode::bounding_radius_os's comment. Read by the far-block cut below and gathered into the frontier's SoA for the filter's own margin.
 
 		// SESSION054: replaced std::priority_queue with a plain LIFO stack (DFS). Profiling in session053/054 showed the
 		// tree is expanded to convergence, not truncated by budget, in every case observed - so the heap's best-first
@@ -2217,58 +2292,26 @@ public:
 		sort_scratch.resizeNoCopy(decorated.size());
 		const double sort_alloc_ms = sort_alloc_timer.elapsed() * 1.0e3;
 		const size_t parallel_sort_min_elements = 16384;
-		// SESSION087: hoisted out of the if below only so the two costs inside sort_ms - the sort proper and the unpack
-		// that follows it - can be timed apart. Reading the total as one number is what hid the unpack for six sessions.
-		const bool sort_parallel = (task_manager != NULL) && (decorated.size() >= parallel_sort_min_elements);
-		Timer sort_radix_timer; // SESSION087 DIAGNOSTIC - see GaussianSplatUnculledFrontier::sort_radix_ms.
 		// SESSION087: put_result_in_working_space=true. Both radix variants run an odd number of 11-bit passes (3, no
 		// branching - checked in Sort.h, not assumed) and so end with the sorted data in the working space; false made them
 		// pay a final full-array copy back into `decorated` (memcpy in the parallel variant, an element loop in the serial
-		// one) purely so the result would sit in the buffer the two readers below happened to name. Those readers now name
+		// one) purely so the result would sit in the buffer the readers below happened to name. Those readers now name
 		// sort_scratch instead, which is the same data without the copy - 34 MB read + 34 MB written per traversal at 4M
 		// nodes, and it bought nothing.
 		// floatKeyAscendingSort honours the flag on its small-N std::sort path too, so the fallback stays correct.
-		if(sort_parallel)
+		if((task_manager != NULL) && (decorated.size() >= parallel_sort_min_elements))
 			Sort::radixSortWithParallelPartition<DistIdx, DistIdxKey>(*task_manager, decorated.data(), (uint32)decorated.size(), DistIdxKey(), sort_scratch.data(), /*put_result_in_working_space=*/true);
 		else
 			Sort::floatKeyAscendingSort(decorated.data(), decorated.size(), DistIdxLess(), DistIdxKey(), sort_scratch.data(), /*put_result_in_working_space=*/true);
-		const double sort_radix_ms = sort_radix_timer.elapsed() * 1.0e3; // SESSION087 DIAGNOSTIC
-		// The sorted stream. NOTE for anyone extending this block: `decorated` is NOT it any more - it holds an
-		// intermediate radix pass's output and is dead from here on. Both readers below (the unpack and dist_pctile) take
-		// `sorted`, and anything added after them must too.
+		// The sorted stream, and the traversal's actual output. NOTE for anyone extending this block: `decorated` is NOT it
+		// any more - it holds an intermediate radix pass's output and is dead from here on.
+		//
+		// SESSION090: this IS the selection now. There used to be an "unpack" pass here that copied every idx out into a
+		// flat uint32 array, because the three readers downstream all wanted one; they read the stream directly instead -
+		// see buildFrontierSoA() for the two on the drawing path, and getFrustumStructureReport() for the third.
 		const DistIdx* const sorted = sort_scratch.data();
 		const size_t sorted_n = decorated.size();
-
-		output.resizeNoCopy(sorted_n);
-
-		// SESSION087: was a serial loop, measured at 12-16 ms - a quarter of sort_ms and the last unsplit pass in this
-		// block. Chunked exactly like buildFrontierSoA() (same pure-map argument: slot i depends on element i alone, so the
-		// result is bit-identical to the serial version), with the same chunk sizing.
-		Timer sort_unpack_timer; // SESSION087 DIAGNOSTIC
-		const size_t unpack_concurrency = (task_manager != NULL) ? myMax<size_t>(1, (size_t)task_manager->getConcurrency()) : 1;
-		const size_t unpack_chunks = myMax<size_t>(1, myMin(unpack_concurrency * 4, sorted_n / 16384));
-		if(task_manager != NULL && unpack_chunks > 1)
-		{
-			glare::TaskGroupRef unpack_group = new glare::TaskGroup();
-			unpack_group->tasks.resize(unpack_chunks);
-			for(size_t c=0; c<unpack_chunks; ++c)
-			{
-				Reference<GsSortUnpackTask> t = new GsSortUnpackTask();
-				t->i_begin = (sorted_n * c)       / unpack_chunks;
-				t->i_end   = (sorted_n * (c + 1)) / unpack_chunks;
-				t->sorted = sorted;
-				t->out_indices = output.data();
-				unpack_group->tasks[c] = t;
-			}
-			task_manager->runTaskGroup(unpack_group);
-		}
-		else
-			for(size_t i=0; i<sorted_n; ++i)
-			{
-				output[i] = sorted[i].idx; // SESSION088: bit 31 used to carry the coarse-floor flag and was masked off here; nothing sets it now.
-			}
-		const double sort_unpack_ms = sort_unpack_timer.elapsed() * 1.0e3; // SESSION087 DIAGNOSTIC
-		const double sort_ms = sort_timer.elapsed() * 1.0e3; // SESSION080 DIAGNOSTIC - includes the unpack loop above, not just the sort call.
+		const double sort_ms = sort_timer.elapsed() * 1.0e3; // SESSION080 DIAGNOSTIC
 
 		// SESSION080 DIAGNOSTIC: where this frontier's nodes actually sit, in metres - see GaussianSplatUnculledFrontier::
 		// dist_pctile. The sorted stream is ascending by dist_sq, so this is five lookups; deliberately not gated on a
@@ -2309,54 +2352,26 @@ public:
 			{
 				Timer soa_timer; // SESSION080 DIAGNOSTIC - see GaussianSplatUnculledFrontier::soa_ms.
 				uf = new GaussianSplatUnculledFrontier();
-				const size_t n = output.size();
+				const size_t n = sorted_n;
 
 				// SESSION080 §4.3: split the sorted selection into the near part this traversal keeps and the far part that
 				// becomes (or already is) a far block - see GaussianSplatUnculledFrontier::far_block.
 				//
 				// The mark rode through the sort in bit 30 of each index (set in expandStack()), so this is a stable partition
 				// of an already-sorted array: both halves come out sorted, which is what lets the two segments be streamed one
-				// after the other without a merge. far_n is 0 in every mode except the one that builds a block.
+				// after the other without a merge. Only the traversal that BUILDS a block ever sets the mark, so `block` comes
+				// back null in every other mode - see buildFrontierSoA(), which does the split as part of its own gather.
+				// SESSION090: reuse_ms_accum is the mark count only. It used to be count + partition + a separate far SoA
+				// build; those are all one pass with the near gather now, so what BUILDING a block costs beyond inheriting
+				// one is no longer separable in full - see buildFrontierSoA()'s out_split_ms. Still 0 exactly when a block
+				// was inherited rather than built, which is the reading the log line is there for.
 				double reuse_ms_accum = 0.0;
-				Timer partition_timer;
-				size_t far_n = 0;
-				// Only the traversal that BUILDS a block ever sets the mark: with reuse off nothing sets it, and with the
-				// cut frozen the walk stops at the cut instead of descending past it. Skipping the count in those two
-				// cases is not an optimisation of the common path so much as the removal of a pure waste - measured at
-				// 15.9ms scanning 13.2M indices for a bit that is never set.
-				if(reuse_enabled && !far_cut_is_frozen)
-				{
-					for(size_t i=0; i<n; ++i)
-						if(output[i] & 0x40000000u)
-							++far_n;
-				}
-				const size_t near_n = n - far_n;
+				Reference<GaussianSplatUnculledFrontier> block;
+				buildFrontierSoA(*uf, block, /*split_wanted=*/reuse_enabled && !far_cut_is_frozen, sorted, n, positions, cull_radii, reuse_ms_accum);
 
-				if(far_n > 0) // Building a block: compact the two halves into [near][far], stripping the mark.
-				{
-					scratch->partition_near.resizeNoCopy(near_n);
-					scratch->partition_far.resizeNoCopy(far_n);
-					size_t wn = 0, wf = 0;
-					for(size_t i=0; i<n; ++i)
-					{
-						if(output[i] & 0x40000000u) { scratch->partition_far[wf] = output[i] & ~0x40000000u; ++wf; }
-						else                        { scratch->partition_near[wn] = output[i];                ++wn; }
-					}
-					assert(wn == near_n && wf == far_n);
-				}
-				reuse_ms_accum += partition_timer.elapsed() * 1.0e3;
-
-				// The near segment - this frontier's own arrays. When no block is being built this is the whole selection and
-				// `output` is used directly, so the common path allocates and copies nothing extra.
-				const uint32* const near_src = (far_n > 0) ? scratch->partition_near.data() : output.data();
-				buildFrontierSoA(*uf, near_src, near_n, positions, cull_radii);
-
-				if(far_n > 0)
+				if(block.nonNull())
 				{
 					// The far segment, materialised ONCE here and then referenced by every traversal of this generation.
-					Timer far_soa_timer;
-					Reference<GaussianSplatUnculledFrontier> block = new GaussianSplatUnculledFrontier();
-					buildFrontierSoA(*block, scratch->partition_far.data(), far_n, positions, cull_radii);
 					// The frozen pair the cut was made at, which every later traversal re-evaluates its predicate against, and
 					// which the drift trigger measures from. reuse_prev_anchor_ws is cam_pos_ws in this mode - see the ctor.
 					block->anchor_pos_ws = reuse_prev_anchor_ws;
@@ -2374,7 +2389,6 @@ public:
 						block->sat_built_time_used = sat_barrier->built_time_real_s;
 					}
 					uf->far_block = block;
-					reuse_ms_accum += far_soa_timer.elapsed() * 1.0e3;
 				}
 				else
 					uf->far_block = inherited_far_block; // Null when reuse is off; the existing block when its cut is frozen.
@@ -2390,7 +2404,6 @@ public:
 				uf->focal_px = focal_px;
 				uf->expand_ms = expand_ms; // SESSION080 DIAGNOSTIC
 				uf->sort_ms = sort_ms;
-				uf->sort_radix_ms = sort_radix_ms; uf->sort_unpack_ms = sort_unpack_ms; // SESSION087
 				uf->traversal_output_n = n;
 				uf->expand_seeds = expand_seeds;
 				uf->expand_num_tasks = expand_num_tasks;
@@ -2402,11 +2415,11 @@ public:
 				uf->expand_splice_reserve_ms = expand_splice_reserve_ms; // SESSION080 DIAGNOSTIC (plan2 §4.1)
 				uf->expand_splice_copy_ms = expand_splice_copy_ms;
 				uf->sort_alloc_ms = sort_alloc_ms;
-				uf->soa_ms = soa_timer.elapsed() * 1.0e3; // SESSION080 DIAGNOSTIC - the whole segment build, partition included.
+				uf->soa_ms = soa_timer.elapsed() * 1.0e3; // SESSION080 DIAGNOSTIC - the whole segment build, split included.
 				uf->reuse_roots = diag_reuse_roots; // SESSION080 §4.3 DIAGNOSTIC: subtrees the walk stopped at, or marked as the block's.
 				uf->reuse_n = uf->far_block.nonNull() ? uf->far_block->indices.size() : 0;
 				// SESSION085: this frontier's own size, both segments - see the field. Nothing has pruned it yet, so the
-				uf->reuse_ms = reuse_ms_accum; // Partition + the far SoA build, i.e. what BUILDING a block costs. 0 when one was inherited - which is the whole point of §4.3.
+				uf->reuse_ms = reuse_ms_accum; // See the field: 0 exactly when a block was inherited - which is the whole point of §4.3.
 				uf->reuse_split_dist_used = reuse_enabled ? reuse_split_dist : 0.f;
 				uf->barrier_disagreement = diag_barrier_disagreement; // SESSION088 DIAGNOSTIC - what the acceptance clause measured for THIS kick, see the field.
 				uf->barrier_flip = diag_barrier_flip; uf->barrier_depth = diag_barrier_depth;
@@ -2670,46 +2683,16 @@ private:
 			const GaussianSplatLodNode& node = m.splat_data->lod_tree[top.tree_local_idx];
 			const uint32 cloud_idx_u32 = (uint32)(m.offset + top.tree_local_idx);
 
-			// SESSION055/059: frustum-cull check. Each plane's margin has three parts:
-			//   base_margin = cull_radius          - SESSION059: enclosing-sphere radius of this node's whole subtree
-			//                                       (see GaussianSplatLodNode::bounding_radius_os), NOT feature_size.
-			//                                       feature_size is a statistical fit of this node's own merged
-			//                                       appearance and can be smaller than the true spread of its
-			//                                       descendants - using it here was session055's original choice and
-			//                                       worked at the small scenes tested then, but under-culls (drops
-			//                                       visible subtrees) at real-world/km scale - see session059 snapshot.
-			//   translation_dilation[i]           - anisotropic pad for camera movement toward this plane over the async
-			//                                       traversal latency window; ~zero for planes the camera moves away from.
-			//   rotation_dilation_rate * dist     - rotational pad: r*theta tangential shift at distance r from camera.
-			// The whole point of the cull is to skip the subtree entirely when the parent is outside, so on cull we neither
-			// push children nor add the node to decorated. Overrides the "no frustum test here" property called out at the
-			// top of the class; the paired re-kick-on-rotation trigger in kickOffTraversals() puts back the property that
-			// turning on the spot updates the selection.
-			// SESSION072: shared by the frustum-cull block below and the distance-slice block right after it - both need
-			// distance-to-camera, and dist_sq is already sitting in top from makeHeapItem() (session054), so computing the
-			// one sqrt here instead of inside each block avoids paying it twice when both culls are active.
-			const bool need_dist_to_node = frustum_cull_enabled || dist_clamp_enabled;
-			const float dist_to_node = need_dist_to_node ? std::sqrt(top.dist_sq) : 0.f;
-
-			if(frustum_cull_enabled)
-			{
-				const Vec3f& p = positions[cloud_idx_u32];
-				const float base_margin = cull_radii[cloud_idx_u32];
-				const float rot_pad = rotation_dilation_rate * dist_to_node;
-				const Vec4f pos4(p.x, p.y, p.z, 1.f);
-				bool outside = false;
-				for(int i=0; i<num_frustum_clip_planes; ++i)
-				{
-					const float margin_i = base_margin + translation_dilation[i] + rot_pad;
-					if(dot(frustum_clip_planes[i].getNormal(), pos4) >= frustum_clip_planes[i].getD() + margin_i)
-					{ outside = true; break; }
-				}
-				if(outside)
-				{
-					recordFrontierNode(cloud_idx_u32, top.member_idx, top.tree_local_idx, top.depth, FrontierStop_OutOfFrustum);
-					continue;
-				}
-			}
+			// SESSION090: the walk applies no frustum test at all. It used to (session055/059), with each plane's margin
+			// padded anisotropically against the ~150-500ms a traversal takes to land, and a re-kick-on-rotation trigger in
+			// kickOffTraversals() to put back the property that turning on the spot updates the selection. All of that
+			// belonged to the pre-session063 pipeline, in which the walk's own output was drawn. What the walk produces now
+			// is U(P), which is orientation-independent by construction, and the per-orientation filter
+			// (filterUnculledFrontier()) applies the planes - with its own, much narrower dilation window.
+			//
+			// SESSION072: dist_sq is already sitting in top from makeHeapItem() (session054), so the one sqrt the
+			// distance-slice block below needs is computed here rather than inside it.
+			const float dist_to_node = dist_clamp_enabled ? std::sqrt(top.dist_sq) : 0.f;
 
 			// SESSION072: distance-slice early-cull - moves the "isolate a distance shell" debug tool (GaussianSplatSettingsWidget's
 			// distClamp* controls, previously a per-instance vertex-shader discard only - see countSplatsInFrustum()) up to a real
@@ -3173,11 +3156,6 @@ private:
 	float max_layer_density;
 	int max_tree_depth;
 	float focal_px;
-	Planef frustum_clip_planes[6]; // SESSION055: local copy; matches OpenGLEngine.h's cap. Empty when frustum_cull_enabled=false (getFrustumStructureReport() takes that path).
-	int num_frustum_clip_planes;
-	bool frustum_cull_enabled;
-	float translation_dilation[6]; // SESSION055: per-plane world-space margin (metres) - see kickOffTraversals()'s anisotropic dilation block.
-	float rotation_dilation_rate;  // SESSION055: rad; multiplied by dist-to-node inside cull so a rotation of theta at range r dilates the plane by r*theta.
 	ThreadSafeQueue<Reference<ThreadMessage> >* result_queue;
 	js::Vector<FrontierNodeRecord, 16>* frontier_record; // Null (the normal case) means don't record anything - see recordFrontierNode().
 	bool build_unculled_frontier; // SESSION063: gather the SoA U(P) at the end of run() and hand it back on the result msg.
@@ -3270,7 +3248,7 @@ private:
 GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 :	opengl_engine(&opengl_engine_), next_handle(1), next_cloud_id(1), num_sorts_in_flight(0),
 	num_traversals_in_flight(0), num_filters_in_flight(0), lod_pixel_scale_limit(1.0f), lod_max_splats_budget(10000000), lod_resort_move_threshold_ws(0.1f),
-	lod_max_layer_density(0.0f), lod_max_tree_depth(0), lod_frustum_cull_enabled(true), split_filter_enabled(false),
+	lod_max_layer_density(0.0f), lod_max_tree_depth(0),
 	adaptive_pixel_scale_enabled(false), adaptive_pixel_scale(2.0f), adaptive_target_fps(50.f), // SESSION079 - see updateAdaptivePixelScale(). Off by default: it overrides a value the user may have set by hand.
 	adaptive_frame_ms_ema(0.0), adaptive_frame_ms_sum(0.0), adaptive_frame_samples(0),
 	adaptive_last_frame_time_s(-1.0), adaptive_last_eval_time_s(0.0), adaptive_last_force_time_s(-1.0),
@@ -4705,7 +4683,6 @@ static const char* const stop_reason_labels[FrontierStop_NumReasons] =
 	"budget cap",
 	"member has no LoD tree",
 	"saturation LoD bias", // SESSION085 ETAP 3 - only produced when the bias ceiling is above 1.
-	"out of frustum", // SESSION055 - only produced by the fast path with cull enabled; getFrustumStructureReport() disables cull so this stays 0 there.
 	"out of distance slice" // SESSION072 - only produced by the fast path with the dist-clamp checkbox on; getFrustumStructureReport() always leaves it off.
 };
 
@@ -4713,7 +4690,7 @@ static const char* const stop_reason_labels[FrontierStop_NumReasons] =
 // SESSION081: the geom-snapshot cache-hit/miss logic, extracted from fillTraversalScratch() below so
 // kickOffSaturationBuilds() can obtain the same snapshot without needing a whole GaussianSplatLodTraversalScratch to
 // hold it - a saturation build reads positions/scales/rotations/alpha exactly like a traversal does, just without the
-// rest of the scratch (selected_indices, members_snapshot, the caps). Behaviour unchanged from before the extraction.
+// rest of the scratch (the sort buffers, members_snapshot, the caps). Behaviour unchanged from before the extraction.
 // SESSION081 ETAP 4: one slice of the packed-occluder build - see getOrBuildCachedGeom() and GsSatPackedOccluder.
 class GsSatPackTask : public glare::Task
 {
@@ -5120,27 +5097,25 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 		frontier.reserve(cloud.total_splats);
 
 		// Null result queue: this frontier is for reading, not for drawing - see the task's own comment there.
-		// SESSION055: report deliberately runs with frustum-cull off. It has to see the whole tree to answer "what would the
-		// LoD hierarchy offer at this camera" - a frustum-culled traversal would misreport pruning ceilings and reason
-		// classifications for anything behind the camera.
+		// SESSION090: the report used to have to ASK for frustum-cull off here, because the walk could apply it. The walk
+		// has no frustum test any more (see expandStack()), so what the report wants - the whole tree, so it can answer
+		// "what would the LoD hierarchy offer at this camera" without misreporting anything behind the camera - is simply
+		// what every traversal now does.
 		GaussianSplatLodTraversalTask task(cloud.cloud_id, cloud.topology_generation, scratch, cam_pos_ws,
 			lod_pixel_scale_limit, lod_max_splats_budget, lod_max_layer_density, lod_max_tree_depth, focal_px,
-			/*frustum_clip_planes=*/NULL, /*num_frustum_clip_planes=*/0, /*frustum_cull_enabled=*/false,
-			/*translation_dilation=*/NULL, /*rotation_dilation_rate=*/0.f,
 			/*result_queue=*/NULL, &frontier);
 		// SESSION072: isolates the traversal itself from the rest of this function's cost (stats accumulation, string
 		// building below) - "Report took" at the bottom times the whole button press, this times just the thing the
 		// owner actually wants to know the cost of. Same task, same call the per-frame async path makes (run() doesn't
-		// know or care whether its caller is sync or a worker thread), just on the main thread and with frustum-cull
-		// off - see the comment above.
+		// know or care whether its caller is sync or a worker thread), just on the main thread.
 		Timer cloud_traversal_timer;
 		task.run(0);
 		const double cloud_traversal_ms = cloud_traversal_timer.elapsed() * 1.0e3;
 		world_traversal_ms += cloud_traversal_ms;
 		s += "  Traversal: " + doubleToStringNSigFigs(cloud_traversal_ms, 4) + " ms (main thread, unculled - see report note above)\n";
 
-		// Not returned to the pool yet: the pruning ceiling below walks scratch->selected_indices, which is the frontier in
-		// the front-to-back order the draw actually uses, and which the frontier records deliberately don't preserve.
+		// Not returned to the pool yet: the pruning ceiling below walks scratch->sort_scratch, which is the frontier in the
+		// front-to-back order the draw actually uses, and which the frontier records deliberately don't preserve.
 
 		//----------------------------- Structure of the trees themselves -----------------------------
 		// Independent of the camera: what the hierarchy offers, against which the frontier below says what was taken.
@@ -5545,7 +5520,7 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 			//----------------------------- The ceiling on pruning by importance -----------------------------
 			// The histograms above say where the fill is; this says how much of it is doing nothing.
 			//
-			// Composites the frontier in the order it is actually drawn - scratch->selected_indices, nearest first - into a
+			// Composites the frontier in the order it is actually drawn - scratch->sort_scratch, nearest first - into a
 			// low-resolution transmittance buffer, and charges each splat with what it actually adds to the image:
 			// sum over the pixels it covers of alpha * (transmittance still remaining in front of it).  A splat behind a
 			// region the composite has already finished with scores zero however large and however opaque it is.
@@ -5618,10 +5593,14 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 				}
 				cloud.importance_num_views++;
 
-				const js::Vector<uint32, 16>& draw_order = scratch->selected_indices;
+				// SESSION090: the sorted stream itself is the draw order. There used to be a flat uint32 copy of it on the
+				// scratch, produced by a pass that existed only because three readers wanted one; this is the third of those
+				// readers - see the sort block in GaussianSplatLodTraversalTask::run(). The far-segment mark cannot be set
+				// here: it requires reuse, which requires the split-filter path, which this report deliberately is not.
+				const js::Vector<GsDistIdx, 16>& draw_order = scratch->sort_scratch;
 				for(size_t i=0; i<draw_order.size(); ++i)
 				{
-					const uint32 idx = draw_order[i];
+					const uint32 idx = draw_order[i].idx;
 					const Vec3f& p = cloud.positions[idx];
 					const SplatFootprint fp = splatFootprint(p, cloud.scales[idx], cloud.rotations[idx],
 						adjustSplatAlpha(cloud.colours[idx][3], splat_alpha_gain, splat_alpha_gamma), // As drawn, not as stored - see getAlphaGain().
@@ -5953,7 +5932,7 @@ std::string GaussianSplatRenderer::getDiagnostics() const
 		// by more than one pooled scratch here, so this can overcount the geom bytes when that sharing happens - a
 		// diagnostic-only imprecision, not a correctness issue (nothing here frees or double-counts an owned allocation).
 		const uint64 geom_bytes = s.geom.isNull() ? 0 : (uint64)(s.geom->positions.size() * sizeof(Vec3f) + s.geom->feature_size.size() * sizeof(float) + s.geom->cull_radius.size() * sizeof(float)); // SESSION059: + cull_radius.
-		traversal_scratch_bytes += geom_bytes + (uint64)(s.selected_indices.size() * sizeof(uint32));
+		traversal_scratch_bytes += geom_bytes + (uint64)((s.decorated.size() + s.sort_scratch.size()) * sizeof(GsDistIdx));
 	}
 
 	// Total leaf count (pre-merge) vs total node count (leaves + merged, what's actually GPU-resident) across every
@@ -8084,18 +8063,19 @@ void GaussianSplatRenderer::drainTraversalResults()
 		if(!cloud || msg->topology_generation != cloud->topology_generation)
 			continue;
 
-		// Already sorted front-to-back by GaussianSplatLodTraversalTask::run()'s decorate-sort - nothing left to do here
-		// but write it.  kickOffSorts() never touches an LoD-active cloud (see its cloudHasLodTree() guard), so there's no
-		// separate sort state on the cloud to invalidate here the way a structural change invalidates the old sort's.
-		const js::Vector<uint32, 16>& selected = msg->scratch->selected_indices;
-
-		// SESSION063: split filter path. When split_filter_enabled the traversal ran cull-off, so `selected` is the whole
-		// unculled frontier U(P) and the msg carries the SoA copy. Adopt it as this cloud's cache and mark it for filtering;
-		// kickOffFilters() then derives the draw list S(P,R) asynchronously and drainFilterResults() uploads THAT (never
-		// U(P), which is the ~7.5M unculled set). The VBO is deliberately left untouched here: the last filter's S(P,R)
-		// keeps drawing until the new one lands (~13ms), so a U(P) rebuild costs no main-thread hitch. The cap flags below
-		// are still copied out - the scratch is about to return to the pool.
-		if(split_filter_enabled && msg->unculled_frontier.nonNull())
+		// SESSION063: the traversal ran cull-off, so what it produced is the whole unculled frontier U(P), carried on the
+		// msg as an SoA. Adopt it as this cloud's cache and mark it for filtering; kickOffFilters() then derives the draw
+		// list S(P,R) asynchronously and drainFilterResults() uploads THAT (never U(P), which is the ~7.5M unculled set).
+		// The VBO is deliberately left untouched here: the last filter's S(P,R) keeps drawing until the new one lands
+		// (~13ms), so a U(P) rebuild costs no main-thread hitch. The cap flags below are still copied out - the scratch is
+		// about to return to the pool.
+		//
+		// SESSION090: unconditional. This used to be the split-filter branch of a fork whose other arm was the
+		// pre-session063 pipeline - a cull-on traversal whose selection went straight into the instance VBO here. That
+		// pipeline is gone; kickOffTraversals() has no way left to ask for a traversal that does not build U(P).
+		// kickOffSorts() still never touches an LoD-active cloud (see its cloudHasLodTree() guard), so there is no separate
+		// sort state on the cloud to invalidate here the way a structural change invalidates the old sort's.
+		if(msg->unculled_frontier.nonNull())
 		{
 			// SESSION085 ETAP 6: unconditional. This used to defer installing a fresh frontier when a saturation APPLY was
 			// about to replace it with a pruned copy - the "draw unpruned" question. With the prune gone there is no
@@ -8160,10 +8140,11 @@ void GaussianSplatRenderer::drainTraversalResults()
 					conPrint("[gsr-traversal] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms " +
 						"expand_ms=" + doubleToStringNDecimalPlaces(uf.expand_ms, 2) +
 						" sort_ms=" + doubleToStringNDecimalPlaces(uf.sort_ms, 2) +
-						// SESSION087: sort_ms split into the sort proper and the unpack that follows it - see the fields.
-						" radix_ms=" + doubleToStringNDecimalPlaces(uf.sort_radix_ms, 2) +
-						" unpack_ms=" + doubleToStringNDecimalPlaces(uf.sort_unpack_ms, 2) +
-						" total_ms=" + doubleToStringNDecimalPlaces(uf.expand_ms + uf.sort_ms, 2) +
+						// SESSION090: soa_ms joins the total. It was always a stage of this same task and was always printed
+						// (further along this line), but the total stopped at the sort - so the headline number understated the
+						// task by a fifth to a quarter. With the unpack folded into the gather the three stages now tile the
+						// task's own duration, and a total that does not sum to it would be a bug rather than an omission.
+						" total_ms=" + doubleToStringNDecimalPlaces(uf.expand_ms + uf.sort_ms + uf.soa_ms, 2) +
 						// SESSION080: traversal_output_n rather than uf.indices.size(). They are equal on THIS (unpruned)
 						// frontier, but the field is the one that stays right if this line is ever read off a pruned copy,
 						// where indices.size() has shrunk to pool_after. See the field's comment.
@@ -8257,25 +8238,7 @@ void GaussianSplatRenderer::drainTraversalResults()
 					// nothing about correctness - reading it otherwise cost session088 a wrong bug report.
 					" bt_delta=" + doubleToStringNDecimalPlaces((uf.diag_live_barrier_time - uf.diag_block_barrier_time) * 1000.0, 1) + "ms");
 			}
-
-			continue;
 		}
-
-		// SESSION058 diag: measures the synchronous GL upload cost on drain, the second suspected contributor to the
-		// session057 §3 CPU cost alongside fillTraversalScratch() (see that function's [gsr-prof] instrumentation).
-		Timer prof_timer;
-		cloud->instance_index_vbo->updateData(0, selected.data(), selected.size() * sizeof(uint32));
-		if(cpu_prof_log)
-			conPrint("[gsr-prof] t" + doubleToStringNDecimalPlaces(diag_timer.elapsed() * 1000.0, 0) + "ms drainVBOUpload cloud=" +
-				toString(cloud->cloud_id) + " indices=" + toString(selected.size()) +
-				" bytes=" + toString(selected.size() * sizeof(uint32)) +
-				" took=" + doubleToStringNDecimalPlaces(prof_timer.elapsed() * 1000.0, 2) + "ms");
-
-		cloud->ob->num_instances_to_draw = (int)selected.size();
-		noteDrawOrderForSlicing(*cloud, selected.data(), selected.size());
-		cloud->last_traversal_hit_budget_cap = msg->scratch->hit_budget_cap; // Copied out here since the scratch itself goes back to the pool below and may be reused by a different cloud's traversal next.
-		cloud->last_traversal_hit_density_cap = msg->scratch->hit_density_cap;
-		cloud->last_traversal_hit_depth_cap = msg->scratch->hit_depth_cap;
 	}
 
 	completed_traversal_msgs.clear(); // Drop the references, so a scratch just returned to the pool isn't kept alive by a stale message.
@@ -8296,8 +8259,6 @@ void GaussianSplatRenderer::drainTraversalResults()
 // both trackers still read ~zero.
 void GaussianSplatRenderer::kickOffFilters()
 {
-	if(!split_filter_enabled)
-		return;
 	glare::TaskManager* const task_manager = opengl_engine->getMainTaskManager();
 	if(task_manager == NULL)
 		return;
@@ -8362,7 +8323,8 @@ void GaussianSplatRenderer::kickOffFilters()
 	// the held wide selection for a tight one. Fires once (the kick clears the flag) and only after motion genuinely calmed,
 	// so it neither boils (session064: that was the per-frame re-filter off decaying trackers, gated out by `rotating` above)
 	// nor holes (the in-motion band stays predictive until this point). This is session059's traversal "settle" ported to
-	// the filter - see SplatCloud::last_traversal_dilation_elevated's comment.
+	// the filter; SESSION090 removed the traversal-side original along with the walk's own frustum cull, so this is the
+	// only one left.
 	const bool motion_calmed = w_effective <= min_rot_rate_rad_s;
 	// SESSION072: anisotropic rotational dilation (session067 §8/§15 plan A). Previously the baseline rates were
 	// isotropic - w_floored (= max(w_effective, min_rot_rate_rad_s)) applied identically to all 6 planes via rate*dist
@@ -8378,8 +8340,7 @@ void GaussianSplatRenderer::kickOffFilters()
 	//     isotropic rate*dist (equality only when the node sits exactly perpendicular to the rotation axis), so this
 	//     is a strict reduction in padding, never an increase, over every plane and every node.
 	// The two are combined with max(), not sum, at the per-node/per-plane site in filterUnculledFrontier() - mirrors
-	// exactly how translation_dilation[] above already floors its per-plane EMA/empirical shift against
-	// min_trans_dilation_m.
+	// exactly how trans_dilation[] above already floors its per-plane EMA shift against min_trans_dilation_m.
 	const float rate_fine_baseline = min_rot_rate_rad_s * dilation_latency_eff; // SESSION063 K3 window, SESSION072: baseline-only now. SESSION088: measured window when enabled - see dilation_latency_eff. The coarse floor had a second, wider window beside this one; it went with the feature.
 	// SESSION072: axis and swept magnitude passed separately rather than as a pre-scaled vector, so the filter can do one
 	// cross product per plane. See filterUnculledFrontier().
@@ -8559,14 +8520,11 @@ void GaussianSplatRenderer::drainFilterResults()
 // SESSION055 diag: one shared Timer for kickOffTraversals logging; timestamps are ms-since-first-log so
 // pauses and streaks in the traversal pipeline read easily against each other. Toggle: getKickDebugLog()/
 // setKickDebugLog() (SESSION072 - was a build-time const here, see its declaration's comment in the header).
-// Only two events actually print, both signal-only:
-//   [gsr-kick]        each successful traversal kick, with reason (rot / trans / topo / first / settle - SESSION059).
-//   [gsr-rot-blocked] when the camera is rotating fast enough to trigger the 5deg re-kick BUT no kick went out
-//                     (either the target cloud's slot is in flight, or all concurrent slots are full).
-// Both are throttled per-event-type - see rot_blocked_min_gap_ms below - so a held-down rotation logs a heartbeat,
-// not a flood.
-static double last_rot_blocked_log_ms = -1e9;
-static const double rot_blocked_min_gap_ms = 250.0;
+// One event prints, signal-only:
+//   [gsr-kick]        each successful traversal kick, with reason (trans / topo / first).
+// SESSION090: the second event, [gsr-rot-blocked], measured unmet demand for a ROTATION re-kick. The traversal is
+// orientation-independent now that the pre-session063 pipeline is gone, so a rotation never asks for one - see
+// kickOffTraversals(). Rotation demand is the filter's business, and drainFilterResults() reports its own.
 
 // SESSION081: kicks a GaussianSplatSaturationBuildTask for any cloud whose saturation barrier is missing, stale by
 // the ball guarantee (camera has left the R-ball its anchor was built at), or built under knobs that no longer match
@@ -8722,67 +8680,19 @@ void GaussianSplatRenderer::kickOffTraversals()
 
 	const OpenGLScene* const scene = opengl_engine->getCurrentScene();
 	const Vec4f cam_pos_ws = scene->cam_to_world.getColumn(3);
-	// SESSION055: Substrata camera basis convention is right=col0, forward=col1, up=col2 (see OpenGLEngine.cpp uses of
-	// cam_to_world.getColumn). Column 2 (up) is INSENSITIVE to pure-yaw rotation at zero pitch, which is exactly the case
-	// (keyboard turn) where re-kicks were silently not firing during session055 diagnosis. Read col 1 (forward), and
-	// normalise: a small non-unit drift in the matrix makes dot > 1 at small angles, myClamp truncates to 1, acos returns
-	// 0, and small rotations vanish from the trigger and from cam_angular_speed_ema in think().
-	const Vec4f cam_forward_ws = normalise(scene->cam_to_world.getColumn(1));
 
 	const Vec2i viewport_dims = opengl_engine->getViewportDims();
 	const float focal_x = (float)viewport_dims.x * scene->lens_sensor_dist / scene->use_sensor_width;
 	const float focal_y = (float)viewport_dims.y * scene->lens_sensor_dist / scene->use_sensor_height;
 	const float focal_px = (focal_x + focal_y) * 0.5f; // Average of the two axes - a splat's on-screen size only differs meaningfully per axis with a non-square viewport/sensor, close enough for the traversal's coarse pixel_scale budget.
 
-	// SESSION055: with frustum-cull on the traversal is view-dependent, so a rotation in place has to trigger a re-kick even
-	// though the camera position hasn't changed. 5deg is the coarse threshold - a full 360deg pan then costs 72 traversals,
-	// which is far under the concurrency cap and negligible per traversal after the session054 speed-up. Kept an internal
-	// constant rather than a live knob: the trade is not scene-dependent, it's about how large a stale frustum edge is
-	// tolerable, and 5deg was chosen to be well under what a first-person turn perceives as a hitch. cos(5deg) ~= 0.99619.
-	const float rotation_cos_threshold = 0.99619f;
-	// SESSION063: in split_filter mode the traversal is deliberately run cull-off (it builds the orientation-independent
-	// U(P)), so cull_active goes false here - which also turns off the rotation/settle re-kick triggers and the dilation
-	// block below, because a rotation no longer needs a fresh traversal: the async filter re-derives S(P,R) from the
-	// cached U(P) instead (see drainTraversalResults()/GaussianSplatFilterTask). Position/topology triggers still fire.
-	const bool cull_active = lod_frustum_cull_enabled && !split_filter_enabled;
-
-	// SESSION055: anisotropic frustum-cull dilation. Async traversal takes ~150-500ms per session054; during that window
-	// the camera keeps moving/rotating, so nodes that were outside at kick time can be inside by the time the result
-	// applies - visible as holes along the screen edge on turns and back-motion.
-	// Rate model: max(EMA, empirical). EMA is the smoothed motion tracker (rise-fast, fall-slow); empirical is the
-	// actual (translation, rotation) that has happened between the previous kick for THIS cloud and now. Empirical
-	// catches burst motion (mouse flicks) that EMA underestimates once the flick ends and the value decays before the
-	// next kick; EMA catches motion that just started (empirical from last kick is stale then). The max covers both.
-	// traversal_latency_estimate is a conservative constant matching session054's measured 165ms interior / 450ms
-	// bridge - one number for both because the dilation is a safety margin, not a precise correction.
-	const float traversal_latency_estimate = 0.3f; // seconds. Conservative; raising it costs a little cull, lowering it risks holes.
+	// SESSION090: the traversal is orientation-independent - it builds U(P), and the per-orientation filter derives the
+	// draw list from it - so what used to sit here is gone: an in-loop frustum cull, the rotation and "settle" re-kick
+	// triggers that cull made necessary, and the anisotropic dilation (session055/059) that padded the cull's planes
+	// against the ~150-500ms a traversal takes to land. That whole apparatus lives on in kickOffFilters(), against the
+	// filter's own far shorter latency window, and in the evolved anisotropic form session072 gave it there. Only
+	// position and topology can make a traversal stale now.
 	const double now_s = diag_timer.elapsed();
-
-	// SESSION055 baseline (see its own comment further down, where it's applied) - hoisted here too so the SESSION059
-	// "settle" check just below can compare the *current* w_effective against the same floor every kick already
-	// guarantees, without duplicating the derivation. min_rot_dilation_rad is the amount of dilation baseline alone
-	// contributes; min_rot_rate_rad_s is the underlying rate, which is what "has w_effective calmed back down" needs.
-	//
-	// SESSION059 tried giving the settle-triggered kick extra margin here, to cover a mouse flick starting during the
-	// settle kick's own in-flight window (the "first flick after calm" hole session055 already documented as generally
-	// unavoidable - previously seen once at app startup, now recurring on every pause because the "stuck wide" bug this
-	// session fixed used to accidentally leave a wide margin in place forever instead of correctly tightening it).
-	// Two attempts, both reverted:
-	//   - Raising this constant itself fixed the hole but made EVERY kick pay for mouse-flick-sized margin permanently
-	//     (measured: pinned CPU at ~19ms with no drop, regardless of motion).
-	//   - Scoping the extra margin to just the settle kick avoided that, but on this session's km-scale test scene,
-	//     rotation_dilation_rate's distance-proportional term means even a scoped ~60deg margin balloons the settle
-	//     kick's own selection back up near the stuck-bug's size (~7.8M vs ~2.4M splats) - so "settle" stopped visibly
-	//     dropping GPU at all, defeating its purpose.
-	// Root cause turned out to be latency, not margin: the first kick after resuming motion already computes a large,
-	// correct dilation (session059 measured 80.9deg from a fresh flick) but still takes the full ~500ms
-	// traversal_latency_estimate to land, and the tight, undialted settle selection is what's on screen for that whole
-	// window regardless of how generous the *next* kick's margin will be once it arrives. No margin tuning here can
-	// shorten that window - the real fix (parallel expand, session054 §2A.4 - splitting the DFS expand across worker
-	// threads to cut traversal latency directly, ~3x expected) is next session's work, see the session059 snapshot.
-	const float min_rot_rate_deg_per_s = 45.f;   // half of typical keyboard turn rate
-	const float min_rot_rate_rad_s = min_rot_rate_deg_per_s * (3.14159265f / 180.f);
-	const float min_rot_dilation_rad = min_rot_rate_rad_s * traversal_latency_estimate;
 
 	while(num_traversals_in_flight < max_concurrent_traversals)
 	{
@@ -8817,27 +8727,6 @@ void GaussianSplatRenderer::kickOffTraversals()
 				const float threshold = myMax(lod_resort_move_threshold_ws, cloud->aabb_ws.distanceToPoint(cam_pos_ws) * resort_threshold_dist_fraction);
 				ratio = cam_pos_ws.getDist(cloud->last_traversal_cam_pos_ws) / threshold;
 				reason = "trans";
-
-				// SESSION055: only meaningful while cull is on; without it the traversal is rotation-invariant as before.
-				if(cull_active)
-				{
-					const float rot_dot = dot(cam_forward_ws, cloud->last_traversal_cam_forward_ws);
-					if(rot_dot < rotation_cos_threshold)
-					{
-						ratio = std::numeric_limits<float>::max();
-						reason = "rot";
-					}
-					// SESSION059: "settle" re-kick - see SplatCloud::last_traversal_dilation_elevated's comment. Only
-					// reached when rotation itself didn't already trigger above: this cloud's applied selection was
-					// picked with an elevated margin, but nothing has rotated since, so nothing else would ever notice
-					// that margin is now stale. Once w_effective has decayed back to (or below) the baseline every kick
-					// already floors to, one more kick captures a tight selection at the current, calmed-down pose.
-					else if(cloud->last_traversal_dilation_elevated && (myMax(cam_angular_speed_ema, cam_angular_speed_peak) <= min_rot_rate_rad_s))
-					{
-						ratio = std::numeric_limits<float>::max();
-						reason = "settle";
-					}
-				}
 			}
 
 			if(ratio > best_ratio)
@@ -8862,65 +8751,9 @@ void GaussianSplatRenderer::kickOffTraversals()
 
 		fillTraversalScratch(*best_cloud, *scratch);
 
-		// SESSION055: per-cloud dilation. Empirical rates use the delta since THIS cloud's previous kick (each cloud may
-		// have been kicked at a different moment). First-kick fallback: no empirical, EMA only.
-		float translation_dilation[6] = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
-		float rotation_dilation_rate = 0.f;
-		float empirical_ang_rate_dbg = 0.f;
-		if(cull_active)
-		{
-			// SESSION055: per-plane max of EMA-vs-empirical directional shift. Doing max on the *shift* rather than on
-			// the velocity vector lets each plane pick the estimate that actually threatens it: a stale-east EMA gives
-			// dot(west_plane_n, ema*L)<0 (rejected by max with 0), while empirical west gives dot(west_plane_n, emp*L)>0
-			// (kept). Handles direction reversals without needing to reason about "which velocity direction is real".
-			const Vec4f ema_expected = cam_velocity_ema_ws * traversal_latency_estimate;
-			Vec4f emp_expected(0.f);
-			float w_effective = myMax(cam_angular_speed_ema, cam_angular_speed_peak); // SESSION055: peak covers mouse-flick-in-past for the next ~1s of kicks - see the peak update in think().
-			if(best_cloud->have_last_traversal_cam_pos)
-			{
-				const double dt = myMax(1.0e-3, now_s - best_cloud->last_traversal_kick_time_s); // Floor guards a degenerate 0 dt (would explode empirical rate); 1ms is well below any realistic kick cadence.
-				const Vec4f empirical_v = (cam_pos_ws - best_cloud->last_traversal_cam_pos_ws) * (float)(1.0 / dt);
-				emp_expected = empirical_v * traversal_latency_estimate;
-				const float rot_dot = myClamp(dot(cam_forward_ws, best_cloud->last_traversal_cam_forward_ws), -1.f, 1.f);
-				const float empirical_w = std::acos(rot_dot) / (float)dt;
-				empirical_ang_rate_dbg = empirical_w;
-				w_effective = myMax(w_effective, empirical_w);
-			}
-			for(int i=0; i<scene->num_frustum_clip_planes && i<6; ++i)
-			{
-				const Vec4f n = scene->frustum_clip_planes[i].getNormal();
-				const float shift_ema = dot(n, ema_expected);
-				const float shift_emp = dot(n, emp_expected);
-				translation_dilation[i] = myMax(0.f, myMax(shift_ema, shift_emp));
-			}
-			rotation_dilation_rate = w_effective * traversal_latency_estimate;
-
-			// SESSION055: baseline minimum dilation covers the "static->moving" transition. Both EMA and empirical
-			// read zero at that transition (nothing has moved yet since last kick), so the traversal that lands next
-			// has no rotation margin at all - and by the time the next kick captures the new motion, another 120ms
-			// of holes have shown. Baseline says "even if pose looked frozen at kick time, allow for X m/s and Y
-			// deg/s of motion possibly starting during this traversal". Tunable; roll back this block if the picture
-			// doesn't improve, since it costs a modest amount of over-inclusion in genuinely static scenes.
-			// min_rot_rate_deg_per_s/min_rot_dilation_rad are hoisted above the while-loop now - see SESSION059's comment
-			// there - so the "settle" check can share the exact same floor this block applies.
-			const float min_trans_rate_m_per_s = 2.0f;   // ~walking pace
-			const float min_trans_dilation_m  = min_trans_rate_m_per_s * traversal_latency_estimate;
-			for(int i=0; i<scene->num_frustum_clip_planes && i<6; ++i)
-				translation_dilation[i] = myMax(translation_dilation[i], min_trans_dilation_m);
-			rotation_dilation_rate = myMax(rotation_dilation_rate, min_rot_dilation_rad);
-		}
-
-		// SESSION059: remember whether this kick used more than baseline dilation, so the "settle" check above can catch
-		// this cloud once w_effective decays back down with no further rotation to naturally trigger a fresh kick - see
-		// SplatCloud::last_traversal_dilation_elevated's comment. A tiny epsilon avoids flagging float noise right at
-		// the floor as "elevated".
-		best_cloud->last_traversal_dilation_elevated = cull_active && (rotation_dilation_rate > min_rot_dilation_rad + 1.0e-6f);
-
 		best_cloud->traversal_in_flight = true;
 		best_cloud->have_last_traversal_cam_pos = true;
 		best_cloud->last_traversal_cam_pos_ws = cam_pos_ws;
-		best_cloud->last_traversal_cam_forward_ws = cam_forward_ws; // SESSION055 - see rotation_cos_threshold above.
-		best_cloud->last_traversal_kick_time_s = now_s;
 		best_cloud->last_traversal_kicked_topology_generation = best_cloud->topology_generation;
 		num_traversals_in_flight++;
 
@@ -8929,22 +8762,15 @@ void GaussianSplatRenderer::kickOffTraversals()
 				toString(best_cloud->cloud_id) + " reason=" + std::string(best_reason) +
 				" ratio=" + (best_ratio == std::numeric_limits<float>::max() ? std::string("inf") : doubleToStringNDecimalPlaces(best_ratio, 2)) +
 				" in_flight=" + toString(num_traversals_in_flight) + "/" + toString(max_concurrent_traversals) +
-				" splats=" + toString(best_cloud->total_splats) +
-				" w_ema=" + doubleToStringNDecimalPlaces(cam_angular_speed_ema * (180.0 / 3.14159265), 1) +
-				" w_emp=" + doubleToStringNDecimalPlaces(empirical_ang_rate_dbg * (180.0 / 3.14159265), 1) +
-				" rot_dil=" + doubleToStringNDecimalPlaces(rotation_dilation_rate * (180.0 / 3.14159265), 1) + "deg");
+				" splats=" + toString(best_cloud->total_splats));
 
-		// SESSION055: pass frustum planes (copied into task, see its ctor) and the anisotropic dilation numbers computed
-		// once above per kickOffTraversals() call.
 		// SESSION088: the coarse-floor capture that used to be requested here is gone - see GaussianSplatRenderer's note
 		// on the feature's removal. The ~1.7M coarse nodes it produced are simply never made: no push_backs in the DFS,
 		// no ~56% growth of the radix sort's array, no SoA gather, no inflated pool for the filter to stream.
 		task_manager->addTask(new GaussianSplatLodTraversalTask(best_cloud->cloud_id, best_cloud->topology_generation, scratch, cam_pos_ws,
 			lod_pixel_scale_limit, lod_max_splats_budget, lod_max_layer_density, lod_max_tree_depth, focal_px,
-			scene->frustum_clip_planes, scene->num_frustum_clip_planes, cull_active,
-			translation_dilation, rotation_dilation_rate,
 			&traversal_result_queue,
-			/*frontier_record=*/NULL, /*build_unculled_frontier=*/split_filter_enabled, // SESSION063: cull-off traversal builds U(P) for the split filter.
+			/*frontier_record=*/NULL, /*build_unculled_frontier=*/true, // SESSION063: the traversal builds U(P) for the split filter.
 			/*dist_clamp_enabled=*/splat_dist_clamp_enabled, splat_dist_clamp_min, splat_dist_clamp_max, splat_dist_clamp_invert, // SESSION072.
 			/*sat_diag_log=*/sat_diag_log, // SESSION076 DIAGNOSTIC.
 			/*task_manager=*/task_manager, // SESSION079
@@ -8964,44 +8790,6 @@ void GaussianSplatRenderer::kickOffTraversals()
 			/*expand_seed_target=*/expand_seed_target, // SESSION086 - see updateExpandSeedTarget().
 			/*sat_barrier_agree_tol=*/sat_barrier_agree_tol, // SESSION088 - see getSatBarrierAgreeTol(). 1 = accept any barrier change, as before.
 			/*sat_bias_exponent=*/sat_bias_exponent)); // SESSION088 - see getSatBiasExponent(). 1 = session085's original curve.
-	}
-
-	// SESSION055 diag: after the while-loop, detect *unmet* rotation demand - a cloud whose forward has shifted past the
-	// re-kick threshold since its last kick, but that couldn't be kicked this pass because its slot is in flight or all
-	// concurrent slots are full. Throttled: at most one line every rot_blocked_min_gap_ms, so a held-down rotation logs a
-	// heartbeat rather than a per-frame stream.
-	if(kick_debug_log && cull_active)
-	{
-		int blocked_inflight = 0, blocked_no_slot = 0;
-		float worst_deg_over_threshold = 0.f;
-		for(size_t i=0; i<clouds.size(); ++i)
-		{
-			const SplatCloud* const cloud = clouds[i].ptr();
-			if(cloud->total_splats == 0 || !cloudHasLodTree(*cloud) || !cloud->have_last_traversal_cam_pos)
-				continue;
-			const float rot_dot = myClamp(dot(cam_forward_ws, cloud->last_traversal_cam_forward_ws), -1.f, 1.f);
-			if(rot_dot >= rotation_cos_threshold)
-				continue; // Within tolerance, no demand.
-			const float deg = std::acos(rot_dot) * (180.f / 3.14159265f);
-			if(deg > worst_deg_over_threshold)
-				worst_deg_over_threshold = deg;
-			if(cloud->traversal_in_flight)
-				blocked_inflight++;
-			else if(num_traversals_in_flight >= max_concurrent_traversals) // Slot exhaustion by *other* clouds' work.
-				blocked_no_slot++;
-		}
-		if(blocked_inflight > 0 || blocked_no_slot > 0)
-		{
-			const double now_ms = diag_timer.elapsed() * 1000.0;
-			if(now_ms - last_rot_blocked_log_ms >= rot_blocked_min_gap_ms)
-			{
-				last_rot_blocked_log_ms = now_ms;
-				conPrint("[gsr-rot-blocked] t" + doubleToStringNDecimalPlaces(now_ms, 0) + "ms worst=" +
-					doubleToStringNDecimalPlaces(worst_deg_over_threshold, 1) + "deg (thr 5deg) inflight_blocked=" +
-					toString(blocked_inflight) + " no_slot_blocked=" + toString(blocked_no_slot) +
-					" w=" + doubleToStringNDecimalPlaces(cam_angular_speed_ema * (180.0 / 3.14159265), 1) + "deg/s");
-			}
-		}
 	}
 }
 

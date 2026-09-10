@@ -402,24 +402,13 @@ public:
 	int getMaxTreeDepth() const { return lod_max_tree_depth; }
 	void setMaxTreeDepth(int v) { lod_max_tree_depth = v; }
 
-	// SESSION055: turns on frustum-culling inside the traversal's expand loop - each popped node is tested against the
-	// scene's frustum planes (dilated by 1.5 * feature_size to keep large-radius nodes whose centre is just outside),
-	// and out-of-frustum nodes are neither recorded nor expanded, pruning entire subtrees behind the camera. Paired with
-	// an angular re-kick threshold in kickOffTraversals(), so that turning on the spot re-runs the traversal.
-	//
-	// Trades the property that the old comment on GaussianSplatLodTraversalTask leans on ("rotation stays free") for a
-	// large drop in nodes visited on interior scenes - see session054 §2A. Kept as a live switch to allow A/B comparison
-	// and to fall back if a rotation-heavy workflow shows the extra re-kicks costing more than the cull saves.
-	bool getFrustumCullEnabled() const { return lod_frustum_cull_enabled; }
-	void setFrustumCullEnabled(bool v) { lod_frustum_cull_enabled = v; }
-
-	// SESSION063: split filter architecture (session062 §9.3). When on, the traversal runs cull-off and builds the
-	// orientation-independent unculled frontier U(P); a cheap per-orientation SSE frustum filter derives the actual draw
-	// list S(P,R) from it, so a pure rotation no longer needs a fresh ~450ms traversal. Mutually exclusive in effect with
-	// the in-traversal frustum cull above (kickOffTraversals() forces cull_active false when this is on). Live switch for
-	// A/B against the cull path. See GaussianSplatUnculledFrontier / filterUnculledFrontier() / drainTraversalResults().
-	bool getSplitFilterEnabled() const { return split_filter_enabled; }
-	void setSplitFilterEnabled(bool v) { split_filter_enabled = v; }
+	// SESSION090: getFrustumCullEnabled()/getSplitFilterEnabled() stood here. The split filter architecture (session063,
+	// session062 §9.3) is the only pipeline now: the traversal builds the orientation-independent unculled frontier U(P),
+	// and a cheap per-orientation SSE frustum filter derives the actual draw list S(P,R) from it, so a pure rotation never
+	// costs a fresh ~450ms traversal. Both switches existed to A/B that against the pre-session063 pipeline, whose
+	// in-traversal frustum cull (session055) is gone with it - see GaussianSplatUnculledFrontier /
+	// filterUnculledFrontier() / drainTraversalResults(), and getFilterFrustumPlanesEnabled() below for the cull switch
+	// that remains.
 
 	// SESSION063 K3: live-tunable dilation of the per-orientation filter (see kickOffFilters()). The filter keeps nodes
 	// slightly outside the frustum so the edge doesn't trail during the filter's latency window; how far is these three.
@@ -857,10 +846,9 @@ public:
 	// mechanisms can be A/B'd independently on one scene: frustum-only (sat pre-filter off), saturation-only (this
 	// off), both, or neither.
 	//
-	// This is NOT the same switch as getFrustumCullEnabled(): that one, when cleared, also takes the split architecture
-	// down with it and reverts to the pre-session063 whole-traversal path (which is itself a meaningful comparison - see
-	// the session073 snapshot - and is deliberately left working exactly as it was). This one changes only what the
-	// filter does with the planes it is handed.
+	// SESSION090: this is the only frustum-cull switch left. It used to have a sibling, getFrustumCullEnabled(), which
+	// controlled the pre-session063 pipeline's in-traversal cull and took the whole split architecture down with it; that
+	// pipeline is gone. This one changes only what the filter does with the planes it is handed.
 	bool getFilterFrustumPlanesEnabled() const { return filter_frustum_planes_enabled; }
 	void setFilterFrustumPlanesEnabled(bool v) { filter_frustum_planes_enabled = v; }
 
@@ -872,9 +860,9 @@ public:
 	// guarding every conPrint() call - no rebuild needed either way.
 	bool getFilterDebugLog() const { return filter_debug_log; } // [gsr-filter-kick] / [gsr-filter-drain] - kickOffFilters()/drainFilterResults().
 	void setFilterDebugLog(bool v) { filter_debug_log = v; }
-	bool getKickDebugLog() const { return kick_debug_log; }     // [gsr-kick] / [gsr-rot-blocked] - kickOffTraversals().
+	bool getKickDebugLog() const { return kick_debug_log; }     // [gsr-kick] - kickOffTraversals().
 	void setKickDebugLog(bool v) { kick_debug_log = v; }
-	bool getCpuProfLog() const { return cpu_prof_log; }         // [gsr-prof] - fillTraversalScratch()/drainTraversalResults() VBO upload.
+	bool getCpuProfLog() const { return cpu_prof_log; }         // [gsr-prof] - fillTraversalScratch(). SESSION090: the drain-side VBO upload it also covered belonged to the pre-session063 pipeline and went with it; the filter's upload has its own line.
 	void setCpuProfLog(bool v) { cpu_prof_log = v; }
 
 	// SESSION088 DIAGNOSTIC - [gsr-sat-probe], printed from think() at most twice a second while this is on.
@@ -1934,12 +1922,6 @@ private:
 	// See getMaxTreeDepth() above. 0 disables the check.
 	int lod_max_tree_depth;
 
-	// See getFrustumCullEnabled() above. On by default from session055.
-	bool lod_frustum_cull_enabled;
-
-	// SESSION063: see getSplitFilterEnabled() above. Off by default - the split path is opt-in for A/B while it's built out.
-	bool split_filter_enabled;
-
 	// SESSION063 K3: filter dilation knobs - see the getters above.
 	float filter_dilation_latency;      // s
 	float filter_min_rot_rate_deg_per_s;
@@ -1996,7 +1978,7 @@ private:
 	Timer prev_think_timer;                  // Reset each think(); elapsed() between resets is dt for the velocity diff.
 	Vec4f cam_velocity_ema_ws;               // World-space linear velocity (m/s), EMA-smoothed.
 	float cam_angular_speed_ema;             // Scalar angular speed (rad/s), max(inst, blended).
-	float cam_angular_speed_peak;            // SESSION055: slow-decay peak of angular speed, so a mouse flick keeps rotation dilation elevated for the next ~1s of kicks - covers subsequent bursts that neither EMA nor empirical predict in time.
+	float cam_angular_speed_peak;            // SESSION055: slow-decay peak of angular speed, so a mouse flick keeps the filter's rotation dilation elevated for the next ~1s of kicks - covers subsequent bursts the EMA does not predict in time. SESSION090: read by kickOffFilters() only, the traversal having no dilation of its own any more.
 	float cam_inst_angular_speed;            // SESSION064: this frame's raw instantaneous angular speed (rad/s), NOT smoothed. Drives the filter's per-frame re-filter trigger (kickOffFilters()): it is 0 the moment the camera stops, whereas the EMA/peak above coast down over ~2s and would keep re-filtering (and boiling) a static camera - see session064 snapshot.
 	// SESSION072: EMA-smoothed unit rotation axis (world space, w=0) - the direction cam_angular_speed_ema/_peak's
 	// magnitude is spinning about. Updated only on frames with a measurable rotation (near-zero deltas would normalise

@@ -397,6 +397,9 @@ public:
 	// and session085's LoD bias then gave the block a second, far more sensitive dependence on the barrier that the same
 	// one number was left to cover. This is the second dependence's own evidence, so it can be checked directly instead
 	// of proxied by how far the camera has walked.
+	//
+	// EMPTY means this block's selection was made with the bias OFF - not that it is compatible with anything. A live
+	// bias therefore rejects such a block rather than accepting it; see the acceptance clause's SESSION090 note.
 	js::Vector<float, 16> sat_depth_used;
 	int sat_grid_res_used;
 	Vec4f sat_anchor_used; // The barrier anchor that grid was measured from - two grids are only comparable tile-by-tile while their anchors are close, see gsSatBarrierDisagreement().
@@ -2047,7 +2050,18 @@ public:
 				// below 1 the block is discarded when the grid has moved further than that, whether it took the camera
 				// five metres or one. Ordering and detail are now bounded by the quantity each is actually about, which is
 				// what makes raising reuse_drift_fraction (the order budget, which is genuinely tolerant) safe to try.
-				(!sat_bias_active || block->sat_depth_used.empty() || diag_barrier_disagreement <= sat_barrier_agree_tol))
+				//
+				// SESSION090 BUGFIX: an EMPTY sat_depth_used used to satisfy this clause on its own. It reads as "this block
+				// owes the barrier nothing", which is true only if the bias was off when the block was built AND is off now -
+				// and the second half was never checked. A block built before the cloud's first barrier existed (the walk
+				// runs the moment a cloud loads; the first barrier build lands later) records nothing, and then, once the
+				// bias goes live, is accepted forever on that emptiness. Its selection was made with no bias at all, so it
+				// is uniformly finer than the near segment beside it: observed at 9.7M nodes against the 3.5M an equivalent
+				// biased block holds, held for 28 traversals until unrelated drift finally forced a rebuild, with the
+				// filter paying 176ms a pass instead of 46ms for the whole time. Requiring a recorded barrier whenever the
+				// bias is live costs exactly one extra rebuild per cloud, at startup: every block built from then on has a
+				// barrier to record, because sat_bias_active is what decides both.
+				(!sat_bias_active || (!block->sat_depth_used.empty() && diag_barrier_disagreement <= sat_barrier_agree_tol)))
 			{
 				far_cut_is_frozen = true;
 				reuse_prev_anchor_ws = block->anchor_pos_ws; // The FROZEN anchor, not the predecessor's - that is the whole point.
@@ -2379,8 +2393,10 @@ public:
 					block->topology_generation = topology_generation;
 					// SESSION088: the barrier this block's LoD was actually chosen under, kept so later traversals can ask
 					// whether that choice still stands - see GaussianSplatUnculledFrontier::sat_depth_used. Captured only
-					// when the bias was live: with it off the selection does not depend on the barrier at all, and an empty
-					// grid is the signal the acceptance clause reads as "this block owes the barrier nothing".
+					// when the bias was live: with it off the selection does not depend on the barrier at all, so there is
+					// nothing to record and nothing a later traversal could compare against.
+					// SESSION090: an empty grid therefore means "built with no bias", NOT "agrees with any barrier" - the
+					// acceptance clause treats it as a mismatch once the bias IS live, see the BUGFIX note there.
 					if(sat_bias_active)
 					{
 						block->sat_depth_used = sat_barrier->sat_depth;

@@ -26,6 +26,12 @@ uniform sampler2D albedo_texture; // The scene's depth, at full resolution, as a
 uniform vec2 splat_depth_src_dims_px; // Size of that copy.
 uniform vec2 splat_depth_dst_dims_px; // Size of this pass's target, i.e. of the accumulation buffer.
 
+// SESSION094 - the same farthest depth, also written as colour.  Inert in the depth-only draw in drawSplatClouds(), which
+// masks colour off.  OpenGLEngine::resolveSplatAccumBuffer() runs this program a second time into a colour-only R32F
+// target (where gl_FragDepth is dropped instead), so TAA's history rejection compares exactly the depth the splats were
+// tested against - see gaussian_splat_taa_accum_frag_shader.glsl.
+out vec4 colour_out;
+
 
 void main()
 {
@@ -67,4 +73,5 @@ void main()
 #endif
 
 	gl_FragDepth = acc;
+	colour_out = vec4(acc, 0.0, 0.0, 1.0);
 }

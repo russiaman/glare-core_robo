@@ -718,6 +718,12 @@ public:
 	Reference<FrameBuffer> splat_taa_history_framebuffer[2];
 	OpenGLTextureRef       splat_taa_history_texture[2];
 
+	// SESSION094 - the farthest depth the splats were tested against, at accumulation-buffer resolution (R32F), for this
+	// frame and last - ping-ponged on the same write index as the history.  The accumulate pass drops history wherever
+	// the two differ, see gaussian_splat_taa_accum_frag_shader.glsl.  Allocated alongside the TAA buffers above.
+	Reference<FrameBuffer> splat_taa_depth_framebuffer[2];
+	OpenGLTextureRef       splat_taa_depth_texture[2];
+
 	// DIAGNOSTIC ONLY (SESSION066) - the "Clip" diagnostic's own per-pixel overdraw count, kept separate from the gate's
 	// mask so Clip can cull red-zone splats WITHOUT standing the saturation gate down (they no longer share one mask).
 	// A full-resolution copy of the overdraw counting pre-pass, sampled per-splat in gaussian_splat_vert_shader.glsl.
@@ -1607,7 +1613,8 @@ private:
 	// this frame - see drawSplatClouds(), which computes it and owns the depth-only Prepass mode alongside this.
 	void resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name, bool write_weighted_depth);
 	// SESSION069 - Allocates the three full-resolution RGBA16F textures TAA uses (current + history*2) whenever the
-	// renderer wants TAA active and either they don't exist yet or the frame size changed under them.
+	// renderer wants TAA active and either they don't exist yet or the frame size changed under them.  SESSION094: plus
+	// the accumulation-resolution depth pair for history rejection, on its own size check.
 	void allocSplatTAABuffersIfNeeded();
 
 	//----------------------------------------------------------------------------------------------------------------

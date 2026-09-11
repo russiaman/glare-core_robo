@@ -1597,10 +1597,15 @@ public:
 	// is roughly 2x this.  Null until the first addObject(), like the resolve.  Uniform locations resolved via the
 	// same appendUserUniformInfo() defer-until-linked mechanism as the other programs; the indices are:
 	//   0 = current_texture (sampler2D), 1 = history_texture (sampler2D), 2 = taa_weight (float).
+	//   SESSION094: 3 = taa_depth_texture, 4 = taa_prev_depth_texture (sampler2D), 5 = taa_depth_reject_enabled (int) -
+	//   per-pixel history rejection where the occluding depth changed, up to 18 extra fetches per pixel.
 	const Reference<OpenGLProgram>& getTAAAccumulateProgram() const { return taa_accumulate_prog; }
 	int getTAAAccumulateCurrentTexUniformLoc() const;
 	int getTAAAccumulateHistoryTexUniformLoc() const;
 	void setTAAAccumulateWeight(float weight) const; // Renamed from setTAAAccumulateUniform for clarity.
+	int getTAAAccumulateDepthTexUniformLoc() const;     // SESSION094
+	int getTAAAccumulatePrevDepthTexUniformLoc() const; // SESSION094
+	void setTAAAccumulateDepthRejectEnabled(bool enabled) const; // SESSION094
 
 	// SESSION069 - TAA composite pass: reads the freshly written history and draws it into the frame with the same
 	// front-to-back "under" blend the resolve used to do directly.  Splits out because the write and the blend need two

@@ -4109,6 +4109,9 @@ void GaussianSplatRenderer::buildShadersIfNeeded()
 	taa_accumulate_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "current_texture");
 	taa_accumulate_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "history_texture");
 	taa_accumulate_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Float, "taa_weight");
+	taa_accumulate_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "taa_depth_texture");        // SESSION094 - history rejection, see the shader.
+	taa_accumulate_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "taa_prev_depth_texture");   // SESSION094
+	taa_accumulate_prog->appendUserUniformInfo(UserUniformInfo::UniformType_Int,   "taa_depth_reject_enabled"); // SESSION094
 
 
 	// SESSION069 - TAA composite: draws the freshly accumulated history onto the frame with (GL_ONE, GL_ONE_MINUS_SRC_ALPHA),
@@ -4572,6 +4575,27 @@ int GaussianSplatRenderer::getTAAAccumulateCurrentTexUniformLoc() const
 int GaussianSplatRenderer::getTAAAccumulateHistoryTexUniformLoc() const
 {
 	return taa_accumulate_prog.nonNull() ? taa_accumulate_prog->user_uniform_info[1].loc : -1;
+}
+
+
+// SESSION094 - depth-change history rejection, see gaussian_splat_taa_accum_frag_shader.glsl.  Indices 3-5 in the
+// appendUserUniformInfo() order.
+int GaussianSplatRenderer::getTAAAccumulateDepthTexUniformLoc() const
+{
+	return taa_accumulate_prog.nonNull() ? taa_accumulate_prog->user_uniform_info[3].loc : -1;
+}
+
+
+int GaussianSplatRenderer::getTAAAccumulatePrevDepthTexUniformLoc() const
+{
+	return taa_accumulate_prog.nonNull() ? taa_accumulate_prog->user_uniform_info[4].loc : -1;
+}
+
+
+void GaussianSplatRenderer::setTAAAccumulateDepthRejectEnabled(bool enabled) const
+{
+	if(taa_accumulate_prog.nonNull())
+		glUniform1i(taa_accumulate_prog->user_uniform_info[5].loc, enabled ? 1 : 0);
 }
 
 

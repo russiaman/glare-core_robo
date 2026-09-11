@@ -8197,6 +8197,8 @@ void OpenGLEngine::draw()
 			cur_scene->splat_taa_current_texture = NULL; // SESSION069 - reallocated by resolveSplatAccumBuffer() when TAA is active.
 			cur_scene->splat_taa_history_texture[0] = NULL;
 			cur_scene->splat_taa_history_texture[1] = NULL;
+			cur_scene->splat_taa_depth_texture[0] = NULL; // SESSION094
+			cur_scene->splat_taa_depth_texture[1] = NULL;
 
 			cur_scene->main_colour_renderbuffer = NULL;
 			cur_scene->main_normal_renderbuffer = NULL;
@@ -8213,6 +8215,8 @@ void OpenGLEngine::draw()
 			cur_scene->splat_taa_current_framebuffer = NULL; // SESSION069
 			cur_scene->splat_taa_history_framebuffer[0] = NULL;
 			cur_scene->splat_taa_history_framebuffer[1] = NULL;
+			cur_scene->splat_taa_depth_framebuffer[0] = NULL; // SESSION094
+			cur_scene->splat_taa_depth_framebuffer[1] = NULL;
 
 			main_texture_size_changed = true;
 		}
@@ -11847,6 +11851,30 @@ same as a fully covered one.
 // this pass reads them by texelFetch, one-to-one with the frame.
 void OpenGLEngine::allocSplatTAABuffersIfNeeded()
 {
+	// SESSION094 - the depth pair for history rejection.  Sized to the accumulation buffer, not the frame, so it has its
+	// own check: the accumulation scale can change without the frame size changing.
+	const int depth_xres = (int)current_scene->splat_accum_renderbuffer->xRes();
+	const int depth_yres = (int)current_scene->splat_accum_renderbuffer->yRes();
+	if(current_scene->splat_taa_depth_texture[0].isNull() ||
+		(int)current_scene->splat_taa_depth_texture[0]->xRes() != depth_xres ||
+		(int)current_scene->splat_taa_depth_texture[0]->yRes() != depth_yres)
+	{
+		for(int i = 0; i < 2; ++i)
+		{
+			current_scene->splat_taa_depth_texture[i] = new OpenGLTexture(depth_xres, depth_yres, this,
+				ArrayRef<uint8>(), // data
+				OpenGLTextureFormat::Format_Greyscale_Float, // Full float: the accumulate pass compares for exact equality.
+				OpenGLTexture::Filtering_Nearest,
+				OpenGLTexture::Wrapping_Clamp,
+				false, // has_mipmaps
+				/*MSAA_samples=*/1
+			);
+			current_scene->splat_taa_depth_framebuffer[i] = new FrameBuffer();
+			current_scene->splat_taa_depth_framebuffer[i]->attachTexture(*current_scene->splat_taa_depth_texture[i], GL_COLOR_ATTACHMENT0);
+		}
+		conPrint("Allocated splat TAA depth buffers, width " + toString(depth_xres) + " height " + toString(depth_yres));
+	}
+
 	const int xres = myMax(16, current_scene->viewport_w);
 	const int yres = myMax(16, current_scene->viewport_h);
 
@@ -12033,6 +12061,28 @@ void OpenGLEngine::resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name,
 		unbindTextureFromTextureUnit(*current_scene->splat_accum_copy_texture, /*texture_unit_index=*/0);
 		OpenGLProgram::useNoPrograms();
 
+		//----- Depth snapshot for history rejection (SESSION094) -----
+		// The depth downsample program again, drawn into this frame's R32F depth texture instead of the accumulation
+		// buffer's depth attachment: same program, same inputs, so it reproduces exactly the depth this frame's splats were
+		// tested against.  The accumulate pass compares it with last frame's - see gaussian_splat_taa_accum_frag_shader.glsl.
+		// Without a scene depth copy the splats were not occluded by meshes at all, so there is nothing to reject.
+		const Reference<OpenGLProgram>& taa_depth_prog = splat_renderer->getDepthDownsampleProgram();
+		const bool taa_depth_reject = splat_depth_copy_works && current_scene->splat_depth_src_texture.nonNull() &&
+			taa_depth_prog.nonNull() && taa_depth_prog->isBuilt();
+		if(taa_depth_reject)
+		{
+			const Vec2i taa_depth_dims((int)current_scene->splat_taa_depth_texture[write]->xRes(), (int)current_scene->splat_taa_depth_texture[write]->yRes());
+			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, current_scene->splat_taa_depth_framebuffer[write]->buffer_name);
+			setSingleDrawBuffer(GL_COLOR_ATTACHMENT0);
+			glViewport(0, 0, (GLsizei)taa_depth_dims.x, (GLsizei)taa_depth_dims.y);
+			glDisable(GL_BLEND);
+			taa_depth_prog->useProgram();
+			splat_renderer->setDepthDownsampleUniforms(Vec2i((int)current_scene->splat_depth_src_texture->xRes(), (int)current_scene->splat_depth_src_texture->yRes()), taa_depth_dims);
+			bindTextureUnitToSampler(*current_scene->splat_depth_src_texture, /*unit=*/0, taa_depth_prog->albedo_texture_loc);
+			drawElementsBaseVertex(GL_TRIANGLES, (GLsizei)unit_quad_meshdata->batches[0].num_indices, unit_quad_meshdata->getIndexType(), (void*)unit_quad_meshdata->getBatch0IndicesTotalBufferOffset(), unit_quad_meshdata->vbo_handle.base_vertex);
+			unbindTextureFromTextureUnit(*current_scene->splat_depth_src_texture, /*unit=*/0);
+		}
+
 		//----- Accumulate pass -----
 		const Reference<OpenGLProgram>& accum_prog = splat_renderer->getTAAAccumulateProgram();
 		assert(accum_prog.nonNull());
@@ -12044,9 +12094,16 @@ void OpenGLEngine::resolveSplatAccumBuffer(GLuint scene_target_framebuffer_name,
 		splat_renderer->setTAAAccumulateWeight(splat_renderer->getTAAAccumulateWeight());
 		bindTextureUnitToSampler(*current_scene->splat_taa_current_texture,      /*unit=*/0, splat_renderer->getTAAAccumulateCurrentTexUniformLoc());
 		bindTextureUnitToSampler(*current_scene->splat_taa_history_texture[read], /*unit=*/1, splat_renderer->getTAAAccumulateHistoryTexUniformLoc());
+		// SESSION094 - the depth pair is bound even with rejection off, for the same reason the history is on a reset frame
+		// (see splat_taa_write_index in updateTAAState()).
+		splat_renderer->setTAAAccumulateDepthRejectEnabled(taa_depth_reject);
+		bindTextureUnitToSampler(*current_scene->splat_taa_depth_texture[write], /*unit=*/2, splat_renderer->getTAAAccumulateDepthTexUniformLoc());
+		bindTextureUnitToSampler(*current_scene->splat_taa_depth_texture[read],  /*unit=*/3, splat_renderer->getTAAAccumulatePrevDepthTexUniformLoc());
 		drawElementsBaseVertex(GL_TRIANGLES, (GLsizei)unit_quad_meshdata->batches[0].num_indices, unit_quad_meshdata->getIndexType(), (void*)unit_quad_meshdata->getBatch0IndicesTotalBufferOffset(), unit_quad_meshdata->vbo_handle.base_vertex);
 		unbindTextureFromTextureUnit(*current_scene->splat_taa_current_texture,      /*unit=*/0);
 		unbindTextureFromTextureUnit(*current_scene->splat_taa_history_texture[read], /*unit=*/1);
+		unbindTextureFromTextureUnit(*current_scene->splat_taa_depth_texture[write], /*unit=*/2); // SESSION094
+		unbindTextureFromTextureUnit(*current_scene->splat_taa_depth_texture[read],  /*unit=*/3); // SESSION094
 
 		//----- Composite pass -----
 		const Reference<OpenGLProgram>& comp_prog = splat_renderer->getTAACompositeProgram();

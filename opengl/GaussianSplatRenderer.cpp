@@ -21,6 +21,8 @@ Copyright Glare Technologies Limited 2026 -
 #include "../maths/vec2.h" // For the screen-space ellipse axes in splatFootprint().
 #include "../utils/ArrayRef.h"
 #include "../utils/AtomicInt.h" // SESSION080 DIAGNOSTIC: counts saturation phases running at once - see gs_sat_phases_running.
+#include "../utils/Lock.h" // SESSION093: GsExpandJoin.
+#include "GaussianSplatPoolTask.h" // SESSION093 - see that header.
 #include "../utils/BitUtils.h"
 #include "../utils/ConPrint.h"
 #include "../utils/Exception.h"
@@ -300,6 +302,15 @@ public:
 	// fixes, so measuring them apart is the whole point of printing both.
 	size_t expand_workers;
 	double expand_seed_max_ms;
+	// SESSION093 DIAGNOSTIC: what yielding the pool to the other splat stages cost this traversal - see
+	// GaussianSplatPoolTask.h. expand_yields is how many times its tasks went to the back of the queue (0 = nothing else
+	// wanted the pool); expand_yield_ms is the worker-time they spent in the queue as a result, summed over tasks -
+	// task-ms, on the same scale as task_sum_ms, and the price of the other stages' priority measured directly.
+	// expand_join_ms is how long the calling thread then waited for the pool's tasks after its own share ran dry:
+	// the slowest task's tail, plus any queue time it was still paying - wall-clock, the part of the price that
+	// lands on expand_ms.
+	size_t expand_yields;
+	double expand_yield_ms, expand_join_ms;
 	// SESSION086: how finely the split ran, so the closed loop in updateExpandSeedTarget() can be read off the log -
 	// expand_seed_max_ms above is the quantity it steers, this is where it steered to.
 	size_t expand_seed_target;
@@ -411,6 +422,7 @@ public:
 	size_t reuse_n;              // Nodes the far block contributes, i.e. how much of the frontier was not walked.
 	double reuse_ms;             // SESSION090: the mark-count pass, i.e. the separable part of what BUILDING the far segment costs - see buildFrontierSoA()'s out_split_ms. 0 exactly when the segment was inherited instead.
 	float reuse_split_dist_used; // The frozen split distance this frontier's cut was made at - see far_block.
+	bool far_block_inherited;    // SESSION093: this traversal walked only the near part and took far_block from its predecessor - see updateExpandSeedTarget() for the one consumer.
 	float barrier_disagreement;  // SESSION088 DIAGNOSTIC: flip + depth, what the acceptance clause gates on - see gsSatBarrierDisagreement().
 	float barrier_flip, barrier_depth, barrier_mean_rel_depth; // SESSION088: its two components, and the mean relative depth move behind the second.
 	bool barrier_measured;       // SESSION088: false = nothing was compared. Printed as n/a, so a not-measured row can no longer be read as perfect agreement.
@@ -432,13 +444,14 @@ public:
 		expand_ms(0.0), sort_ms(0.0), // SESSION080
 		expand_seeds(0), expand_num_tasks(0), expand_prologue_ms(0.0), expand_task_max_ms(0.0), expand_task_sum_ms(0.0), // SESSION080
 		expand_workers(0), expand_seed_max_ms(0.0), expand_seed_target(0), // SESSION086
+		expand_yields(0), expand_yield_ms(0.0), expand_join_ms(0.0), // SESSION093
 		expand_splice_reserve_ms(0.0), expand_splice_copy_ms(0.0), sort_alloc_ms(0.0), soa_ms(0.0), // SESSION080 (plan2 §4.1)
 		traversal_output_n(0), // SESSION080
 		sat_bias_barrier_time(0.0), // SESSION085
 		sort_staleness_delta_ws(0.0), sort_staleness_prev_n(0), sort_staleness_common_n(0), sort_staleness_max_disp(0), // SESSION080
 		sort_staleness_mean_disp(0.0), sort_staleness_gt1k(0), sort_staleness_gt10k(0), sort_staleness_ms(0.0), // SESSION080
 		sat_grid_res_used(0), sat_anchor_used(0.f), sat_built_time_used(0.0), // SESSION088 - see sat_depth_used.
-		reuse_roots(0), reuse_n(0), reuse_ms(0.0), reuse_split_dist_used(0.f), barrier_disagreement(0.f), // SESSION080 §4.3; SESSION088
+		reuse_roots(0), reuse_n(0), reuse_ms(0.0), reuse_split_dist_used(0.f), far_block_inherited(false), barrier_disagreement(0.f), // SESSION080 §4.3; SESSION093; SESSION088
 		barrier_flip(0.f), barrier_depth(0.f), barrier_mean_rel_depth(0.f), barrier_measured(false),
 		diag_live_barrier_time(0.0), diag_block_barrier_time(0.0), reuse_base_anchor_ws(0.f)
 	{
@@ -583,6 +596,7 @@ public:
 		last_applied_filter_frontier_time_s(0.0), // SESSION081
 		filter_dilation_elevated(false), // SESSION066
 		diag_filter_kick_time_s(0.0), sat_build_kick_time_s(0.0), // SESSION073 DIAGNOSTIC; SESSION088 - see the members.
+		expand_seed_target(0), // SESSION093 - see the member.
 		diag_filter_band_fine_rad(0.f), diag_applied_kick_forward_ws(0.f), diag_have_applied_filter(false), // SESSION073 DIAGNOSTIC
 		sat_build_in_flight(false) // SESSION081
 	{}
@@ -704,6 +718,10 @@ public:
 	// round trip that matters is kick->APPLIED (what the LoD bias actually waits for), not the task's own run time,
 	// which the build already reports as gather_ms/grid_build_ms/walk_ms and which excludes every queue it sat in.
 	double sat_build_kick_time_s;
+	// SESSION093: how finely this cloud's traversal splits its expand into seeds - closed-loop, from its own previous
+	// traversal's measurements. 0 until the first one reports back. Was a renderer member; see
+	// GaussianSplatRenderer::updateExpandSeedTarget() for why sharing it between clouds was wrong.
+	size_t expand_seed_target;
 	float diag_filter_band_fine_rad;       // swept_fine of that kick - the angular half-width the fine layer was dilated by.
 	Vec4f diag_applied_kick_forward_ws;    // Camera forward at the kick of the list CURRENTLY on screen, so the next drain can report the total angle that list went stale by before being replaced (the worst-case deficit, roughly double the kick->drain figure).
 	bool diag_have_applied_filter;         // False until the first result has been applied, so the first drain doesn't report a bogus staleness against a zero vector.
@@ -935,6 +953,11 @@ struct GsSatPhaseScope
 };
 
 
+// SESSION093: pool priority between the stages sharing the main task manager - GsExpandTask yields to every other
+// splat task, and every other splat task is a GsPoolTask. The whole argument is in GaussianSplatPoolTask.h; the
+// mechanics on the expand's side are in GsExpandTask::run() and expandParallel().
+
+
 // Whether any member of this cloud has a built LoD tree.  Drives two things: whether kickOffTraversals() bothers picking
 // this cloud at all (nothing to choose between without a tree), and, temporarily, whether kickOffSorts() skips it (see
 // that function's use of this) - a cloud with no tree anywhere in it behaves exactly as before LoD existed.
@@ -1061,7 +1084,7 @@ public:
 
 
 // Sorts one cloud front-to-back by camera distance, entirely on a worker thread.  No GL calls here.
-class GaussianSplatSortTask : public glare::Task
+class GaussianSplatSortTask : public GsPoolTask // SESSION093 - see GaussianSplatPoolTask.h.
 {
 public:
 	GaussianSplatSortTask(uint64 cloud_id_, uint64 generation_, const Reference<GaussianSplatSortScratch>& scratch_, const Matrix4f& world_to_cam_,
@@ -1069,7 +1092,7 @@ public:
 	:	cloud_id(cloud_id_), generation(generation_), scratch(scratch_), world_to_cam(world_to_cam_), result_queue(result_queue_)
 	{}
 
-	virtual void run(size_t /*thread_index*/) override
+	virtual void runQueued(size_t /*thread_index*/) override
 	{
 		typedef GaussianSplatSortScratch::SortItem SortItem;
 		struct SortItemGetKey { inline uint32 operator () (const SortItem& item) const { return item.key; } };
@@ -1278,10 +1301,10 @@ struct FrontierNodeRecord
 // SESSION090: how many of one slice's nodes carry the far-segment mark. Only ever run by the traversal that BUILDS a far
 // block; see buildFrontierSoA(), which needs the counts PER SLICE (not just the total) to hand each slice a disjoint
 // write range in the gather below.
-class GsFrontierFarCountTask : public glare::Task
+class GsFrontierFarCountTask : public GsPoolTask // SESSION093 - see GaussianSplatPoolTask.h.
 {
 public:
-	virtual void run(size_t /*thread_index*/)
+	virtual void runQueued(size_t /*thread_index*/)
 	{
 		size_t n = 0;
 		for(size_t i=i_begin; i<i_end; ++i)
@@ -1307,10 +1330,10 @@ public:
 // Still a pure function of the input per element, so the result is bit-identical to the serial version and the slices
 // need nothing from each other: the two write cursors start at ranges the caller's prefix sum made disjoint, and each
 // segment stays in sorted order because the slices are consecutive and each keeps its own elements' relative order.
-class GsFrontierSoATask : public glare::Task
+class GsFrontierSoATask : public GsPoolTask // SESSION093 - see GaussianSplatPoolTask.h.
 {
 public:
-	virtual void run(size_t /*thread_index*/)
+	virtual void runQueued(size_t /*thread_index*/)
 	{
 		// Indexed by the mark, so the per-element branch is an array lookup rather than a jump. seg 0 = near (the
 		// published frontier's own arrays), seg 1 = far (the block's). With no block being built out_*[1] is never
@@ -1421,10 +1444,10 @@ struct GsWalkDistLess { inline bool operator () (const GsDistIdx& a, const GsDis
 //
 // The duplicated radius/alpha expression that used to sit here and in GsSatGatherTask, with a standing obligation to
 // keep the two in step, is resolved: this is the surviving copy.
-class GsSatWalkGatherTask : public glare::Task
+class GsSatWalkGatherTask : public GsPoolTask // SESSION093 - see GaussianSplatPoolTask.h.
 {
 public:
-	virtual void run(size_t /*thread_index*/) override
+	virtual void runQueued(size_t /*thread_index*/) override
 	{
 		for(size_t i=i_begin; i<i_end; ++i)
 		{
@@ -1480,10 +1503,10 @@ public:
 // kickOffTraversals() does) - it becomes the new barrier's own anchor, which is deliberately NOT the same point
 // source_frontier was built at: the frontier can be arbitrarily older (whatever the cloud's last_unpruned_ufrontier
 // currently holds), while the barrier's ball guarantee has to be centred on where the camera actually is now.
-class GaussianSplatSaturationBuildTask : public glare::Task
+class GaussianSplatSaturationBuildTask : public GsPoolTask // SESSION093 - see GaussianSplatPoolTask.h.
 {
 public:
-	virtual void run(size_t /*thread_index*/) override
+	virtual void runQueued(size_t /*thread_index*/) override
 	{
 		// SESSION085: the frontier is no longer READ for occluders (the tree walk supplies its own - see below); its size
 		// is still recorded, because frontier_n is what [gsr-sat-build] reports the walk's occluder count against.
@@ -1629,12 +1652,12 @@ public:
 	//
 	// run_ms therefore means "how long this thread was working", not "how long one bucket took", so par reads as true
 	// utilisation.
-	class GsOccWalkTask : public glare::Task
+	class GsOccWalkTask : public GsPoolTask // SESSION093 - see GaussianSplatPoolTask.h.
 	{
 	public:
 		GsOccWalkTask() : parent(NULL), seeds(NULL), next_seed(NULL), visited(0), run_ms(0.0), seeds_taken(0), seed_max_ms(0.0) {}
 
-		virtual void run(size_t /*thread_index*/) override
+		virtual void runQueued(size_t /*thread_index*/) override
 		{
 			Timer task_timer; // SESSION092 DIAGNOSTIC: this task's own duration - see runWalk()'s par bookkeeping, which mirrors the traversal's expand_task_max_ms/expand_task_sum_ms exactly so the two numbers can be read side by side.
 			while(1)
@@ -1720,11 +1743,13 @@ public:
 		{
 			js::Vector<GsDistIdx, 16> sort_scratch;
 			sort_scratch.resizeNoCopy(count);
-			const size_t parallel_sort_min_elements = 16384;
-			if(task_manager != NULL && count >= parallel_sort_min_elements)
-				Sort::radixSortWithParallelPartition<GsDistIdx, GsWalkDistKey>(*task_manager, selected.data(), (uint32)count, GsWalkDistKey(), sort_scratch.data(), /*put_result_in_working_space=*/false);
-			else
-				Sort::floatKeyAscendingSort(selected.data(), count, GsWalkDistLess(), GsWalkDistKey(), sort_scratch.data(), /*put_result_in_working_space=*/false);
+			// SESSION093: serial, always. The parallel partition sort's tasks are Sort's own, so the expand cannot count
+			// them (see GaussianSplatPoolTask.h) and they would sit behind a running expand for its whole remaining
+			// length; the alternative - a coarse "pool wanted" claim held for the sort's duration - left the pool's
+			// spare workers cycling expand tasks through the queue for nothing. At this phase's sizes the parallel sort
+			// was not buying much anyway: 3.1ms mean exterior (~100-200K elements), 7.7ms interior (~630-760K),
+			// dispatch overhead included. walk_sort_ms= on [gsr-sat-build] is the number to check this against.
+			Sort::floatKeyAscendingSort(selected.data(), count, GsWalkDistLess(), GsWalkDistKey(), sort_scratch.data(), /*put_result_in_working_space=*/false);
 		}
 		barrier.walk_sort_ms = sort_timer.elapsed() * 1.0e3;
 
@@ -1748,10 +1773,10 @@ public:
 			t->alpha_gain = alpha_gain; t->alpha_gamma = alpha_gamma;
 			t->i_begin = (count * c) / num_chunks;
 			t->i_end   = (count * (c + 1)) / num_chunks;
-			if(task_manager != NULL) group->tasks.push_back(t); else t->run(0);
+			if(task_manager != NULL) group->tasks.push_back(t); else t->runQueued(0); // runQueued, not run: never dispatched, so never counted - see GsPoolTask.
 		}
 		if(task_manager != NULL)
-			task_manager->runTaskGroup(group);
+			gsRunPoolTaskGroup(*task_manager, group); // SESSION093 - see GaussianSplatPoolTask.h.
 	}
 
 
@@ -1885,7 +1910,7 @@ public:
 					task->next_seed = &next_seed;
 					group->tasks[t] = task;
 				}
-				task_manager->runTaskGroup(group);
+				gsRunPoolTaskGroup(*task_manager, group); // SESSION093 - see GaussianSplatPoolTask.h.
 
 				for(size_t t=0; t<num_tasks; ++t) // Task order, not completion order - see the determinism note above.
 				{
@@ -2182,7 +2207,7 @@ static void gsSatBarrierDisagreement(const js::Vector<float, 16>& cur, const js:
 }
 
 
-class GaussianSplatLodTraversalTask : public glare::Task
+class GaussianSplatLodTraversalTask : public GsPoolTask // SESSION093 - see GaussianSplatPoolTask.h.
 {
 public:
 	// SESSION054: build (dist_sq, idx) pairs directly during traversal, so the sort phase reuses the distance already
@@ -2223,6 +2248,7 @@ public:
 		task_manager(task_manager_), // SESSION079
 		expand_seeds(0), expand_num_tasks(0), expand_prologue_ms(0.0), expand_task_max_ms(0.0), expand_task_sum_ms(0.0), // SESSION080 DIAGNOSTIC
 		expand_workers(0), expand_seed_max_ms(0.0), // SESSION086
+		expand_yields(0), expand_yield_ms(0.0), expand_join_ms(0.0), // SESSION093
 		expand_seed_target(expand_seed_target_), // SESSION086 - see GaussianSplatRenderer::updateExpandSeedTarget().
 		expand_splice_reserve_ms(0.0), expand_splice_copy_ms(0.0), // SESSION080 DIAGNOSTIC (plan2 §4.1)
 		prev_frontier(prev_frontier_), sort_staleness_diag_enabled(sort_staleness_diag_enabled_), // SESSION080 DIAGNOSTIC
@@ -2407,7 +2433,7 @@ public:
 					t->far_count = 0;
 					count_group->tasks[c] = t;
 				}
-				task_manager->runTaskGroup(count_group);
+				gsRunPoolTaskGroup(*task_manager, count_group); // SESSION093 - see GaussianSplatPoolTask.h.
 				for(size_t c=0; c<num_chunks; ++c) // In slice order, which is what keeps each segment sorted.
 				{
 					chunk_far_begin[c] = far_n;
@@ -2461,7 +2487,7 @@ public:
 				t->out_far_radius = far_out.nonNull() ? far_out->radius.data() : NULL;
 				group->tasks[c] = t;
 			}
-			task_manager->runTaskGroup(group);
+			gsRunPoolTaskGroup(*task_manager, group); // SESSION093 - see GaussianSplatPoolTask.h.
 		}
 		else
 		{
@@ -2481,7 +2507,7 @@ public:
 	}
 
 
-	virtual void run(size_t /*thread_index*/) override
+	virtual void runQueued(size_t /*thread_index*/) override
 	{
 		// SESSION076: pin the geometry snapshot for the whole of run(). The saturation phase now runs AFTER this task has
 		// published its frontier (see the two enqueues at the end), by which point drainTraversalResults() may already have
@@ -2710,6 +2736,7 @@ public:
 				uf->expand_prologue_ms = expand_prologue_ms;
 				uf->expand_task_max_ms = expand_task_max_ms;
 				uf->expand_workers = expand_workers; uf->expand_seed_max_ms = expand_seed_max_ms; // SESSION086 DIAGNOSTIC
+				uf->expand_yields = expand_yields; uf->expand_yield_ms = expand_yield_ms; uf->expand_join_ms = expand_join_ms; // SESSION093 DIAGNOSTIC
 				uf->expand_seed_target = expand_seed_target;
 				uf->expand_task_sum_ms = expand_task_sum_ms;
 				uf->expand_splice_reserve_ms = expand_splice_reserve_ms; // SESSION080 DIAGNOSTIC (plan2 §4.1)
@@ -2721,6 +2748,7 @@ public:
 				// SESSION085: this frontier's own size, both segments - see the field. Nothing has pruned it yet, so the
 				uf->reuse_ms = reuse_ms_accum; // See the field: 0 exactly when a block was inherited - which is the whole point of §4.3.
 				uf->reuse_split_dist_used = reuse_enabled ? reuse_split_dist : 0.f;
+				uf->far_block_inherited = far_cut_is_frozen; // SESSION093 - see the field.
 				uf->barrier_disagreement = diag_barrier_disagreement; // SESSION088 DIAGNOSTIC - what the acceptance clause measured for THIS kick, see the field.
 				uf->barrier_flip = diag_barrier_flip; uf->barrier_depth = diag_barrier_depth;
 				uf->barrier_mean_rel_depth = diag_barrier_mean_rel_depth; uf->barrier_measured = diag_barrier_measured;
@@ -3207,39 +3235,104 @@ private:
 	//
 	// run_ms now means "how long this thread was working", not "how long one bucket took", so par reads as true
 	// utilisation. Fragment order across tasks was already documented as not mattering - see expandParallel().
+	// SESSION093: the expand tasks' completion count - what runTaskGroup()'s own count did while they were a group. Not a
+	// group any more, because a group finishes only when every task has RETURNED, and a task that yields returns early:
+	// one that yielded first then sat idle until the slowest task's current seed ended (up to expand_seed_max_ms), once
+	// per yield, ~10 yields per overlapping build. Measured as +30-100ms on full exterior traversals. Here a task counts
+	// itself done only when the cursor has run dry, however many times it was dispatched on the way.
+	struct GsExpandJoin
+	{
+		GsExpandJoin(int num_tasks_) : remaining(num_tasks_) {}
+		void finished()
+		{
+			Lock lock(mutex);
+			if(--remaining == 0)
+				cond.notify(); // Under the lock, so the waiter cannot wake, return and destroy this before the notify has happened.
+		}
+		void wait()
+		{
+			Lock lock(mutex);
+			while(remaining > 0)
+				cond.wait(mutex);
+		}
+		::Mutex mutex;
+		Condition cond;
+		int remaining GUARDED_BY(mutex);
+	};
+
+	// NOT a GsPoolTask: this is the task that yields, not one that is yielded to - see GaussianSplatPoolTask.h.
 	class GsExpandTask : public glare::Task
 	{
 	public:
-		GsExpandTask() : diag_reuse_roots(0), hit_density_cap(false), hit_depth_cap(false), num_sat_bias_stops(0), num_sat_bias_tested(0), run_ms(0.0), seeds_taken(0), seed_max_ms(0.0) {}
+		GsExpandTask() : task_manager(NULL), join(NULL), diag_reuse_roots(0), hit_density_cap(false), hit_depth_cap(false), num_sat_bias_stops(0), num_sat_bias_tested(0), run_ms(0.0), seeds_taken(0), seed_max_ms(0.0), yields(0), requeue_wait_ms(0.0), yielded(false) {}
 
 		virtual void run(size_t /*thread_index*/) override
 		{
+			if(yielded) // SESSION093 DIAGNOSTIC: back from a yield - how long the queue held this task, i.e. the worker-time the expand gave up.
+			{
+				requeue_wait_ms += requeue_timer.elapsed() * 1.0e3;
+				yielded = false;
+			}
 			Timer task_timer; // SESSION080 DIAGNOSTIC - see GaussianSplatUnculledFrontier::expand_task_max_ms.
-			bool unused_budget_cap = false; // Not enforced here - see expandParallel().
 			while(1)
 			{
-				const int64 seed_i = next_seed->increment(); // Returns the value BEFORE the increment - see AtomicInt::increment().
-				if(seed_i >= (int64)seeds->size())
+				// SESSION093: something else is waiting for a worker - go to the back of the queue, behind it, and let
+				// this worker take it. Checked BEFORE taking a seed, so a yield never strands one. See
+				// GaussianSplatPoolTask.h for the argument, GsExpandJoin above for why this is not a task group.
+				if(gsExpandShouldYield())
+				{
+					run_ms += task_timer.elapsed() * 1.0e3; // +=: the sum over every dispatch is what task_sum_ms wants.
+					++yields;
+					yielded = true;
+					requeue_timer.reset();
+					task_manager->addTask(glare::TaskRef(this)); // Re-enqueued from inside its own run(): legal - the runner thread's bookkeeping after run() returns touches nothing this task can change, and the queue holds its own reference.
+					return;
+				}
+				if(!expandNextSeed())
 					break;
-
-				// expandStack() runs the stack down to empty in DFS mode and APPENDS to `decorated`, so taking one seed at a
-				// time accumulates into the same output block a whole bucket used to fill.
-				++seeds_taken; // SESSION086 DIAGNOSTIC
-				Timer seed_timer; // SESSION086 DIAGNOSTIC - see GaussianSplatUnculledFrontier::expand_seed_max_ms.
-				stack.push_back((*seeds)[(size_t)seed_i]);
-				parent->expandStack(stack, decorated, *positions, *feature_sizes, *cull_radii,
-					/*enforce_budget=*/false, /*breadth_first=*/false, /*pause_at_stack_size=*/0,
-					diag_reuse_roots, unused_budget_cap, hit_density_cap, hit_depth_cap, num_sat_bias_stops, num_sat_bias_tested);
-				seed_max_ms = myMax(seed_max_ms, seed_timer.elapsed() * 1.0e3);
 			}
-			run_ms = task_timer.elapsed() * 1.0e3;
+			run_ms += task_timer.elapsed() * 1.0e3;
+			join->finished();
 		}
 
-		GaussianSplatLodTraversalTask* parent; // Outlives every task: runTaskGroup() below blocks until they have all finished.
+		// SESSION093: the calling thread's own share, run inline by expandParallel() - the thread is not a pool worker
+		// anyone else could use, so it never yields. Not counted in the join either; expandParallel() waits only for
+		// the pool's tasks.
+		void runOnCallingThread()
+		{
+			Timer task_timer;
+			while(expandNextSeed()) {}
+			run_ms += task_timer.elapsed() * 1.0e3;
+		}
+
+		// One seed off the shared cursor. False when the cursor has run dry. SESSION093: factored out of run() so the
+		// yield check reads as what it is.
+		bool expandNextSeed()
+		{
+			const int64 seed_i = next_seed->increment(); // Returns the value BEFORE the increment - see AtomicInt::increment().
+			if(seed_i >= (int64)seeds->size())
+				return false;
+
+			// expandStack() runs the stack down to empty in DFS mode and APPENDS to `decorated`, so taking one seed at a
+			// time accumulates into the same output block a whole bucket used to fill.
+			++seeds_taken; // SESSION086 DIAGNOSTIC
+			Timer seed_timer; // SESSION086 DIAGNOSTIC - see GaussianSplatUnculledFrontier::expand_seed_max_ms.
+			bool unused_budget_cap = false; // Not enforced here - see expandParallel().
+			stack.push_back((*seeds)[(size_t)seed_i]);
+			parent->expandStack(stack, decorated, *positions, *feature_sizes, *cull_radii,
+				/*enforce_budget=*/false, /*breadth_first=*/false, /*pause_at_stack_size=*/0,
+				diag_reuse_roots, unused_budget_cap, hit_density_cap, hit_depth_cap, num_sat_bias_stops, num_sat_bias_tested);
+			seed_max_ms = myMax(seed_max_ms, seed_timer.elapsed() * 1.0e3);
+			return true;
+		}
+
+		GaussianSplatLodTraversalTask* parent; // Outlives every task: expandParallel() waits on the join below before returning.
+		glare::TaskManager* task_manager; // SESSION093: to re-enqueue itself on a yield.
+		GsExpandJoin* join;               // SESSION093: owned by expandParallel(), outlives the tasks - see GsExpandJoin.
 		const js::Vector<Vec3f, 16>* positions;
 		const js::Vector<float, 16>* feature_sizes;
 		const js::Vector<float, 16>* cull_radii;
-		const std::vector<HeapItem>* seeds; // SESSION086: shared and read-only, owned by expandParallel() for the group's lifetime.
+		const std::vector<HeapItem>* seeds; // SESSION086: shared and read-only, owned by expandParallel() until the join.
 		glare::AtomicInt* next_seed;        // SESSION086: the shared cursor into `seeds`.
 		std::vector<HeapItem> stack; // This task's working stack - empty between seeds.
 		js::Vector<DistIdx, 16> decorated;
@@ -3248,6 +3341,8 @@ private:
 		size_t num_sat_bias_stops, num_sat_bias_tested; // SESSION085 ETAP 3 - see the parent's.
 		double run_ms; // SESSION080 DIAGNOSTIC
 		size_t seeds_taken; double seed_max_ms; // SESSION086 DIAGNOSTIC - see the frontier's expand_workers/expand_seed_max_ms.
+		size_t yields; double requeue_wait_ms; // SESSION093 DIAGNOSTIC - see the frontier's expand_yields/expand_yield_ms.
+		bool yielded; Timer requeue_timer;     // SESSION093 DIAGNOSTIC: set at a yield, read at the next run() - see requeue_wait_ms.
 	};
 
 	// SESSION080: the parallel expand. Walks the top of the tree serially just far enough to have a good supply of
@@ -3352,23 +3447,43 @@ private:
 		// SESSION086: one task per THREAD, each pulling seeds off a shared cursor, rather than session080's fixed
 		// round-robin deal of seeds into concurrency*4 buckets - see GsExpandTask for the measurement that motivated it.
 		// More tasks than threads no longer buys anything once the balancing is dynamic; it would only add task overhead.
-		// `stack` stays alive as the seed array for the whole group, so it is cleared after the run rather than before it.
+		// `stack` stays alive as the seed array until the join, so it is cleared after it rather than before.
+		//
+		// SESSION093: plain addTasks() and a GsExpandJoin, not a task group - see GsExpandJoin for why. Task 0 is run on
+		// this thread, as runTaskGroup() would have done; the rest go to the pool, and each comes back through the queue
+		// as many times as it yields (see GsExpandTask::run()) before counting itself finished. No task is ever
+		// dispatched twice at once: one is either running, or in the queue, or done. A task's state accumulates across
+		// its dispatches - `decorated` just keeps appending, the diagnostic counters are sums - so nothing here depends
+		// on how many dispatches there were. With nothing else on the pool this is one dispatch per task, and
+		// yields=0: the pre-session093 behaviour, bit for bit.
 		const size_t num_tasks = myMin(stack.size(), concurrency);
 		expand_num_tasks = num_tasks;
 		glare::AtomicInt next_seed(0);
-		glare::TaskGroupRef group = new glare::TaskGroup();
-		group->tasks.resize(num_tasks);
+		GsExpandJoin join((int)num_tasks - 1); // The pool's tasks. Task 0 is not waited on; it is run to completion right here.
+		std::vector<Reference<GsExpandTask> > tasks(num_tasks);
 		for(size_t t=0; t<num_tasks; ++t)
 		{
 			Reference<GsExpandTask> task = new GsExpandTask();
 			task->parent = this;
+			task->task_manager = task_manager;
+			task->join = &join;
 			task->positions = &positions; task->feature_sizes = &feature_sizes; task->cull_radii = &cull_radii;
 			task->seeds = &stack;
 			task->next_seed = &next_seed;
-			group->tasks[t] = task;
+			tasks[t] = task;
 		}
+		if(num_tasks > 1)
+		{
+			std::vector<glare::TaskRef> pool_tasks(tasks.begin() + 1, tasks.end());
+			task_manager->addTasks(pool_tasks);
+		}
+		tasks[0]->runOnCallingThread();
 
-		task_manager->runTaskGroup(group);
+		// SESSION093 DIAGNOSTIC: how long this thread waited for the pool's tasks after its own share ran dry. Their
+		// tail (the slowest one's last seed) plus whatever they were queued behind - see expand_join_ms.
+		Timer join_timer;
+		join.wait();
+		expand_join_ms = join_timer.elapsed() * 1.0e3;
 		stack.clear(); // Only now: the tasks read it as their seed array - see above.
 
 		// SESSION080: what the serial part (run()'s no-tree seeds plus this function's prologue) already put in - NOT
@@ -3379,12 +3494,13 @@ private:
 		size_t total = serial_prefix_n;
 		for(size_t t=0; t<num_tasks; ++t)
 		{
-			const GsExpandTask* const task = static_cast<const GsExpandTask*>(group->tasks[t].ptr());
+			const GsExpandTask* const task = tasks[t].ptr();
 			total += task->decorated.size();
 			expand_task_sum_ms += task->run_ms; // SESSION080 DIAGNOSTIC - see the fields' comment.
 			expand_task_max_ms = myMax(expand_task_max_ms, task->run_ms);
 			if(task->seeds_taken > 0) ++expand_workers; // SESSION086 DIAGNOSTIC - see the fields' comment.
 			expand_seed_max_ms = myMax(expand_seed_max_ms, task->seed_max_ms); // SESSION086 - the quantity updateExpandSeedTarget() steers on.
+			expand_yields += task->yields; expand_yield_ms += task->requeue_wait_ms; // SESSION093 DIAGNOSTIC - see the fields' comment.
 		}
 
 		// Over budget: the parallel walk's truncation would not match the serial one's, so throw it away and redo the
@@ -3430,7 +3546,7 @@ private:
 		size_t write_pos = serial_prefix_n; // Where the tasks' output starts - see that variable.
 		for(size_t t=0; t<num_tasks; ++t)
 		{
-			const GsExpandTask* const task = static_cast<const GsExpandTask*>(group->tasks[t].ptr());
+			const GsExpandTask* const task = tasks[t].ptr();
 			const size_t task_n = task->decorated.size();
 			if(task_n > 0)
 			{
@@ -3484,6 +3600,7 @@ private:
 	size_t expand_seeds, expand_num_tasks;
 	double expand_prologue_ms, expand_task_max_ms, expand_task_sum_ms;
 	size_t expand_workers; double expand_seed_max_ms; // SESSION086 DIAGNOSTIC - see the frontier's matching fields.
+	size_t expand_yields; double expand_yield_ms, expand_join_ms; // SESSION093 DIAGNOSTIC - see the frontier's matching fields.
 	size_t expand_seed_target;  // SESSION086 - see GaussianSplatRenderer::updateExpandSeedTarget().
 	double expand_splice_reserve_ms, expand_splice_copy_ms; // SESSION080 DIAGNOSTIC (plan2 §4.1)
 
@@ -3576,7 +3693,7 @@ GaussianSplatRenderer::GaussianSplatRenderer(OpenGLEngine& opengl_engine_)
 	// measured it against the LoD bias, and turned it back off - the mechanism is sound but incompatible with the bias
 	// as cut. The measurement and the verdict are in getFrontierReuseSplitDist(); the drift fraction that measured it
 	// stays at session080's 0.25 and no longer has a UI knob.
-	frontier_reuse_split_dist(0.f), frontier_reuse_drift_fraction(0.25f), sat_barrier_agree_tol(1.f), expand_seed_target(0), // SESSION086: 0 = nothing measured yet - see updateExpandSeedTarget(). SESSION088: tol 1 = accept any barrier change, as before.
+	frontier_reuse_split_dist(0.f), frontier_reuse_drift_fraction(0.25f), sat_barrier_agree_tol(1.f), // SESSION088: tol 1 = accept any barrier change, as before.
 	filter_latency_measured_enabled(false), sat_predict_gain(0.f), // SESSION088: both default to today's behaviour - see getFilterLatencyMeasuredEnabled()/getSatPredictGain(). The two GsMeasuredLatency members self-initialise.
 	sat_predict_prev_kick_pos_ws(0.f), sat_predict_prev_kick_time_s(0.0), have_sat_predict_prev_kick(false), diag_sat_predict_lead_m(0.f), // SESSION088 - see kickOffSaturationBuilds().
 	splat_point_size_px(1.f),
@@ -4473,10 +4590,10 @@ struct GsFilterSliceParams
 };
 
 
-class GaussianSplatFilterSliceTask : public glare::Task
+class GaussianSplatFilterSliceTask : public GsPoolTask // SESSION093 - see GaussianSplatPoolTask.h.
 {
 public:
-	virtual void run(size_t /*thread_index*/)
+	virtual void runQueued(size_t /*thread_index*/)
 	{
 		num_out = filterFrontierSegment(*seg, p.planes, p.num_planes, p.cam_pos_ws, p.rate_baseline,
 			p.rotation_axis, p.swept, p.trans_dilation, i_begin, i_end, out);
@@ -4590,7 +4707,7 @@ static size_t filterUnculledFrontier(const GaussianSplatUnculledFrontier& uf, co
 	if(far_seg)
 		addFilterSliceTasks(p, *far_seg, myMax<size_t>(1, (num_slices * far_n) / total_in), near_n, out, group->tasks, out_begin);
 
-	task_manager->runTaskGroup(group); // Blocks, and the calling worker takes a slice itself rather than idling.
+	gsRunPoolTaskGroup(*task_manager, group); // Blocks, and the calling worker takes a slice itself rather than idling. SESSION093 - see GaussianSplatPoolTask.h.
 
 	// Close the gaps the slices left. Each slice wrote from the start of its own input range, so the survivors sit in
 	// order but with a hole after each. Walking left to right, the destination is always at or behind the source (the
@@ -4626,7 +4743,7 @@ public:
 // against the current frustum on a worker thread (~13ms on ~7.5M, measured session063), so a pure rotation produces a
 // fresh draw list without the ~450ms traversal. The frontier is immutable and refcounted, so reading it here while the
 // main thread holds its own reference is safe.
-class GaussianSplatFilterTask : public glare::Task
+class GaussianSplatFilterTask : public GsPoolTask // SESSION093 - see GaussianSplatPoolTask.h.
 {
 public:
 	GaussianSplatFilterTask(uint64 cloud_id_, const Reference<GaussianSplatUnculledFrontier>& frontier_,
@@ -4647,7 +4764,7 @@ public:
 			trans_dilation[i] = trans_dilation_ ? trans_dilation_[i] : 0.f;
 	}
 
-	virtual void run(size_t /*thread_index*/) override
+	virtual void runQueued(size_t /*thread_index*/) override
 	{
 		Reference<GaussianSplatFilterResultMsg> msg = new GaussianSplatFilterResultMsg();
 		msg->cloud_id = cloud_id;
@@ -5128,10 +5245,10 @@ static const char* const stop_reason_labels[FrontierStop_NumReasons] =
 // hold it - a saturation build reads positions/scales/rotations/alpha exactly like a traversal does, just without the
 // rest of the scratch (the sort buffers, members_snapshot, the caps). Behaviour unchanged from before the extraction.
 // SESSION081 ETAP 4: one slice of the packed-occluder build - see getOrBuildCachedGeom() and GsSatPackedOccluder.
-class GsSatPackTask : public glare::Task
+class GsSatPackTask : public GsPoolTask // SESSION093 - see GaussianSplatPoolTask.h.
 {
 public:
-	virtual void run(size_t /*thread_index*/)
+	virtual void runQueued(size_t /*thread_index*/)
 	{
 		for(size_t i=i_begin; i<i_end; ++i)
 			out[i] = gsSatPackOccluder(scales[i], rotations[i], colours[i][3]);
@@ -5188,9 +5305,9 @@ Reference<GaussianSplatCachedGeom> GaussianSplatRenderer::getOrBuildCachedGeom(S
 			t->out = geom->sat_occl.data();
 			t->i_begin = (n * c) / num_chunks;
 			t->i_end   = (n * (c + 1)) / num_chunks;
-			if(pack_task_manager != NULL) group->tasks.push_back(t); else t->run(0);
+			if(pack_task_manager != NULL) group->tasks.push_back(t); else t->runQueued(0); // runQueued, not run: never dispatched, so never counted - see GsPoolTask.
 		}
-		if(pack_task_manager != NULL) pack_task_manager->runTaskGroup(group);
+		if(pack_task_manager != NULL) gsRunPoolTaskGroup(*pack_task_manager, group); // SESSION093 - see GaussianSplatPoolTask.h.
 	}
 
 	cloud.cached_traversal_geom = geom;
@@ -5545,7 +5662,7 @@ std::string GaussianSplatRenderer::getFrustumStructureReport(float merge_colour_
 		// owner actually wants to know the cost of. Same task, same call the per-frame async path makes (run() doesn't
 		// know or care whether its caller is sync or a worker thread), just on the main thread.
 		Timer cloud_traversal_timer;
-		task.run(0);
+		task.runQueued(0); // SESSION093: runQueued, not run - never dispatched, so never counted. See GsPoolTask.
 		const double cloud_traversal_ms = cloud_traversal_timer.elapsed() * 1.0e3;
 		world_traversal_ms += cloud_traversal_ms;
 		s += "  Traversal: " + doubleToStringNSigFigs(cloud_traversal_ms, 4) + " ms (main thread, unculled - see report note above)\n";
@@ -7206,7 +7323,7 @@ void GaussianSplatRenderer::setFrontierReuseDriftFraction(float v)
 
 
 // SESSION086 - see the declaration for why the seed count is measured rather than chosen.
-void GaussianSplatRenderer::updateExpandSeedTarget(double seed_max_ms, double task_sum_ms, double prologue_ms, double expand_ms)
+void GaussianSplatRenderer::updateExpandSeedTarget(SplatCloud& cloud, double seed_max_ms, double task_sum_ms, double prologue_ms, double expand_ms)
 {
 	if(seed_max_ms <= 0.0 || task_sum_ms <= 0.0)
 		return; // Serial path, or a traversal that never reached expandParallel() - nothing measured, so nothing to learn from.
@@ -7221,13 +7338,13 @@ void GaussianSplatRenderer::updateExpandSeedTarget(double seed_max_ms, double ta
 	const size_t min_target = concurrency * 4;
 	const size_t max_target = concurrency * 4096;
 
-	size_t target = expand_seed_target > 0 ? expand_seed_target : concurrency * 16;
+	size_t target = cloud.expand_seed_target > 0 ? cloud.expand_seed_target : concurrency * 16;
 	if(seed_max_ms > fair_share_ms * 1.5)
 		target *= 2;                                   // The worst seed still carries well over its share: split finer.
 	else if(prologue_ms > expand_ms * 0.05)
 		target /= 2;                                   // The split is now a real cost of its own: back off. See the declaration.
 
-	expand_seed_target = myClamp(target, min_target, max_target);
+	cloud.expand_seed_target = myClamp(target, min_target, max_target);
 }
 
 
@@ -8179,7 +8296,7 @@ void GaussianSplatRenderer::kickOffSorts()
 		Matrix4f world_to_cam;
 		scene->cam_to_world.getInverseForAffine3Matrix(world_to_cam);
 
-		task_manager->addTask(new GaussianSplatSortTask(best_cloud->cloud_id, best_cloud->structure_generation, scratch, world_to_cam, &sort_result_queue));
+		gsAddPoolTask(*task_manager, new GaussianSplatSortTask(best_cloud->cloud_id, best_cloud->structure_generation, scratch, world_to_cam, &sort_result_queue));
 	}
 }
 
@@ -8545,8 +8662,10 @@ void GaussianSplatRenderer::drainTraversalResults()
 			cloud->last_traversal_sat_bias_tested = msg->scratch->num_sat_bias_tested;
 
 			// SESSION086: close the loop on how finely the next traversal splits its seeds - see updateExpandSeedTarget().
-			if(msg->unculled_frontier.nonNull())
-				updateExpandSeedTarget(msg->unculled_frontier->expand_seed_max_ms, msg->unculled_frontier->expand_task_sum_ms,
+			// SESSION093: from FULL walks only - a near-only walk under a frozen cut is the other half of the swing the
+			// declaration describes, and the target is for the walks that cost something.
+			if(msg->unculled_frontier.nonNull() && !msg->unculled_frontier->far_block_inherited)
+				updateExpandSeedTarget(*cloud, msg->unculled_frontier->expand_seed_max_ms, msg->unculled_frontier->expand_task_sum_ms,
 					msg->unculled_frontier->expand_prologue_ms, msg->unculled_frontier->expand_ms);
 
 			// SESSION076/081: no saturation numbers to print here any more. A traversal's first (and now only) message
@@ -8605,6 +8724,10 @@ void GaussianSplatRenderer::drainTraversalResults()
 						" seed_max_ms=" + doubleToStringNDecimalPlaces(uf.expand_seed_max_ms, 2) +
 						" seed_target=" + uInt64ToStringCommaSeparated(uf.expand_seed_target) +
 						" task_sum_ms=" + doubleToStringNDecimalPlaces(uf.expand_task_sum_ms, 2) +
+						// SESSION093 DIAGNOSTIC: what yielding the pool cost - see the fields. yields=0 means nothing else wanted the pool during this expand.
+						" yields=" + uInt64ToStringCommaSeparated(uf.expand_yields) +
+						" yield_ms=" + doubleToStringNDecimalPlaces(uf.expand_yield_ms, 2) +
+						" join_ms=" + doubleToStringNDecimalPlaces(uf.expand_join_ms, 2) +
 						// SESSION080 DIAGNOSTIC (plan2 §4.1): the serial concatenation after runTaskGroup() returns, split
 						// into the destination's allocation and the copy loop itself - see expand_splice_reserve_ms. Both
 						// 0 on the serial path (expandParallel() never ran). sort_alloc is the same question asked of the
@@ -8827,7 +8950,7 @@ void GaussianSplatRenderer::kickOffFilters()
 		// with no frustum edge there is nothing for it to plug (the band restriction below rejects it on its own).
 		const int filter_num_planes = filter_frustum_planes_enabled ? scene->num_frustum_clip_planes : 0;
 
-		task_manager->addTask(new GaussianSplatFilterTask(best_cloud->cloud_id, best_cloud->cached_ufrontier,
+		gsAddPoolTask(*task_manager, new GaussianSplatFilterTask(best_cloud->cloud_id, best_cloud->cached_ufrontier,
 			scene->frustum_clip_planes, filter_num_planes, cam_pos_ws, rate_fine_baseline,
 			cam_angular_axis_ema_ws, swept_fine, &filter_result_queue, trans_dilation, task_manager));
 
@@ -9101,7 +9224,7 @@ void GaussianSplatRenderer::kickOffSaturationBuilds()
 		sat_predict_prev_kick_pos_ws = cam_pos_ws;
 		sat_predict_prev_kick_time_s = sat_kick_now_s;
 		have_sat_predict_prev_kick = true;
-		task_manager->addTask(t);
+		gsAddPoolTask(*task_manager, t.ptr()); // SESSION093 - see GaussianSplatPoolTask.h.
 	}
 }
 
@@ -9203,7 +9326,7 @@ void GaussianSplatRenderer::kickOffTraversals()
 		// SESSION088: the coarse-floor capture that used to be requested here is gone - see GaussianSplatRenderer's note
 		// on the feature's removal. The ~1.7M coarse nodes it produced are simply never made: no push_backs in the DFS,
 		// no ~56% growth of the radix sort's array, no SoA gather, no inflated pool for the filter to stream.
-		task_manager->addTask(new GaussianSplatLodTraversalTask(best_cloud->cloud_id, best_cloud->topology_generation, scratch, cam_pos_ws,
+		gsAddPoolTask(*task_manager, new GaussianSplatLodTraversalTask(best_cloud->cloud_id, best_cloud->topology_generation, scratch, cam_pos_ws,
 			lod_pixel_scale_limit, lod_max_splats_budget, lod_max_layer_density, lod_max_tree_depth, focal_px,
 			&traversal_result_queue,
 			/*frontier_record=*/NULL, /*build_unculled_frontier=*/true, // SESSION063: the traversal builds U(P) for the split filter.
@@ -9223,7 +9346,7 @@ void GaussianSplatRenderer::kickOffTraversals()
 			/*sat_barrier=*/best_cloud->cached_sat_barrier,
 			/*sat_bias_ceiling=*/sat_bias_ceiling, // SESSION085 ETAP 3 - see getSatBiasCeiling(). 1 = off.
 			/*reuse_drift_fraction=*/frontier_reuse_drift_fraction, // SESSION086 - see getFrontierReuseDriftFraction().
-			/*expand_seed_target=*/expand_seed_target, // SESSION086 - see updateExpandSeedTarget().
+			/*expand_seed_target=*/best_cloud->expand_seed_target, // SESSION086 - see updateExpandSeedTarget(). SESSION093: per cloud.
 			/*sat_barrier_agree_tol=*/sat_barrier_agree_tol, // SESSION088 - see getSatBarrierAgreeTol(). 1 = accept any barrier change, as before.
 			/*sat_bias_exponent=*/sat_bias_exponent)); // SESSION088 - see getSatBiasExponent(). 1 = session085's original curve.
 	}

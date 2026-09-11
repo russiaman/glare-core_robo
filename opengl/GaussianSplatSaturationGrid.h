@@ -11,6 +11,7 @@ Copyright Glare Technologies Limited 2026 -
 #include "../maths/Vec4f.h"
 #include "../utils/Vector.h"
 #include "../utils/Platform.h" // SESSION081: uint16/uint32 in GsSatBuildScratch.
+#include "GaussianSplatPoolTask.h" // SESSION093: every task the build dispatches is a GsPoolTask - see that header.
 #include <limits> // SESSION081: gsSatRegionErosionTiles() returns +inf for a direction whose occluder sits inside the ball.
 
 namespace glare { class TaskManager; } // SESSION079: gsBuildSaturationGridParallel().

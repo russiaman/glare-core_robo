@@ -874,16 +874,16 @@ static void gsSatCloseFinishRows(const float* const src, const float* const tmp_
 // below. Two SEPARATE task classes (and, in gsSatApplyClosing(), two separate task groups) because pass 2 reads
 // tmp_min across the WHOLE grid - a window can straddle any strip boundary - so every strip's pass 1 must finish
 // before any strip starts pass 2.
-class GsSatCloseMinTask : public glare::Task
+class GsSatCloseMinTask : public GsPoolTask // SESSION093 - see GaussianSplatPoolTask.h.
 {
 public:
-	virtual void run(size_t /*thread_index*/) { gsSatCloseMinRows(src, tmp_min, res, rc, v_begin, v_end); }
+	virtual void runQueued(size_t /*thread_index*/) { gsSatCloseMinRows(src, tmp_min, res, rc, v_begin, v_end); }
 	const float* src; float* tmp_min; int res, rc, v_begin, v_end;
 };
-class GsSatCloseFinishTask : public glare::Task
+class GsSatCloseFinishTask : public GsPoolTask // SESSION093 - see GaussianSplatPoolTask.h.
 {
 public:
-	virtual void run(size_t /*thread_index*/) { gsSatCloseFinishRows(src, tmp_min, dst, res, rc, v_begin, v_end, &stats); }
+	virtual void runQueued(size_t /*thread_index*/) { gsSatCloseFinishRows(src, tmp_min, dst, res, rc, v_begin, v_end, &stats); }
 	const float* src; const float* tmp_min; float* dst; int res, rc, v_begin, v_end;
 	GsSatCloseStats stats;
 };
@@ -932,7 +932,7 @@ static void gsSatApplyClosing(js::Vector<float, 16>& sat_depth, int res, int clo
 				tasks[t] = task;
 				group->tasks.push_back(task);
 			}
-			task_manager->runTaskGroup(group);
+			gsRunPoolTaskGroup(*task_manager, group); // SESSION093 - see GaussianSplatPoolTask.h.
 		}
 		{
 			glare::TaskGroupRef group = new glare::TaskGroup();
@@ -946,7 +946,7 @@ static void gsSatApplyClosing(js::Vector<float, 16>& sat_depth, int res, int clo
 				tasks[t] = task;
 				group->tasks.push_back(task);
 			}
-			task_manager->runTaskGroup(group);
+			gsRunPoolTaskGroup(*task_manager, group); // SESSION093 - see GaussianSplatPoolTask.h.
 			for(int t=0; t<num_strips; ++t)
 				total.closed += tasks[t]->stats.closed;
 		}
@@ -959,10 +959,10 @@ static void gsSatApplyClosing(js::Vector<float, 16>& sat_depth, int res, int clo
 
 // SESSION080: the erosion split over the task manager by rows. Read-only source, disjoint destination rows - nothing to
 // synchronise, same shape as the build's strips.
-class GsSatErodeTask : public glare::Task
+class GsSatErodeTask : public GsPoolTask // SESSION093 - see GaussianSplatPoolTask.h.
 {
 public:
-	virtual void run(size_t /*thread_index*/)
+	virtual void runQueued(size_t /*thread_index*/)
 	{
 		gsSatErodeRegionRows(src, dst, res, region_radius, v_begin, v_end, &stats);
 	}
@@ -1025,7 +1025,7 @@ static void gsSatApplyRegionErosion(js::Vector<float, 16>& sat_depth, int res,
 			tasks[t] = task;
 			group->tasks.push_back(task);
 		}
-		task_manager->runTaskGroup(group);
+		gsRunPoolTaskGroup(*task_manager, group); // SESSION093 - see GaussianSplatPoolTask.h.
 
 		for(int t=0; t<num_strips; ++t)
 		{
@@ -1097,10 +1097,10 @@ void gsBuildSaturationGrid(const float* px, const float* py, const float* pz, co
 // many of that slice were used. Nodes are visited in ascending order and appended, so the records stay in front-to-back
 // order within the slice, and the slices themselves are in order - which is what lets phase 2 keep the accumulation
 // exact.
-class GsSatRecordTask : public glare::Task
+class GsSatRecordTask : public GsPoolTask // SESSION093 - see GaussianSplatPoolTask.h.
 {
 public:
-	virtual void run(size_t /*thread_index*/)
+	virtual void runQueued(size_t /*thread_index*/)
 	{
 		start_ms = clock->elapsed() * 1.0e3; // SESSION081 SCHEDULING PROBE, TEMPORARY DIAGNOSTIC - see the field.
 		Timer task_timer; // SESSION081 PLAN, REC-BALANCE PROBE, TEMPORARY DIAGNOSTIC - see task_ms. Nodes are FRONT-TO-BACK and the cheap/expensive split correlates with distance, so an equal-COUNT chunking may not be an equal-WORK chunking; this measures whether that is actually true before anything is rebalanced.
@@ -1205,10 +1205,10 @@ public:
 //
 // Expect bandwidth, not thread count, to set the ceiling here: this is ~57MB of pure copy on the reference scene, and
 // a handful of threads already saturate a desktop's memcpy bandwidth. The win is real but it will not be 12x.
-class GsSatCompactTask : public glare::Task
+class GsSatCompactTask : public GsPoolTask // SESSION093 - see GaussianSplatPoolTask.h.
 {
 public:
-	virtual void run(size_t /*thread_index*/)
+	virtual void runQueued(size_t /*thread_index*/)
 	{
 		std::memcpy(dst, src, count * sizeof(GsSatOccluderRec)); // Disjoint arrays - see the note above.
 	}
@@ -1248,11 +1248,11 @@ public:
 // [v0_grid, v1_grid] meets t's rows - i.e. for t in [strip_of_row[v0_grid], strip_of_row[v1_grid]], nothing wider and
 // nothing narrower. v0_grid/v1_grid are computed here with the same two expressions the deposit uses, so the two agree
 // by construction rather than by a second derivation that could drift from it.
-struct GsSatBinTask : public glare::Task
+struct GsSatBinTask : public GsPoolTask // SESSION093 - see GaussianSplatPoolTask.h.
 {
 	// Pass A counts, pass B (after the caller's prefix sum) scatters. The strip range is computed in A and kept in
 	// rec_range so B does not recompute it - two bytes per record, against recomputing a clamp and two ceils.
-	virtual void run(size_t /*thread_index*/)
+	virtual void runQueued(size_t /*thread_index*/)
 	{
 		if(counting)
 		{
@@ -1311,10 +1311,10 @@ static const size_t gs_sat_deposit_prefetch_dist = 16;
 // reads the whole record array but the reject is now a single float compare against a span it does not have to derive,
 // which is the entire point: the first cut of this had each strip redo the geometry, and that repeated work was 91% of
 // the parallel build's time.
-class GsSatStripTask : public glare::Task
+class GsSatStripTask : public GsPoolTask // SESSION093 - see GaussianSplatPoolTask.h.
 {
 public:
-	virtual void run(size_t /*thread_index*/)
+	virtual void runQueued(size_t /*thread_index*/)
 	{
 		start_ms = clock->elapsed() * 1.0e3; // SESSION081 SCHEDULING PROBE - see GsSatRecordTask's start_ms for what this answers.
 		if(list)
@@ -1493,7 +1493,7 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 				group->tasks.push_back(t);
 			}
 			rec_group_clock.reset(); // SESSION081 SCHEDULING PROBE: zero the shared clock at the launch itself.
-			task_manager.runTaskGroup(group);
+			gsRunPoolTaskGroup(task_manager, group); // SESSION093 - see GaussianSplatPoolTask.h.
 			rec_group_wall_total += rec_group_clock.elapsed() * 1.0e3;
 		}
 
@@ -1536,7 +1536,7 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 		}
 		Timer move_timer; // SESSION081: times the compaction alone, as the probe's serial version did, so the before/after is like for like.
 		if(move_group->tasks.size() > 0)
-			task_manager.runTaskGroup(move_group);
+			gsRunPoolTaskGroup(task_manager, move_group); // SESSION093 - see GaussianSplatPoolTask.h.
 		move_ms_total += move_timer.elapsed() * 1.0e3;
 		rec_ms_total += rec_timer.elapsed() * 1.0e3;
 		num_recs_total += num_recs;
@@ -1572,7 +1572,7 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 				t->counting = true;
 				count_group->tasks.push_back(t);
 			}
-			task_manager.runTaskGroup(count_group);
+			gsRunPoolTaskGroup(task_manager, count_group); // SESSION093 - see GaussianSplatPoolTask.h.
 
 			// Prefix sum, strip-major then chunk-major: strip t's entries are contiguous, and within them the chunks
 			// appear in ascending order - which is what keeps each list front-to-back. Serial, but it is only
@@ -1610,7 +1610,7 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 				t->counting = false;
 				scatter_group->tasks.push_back(t);
 			}
-			task_manager.runTaskGroup(scatter_group);
+			gsRunPoolTaskGroup(task_manager, scatter_group); // SESSION093 - see GaussianSplatPoolTask.h.
 		}
 		bin_ms_total += bin_timer.elapsed() * 1.0e3;
 
@@ -1646,7 +1646,7 @@ void gsBuildSaturationGridParallel(const float* px, const float* py, const float
 		// running on this same TaskManager - there is no configuration in which it waits on a thread that never arrives.
 		// It is also why a build degrades gracefully to serial where there are no worker threads, with no separate path.
 		dep_group_clock.reset(); // SESSION081 SCHEDULING PROBE: zero at the launch itself, as phase 1 does.
-		task_manager.runTaskGroup(group);
+		gsRunPoolTaskGroup(task_manager, group); // SESSION093 - see GaussianSplatPoolTask.h.
 		dep_ms_total += dep_timer.elapsed() * 1.0e3;
 
 		for(int t=0; t<num_strips; ++t)

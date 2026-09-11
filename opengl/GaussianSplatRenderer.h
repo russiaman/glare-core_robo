@@ -837,7 +837,23 @@ public:
 	//
 	// The 1.5x band and the 5% split-cost ceiling are the loop's own hysteresis - dimensionless, about its stability,
 	// with nothing in them chosen per scene.
-	void updateExpandSeedTarget(double seed_max_ms, double task_sum_ms, double prologue_ms, double expand_ms);
+	//
+	// SESSION093: the target lives on the CLOUD (SplatCloud::expand_seed_target), not on the renderer, because the loop
+	// is closed per traversal and a traversal is of one cloud. Shared, two clouds in view drove it against each other:
+	// a small cloud (a few ms of expand) sees its prologue exceed 5% and halves, the big one then sees a seed over its
+	// share and doubles back - measured on the bridge exterior with the interior in view, seed_target swinging
+	// 544<->4352 and the big cloud's worst seed reaching 175-185ms at the bottom of the swing (expand 270ms against
+	// its usual ~105). Went unnoticed until session093 only because the second cloud had always fitted in the
+	// prologue before (no seeds, no update).
+	//
+	// SESSION093, the same swing from inside ONE cloud: under a frozen far cut (getFrontierReuseSplitDist() > 0) most
+	// traversals walk only the near part - a few ms of expand, on which a 1-2ms split loop is over the 5% ceiling, so
+	// they halve - and the occasional full walk that rebuilds the block then doubles back. Measured on the same
+	// exterior with the target already per cloud: 544<->4352 exactly as before. So the loop is fed by full walks only
+	// (drainTraversalResults() skips a frontier whose far_block_inherited is set). A near-only walk then runs at the
+	// full walks' target, and pays at most that 1-2ms of split for it - the full walks are the ones with hundreds of
+	// milliseconds riding on the split, and they are what the target is for.
+	void updateExpandSeedTarget(SplatCloud& cloud, double seed_max_ms, double task_sum_ms, double prologue_ms, double expand_ms);
 
 
 	// SESSION074: whether the per-orientation filter applies the frustum planes at all. On (the default) is the normal
@@ -1947,7 +1963,6 @@ private:
 	float frontier_reuse_split_dist;                 // SESSION080 STEP B - see getFrontierReuseSplitDist(). 0 = disabled.
 	float frontier_reuse_drift_fraction;             // SESSION086 - see getFrontierReuseDriftFraction().
 	float sat_barrier_agree_tol;                     // SESSION088 - see getSatBarrierAgreeTol(). 1 = accept any barrier change, as before.
-	size_t expand_seed_target;                       // SESSION086 - see updateExpandSeedTarget(). 0 until the first traversal reports back.
 
 	// SESSION088: measured stage latencies and the two knobs that consume them - see GsMeasuredLatency,
 	// getFilterLatencyMeasuredEnabled() and getSatPredictGain(). Both trackers are fed unconditionally at their stage's

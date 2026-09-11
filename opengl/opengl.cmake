@@ -99,6 +99,7 @@ ${GLARE_CORE_TRUNK_DIR_ENV}/opengl/GaussianSplatRenderer.cpp
 ${GLARE_CORE_TRUNK_DIR_ENV}/opengl/GaussianSplatRenderer.h
 ${GLARE_CORE_TRUNK_DIR_ENV}/opengl/GaussianSplatSaturationGrid.cpp
 ${GLARE_CORE_TRUNK_DIR_ENV}/opengl/GaussianSplatSaturationGrid.h
+${GLARE_CORE_TRUNK_DIR_ENV}/opengl/GaussianSplatPoolTask.h
 )
 
 

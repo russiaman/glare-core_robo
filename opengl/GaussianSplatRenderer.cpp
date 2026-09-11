@@ -1436,6 +1436,169 @@ struct GsWalkIdxLess  { inline bool operator () (const GsDistIdx& a, const GsDis
 struct GsWalkDistLess { inline bool operator () (const GsDistIdx& a, const GsDistIdx& b) const { return a.dist_sq < b.dist_sq; } };
 
 
+// SESSION093: the three passes of gsWalkSortParallel() - see there.
+class GsWalkSortCountTask : public GsPoolTask // SESSION093 - see GaussianSplatPoolTask.h.
+{
+public:
+	virtual void runQueued(size_t /*thread_index*/) override
+	{
+		const float* const splitters_end = splitters + num_splitters;
+		for(size_t i=i_begin; i<i_end; ++i)
+		{
+			const size_t b = (size_t)(std::upper_bound(splitters, splitters_end, src[i].dist_sq) - splitters);
+			bucket_of[i] = (uint8)b;
+			counts[b]++;
+		}
+	}
+	const GsDistIdx* src;
+	const float* splitters; size_t num_splitters;
+	uint8* bucket_of;
+	size_t i_begin, i_end;
+	std::vector<size_t> counts; // This chunk's own per-bucket counts, so no two chunks write to the same memory.
+};
+
+class GsWalkSortPlaceTask : public GsPoolTask // SESSION093 - see GaussianSplatPoolTask.h.
+{
+public:
+	virtual void runQueued(size_t /*thread_index*/) override
+	{
+		for(size_t i=i_begin; i<i_end; ++i)
+			dst[write_pos[bucket_of[i]]++] = src[i];
+	}
+	const GsDistIdx* src;
+	GsDistIdx* dst;
+	const uint8* bucket_of;
+	size_t i_begin, i_end;
+	std::vector<size_t> write_pos; // Where this chunk's next element of each bucket goes - a slice of the bucket no other chunk writes to.
+};
+
+class GsWalkSortBucketTask : public GsPoolTask // SESSION093 - see GaussianSplatPoolTask.h.
+{
+public:
+	virtual void runQueued(size_t /*thread_index*/) override
+	{
+		Sort::radixSort(src, (uint32)n, GsWalkDistKey(), dst, /*put_result_in_working_space=*/true);
+	}
+	GsDistIdx* src; // The bucket as placed. radixSort() uses it as its own scratch, so it is scrambled afterwards.
+	GsDistIdx* dst; // The same bucket's range in the output, where the sorted result lands.
+	size_t n;
+};
+
+
+// SESSION093: sorts data[0, n) nearest first, in place - bit-identical to Sort::floatKeyAscendingSort() on the same input,
+// ties included (checked under "diag": [gsr-sort-verify], see occluderTreeWalk()). scratch must hold n elements; its
+// contents afterwards are garbage.
+//
+// Why this exists. The walk's sort was Sort::radixSortWithParallelPartition() until session093, but that function's
+// tasks are Sort's own, and a traversal's expand yields the pool only to GsPoolTasks (see GaussianSplatPoolTask.h) - so
+// they sat behind a running expand. Session093 made the sort serial to keep it off the pool, and that turned out to be
+// the one reproducible regression the pool priority left: interior walk_sort_ms 8-11ms -> 28-34ms, and build latency up
+// by the same 20-23ms. So the same Sort primitive, radixSort(), is used here, but dispatched as tasks the expand does
+// yield to.
+//
+// A sample sort in three pool passes:
+//   1. count - every element's bucket is the first splitter strictly above its key (upper_bound);
+//   2. place - each chunk copies its elements, in input order, into its own slice of each bucket;
+//   3. sort  - each bucket is radix sorted on its own.
+// Buckets are contiguous key ranges in ascending order, and equal keys always share one (upper_bound is a function of
+// the key alone), so concatenating the sorted buckets orders by key. Ties keep input order: placing is stable (within a
+// bucket, chunk 0's elements come first, each chunk's in input order), and radixSort() is stable. That is exactly the
+// order the serial radix sort produces - hence bit-identical, not merely "also sorted".
+//
+// The splitters come from an evenly spaced sample of the input, not a random one, so the same input always splits the
+// same way. How good the sample is only decides speed - a lopsided bucket takes longer - never the result.
+static const size_t gs_walk_sort_parallel_min_elements = 16384; // The threshold the Sort::radixSortWithParallelPartition() call this replaces used.
+static const size_t gs_walk_sort_min_bucket_elements = 4096;    // radixSort() clears a 6144-entry histogram per call; at this size that is small against the work, below it the clearing starts to dominate.
+
+void gsWalkSortParallel(glare::TaskManager& task_manager, GsDistIdx* data, size_t n, GsDistIdx* scratch, size_t* out_num_buckets = NULL, size_t* out_max_bucket = NULL)
+{
+	const size_t concurrency = myMax<size_t>(1, (size_t)task_manager.getConcurrency());
+	// Several buckets per thread, for the reason the gather and the walk cut finer than the thread count: sizes come out
+	// uneven, and many small tasks let the pool even that out. <= 256 because bucket ids are stored as uint8.
+	const size_t num_buckets = myClamp<size_t>(myMin(concurrency * 4, n / gs_walk_sort_min_bucket_elements), 2, 256);
+
+	// ---- Splitters: every oversample'th element of a sorted, evenly spaced sample. ----
+	const size_t oversample = 8;
+	std::vector<float> sample(num_buckets * oversample);
+	for(size_t i=0; i<sample.size(); ++i)
+		sample[i] = data[(size_t)(((uint64)i * (uint64)n) / (uint64)sample.size())].dist_sq; // uint64: i*n overflows a 32-bit size_t (web) well within realistic n.
+	std::sort(sample.begin(), sample.end());
+	std::vector<float> splitters(num_buckets - 1);
+	for(size_t b=0; b+1<num_buckets; ++b)
+		splitters[b] = sample[(b + 1) * oversample];
+
+	// ---- Pass 1: count. Chunked like the gather below it in occluderTreeWalk(). ----
+	const size_t num_chunks = myMax<size_t>(1, myMin(concurrency * 4, n / 16384));
+	js::Vector<uint8, 16> bucket_of;
+	bucket_of.resizeNoCopy(n);
+	glare::TaskGroupRef count_group = new glare::TaskGroup();
+	count_group->tasks.resize(num_chunks);
+	for(size_t c=0; c<num_chunks; ++c)
+	{
+		Reference<GsWalkSortCountTask> t = new GsWalkSortCountTask();
+		t->src = data;
+		t->splitters = splitters.data(); t->num_splitters = splitters.size();
+		t->bucket_of = bucket_of.data();
+		t->i_begin = (size_t)(((uint64)n * (uint64)c)       / (uint64)num_chunks);
+		t->i_end   = (size_t)(((uint64)n * (uint64)(c + 1)) / (uint64)num_chunks);
+		t->counts.assign(num_buckets, 0);
+		count_group->tasks[c] = t;
+	}
+	gsRunPoolTaskGroup(task_manager, count_group);
+
+	// Where each bucket starts in the output...
+	std::vector<size_t> bucket_begin(num_buckets + 1, 0);
+	for(size_t c=0; c<num_chunks; ++c)
+	{
+		const GsWalkSortCountTask* const t = static_cast<const GsWalkSortCountTask*>(count_group->tasks[c].ptr());
+		for(size_t b=0; b<num_buckets; ++b)
+			bucket_begin[b + 1] += t->counts[b];
+	}
+	for(size_t b=0; b<num_buckets; ++b)
+		bucket_begin[b + 1] += bucket_begin[b];
+	assert(bucket_begin[num_buckets] == n);
+
+	// ---- Pass 2: place. ...and where each chunk's share of each bucket starts - chunks in input order, which is what
+	// keeps the placing stable. ----
+	std::vector<size_t> next_write(bucket_begin.begin(), bucket_begin.end() - 1);
+	glare::TaskGroupRef place_group = new glare::TaskGroup();
+	place_group->tasks.resize(num_chunks);
+	for(size_t c=0; c<num_chunks; ++c)
+	{
+		const GsWalkSortCountTask* const count_task = static_cast<const GsWalkSortCountTask*>(count_group->tasks[c].ptr());
+		Reference<GsWalkSortPlaceTask> t = new GsWalkSortPlaceTask();
+		t->src = data; t->dst = scratch; t->bucket_of = bucket_of.data();
+		t->i_begin = count_task->i_begin; t->i_end = count_task->i_end;
+		t->write_pos = next_write;
+		for(size_t b=0; b<num_buckets; ++b)
+			next_write[b] += count_task->counts[b];
+		place_group->tasks[c] = t;
+	}
+	gsRunPoolTaskGroup(task_manager, place_group);
+
+	// ---- Pass 3: sort each bucket, straight back into data. ----
+	glare::TaskGroupRef bucket_group = new glare::TaskGroup();
+	bucket_group->tasks.reserve(num_buckets);
+	size_t max_bucket = 0;
+	for(size_t b=0; b<num_buckets; ++b)
+	{
+		const size_t bucket_n = bucket_begin[b + 1] - bucket_begin[b];
+		max_bucket = myMax(max_bucket, bucket_n);
+		if(bucket_n == 0)
+			continue;
+		Reference<GsWalkSortBucketTask> t = new GsWalkSortBucketTask();
+		t->src = scratch + bucket_begin[b];
+		t->dst = data + bucket_begin[b];
+		t->n = bucket_n;
+		bucket_group->tasks.push_back(t);
+	}
+	gsRunPoolTaskGroup(task_manager, bucket_group);
+
+	if(out_num_buckets) *out_num_buckets = num_buckets;
+	if(out_max_bucket) *out_max_bucket = max_bucket;
+}
+
+
 // SESSION082: the tree walk's gather - fills the grid's five input arrays from the walk's own, already-sorted index
 // list. SESSION085: the only occluder gather there is, now that the frontier-derived sources are retired. It reads
 // positions[idx] as well as occl[idx] - two scattered reads per node, where the frontier path had one because it could
@@ -1735,23 +1898,50 @@ public:
 
 		runSelfCheck(barrier, selected, visited);
 
-		// Nearest first - the order the grid's accumulation depends on (see gsBuildSaturationGrid()). Same two sorts,
-		// same threshold between them, as the traversal uses on its own output.
-		Timer sort_timer;
+		// Nearest first - the order the grid's accumulation depends on (see gsBuildSaturationGrid()). SESSION093: in
+		// parallel through gsWalkSortParallel(), whose tasks the traversal's expand yields to - see there for why not
+		// Sort's own parallel sort, and why not serial.
 		const size_t count = selected.size();
+		const bool sort_parallel = (task_manager != NULL) && (count >= gs_walk_sort_parallel_min_elements);
+
+		// SESSION093 DIAGNOSTIC: under "diag", keep the unsorted input, so the parallel result can be compared against the
+		// serial sort it must match bit for bit - see [gsr-sort-verify] below. Both the copy and the check are timed into
+		// walk_verify_ms, which the caller subtracts out of gather_ms, and neither is inside walk_sort_ms.
+		const bool sort_verify = sort_parallel && diag_log;
+		js::Vector<GsDistIdx, 16> sort_verify_input;
+		if(sort_verify)
+		{
+			Timer copy_timer;
+			sort_verify_input.resizeNoCopy(count);
+			std::memcpy(sort_verify_input.data(), selected.data(), count * sizeof(GsDistIdx));
+			walk_verify_ms += copy_timer.elapsed() * 1.0e3;
+		}
+
+		Timer sort_timer;
+		js::Vector<GsDistIdx, 16> sort_scratch;
+		size_t sort_num_buckets = 0, sort_max_bucket = 0; // SESSION093 DIAGNOSTIC
 		if(count > 0)
 		{
-			js::Vector<GsDistIdx, 16> sort_scratch;
 			sort_scratch.resizeNoCopy(count);
-			// SESSION093: serial, always. The parallel partition sort's tasks are Sort's own, so the expand cannot count
-			// them (see GaussianSplatPoolTask.h) and they would sit behind a running expand for its whole remaining
-			// length; the alternative - a coarse "pool wanted" claim held for the sort's duration - left the pool's
-			// spare workers cycling expand tasks through the queue for nothing. At this phase's sizes the parallel sort
-			// was not buying much anyway: 3.1ms mean exterior (~100-200K elements), 7.7ms interior (~630-760K),
-			// dispatch overhead included. walk_sort_ms= on [gsr-sat-build] is the number to check this against.
-			Sort::floatKeyAscendingSort(selected.data(), count, GsWalkDistLess(), GsWalkDistKey(), sort_scratch.data(), /*put_result_in_working_space=*/false);
+			if(sort_parallel)
+				gsWalkSortParallel(*task_manager, selected.data(), count, sort_scratch.data(), &sort_num_buckets, &sort_max_bucket);
+			else
+				Sort::floatKeyAscendingSort(selected.data(), count, GsWalkDistLess(), GsWalkDistKey(), sort_scratch.data(), /*put_result_in_working_space=*/false);
 		}
 		barrier.walk_sort_ms = sort_timer.elapsed() * 1.0e3;
+
+		if(sort_verify)
+		{
+			Timer check_timer;
+			Sort::floatKeyAscendingSort(sort_verify_input.data(), count, GsWalkDistLess(), GsWalkDistKey(), sort_scratch.data(), /*put_result_in_working_space=*/false);
+			const bool match = std::memcmp(sort_verify_input.data(), selected.data(), count * sizeof(GsDistIdx)) == 0; // Bytes, not keys: ties must come out in the same order too.
+			walk_verify_ms += check_timer.elapsed() * 1.0e3;
+			conPrint("[gsr-sort-verify] cloud=" + toString(cloud_id) + " n=" + uInt64ToStringCommaSeparated(count) +
+				" buckets=" + uInt64ToStringCommaSeparated(sort_num_buckets) +
+				" max_bucket=" + uInt64ToStringCommaSeparated(sort_max_bucket) +
+				" (" + doubleToStringNDecimalPlaces(sort_num_buckets > 0 ? (double)sort_max_bucket * (double)sort_num_buckets / (double)count : 0.0, 2) + "x mean)" +
+				(match ? " PASS" : " ***FAIL***"));
+		}
 
 		occl_px.resizeNoCopy(count); occl_py.resizeNoCopy(count); occl_pz.resizeNoCopy(count);
 		occl_radius.resizeNoCopy(count); occl_alpha.resizeNoCopy(count);

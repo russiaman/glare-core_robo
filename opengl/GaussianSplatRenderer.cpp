@@ -1360,6 +1360,24 @@ public:
 static const size_t gs_sat_gather_prefetch_dist = 32;
 
 
+// SESSION092: how many independent seeds the occluder walk is finally handed out in, per pool thread - see the targeted
+// split in GaussianSplatSaturationBuildTask::runWalk(). Relative to getConcurrency() rather than an absolute count, so a
+// 4-worker web/mobile pool gets the same granularity per thread that a 17-worker desktop does.
+//
+// Chosen by TOTAL WORK, not by wall time, and that is the whole point. [gsr-walk-sweep] priced 32/64/256 against each
+// other inside single captures: x256 balances best by a long way (par 15.1 against ~7) and wins on wall time whenever
+// the pool is free - but it costs 34-40% more work than x64 (interior task_sum 88.2 vs 65.9 ms, exterior 20.1 vs 14.4),
+// because splitting into ~4,300 fine seeds makes a thread hop between unrelated parts of a tree that does not fit in
+// cache, where ~1,100 coarser ones let it walk connected subtrees.
+//
+// The pool is NOT free. Measured over six captures with the walk's own par printed beside it: on the exterior the build's
+// walk got par=1.00 w=1 every single time - one worker out of seventeen, because the render traversal held the rest -
+// and on the interior par was 1.3-3.5 with tasks abandoned partway. At an effective parallelism of ~1 the wall time IS
+// the total work, so the setting that minimises work wins and the balance x256 buys cannot be spent. This will be more
+// true on the web/mobile target, not less: a 4-8 worker pool has nothing spare once a traversal is running.
+static const size_t gs_walk_target_seeds_per_thread = 64;
+
+
 // SESSION085: GsSatGatherChunk / GsSatGatherTask - the frontier-derived occluder gather - are removed with the
 // Fine and CoarseFloor sources they existed to serve. The tree walk builds its occluder set itself (see
 // occluderTreeWalk() and GsSatWalkGatherTask), so nothing reads the frontier's SoA for occluders any more. This
@@ -1376,6 +1394,14 @@ static const size_t gs_sat_gather_prefetch_dist = 32;
 // Deliberately smaller than the traversal's HeapItem: the walk carries no pixel_scale, no depth, and none of the
 // once-per-branch inherited flags, because its stop rule reads only the node itself.
 struct GsWalkItem { uint32 member_idx; uint32 tree_local_idx; };
+
+
+// SESSION092: one seed while it is being SPLIT, carrying the cost signal the split orders by - see the targeted split in
+// GaussianSplatSaturationBuildTask::runWalk(). Deliberately not a field on GsWalkItem: that struct is the DFS stack's
+// element, pushed once per child on the walk's innermost loop, and this quantity is wanted a few thousand times in a
+// prologue rather than millions of times in the walk.
+struct GsWalkSeed { float ratio; GsWalkItem item; };
+struct GsWalkSeedLess { inline bool operator () (const GsWalkSeed& a, const GsWalkSeed& b) const { return a.ratio < b.ratio; } };
 
 
 // SESSION082: front-to-back sort key for that walk. Same shape as the traversal's DistIdxKey/DistIdxLess pair over the
@@ -1585,22 +1611,58 @@ public:
 	}
 
 
-	// SESSION082: one seed subtree's worth of the walk, on a pool thread, into its own output vector. No shared mutable
-	// state at all - see occluderTreeWalk()'s determinism note.
+	// SESSION082: seed subtrees' worth of the walk, on a pool thread, into its own output vector. The only shared mutable
+	// state is the seed cursor below; every array it reads is a frozen snapshot.
+	//
+	// SESSION092: the seeds are PULLED one at a time off a shared cursor, exactly as GsExpandTask was changed to do in
+	// session086. This walk was left on session082's fixed round-robin deal and showed the same defect that motivated
+	// that change, measured over six captures on two structurally unrelated scenes: par (task_sum/task_max) 4.0-4.3
+	// against 17 threads, with task_max 23-25% of task_sum every single time - one bucket of 68 held a quarter of the
+	// work and the group waited on it. Pulling bounds the imbalance by the cost of the largest single SEED instead of
+	// the largest BUCKET, needs no per-subtree cost estimate (the tree stores none), and yields on its own when the pool
+	// is already busy with a traversal - which a static deal cannot.
+	//
+	// What this gives up, deliberately and in step with the traversal: which seeds land in which task is no longer
+	// fixed, so the relative order of nodes at EXACTLY equal dist_sq now varies between runs rather than being stable
+	// but different from serial. The set of chosen nodes and their distances are unaffected - which is precisely what
+	// [gsr-occ-verify] checks, and it compares as a set for this very reason.
+	//
+	// run_ms therefore means "how long this thread was working", not "how long one bucket took", so par reads as true
+	// utilisation.
 	class GsOccWalkTask : public glare::Task
 	{
 	public:
-		GsOccWalkTask() : parent(NULL), visited(0) {}
+		GsOccWalkTask() : parent(NULL), seeds(NULL), next_seed(NULL), visited(0), run_ms(0.0), seeds_taken(0), seed_max_ms(0.0) {}
 
 		virtual void run(size_t /*thread_index*/) override
 		{
-			parent->walkStack(stack, selected, visited, /*breadth_first=*/false, /*pause_at_stack_size=*/0);
+			Timer task_timer; // SESSION092 DIAGNOSTIC: this task's own duration - see runWalk()'s par bookkeeping, which mirrors the traversal's expand_task_max_ms/expand_task_sum_ms exactly so the two numbers can be read side by side.
+			while(1)
+			{
+				const int64 seed_i = next_seed->increment(); // Returns the value BEFORE the increment - see AtomicInt::increment().
+				if(seed_i >= (int64)seeds->size())
+					break;
+
+				++seeds_taken; // SESSION092 DIAGNOSTIC
+				Timer seed_timer; // SESSION092 DIAGNOSTIC: the largest single seed is the floor this scheme cannot go below - see seed_max_ms.
+				// walkStack() runs the stack down to empty in DFS mode and APPENDS to `selected`, so taking one seed
+				// at a time accumulates into the same output block a whole bucket used to fill.
+				stack.push_back((*seeds)[(size_t)seed_i]);
+				parent->walkStack(stack, selected, visited, /*breadth_first=*/false, /*pause_at_stack_size=*/0);
+				seed_max_ms = myMax(seed_max_ms, seed_timer.elapsed() * 1.0e3);
+			}
+			run_ms = task_timer.elapsed() * 1.0e3;
 		}
 
 		GaussianSplatSaturationBuildTask* parent; // Outlives every task: runTaskGroup() blocks until they have all finished.
-		std::vector<GsWalkItem> stack;            // This task's seeds, and its own working stack thereafter.
+		const std::vector<GsWalkItem>* seeds;     // SESSION092: shared and read-only, owned by runWalk() for the group's lifetime.
+		glare::AtomicInt* next_seed;              // SESSION092: the shared cursor into `seeds`.
+		std::vector<GsWalkItem> stack;            // This task's working stack - empty between seeds.
 		js::Vector<GsDistIdx, 16> selected;
 		size_t visited;
+		double run_ms;                            // SESSION092 DIAGNOSTIC - see the ctor.
+		size_t seeds_taken;                       // SESSION092 DIAGNOSTIC
+		double seed_max_ms;                       // SESSION092 DIAGNOSTIC
 	};
 
 
@@ -1634,11 +1696,76 @@ public:
 		// rule and the grid's tile size cannot drift apart.
 		const int res = gsSatGridResForFocal(focal_px, tile_px);
 		walk_tile_ang = myMax(gsSatGridTileAngle(res), 1.0e-6f); // Stored, not local: every walk task reads it - see walkStack().
+		walk_serial_ms = 0.0; // SESSION092: set only if the self-check below runs.
 		walk_verify_ms = 0.0; // SESSION085: set only if the self-check below runs, and the caller subtracts it unconditionally.
 
 		Timer walk_timer;
 		js::Vector<GsDistIdx, 16> selected;
 		size_t visited = 0;
+		runWalk(selected, visited, /*target_seeds=*/(task_manager != NULL ? myMax<size_t>(1, (size_t)task_manager->getConcurrency()) : 1) * gs_walk_target_seeds_per_thread);
+		barrier.walk_ms = walk_timer.elapsed() * 1.0e3; // Stopped HERE, before the self-check below - that check runs a whole second walk, and timing it as part of the first would make walk_ms meaningless under "diag", which is the mode most likely to be captured.
+		barrier.walk_visited = visited;
+		// SESSION092 DIAGNOSTIC: taken now, because the self-check and the probe below both call runWalk() again.
+		walk_diag_prologue_ms = walk_prologue_ms; walk_diag_task_sum_ms = walk_task_sum_ms;
+		walk_diag_task_max_ms = walk_task_max_ms; walk_diag_seed_max_ms = walk_seed_max_ms;
+		walk_diag_workers = walk_workers; walk_diag_num_tasks = walk_num_tasks; walk_diag_seeds = walk_seeds;
+
+		runSelfCheck(barrier, selected, visited);
+
+		// Nearest first - the order the grid's accumulation depends on (see gsBuildSaturationGrid()). Same two sorts,
+		// same threshold between them, as the traversal uses on its own output.
+		Timer sort_timer;
+		const size_t count = selected.size();
+		if(count > 0)
+		{
+			js::Vector<GsDistIdx, 16> sort_scratch;
+			sort_scratch.resizeNoCopy(count);
+			const size_t parallel_sort_min_elements = 16384;
+			if(task_manager != NULL && count >= parallel_sort_min_elements)
+				Sort::radixSortWithParallelPartition<GsDistIdx, GsWalkDistKey>(*task_manager, selected.data(), (uint32)count, GsWalkDistKey(), sort_scratch.data(), /*put_result_in_working_space=*/false);
+			else
+				Sort::floatKeyAscendingSort(selected.data(), count, GsWalkDistLess(), GsWalkDistKey(), sort_scratch.data(), /*put_result_in_working_space=*/false);
+		}
+		barrier.walk_sort_ms = sort_timer.elapsed() * 1.0e3;
+
+		occl_px.resizeNoCopy(count); occl_py.resizeNoCopy(count); occl_pz.resizeNoCopy(count);
+		occl_radius.resizeNoCopy(count); occl_alpha.resizeNoCopy(count);
+		if(count == 0)
+			return;
+
+		// Chunked exactly like the frontier gather, and for the same reason: the cost is DRAM miss latency on the
+		// scattered reads, so what threads buy is outstanding misses rather than arithmetic.
+		const size_t concurrency = (task_manager != NULL) ? myMax<size_t>(1, (size_t)task_manager->getConcurrency()) : 1;
+		const size_t num_chunks = myMax<size_t>(1, myMin(concurrency * 4, count / 16384));
+		glare::TaskGroupRef group = new glare::TaskGroup();
+		for(size_t c=0; c<num_chunks; ++c)
+		{
+			Reference<GsSatWalkGatherTask> t = new GsSatWalkGatherTask();
+			t->src = selected.data(); t->positions = positions.data(); t->occl = geom->sat_occl.data();
+			t->out_px = occl_px.data(); t->out_py = occl_py.data(); t->out_pz = occl_pz.data();
+			t->out_radius = occl_radius.data(); t->out_alpha = occl_alpha.data();
+			t->cam_pos_ws = anchor_pos_ws;
+			t->alpha_gain = alpha_gain; t->alpha_gamma = alpha_gamma;
+			t->i_begin = (count * c) / num_chunks;
+			t->i_end   = (count * (c + 1)) / num_chunks;
+			if(task_manager != NULL) group->tasks.push_back(t); else t->run(0);
+		}
+		if(task_manager != NULL)
+			task_manager->runTaskGroup(group);
+	}
+
+
+	// SESSION082: the walk itself - seeds, then the parallel split across the pool. SESSION092: factored out of
+	// occluderTreeWalk() unchanged, so [gsr-walk-sweep]'s repeat runs at other granularities are literally this walk
+	// rather than a second copy of the split that could drift from it. target_seeds is a parameter for that reason.
+	void runWalk(js::Vector<GsDistIdx, 16>& selected, size_t& visited, size_t target_seeds)
+	{
+		// SESSION092 DIAGNOSTIC: reset per call, so a probe's repeat walks cannot leave their numbers behind for the
+		// measured one - occluderTreeWalk() snapshots these immediately after the call it cares about.
+		walk_prologue_ms = 0.0; walk_task_sum_ms = 0.0; walk_task_max_ms = 0.0; walk_seed_max_ms = 0.0;
+		// walk_serial_ms is NOT reset here - it belongs to the self-check, which runs once per build, not per runWalk().
+
+		walk_workers = 0; walk_num_tasks = 0; walk_seeds = 0;
 
 		std::vector<GsWalkItem> stack;
 		for(size_t mi=0; mi<walk_members.size(); ++mi)
@@ -1670,39 +1797,141 @@ public:
 			// Seeds cut far finer than the thread count, for the reason expandParallel() gives: subtree cost is wildly
 			// uneven (the member the camera stands inside dwarfs the others), so an even split of the SUBTREES is not
 			// an even split of the work. Many small tasks let the pool even that out itself.
-			walkStack(stack, selected, visited, /*breadth_first=*/true, /*pause_at_stack_size=*/concurrency * 16);
+			// SESSION092: two numbers meaning different things, exactly as expandParallel() splits them - spread_seeds is
+			// how far the plain breadth-first prologue runs, target_seeds is how many independent pieces the walk is
+			// finally handed out in (a parameter, so [gsr-walk-sweep] can price several in one capture). Both are
+			// granularity; what decides BALANCE is the targeted split below.
+			const size_t spread_seeds = concurrency * 4;
+
+			Timer prologue_timer; // SESSION092 DIAGNOSTIC: the serial breadth-first top of the walk, which no thread can help with - the walk's own Amdahl floor.
+			walkStack(stack, selected, visited, /*breadth_first=*/true, /*pause_at_stack_size=*/spread_seeds);
+
+			// SESSION092: TARGETED SPLITTING - keep expanding whichever seed still has the most walking ahead of it,
+			// instead of expanding everything uniformly and stopping on a global count. Same mechanism, same reason, as
+			// the traversal's session086 split; this walk was left on the plain prologue and reproduced that defect
+			// exactly.
+			//
+			// The uniform-deepening experiment was run here too, and failed the same way it did there: raising the plain
+			// prologue 16x (272 -> 4,353 seeds) moved par only 4.0 -> 5.0, and in all six captures seed_max_ms came back
+			// equal to task_max_ms to within 2% - ONE seed was the entire critical path, ~20% of all the work in a piece
+			// no cursor can divide. Uniform deepening pays to cut the whole tree and mostly misses the one branch that
+			// matters.
+			//
+			// feature_size/dist as the cost signal: it is not a guess at subtree size, it is the very quantity the walk
+			// STOPS on (> walk_tile_ang), so it says how many levels a seed still has to descend, and the node count
+			// below it grows roughly as its square. The tree stores no subtree sizes, so this is the only free signal -
+			// and it is the right one. It can be fooled by an unusually dense subtree at a modest ratio; that shows up
+			// as an unsplit straggler, which is precisely what seed_max_ms reports, so it cannot be silent.
+			//
+			// Each iteration expands exactly ONE node, through the walk's own body (pause_at_stack_size=2 stops the
+			// moment that node's children are pending), so the node is popped, counted in `visited` and tested by the
+			// same stop rule as always - splitting cannot change WHICH nodes the walk selects, only how they are grouped.
+			// A seed whose own test says "stop" is emitted by that call and comes back as an empty split_tmp: that seed
+			// is simply gone from the set, and the loop carries on with the next largest. It must NOT stop there - a
+			// LEAF can hold the largest ratio of all (an original splat close to the anchor is big and has no children),
+			// and treating it as "everything left is a stopper" ends the split at once. Measured: doing exactly that
+			// halted it at 596 seeds against a target of 4,352.
+			if(!stack.empty() && stack.size() < target_seeds)
+			{
+				std::vector<GsWalkSeed> heap;
+				heap.reserve(target_seeds + 16);
+				for(size_t i=0; i<stack.size(); ++i)
+					heap.push_back(makeWalkSeed(stack[i]));
+				std::make_heap(heap.begin(), heap.end(), GsWalkSeedLess());
+
+				std::vector<GsWalkItem> split_tmp; // One node's children at a time; kept outside the loop so its capacity is reused.
+				split_tmp.reserve(16);
+				while(!heap.empty() && heap.size() < target_seeds)
+				{
+					std::pop_heap(heap.begin(), heap.end(), GsWalkSeedLess()); // Largest ratio moves to the back.
+					const GsWalkSeed top = heap.back();
+					heap.pop_back();
+
+					split_tmp.clear();
+					split_tmp.push_back(top.item);
+					// One level. If the node stops here instead (leaf, or its own ratio test says stop) it is emitted by
+					// the very same code that would have emitted it during the walk, and split_tmp comes back empty -
+					// nothing to re-add, and nothing to stop for.
+					walkStack(split_tmp, selected, visited, /*breadth_first=*/true, /*pause_at_stack_size=*/2);
+
+					for(size_t i=0; i<split_tmp.size(); ++i)
+					{
+						heap.push_back(makeWalkSeed(split_tmp[i]));
+						std::push_heap(heap.begin(), heap.end(), GsWalkSeedLess());
+					}
+				}
+
+				stack.clear();
+				for(size_t i=0; i<heap.size(); ++i)
+					stack.push_back(heap[i].item);
+			}
+			walk_prologue_ms = prologue_timer.elapsed() * 1.0e3;
+			walk_seeds = stack.size(); // SESSION092 DIAGNOSTIC
 			if(!stack.empty())
 			{
-				const size_t num_tasks = myMin(stack.size(), concurrency * 4);
+				// SESSION092: one task per THREAD, each pulling seeds off a shared cursor - see GsOccWalkTask. More tasks
+				// than threads bought something only while the deal was static; with dynamic pulling it is pure overhead.
+				// `stack` stays alive as the seed array for the whole group, so it is cleared after the run, not before.
+				const size_t num_tasks = myMin(stack.size(), concurrency);
+				walk_num_tasks = num_tasks; // SESSION092 DIAGNOSTIC
+				glare::AtomicInt next_seed(0);
 				glare::TaskGroupRef group = new glare::TaskGroup();
 				group->tasks.resize(num_tasks);
 				for(size_t t=0; t<num_tasks; ++t)
 				{
 					Reference<GsOccWalkTask> task = new GsOccWalkTask();
 					task->parent = this;
-					for(size_t si=t; si<stack.size(); si += num_tasks) // Round-robin, so a task gets a spread of the tree rather than a contiguous run of siblings, whose costs are correlated.
-						task->stack.push_back(stack[si]);
+					task->seeds = &stack;
+					task->next_seed = &next_seed;
 					group->tasks[t] = task;
 				}
-				stack.clear();
 				task_manager->runTaskGroup(group);
 
 				for(size_t t=0; t<num_tasks; ++t) // Task order, not completion order - see the determinism note above.
 				{
 					const GsOccWalkTask* const task = static_cast<const GsOccWalkTask*>(group->tasks[t].ptr());
+					// SESSION092 DIAGNOSTIC: same sum-vs-max pair the traversal keeps - par = sum/max is how much of the
+					// pool the walk actually converts into speed. workers counts the tasks that got a seed at all, which
+					// under a shared cursor is a real reading rather than a tautology: a thread the pool never started
+					// (because a traversal holds it) takes none, and that is exactly the contention this needs to show.
+					walk_task_sum_ms += task->run_ms;
+					walk_task_max_ms = myMax(walk_task_max_ms, task->run_ms);
+					walk_seed_max_ms = myMax(walk_seed_max_ms, task->seed_max_ms);
+					if(task->seeds_taken > 0) walk_workers++;
 					visited += task->visited;
 					const size_t base = selected.size();
 					selected.resize(base + task->selected.size());
 					if(!task->selected.empty())
 						std::memcpy(selected.data() + base, task->selected.data(), task->selected.size() * sizeof(GsDistIdx));
 				}
+				stack.clear(); // After the run - see the seed-array note above.
 			}
 		}
 		else
 			walkStack(stack, selected, visited, /*breadth_first=*/false, /*pause_at_stack_size=*/0);
-		barrier.walk_ms = walk_timer.elapsed() * 1.0e3; // Stopped HERE, before the self-check below - that check runs a whole second walk, and timing it as part of the first would make walk_ms meaningless under "diag", which is the mode most likely to be captured.
-		barrier.walk_visited = visited;
+	}
 
+
+	// SESSION092: a seed tagged with the walk's own stop-rule ratio, which the targeted split orders by - see runWalk().
+	// Reads the same two arrays the walk's test reads, at the same index, so the ordering cannot drift from the rule it
+	// is meant to predict.
+	GsWalkSeed makeWalkSeed(const GsWalkItem& item) const
+	{
+		const WalkMember& m = walk_members[item.member_idx];
+		const size_t cloud_idx = m.offset + item.tree_local_idx;
+		const Vec3f& p = geom->positions[cloud_idx];
+		const float dist = myMax(std::sqrt(anchor_pos_ws.getDist2(Vec4f(p.x, p.y, p.z, 1.f))), 1.0e-6f);
+		GsWalkSeed s; s.ratio = geom->feature_size[cloud_idx] / dist; s.item = item;
+		return s;
+	}
+
+
+	// SESSION082 SELF-CHECK + SESSION092 MEMORY PROBE, both TEMPORARY and both under the existing "diag" checkbox.
+	// Split out of occluderTreeWalk() so that function reads as the walk it is. Everything here runs AFTER walk_ms has
+	// been stopped, and its whole cost is accumulated into walk_verify_ms, which the caller subtracts back out of
+	// gather_ms - a diagnostic must not change the measurement it is printed beside (see session085's 3-5x inflation).
+	void runSelfCheck(GaussianSplatSaturationBarrier& barrier, const js::Vector<GsDistIdx, 16>& selected, size_t visited)
+	{
 		// SESSION082 SELF-CHECK, TEMPORARY: the parallel walk must select exactly the set the serial one does. Runs the
 		// serial walk a second time and compares, under the existing "diag" checkbox rather than a switch of its own -
 		// that checkbox already means "spend real time measuring what is normally left alone", which is precisely this.
@@ -1730,7 +1959,11 @@ public:
 				GsWalkItem it; it.member_idx = (uint32)mi; it.tree_local_idx = 0;
 				serial_stack.push_back(it);
 			}
+			// SESSION092: this walk was already being run for the set comparison; timing it costs nothing and gives the
+			// one number the pool cannot contaminate - see walkSeedSweep(), which prints it as serial_walk_ms.
+			Timer serial_walk_timer;
 			walkStack(serial_stack, serial_sel, serial_visited, /*breadth_first=*/false, /*pause_at_stack_size=*/0);
+			walk_serial_ms = serial_walk_timer.elapsed() * 1.0e3;
 
 			bool match = (serial_sel.size() == selected.size()) && (serial_visited == visited);
 			if(match)
@@ -1749,45 +1982,87 @@ public:
 				(match ? " PASS" : " ***FAIL***"));
 		}
 
-		// Nearest first - the order the grid's accumulation depends on (see gsBuildSaturationGrid()). Same two sorts,
-		// same threshold between them, as the traversal uses on its own output.
-		Timer sort_timer;
-		const size_t count = selected.size();
-		if(count > 0)
-		{
-			js::Vector<GsDistIdx, 16> sort_scratch;
-			sort_scratch.resizeNoCopy(count);
-			const size_t parallel_sort_min_elements = 16384;
-			if(task_manager != NULL && count >= parallel_sort_min_elements)
-				Sort::radixSortWithParallelPartition<GsDistIdx, GsWalkDistKey>(*task_manager, selected.data(), (uint32)count, GsWalkDistKey(), sort_scratch.data(), /*put_result_in_working_space=*/false);
-			else
-				Sort::floatKeyAscendingSort(selected.data(), count, GsWalkDistLess(), GsWalkDistKey(), sort_scratch.data(), /*put_result_in_working_space=*/false);
-		}
-		barrier.walk_sort_ms = sort_timer.elapsed() * 1.0e3;
+		if(diag_log && task_manager != NULL)
+			walkSeedSweep(barrier, visited);
+	}
 
-		occl_px.resizeNoCopy(count); occl_py.resizeNoCopy(count); occl_pz.resizeNoCopy(count);
-		occl_radius.resizeNoCopy(count); occl_alpha.resizeNoCopy(count);
-		if(count == 0)
-			return;
 
-		// Chunked exactly like the frontier gather, and for the same reason: the cost is DRAM miss latency on the
-		// scattered reads, so what threads buy is outstanding misses rather than arithmetic.
-		const size_t num_chunks = myMax<size_t>(1, myMin(concurrency * 4, count / 16384));
-		glare::TaskGroupRef group = new glare::TaskGroup();
-		for(size_t c=0; c<num_chunks; ++c)
+	// SESSION092 DIAGNOSTIC, TEMPORARY - [gsr-walk-sweep]. Prices several seed granularities against each other inside
+	// ONE capture, which is the only way CPU milliseconds here can be compared at all: the pool is shared with the
+	// render traversal, and the same walk on a bitwise identical node set has measured 22 ms and 65 ms depending on
+	// what the traversal was doing at that moment.
+	//
+	// Why this is the question. target_seeds was taken from expandParallel()'s own figure, and that function walks
+	// 1.7-6.5M nodes where this one visits ~0.9M - there is no reason the same granularity should suit both. Measured
+	// after the switch to a shared cursor plus targeted splitting at concurrency*256: par rose 4.0 -> 8.4, and task_sum
+	// rose with it, 71.5 -> 109.0 ms on the same input (80.6 -> 122.8 ns/node), so walk_ms did not move. Balance was
+	// bought and spent. The likely payer is locality - with 68 coarse seeds a thread walks one large connected subtree,
+	// with 4,352 fine ones it hops between unrelated parts of an 85 MB tree - and if so there is an optimum well below
+	// the traversal's, which this finds.
+	//
+	// The memory probe that stood here is REMOVED, its question closed: replayed serially against a serial walk (the
+	// only pair the pool cannot distort), the walk's three scattered streams came to 8.2/10.6/13.3% of it - ~10 ns/node
+	// of memory against ~90 ns/node of walk. A lower bound, since the walk's misses are a dependency chain and the
+	// replay's are not, but nowhere near enough to justify repacking a shared 96-byte node array. What the other ~80%
+	// is: the DFS machinery itself - stack push/pop, the output push_back, the sqrt, and a stop test that mispredicts
+	// (83% of visited nodes stop, 17% descend).
+	void walkSeedSweep(GaussianSplatSaturationBarrier& barrier, size_t visited)
+	{
+		Timer sweep_timer;
+		const size_t concurrency = myMax<size_t>(1, (size_t)task_manager->getConcurrency());
+		const size_t mults[3] = { 32, 64, 256 };
+
+		// SESSION092: run the ladder UP then DOWN - 32,64,256,256,64,32 - and report both readings for each multiplier.
+		// The one-way version of this sweep was not the interleaved comparison it was meant to be: on the interior every
+		// capture had ms falling and par rising monotonically along the running order, and the build's own walk at x256
+		// (which runs FIRST, cold, inside a traversal's window) measured 70.76 ms against the same x256 measured LAST in
+		// the sweep at 11.49 - a 6x spread for one setting on one input. Position in the sequence was outweighing the
+		// thing being measured. Going up and back down puts every multiplier in both an early and a late slot, so the
+		// trend shows up as the gap between a pair rather than hiding inside the comparison between settings.
+		double sw_ms[3][2], sw_sum[3][2], sw_max[3][2], sw_prologue[3][2];
+		size_t sw_seeds[3], sw_workers[3][2];
+
+		for(int step=0; step<6; ++step)
 		{
-			Reference<GsSatWalkGatherTask> t = new GsSatWalkGatherTask();
-			t->src = selected.data(); t->positions = positions.data(); t->occl = geom->sat_occl.data();
-			t->out_px = occl_px.data(); t->out_py = occl_py.data(); t->out_pz = occl_pz.data();
-			t->out_radius = occl_radius.data(); t->out_alpha = occl_alpha.data();
-			t->cam_pos_ws = anchor_pos_ws;
-			t->alpha_gain = alpha_gain; t->alpha_gamma = alpha_gamma;
-			t->i_begin = (count * c) / num_chunks;
-			t->i_end   = (count * (c + 1)) / num_chunks;
-			if(task_manager != NULL) group->tasks.push_back(t); else t->run(0);
+			const int i = (step < 3) ? step : (5 - step); // 0,1,2,2,1,0
+			const int slot = (step < 3) ? 0 : 1;
+			js::Vector<GsDistIdx, 16> sel;
+			size_t vis = 0;
+			Timer t;
+			runWalk(sel, vis, concurrency * mults[i]);
+			sw_ms[i][slot] = t.elapsed() * 1.0e3;
+			sw_sum[i][slot] = walk_task_sum_ms; sw_max[i][slot] = walk_task_max_ms; sw_prologue[i][slot] = walk_prologue_ms;
+			sw_seeds[i] = walk_seeds; sw_workers[i][slot] = walk_workers;
 		}
-		if(task_manager != NULL)
-			task_manager->runTaskGroup(group);
+
+		walk_verify_ms += sweep_timer.elapsed() * 1.0e3; // Added, not assigned: the self-check above already put its own cost here, and the caller subtracts the total out of gather_ms.
+
+		std::string line = "[gsr-walk-sweep] cloud=" + toString(cloud_id) +
+			" visited=" + uInt64ToStringCommaSeparated(visited) +
+			// SESSION092: the build's own walk - the only one production ever runs, and the only one that meets the data
+			// COLD. Every walk below it in this line has had the tree pulled in by the ones before, so the gap between
+			// live_walk_ms and the sweep's x256 is what a barrier build actually pays and the sweep never sees. Its own
+			// par/workers are printed beside it to say which of the two candidate causes it is: few workers means the
+			// pool was held by a traversal, a full 16 with par ~15 and still several times the warm figure means cold
+			// misses, and those point at opposite fixes.
+			" live_walk_ms=" + doubleToStringNDecimalPlaces(barrier.walk_ms, 2) +
+			" (par=" + doubleToStringNDecimalPlaces(walk_diag_task_max_ms > 0.0 ? (walk_diag_task_sum_ms / walk_diag_task_max_ms) : 0.0, 2) +
+			" w=" + uInt64ToStringCommaSeparated(walk_diag_workers) +
+			" sum=" + doubleToStringNDecimalPlaces(walk_diag_task_sum_ms, 2) +
+			" max=" + doubleToStringNDecimalPlaces(walk_diag_task_max_ms, 2) +
+			" prol=" + doubleToStringNDecimalPlaces(walk_diag_prologue_ms, 2) +
+			" seed_max=" + doubleToStringNDecimalPlaces(walk_diag_seed_max_ms, 2) + ")" 
+			" serial_walk_ms=" + doubleToStringNDecimalPlaces(walk_serial_ms, 2); // The self-check's walk, timed. One thread, so the pool cannot touch it - the only stable reference here.
+		for(int i=0; i<3; ++i) // Each pair reads "up-pass/down-pass"; their spread IS the ordering artifact, measured rather than assumed.
+			line += " || x" + toString(mults[i]) +
+				" seeds=" + uInt64ToStringCommaSeparated(sw_seeds[i]) +
+				" ms=" + doubleToStringNDecimalPlaces(sw_ms[i][0], 2) + "/" + doubleToStringNDecimalPlaces(sw_ms[i][1], 2) +
+				" prol=" + doubleToStringNDecimalPlaces(sw_prologue[i][0], 2) + "/" + doubleToStringNDecimalPlaces(sw_prologue[i][1], 2) +
+				" sum=" + doubleToStringNDecimalPlaces(sw_sum[i][0], 2) + "/" + doubleToStringNDecimalPlaces(sw_sum[i][1], 2) +
+				" par=" + doubleToStringNDecimalPlaces(sw_max[i][0] > 0.0 ? (sw_sum[i][0] / sw_max[i][0]) : 0.0, 2) +
+					"/" + doubleToStringNDecimalPlaces(sw_max[i][1] > 0.0 ? (sw_sum[i][1] / sw_max[i][1]) : 0.0, 2) +
+				" w=" + uInt64ToStringCommaSeparated(sw_workers[i][0]) + "/" + uInt64ToStringCommaSeparated(sw_workers[i][1]);
+		conPrint(line);
 	}
 
 
@@ -1809,6 +2084,15 @@ public:
 	std::vector<WalkMember> walk_members;
 	float walk_tile_ang; // SESSION082: angular size of one grid tile, derived in occluderTreeWalk() from this build's own gsSatGridResForFocal() call so the walk's stop rule and the grid's resolution cannot drift apart.
 	double walk_ms, walk_sort_ms; // SESSION082: the walk's own two costs, reported apart from gather_ms - see the barrier's fields of the same name.
+	// SESSION092 DIAGNOSTIC, TEMPORARY: the walk's own parallel bookkeeping, mirroring the traversal's
+	// expand_prologue_ms/expand_task_sum_ms/expand_task_max_ms so the two can be compared directly. Written by every
+	// runWalk() call; the walk_diag_* copies below are the measured call's, taken before the probe overwrites them.
+	double walk_prologue_ms, walk_task_sum_ms, walk_task_max_ms, walk_seed_max_ms;
+	size_t walk_workers, walk_num_tasks, walk_seeds;
+	double walk_serial_ms;        // SESSION092 DIAGNOSTIC, TEMPORARY: the self-check's serial walk, timed - see walkSeedSweep(). 0 unless the self-check ran.
+	double walk_diag_prologue_ms, walk_diag_task_sum_ms, walk_diag_task_max_ms, walk_diag_seed_max_ms;
+	size_t walk_diag_workers, walk_diag_num_tasks, walk_diag_seeds;
+
 	double walk_verify_ms;        // SESSION085: cost of the "diag" self-check below, subtracted back out of gather_ms by the caller so a diagnostic cannot inflate the number it is printed beside. 0 when the check did not run.
 	size_t walk_visited;          // SESSION082: nodes the walk touched, against the number it selected - the walk's own overhead ratio.
 	glare::TaskManager* task_manager; // May be NULL - see gsBuildSaturationGridParallel()'s caller-side branch above.

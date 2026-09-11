@@ -1947,7 +1947,6 @@ private:
 	GaussianSplatMergeColourParams splat_merge_colour_params; // SESSION071 - see the getters above.
 	float splat_merge_spread_widen;                           // SESSION071 - see getMergeSpreadWiden() above.
 
-	// SESSION063 K4: coarse floor knobs - see the getters above.
 	bool filter_debug_log, kick_debug_log, cpu_prof_log; // SESSION072: live log toggles - see getFilterDebugLog() etc.
 	float sat_prefilter_threshold;                    // SESSION079 - see getSatPrefilterThreshold(). This stage's own threshold, independent of splat_saturation_threshold (the GPU gate's).
 	bool filter_frustum_planes_enabled;              // SESSION074 - see getFilterFrustumPlanesEnabled().

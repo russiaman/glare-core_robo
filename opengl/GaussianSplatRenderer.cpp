@@ -3809,10 +3809,7 @@ private:
 	// Preconditions, each of which would otherwise break the cut invariant or the block's meaning:
 	//   - frustum cull is off (it is, in split-filter mode): a culled traversal's frontier is not a complete cut, so a
 	//     block split out of one could hold a hole;
-	//   - the distance clamp is off, for the same reason - it prunes whole subtrees out of the cut;
-	//   - the coarse floor is off. Not a correctness problem but a scope one: the coarse layer is captured once per
-	//     branch on the way down, and a branch that stops at the cut is never walked below it, so the two capture rules
-	//     would have to be reconciled. The owner runs coarse off; revisit if that changes.
+	//   - the distance clamp is off, for the same reason - it prunes whole subtrees out of the cut.
 	bool reuse_enabled;
 
 	// SESSION080 §4.3: false = this traversal BUILDS a block (walks everything, marking the far part); true = a block

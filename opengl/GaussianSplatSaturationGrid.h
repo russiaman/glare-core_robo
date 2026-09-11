@@ -305,10 +305,10 @@ float gsSatProjectedRadius(const Vec3f& scales, const Vec4f& rot, const Vec4f& u
 float gsSatGridTileAngle(int res);
 
 
-// SESSION074: pass 1 - the coarse-floor accumulation pass. Walks the coarse-only SoA (already front-to-back sorted,
-// since it is a filtered subsequence of the traversal's globally-sorted output - see GaussianSplatUnculledFrontier)
-// ONCE, sequentially (this is the only sequential, order-dependent part of the whole mechanism - see the file
-// header), building a per-tile saturation depth.
+// SESSION074: pass 1 - the occluder accumulation pass (originally coarse-floor-only; SESSION076 below switched it to
+// the FINE frontier). Walks its input SoA (already front-to-back sorted, since it is a filtered subsequence of the
+// traversal's globally-sorted output - see GaussianSplatUnculledFrontier) ONCE, sequentially (this is the only
+// sequential, order-dependent part of the whole mechanism - see the file header), building a per-tile saturation depth.
 //
 // SESSION074 REVISION - each node is rasterised into EVERY tile its angular footprint fully covers, not just the one
 // its centre direction lands in. The first cut wrote a single tile per node while simultaneously *requiring* the node

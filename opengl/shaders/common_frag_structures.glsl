@@ -22,7 +22,7 @@ layout (std140) uniform MaterialCommonUniforms
 	int camera_type; // OpenGLScene::CameraType
 
 	int mat_common_flags;
-	float shadow_map_samples_xy_scale;
+	float padding_a0;
 	float padding_a1;
 	float padding_a2;
 
@@ -30,6 +30,12 @@ layout (std140) uniform MaterialCommonUniforms
 
 	vec4 probe_grid_origin; // xyz = world space position of grid probe (0, 0, 0).  w = probe spacing.
 	ivec4 probe_grid_dims;  // xyz = number of probes along each axis.  w = atlas index of grid probe (0, 0, 0).
+
+	// Per-cascade shadow map depth bias scale: (world size of a depth map texel) / (depth range of that cascade's
+	// ortho volume).  Multiplied by tan(theta) in getShadowMappingSunVisFactor() to get the bias.  Only the first
+	// NUM_DYNAMIC_DEPTH_TEXTURES / NUM_STATIC_DEPTH_TEXTURES components respectively are used.
+	vec4 dynamic_cascade_bias_scales;
+	vec4 static_cascade_bias_scales;
 };
 
 
@@ -42,6 +48,7 @@ layout (std140) uniform MaterialCommonUniforms
 #define USE_PROBE_VISIBILITY_FLAG			32 // With the above: weight probes by the Chebyshev visibility test.
 #define DOING_PROBE_CAPTURE_FLAG			64 // This draw is rendering a cube face for a probe capture, not the main view.
                                                // Suppresses the terms that would feed unoccluded sky back into the grid.
+#define ALPHA_TO_COVERAGE_ENABLED_FLAG		128
 
 
 // MaterialData flag values

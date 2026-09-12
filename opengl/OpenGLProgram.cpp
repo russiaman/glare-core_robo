@@ -36,7 +36,7 @@ static const std::string getLog(GLuint program)
 
 
 UniformLocations::UniformLocations() 
-:	caustic_tex_a_location(-1), caustic_tex_b_location(-1), snow_ice_normal_map_location(-1)
+:	caustic_tex_location(-1), snow_ice_normal_map_location(-1)
 {}
 
 
@@ -98,6 +98,17 @@ OpenGLProgram::OpenGLProgram(const std::string& prog_name_, const Reference<Open
 
 	for(size_t i=0; i<extra_args.input_vert_attribute_bindings.size(); ++i)
 		glBindAttribLocation(program, extra_args.input_vert_attribute_bindings[i].index, extra_args.input_vert_attribute_bindings[i].name.c_str());
+
+	// Declare the transform feedback captures.  Like the attribute bindings above this has to go before glLinkProgram(),
+	// since the linker decides the layout of the captured data and stops the captured outputs being optimised away.
+	if(!extra_args.transform_feedback_varyings.empty())
+	{
+		std::vector<const char*> varying_names(extra_args.transform_feedback_varyings.size());
+		for(size_t i=0; i<extra_args.transform_feedback_varyings.size(); ++i)
+			varying_names[i] = extra_args.transform_feedback_varyings[i].c_str();
+
+		glTransformFeedbackVaryings(program, (GLsizei)varying_names.size(), varying_names.data(), GL_INTERLEAVED_ATTRIBS);
+	}
 
 	glLinkProgram(program);
 

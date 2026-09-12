@@ -135,6 +135,7 @@ public:
 		terrain(false),
 		imposter_tex_has_multiple_angles(false),
 		decal(false),
+		alpha_punch_through(false),
 		participating_media(false),
 		alpha_blend(false),
 		splat_cloud(false),
@@ -179,6 +180,8 @@ public:
 	bool terrain;
 	bool imposter_tex_has_multiple_angles;
 	bool decal;
+	bool alpha_punch_through; // For WebGL: material writes alpha zero, to punch a hole in the canvas so an HTML element positioned under the canvas shows through.
+	// The material must not be alpha-tested, see drawAlphaPunchThroughObjects().
 	bool participating_media;
 	bool alpha_blend;
 	bool splat_cloud; // Gaussian splat cloud.  Drawn in drawSplatClouds(), which orders whole clouds in depth order against each other; see GaussianSplatRenderer.
@@ -277,25 +280,34 @@ struct GlInstanceInfo
 // Bit 28: material is water
 // Bit 27: material is a decal
 // Bit 26: material is alpha blended
-// Bits 24-25: face culling type (0 = none, 1 = cull backface, 2 = cull frontface).  (has to go last)
-// Bits 0-23: program index
+// Bit 25: material is alpha tested (foliage etc..)
+// Bit 24: material is alpha-punching.  (Punches a hole in the canvas alpha)
+// Bits 22-23: face culling type (0 = none, 1 = cull backface, 2 = cull frontface).  (has to go last)
+// Bits 0-21: program index
 #define PROGRAM_FINISHED_BUILDING_BITFLAG				(1u << 31)
 #define PROG_SUPPORTS_GPU_RESIDENT_BITFLAG				(1u << 30)
 #define MATERIAL_TRANSPARENT_BITFLAG					(1u << 29)
 #define MATERIAL_WATER_BITFLAG							(1u << 28)
 #define MATERIAL_DECAL_BITFLAG							(1u << 27)
 #define MATERIAL_ALPHA_BLEND_BITFLAG					(1u << 26)
+#define MATERIAL_ALPHA_TEST_BITFLAG						(1u << 25)
+#define MATERIAL_ALPHA_PUNCH_THROUGH_BITFLAG			(1u << 24)
 
-#define MATERIAL_FACE_CULLING_BIT_INDEX					24u
-#define ISOLATE_FACE_CULLING_MASK						((1u << 24u) | (1u << 25u))
-#define ISOLATE_PROG_INDEX_MASK							0x00FFFFFF // Zero out top 8 bits
-#define ISOLATE_PROG_INDEX_AND_FACE_CULLING_MASK		0x03FFFFFF // Zero out top 6 bits
+#define MATERIAL_FACE_CULLING_BIT_INDEX					22u
+#define ISOLATE_FACE_CULLING_MASK						((1u << 22u) | (1u << 23u))
+#define ISOLATE_PROG_INDEX_MASK							0x003FFFFF // Zero out top 10 bits
+#define ISOLATE_PROG_INDEX_AND_FACE_CULLING_MASK		0x00FFFFFF // Zero out top 8 bits
 
 #define CULL_BACKFACE_BITS								1u
 #define CULL_FRONTFACE_BITS								2u
 
 #define SHIFTED_CULL_BACKFACE_BITS						(CULL_BACKFACE_BITS  << MATERIAL_FACE_CULLING_BIT_INDEX)
 #define SHIFTED_CULL_FRONTFACE_BITS						(CULL_FRONTFACE_BITS << MATERIAL_FACE_CULLING_BIT_INDEX)
+
+
+static_assert((0xFFFFFFFFu >> 10) == ISOLATE_PROG_INDEX_MASK, "(0xFFFFFFFFu >> 10) == ISOLATE_PROG_INDEX_MASK");
+static_assert((0xFFFFFFFFu >> 8) == ISOLATE_PROG_INDEX_AND_FACE_CULLING_MASK, "(0xFFFFFFFFu >> 8) == ISOLATE_PROG_INDEX_AND_FACE_CULLING_MASK");
+static_assert((ISOLATE_PROG_INDEX_AND_FACE_CULLING_MASK & MATERIAL_ALPHA_PUNCH_THROUGH_BITFLAG) == 0, "punch-through bit must be above the face culling bits");
 
 
 struct GLObjectBatchDrawInfo
@@ -484,7 +496,8 @@ public:
 	{
 		ShadowMappingDetail_low, // for mobile
 		ShadowMappingDetail_medium, // standard desktop
-		ShadowMappingDetail_high // high-spec desktop
+		ShadowMappingDetail_high, // high-spec desktop
+		ShadowMappingDetail_ultra// high-spec desktop
 	};
 
 
@@ -656,6 +669,7 @@ public:
 	glare::LinearIterSet<Reference<GLObject>, GLObjectHash> animated_objects; // Objects for which we need to update the animation data (bone matrices etc.) every frame.
 	glare::LinearIterSet<Reference<GLObject>, GLObjectHash> transparent_objects;
 	glare::LinearIterSet<Reference<GLObject>, GLObjectHash> alpha_blended_objects;
+	glare::LinearIterSet<Reference<GLObject>, GLObjectHash> alpha_punch_through_objects; // For WebGL, objects that write alpha zero to punch wholes in the canvas to show video elements below.
 	glare::LinearIterSet<Reference<GLObject>, GLObjectHash> splat_cloud_objects; // Gaussian splat clouds, drawn in their own pass before the alpha-blended objects.
 	glare::LinearIterSet<Reference<GLObject>, GLObjectHash> water_objects;
 	glare::LinearIterSet<Reference<GLObject>, GLObjectHash> decal_objects;
@@ -772,18 +786,12 @@ public:
 	OpenGLTextureRef post_dof_colour_texture;
 
 
-	// Prepass will render to prepass_framebuffer, prepass_colour_renderbuffer, prepass_depth_renderbuffer.
-	// Then blit to prepass_copy_framebuffer, prepass_colour_copy_texture, prepass_colour_depth_texture
-	// Then SSAO is computed, reading from prepass_copy_framebuffer and writing to compute_ssao_output_framebuffer.
+	// Prepass will render to prepass_framebuffer, prepass_colour_texture, prepass_normal_texture, prepass_depth_texture.
+	// Then SSAO is computed, reading from prepass_framebuffer.
 	Reference<FrameBuffer> prepass_framebuffer;
-	Reference<RenderBuffer> prepass_colour_renderbuffer;
-	Reference<RenderBuffer> prepass_normal_renderbuffer;
-	Reference<RenderBuffer> prepass_depth_renderbuffer;
-
-	Reference<FrameBuffer> prepass_copy_framebuffer;
-	OpenGLTextureRef prepass_colour_copy_texture;
-	OpenGLTextureRef prepass_normal_copy_texture;
-	OpenGLTextureRef prepass_depth_copy_texture;
+	OpenGLTextureRef prepass_colour_texture;
+	OpenGLTextureRef prepass_normal_texture;
+	OpenGLTextureRef prepass_depth_texture;
 
 	Reference<FrameBuffer> compute_ssao_framebuffer;
 	OpenGLTextureRef ssao_texture;
@@ -870,53 +878,62 @@ Index type is in here so we can group together more calls for multi-draw-indirec
 If the actual ID exceeds the allocated number of bits, rendering will still be correct, we just will do more state changes than strictly needed.
 
              bits allocated    bit index (0 = least significant bit)
-program_index:     8 bits      24
-face_culling:      2 bits      22
-VAO id:	           8 bits      14
-vert VBO id:       6 bits      8
-index VBO id:      6 bits      2
+alpha test:        1 bit       31
+program_index:     8 bits      23
+face_culling:      2 bits      21
+VAO id:	           9 bits      12
+vert VBO id:       5 bits      7
+index VBO id:      5 bits      2
 index type bits:   2 bits      0
 */
 
+#define BATCHDRAWINFO_ALPHA_TEST_BIT_INDEX     31
+#define BATCHDRAWINFO_PROGRAM_INDEX_BIT_INDEX  23
+#define BATCHDRAWINFO_FACE_CULLING_BIT_INDEX   21
+#define BATCHDRAWINFO_VAO_ID_BIT_INDEX         12
+#define BATCHDRAWINFO_VERT_VBO_ID_BIT_INDEX    7
+#define BATCHDRAWINFO_INDEX_VBO_ID_BIT_INDEX   2
+
+// Make the VAO id, vert VBO id, index VBO id, and index type bits part of the key (lower 4 fields)
 inline uint32 makeVAOAndVBOKey(uint32 vao_id, uint32 vert_vbo_id, uint32 idx_vbo_id, uint32 index_type_bits)
 {
-	return ((vao_id & 255u) << 14) | ((vert_vbo_id & 63u) << 8) | ((idx_vbo_id & 63u) << 2) | index_type_bits;
+	return ((vao_id & 511u) << BATCHDRAWINFO_VAO_ID_BIT_INDEX) | ((vert_vbo_id & 31u) << BATCHDRAWINFO_VERT_VBO_ID_BIT_INDEX) | ((idx_vbo_id & 31u) << BATCHDRAWINFO_INDEX_VBO_ID_BIT_INDEX) | index_type_bits;
 }
 
 struct BatchDrawInfo
 {
-	// To form prog_vao_key:
+	// To form key:
 	// prog_index_and_face_culling_bits is laid out as documented in 'program_index_and_flags' section above.
-	// Get lower 8 buts of program index (which is at bit 0), shift left to bit position 24.
-	// Get 2 face culling bits (which are at bits 24 and 25), shift right from bit 24 to 22.
+	// Get lower 8 buts of program index (which is at bit 0), shift left to bit position 23 (BATCHDRAWINFO_PROGRAM_INDEX_BIT_INDEX).
+	// Get 2 face culling bits (which are at bits 23 and 24 (ISOLATE_FACE_CULLING_MASK)), shift right from bit 23 to 21.
 
 	BatchDrawInfo() {}
 	BatchDrawInfo(uint32 prog_index_and_face_culling_bits, uint32 vao_and_vbo_key, const GLObject* ob_, uint32 batch_i_) 
-	:	prog_vao_key(((prog_index_and_face_culling_bits & 255u) << 24) | ((prog_index_and_face_culling_bits & ISOLATE_FACE_CULLING_MASK) >> (MATERIAL_FACE_CULLING_BIT_INDEX - 22)) | vao_and_vbo_key),
+	:	key(((prog_index_and_face_culling_bits & 255u) << BATCHDRAWINFO_PROGRAM_INDEX_BIT_INDEX) | ((prog_index_and_face_culling_bits & ISOLATE_FACE_CULLING_MASK) >> (MATERIAL_FACE_CULLING_BIT_INDEX - BATCHDRAWINFO_FACE_CULLING_BIT_INDEX)) | vao_and_vbo_key),
 		batch_i(batch_i_), ob(ob_)
 	{}
 
 	BatchDrawInfo(uint32 prog_index_and_face_culling_bits, uint32 vao_id, uint32 vert_vbo_id, uint32 idx_vbo_id, uint32 index_type_bits, const GLObject* ob_, uint32 batch_i_) 
-	:	prog_vao_key(((prog_index_and_face_culling_bits & 255u) << 24) | ((prog_index_and_face_culling_bits & ISOLATE_FACE_CULLING_MASK) >> (MATERIAL_FACE_CULLING_BIT_INDEX - 22)) | makeVAOAndVBOKey(vao_id, vert_vbo_id, idx_vbo_id, index_type_bits)),
+	:	key(((prog_index_and_face_culling_bits & 255u) << BATCHDRAWINFO_PROGRAM_INDEX_BIT_INDEX) | ((prog_index_and_face_culling_bits & ISOLATE_FACE_CULLING_MASK) >> (MATERIAL_FACE_CULLING_BIT_INDEX - BATCHDRAWINFO_FACE_CULLING_BIT_INDEX)) | makeVAOAndVBOKey(vao_id, vert_vbo_id, idx_vbo_id, index_type_bits)),
 		batch_i(batch_i_), ob(ob_)
 	{
 		assert(index_type_bits <= 2);
 	}
 	std::string keyDescription() const;
 
-	uint32 prog_vao_key;
+	uint32 key; // for sorting
 	uint32 batch_i;
 	const GLObject* ob;
 	
-	bool operator < (const BatchDrawInfo& other) const
+	/*bool operator < (const BatchDrawInfo& other) const
 	{
-		if(prog_vao_key < other.prog_vao_key)
+		if(key < other.key)
 			return true;
-		else if(prog_vao_key > other.prog_vao_key)
+		else if(key > other.key)
 			return false;
 		else
 			return ob->mesh_data.ptr() < other.ob->mesh_data.ptr();
-	}
+	}*/
 };
 
 // Similar to BatchDrawInfo, but with a distance field, so we can sort from far to near.
@@ -925,7 +942,7 @@ struct BatchDrawInfoWithDist
 {
 	BatchDrawInfoWithDist() {}
 	BatchDrawInfoWithDist(uint32 prog_index_and_face_culling_bits, uint32 vao_and_vbo_key, uint32 dist_, const GLObject* ob_)
-	:	prog_vao_key(((prog_index_and_face_culling_bits & 255u) << 24) | ((prog_index_and_face_culling_bits & ISOLATE_FACE_CULLING_MASK) >> (MATERIAL_FACE_CULLING_BIT_INDEX - 22)) | vao_and_vbo_key),
+	:	prog_vao_key(((prog_index_and_face_culling_bits & 255u) << BATCHDRAWINFO_PROGRAM_INDEX_BIT_INDEX) | ((prog_index_and_face_culling_bits & ISOLATE_FACE_CULLING_MASK) >> (MATERIAL_FACE_CULLING_BIT_INDEX - BATCHDRAWINFO_FACE_CULLING_BIT_INDEX)) | vao_and_vbo_key),
 		dist(dist_),
 		ob(ob_)
 	{}
@@ -1016,7 +1033,7 @@ struct MaterialCommonUniforms
 	int camera_type; // OpenGLScene::CameraType
 
 	int mat_common_flags;
-	float shadow_map_samples_xy_scale;
+	float padding_a0;
 	float padding_a1;
 	float padding_a2;
 
@@ -1024,6 +1041,11 @@ struct MaterialCommonUniforms
 
 	Vec4f probe_grid_origin; // xyz = world space position of grid probe (0, 0, 0).  w = probe spacing.
 	int probe_grid_dims[4];  // xyz = number of probes along each axis.  w = atlas index of grid probe (0, 0, 0).
+
+	// See ShadowMapping::dynamic_cascade_bias_scale.  Only the first NUM_DYNAMIC_DEPTH_TEXTURES and
+	// NUM_STATIC_DEPTH_TEXTURES components respectively are used.
+	Vec4f dynamic_cascade_bias_scales;
+	Vec4f static_cascade_bias_scales;
 };
 
 
@@ -1401,23 +1423,26 @@ public:
 	// GaussianSplatRenderer::getFrustumStructureReport(), so that what the splat pass cost and the report explaining that
 	// cost land in the log as one record rather than needing to be paired up by hand afterwards.  Zero when profiling is
 	// off, which is why isProfilingEnabled() is here beside them: a zero has to be readable as "not measured" rather than
-	// as "free".  All in seconds, like the members behind them.
-	double getLastDrawSplatsGPUTime() const { return last_draw_splats_GPU_time; }
-	double getLastSplatDepthBlitGPUTime() const { return last_splat_depth_blit_GPU_time; }
-	double getLastMarkSaturatedSplatsGPUTime() const { return last_mark_saturated_splats_GPU_time; }
+	// as "free".  All in seconds, like the timers behind them.
+	double getLastDrawSplatsGPUTime() const;
+	double getLastSplatDepthBlitGPUTime() const;
+	double getLastMarkSaturatedSplatsGPUTime() const;
 	bool isProfilingEnabled() const { return query_profiling_enabled; }
 
 	bool runningInRenderDoc() const { return running_in_renderdoc; }
 	//----------------------------------------------------------------------------------------
 
 	//----------------------------------- Settings ----------------------------------------
-	//void setMSAAEnabled(bool enabled);
+	void setMSAASamples(int samples); // -1 to disable MSAA.
+	int getMSAASamples() const { return settings.msaa_samples; }
 
 	void setSSAOEnabled(bool ssao_enabled); // is SSR and SSGI enabled?
 	bool isSSAOEnabled() const; // is SSR and SSGI enabled?
 
 	bool openglDriverVendorIsIntel() const; // Works after opengl_vendor is set in initialise().
 	bool openglDriverVendorIsATI() const; // Works after opengl_vendor is set in initialise().
+
+	void setShadowMappingDetail(OpenGLEngineSettings::ShadowMappingDetail level);
 
 	//---------- Irradiance probe runtime toggles ----------
 	// All of these do nothing unless OpenGLEngineSettings::irradiance_probes_support was set before initialise().
@@ -1588,13 +1613,13 @@ private:
 	void drawAlwaysVisibleObjects(const Matrix4f& view_matrix, const Matrix4f& proj_matrix);
 	void drawTransparentMaterialBatches(const Matrix4f& view_matrix, const Matrix4f& proj_matrix);
 	void drawColourAndDepthPrePass(const Matrix4f& view_matrix, const Matrix4f& proj_matrix);
-	void drawDepthPrePass(const Matrix4f& view_matrix, const Matrix4f& proj_matrix);
 	void computeSSAO(const Matrix4f& proj_matrix);
 	void drawNonTransparentMaterialBatches(const Matrix4f& view_matrix, const Matrix4f& proj_matrix);
 	void drawProbeCaptureBatches(const Matrix4f& view_matrix, const Matrix4f& proj_matrix);
 	void drawWaterObjects(const Matrix4f& view_matrix, const Matrix4f& proj_matrix);
 	void drawDecals(const Matrix4f& view_matrix, const Matrix4f& proj_matrix);
 	void drawAlphaBlendedObjects(const Matrix4f& view_matrix, const Matrix4f& proj_matrix);
+	void drawAlphaPunchThroughObjects(const Matrix4f& view_matrix, const Matrix4f& proj_matrix);
 	void drawSplatClouds(const Matrix4f& view_matrix, const Matrix4f& proj_matrix);
 	void allocSplatAccumBuffersIfNeeded(GLuint scene_target_framebuffer_name); // Allocates the framebuffer splat clouds blend into, and the depth buffer they test against.
 	// Builds the one-bit screen-space mask the splat vertex shader culls whole splats against. from_layer_count = false
@@ -1724,7 +1749,7 @@ private:
 	int probe_bake_env_phi_location;
 	bool global_sky_probe_needs_bake; // Set when cosine_env_tex changes; the bake happens at the start of the next draw().
 
-	std::vector<Reference<OpenGLTexture>> water_caustics_textures;
+	Reference<OpenGLTexture> water_caustics_texture; // GL_TEXTURE_2D_ARRAY, one layer per caustic animation frame.
 
 	Reference<OpenGLProgram> overlay_prog;
 	int overlay_diffuse_colour_location;
@@ -1853,6 +1878,7 @@ private:
 	PCG32 rng;
 
 	uint64 last_num_obs_in_frustum;
+	uint64 last_num_alpha_test_batches;
 
 	js::Vector<BatchDrawInfo, 16> temp_batch_draw_info;
 	js::Vector<BatchDrawInfo, 16> temp2_batch_draw_info; // Used for temporary working space while sorting temp_batch_draw_info
@@ -1923,10 +1949,9 @@ private:
 	Reference<Query> dynamic_depth_draw_gpu_timer;
 	Reference<Query> static_depth_draw_gpu_timer;
 	Reference<Query> draw_opaque_obs_gpu_timer;
-	Reference<Query> depth_pre_pass_gpu_timer;
+	Reference<Query> col_and_depth_pre_pass_gpu_timer;
 	Reference<Query> compute_ssao_gpu_timer;
 	Reference<Query> blur_ssao_gpu_timer;
-	Reference<Query> copy_prepass_buffers_gpu_timer;
 	Reference<Query> decal_copy_buffers_timer;
 	Reference<Query> draw_overlays_gpu_timer;
 	Reference<Query> bloom_gpu_timer;
@@ -1964,23 +1989,8 @@ private:
 	uint32 depth_draw_last_num_indices_drawn;
 public:
 	double last_total_draw_GPU_time;
+	double last_draw_opaque_sort_time;
 private:
-	double last_dynamic_depth_draw_GPU_time;
-	double last_static_depth_draw_GPU_time;
-	double last_draw_opaque_obs_GPU_time;
-	double last_depth_pre_pass_GPU_time;
-	double last_compute_ssao_GPU_time;
-	double last_blur_ssao_GPU_time;
-	double last_copy_prepass_buffers_GPU_time;
-	double last_decal_copy_buffers_GPU_time;
-	double last_draw_overlay_obs_GPU_time;
-	double last_bloom_GPU_time;
-	double last_final_imaging_GPU_time;
-	double last_fog_post_process_GPU_time;
-	double last_draw_splats_GPU_time;
-	double last_splat_depth_blit_GPU_time;
-	double last_mark_saturated_splats_GPU_time;
-
 	uint32 last_num_animated_obs_processed;
 
 	uint32 last_num_decal_batches_drawn;

@@ -80,8 +80,7 @@ uniform sampler2D detail_tex_2; // vegetation
 //uniform sampler2D detail_heightmap_0; // rock
 #endif // end #if TERRAIN
 
-uniform sampler2D caustic_tex_a;
-uniform sampler2D caustic_tex_b;
+uniform sampler2DArray caustic_tex; // One layer per caustic animation frame.
 
 #if SSAO_SUPPORT
 uniform sampler2D ssao_tex;
@@ -400,9 +399,19 @@ void main()
 	float use_roughness     = MAT_UNIFORM.roughness;
 #endif
 
+	// Cosine of angle between surface normal and sun direction, before normal-mapping is applied.
+	float pre_normal_map_sun_cos_theta;
+
 	// Get normal from normal map if we have one
 	if((use_flags & HAVE_NORMAL_MAP_FLAG) != 0)
 	{
+		// The shadow map bias is the depth change over the receiver plane, and that plane is the triangle the depth
+		// map was rasterised from, not the shading normal.  So take cos(theta) against the sun here, before the
+		// normal map perturbs the normal: perturbing it tilts the assumed plane as well, which overstates the slope
+		// on a surface that really faces the sun, and understates it on one that does not.
+		// abs() since only the tilt matters, and shadow casters are rendered with culling disabled.
+		pre_normal_map_sun_cos_theta = abs(dot(normalize(unit_normal_ws), sundir_ws.xyz));
+
 		vec2 st = main_tex_coords;
 		vec3 norm_map_v = texture(NORMAL_MAP, st).xyz;
 		norm_map_v = norm_map_v * 2.0 - vec3(1.0);
@@ -450,7 +459,10 @@ void main()
 #endif
 	}
 	else
+	{
 		unit_normal_ws = normalize(unit_normal_ws);
+		pre_normal_map_sun_cos_theta = abs(dot(unit_normal_ws, sundir_ws.xyz));
+	}
 
 	// float snow_frac = smoothstep(0.56, 0.6, normalize(unit_normal_ws).z);
 	// if(pos_ws.z < water_level_z - 3.0)
@@ -620,9 +632,14 @@ void main()
 		discard;
 #endif
 
-#if ALPHA_TEST
-	if(refl_diffuse_col.a < 0.5f)
-		discard;
+#if ALPHA_TEST 
+	if(refl_diffuse_col.a < 0.01f)
+		discard; // Zero coverage regardless of technique - bail before the expensive shading below.
+
+	//When using alpha-to-coverage, we don't discard, but rather output an alpha value that is used for MSAA coverage.
+	if((mat_common_flags & ALPHA_TO_COVERAGE_ENABLED_FLAG) == 0) // If alpha-to-coverage is disabled:
+		if(refl_diffuse_col.a < 0.5f)
+			discard;
 #endif
 
 #if DRAW_PLANAR_UV_GRID
@@ -757,10 +774,11 @@ void main()
 		// A capture's pos_cs is relative to the probe, which breaks the usual cascade selection.  See
 		// getProbeCaptureSunVisFactor().
 		if((mat_common_flags & DOING_PROBE_CAPTURE_FLAG) != 0)
-			sun_vis_factor = getProbeCaptureSunVisFactor(final_shadow_tex_coords, static_depth_tex, pixel_hash, shadow_map_samples_xy_scale, sun_light_cos_theta_factor);
+			sun_vis_factor = getProbeCaptureSunVisFactor(final_shadow_tex_coords, static_depth_tex, pixel_hash, pre_normal_map_sun_cos_theta, static_cascade_bias_scales);
 		else
 #endif
-			sun_vis_factor = getShadowMappingSunVisFactor(final_shadow_tex_coords, dynamic_depth_tex, static_depth_tex, pixel_hash, pos_cs, shadow_map_samples_xy_scale, sun_light_cos_theta_factor);
+			sun_vis_factor = getShadowMappingSunVisFactor(final_shadow_tex_coords, dynamic_depth_tex, static_depth_tex, pixel_hash, pos_cs, pre_normal_map_sun_cos_theta,
+				dynamic_cascade_bias_scales, static_cascade_bias_scales);
 	}
 
 #else // else if !SHADOW_MAPPING:
@@ -1094,13 +1112,10 @@ void main()
 	col += sun_and_sky_av_spec_rad.xyz * (1.0 - transmission); // Add in-scattered sky+sunlight
 #endif
 
-	//------------------------------- Apply underwater effects ---------------------------
+	//------------------------------- Apply underwater effects (caustics, attenuation and in-scattering) ---------------------------
 #if UNDERWATER_CAUSTICS
-	// campos_ws + cam_to_pos_ws = pos_ws
-	// campos_ws = pos_ws - cam_to_pos_ws;
-
-	float campos_z = pos_ws.z - cam_to_pos_ws.z;
-	if(/*(campos_z < -3.8) && */pos_ws.z < water_level_z)
+	float campos_z = mat_common_campos_ws.z;
+	if((pos_ws.z < water_level_z) || (campos_z < water_level_z))
 	{
 		vec3 src_col = col.xyz; // texture(main_colour_texture, vec2(refracted_px, refracted_py)).xyz * (1.0 / 0.000000003); // Get colour value at refracted ground position, undo tonemapping.
 
@@ -1119,10 +1134,24 @@ void main()
 		float water_to_ground_sun_d = max(0.0, (water_level_z - pos_ws.z) / sundir_ws.z); // TEMP HACK Assuming water surface height
 
 		float caustic_depth_factor = 0.03 + 0.9 * (smoothstep(0.1, 2.0, water_to_ground_sun_d) - 0.8 *smoothstep(2.0, 8.0, water_to_ground_sun_d)); // Caustics should not be visible just under the surface.
-		float caustic_frac = fract(time * 24.0); // Get fraction through frame, assuming 24 fps.
 		float scale_factor = 1.0; // Controls width of caustic pattern in world space.
-		// Interpolate between caustic animation frames
-		vec3 caustic_val = mix(texture(caustic_tex_a, hitpos_sunbasis * scale_factor),  texture(caustic_tex_b, hitpos_sunbasis * scale_factor), caustic_frac).xyz;
+
+		// Work out which two animation frames to blend between, assuming 24 fps.  caustic_tex is an array texture with
+		// one layer per frame, so this is all done here rather than by binding two textures on the CPU side.
+		// NOTE: wrap the time before scaling it up, not after.  time is a monotonically increasing float, so time*24.0
+		// loses fractional precision as the session goes on: after a few hours the blend between frames would quantise
+		// into visible steps and eventually stop advancing altogether.
+		float num_caustic_frames = float(textureSize(caustic_tex, 0).z);
+		float caustic_t = fract(time * (24.0 / num_caustic_frames)) * num_caustic_frames; // In [0, num_caustic_frames)
+		float caustic_frame = floor(caustic_t);
+		float caustic_frac = caustic_t - caustic_frame; // Get fraction through frame.
+
+		// Interpolate between caustic animation frames.  NOTE: the layer coordinate of an array texture is not
+		// filtered between layers, so the two layers have to be fetched and blended explicitly.
+		vec3 caustic_val = mix(
+			texture(caustic_tex, vec3(hitpos_sunbasis * scale_factor, caustic_frame)),
+			texture(caustic_tex, vec3(hitpos_sunbasis * scale_factor, mod(caustic_frame + 1.0, num_caustic_frames))),
+			caustic_frac).xyz;
 
 		// Since the caustic is focused light, we should dim the src texture slightly between the focused caustic light areas.
 		src_col *= mix(vec3(1.0), vec3(0.3, 0.5, 0.7) + vec3(3.0, 1.0, 0.8) * caustic_val * 7.0, caustic_depth_factor * sun_lambert_factor);
@@ -1161,7 +1190,16 @@ void main()
 	float dist_field_tex_val = texture(TRANSMISSION_TEX, use_texture_coords).w;
 	float alpha = smoothstep(0.5f - half_w, 0.5f + half_w, dist_field_tex_val);
 #else
-	float alpha = use_diffuse_colour.w; // Use alpha of material constant colour, for alpha cutout techniques.
+
+	float alpha;
+	#if ALPHA_TEST
+		if((mat_common_flags & ALPHA_TO_COVERAGE_ENABLED_FLAG) == 0) // If alpha-to-coverage is disabled:
+			alpha = use_diffuse_colour.w; // Use alpha of material constant colour, for alpha cutout techniques.
+		else
+			alpha = refl_diffuse_col.w; // Output texture alpha to use for coverage.
+	#else
+		alpha = use_diffuse_colour.w; // Use alpha of material constant colour, for alpha cutout/punch-through techniques (showing web view in iframe under the opengl frame in browser).
+	#endif
 #endif
 	
 #if DO_POST_PROCESSING

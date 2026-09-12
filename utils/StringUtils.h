@@ -146,7 +146,7 @@ const std::string stripTailWhitespace(const std::string& text);
 const std::string stripHeadAndTailWhitespace(const std::string& text);
 const std::string stripWhitespace(const std::string& s); // Strip all whitespace, included interior whitespace.
 const std::string collapseWhitespace(const std::string& s); // Convert runs of 1 or more whitespace characters to just the first whitespace char.
-bool isAllWhitespace(const std::string& s);
+bool isAllWhitespace(const string_view text);
 
 std::string toLowerCase(const string_view text);
 std::string toUpperCase(const string_view text);
@@ -263,6 +263,9 @@ void appendTabbed(std::string& s, const std::string& addition, int num_tabs);
 bool containsChar(const std::string& s, char c);
 bool containsString(const string_view s, const string_view target);
 bool containsStringCaseInvariant(const string_view s, const string_view target);
+
+// Return the number of times target occurs in s.  Does not count overlapping occurrences.
+size_t countOccurrences(const string_view s, const string_view target);
 
 // Replace non-printable chars with '?'
 const std::string removeNonPrintableChars(const std::string& s);

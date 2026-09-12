@@ -85,8 +85,6 @@ ${GLARE_CORE_TRUNK_DIR_ENV}/opengl/PBOAsyncTextureUploader.cpp
 ${GLARE_CORE_TRUNK_DIR_ENV}/opengl/PBOAsyncTextureUploader.h
 ${GLARE_CORE_TRUNK_DIR_ENV}/opengl/AsyncGeometryUploader.cpp
 ${GLARE_CORE_TRUNK_DIR_ENV}/opengl/AsyncGeometryUploader.h
-${GLARE_CORE_TRUNK_DIR_ENV}/opengl/RenderStatsWidget.cpp
-${GLARE_CORE_TRUNK_DIR_ENV}/opengl/RenderStatsWidget.h
 ${GLARE_CORE_TRUNK_DIR_ENV}/opengl/OpenGLUploadThread.cpp
 ${GLARE_CORE_TRUNK_DIR_ENV}/opengl/OpenGLUploadThread.h
 ${GLARE_CORE_TRUNK_DIR_ENV}/opengl/OpenGLMemoryObject.cpp
@@ -101,6 +99,7 @@ ${GLARE_CORE_TRUNK_DIR_ENV}/opengl/GaussianSplatSaturationGrid.cpp
 ${GLARE_CORE_TRUNK_DIR_ENV}/opengl/GaussianSplatSaturationGrid.h
 ${GLARE_CORE_TRUNK_DIR_ENV}/opengl/GaussianSplatPoolTask.h
 )
+# NOTE: RenderStatsWidget.cpp and .h are not included in the above because they use GLUI.
 
 
 set(opengl_ui
@@ -194,6 +193,8 @@ ${GLARE_CORE_TRUNK_DIR_ENV}/opengl/shaders/probe_bake_from_cubemap_frag_shader.g
 ${GLARE_CORE_TRUNK_DIR_ENV}/opengl/shaders/probe_convolve_frag_shader.glsl
 ${GLARE_CORE_TRUNK_DIR_ENV}/opengl/shaders/probe_debug_vert_shader.glsl
 ${GLARE_CORE_TRUNK_DIR_ENV}/opengl/shaders/probe_debug_frag_shader.glsl
+${GLARE_CORE_TRUNK_DIR_ENV}/opengl/shaders/OIT_composite_vert_shader.glsl
+${GLARE_CORE_TRUNK_DIR_ENV}/opengl/shaders/OIT_composite_frag_shader.glsl
 )
 
 

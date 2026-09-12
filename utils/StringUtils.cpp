@@ -812,7 +812,7 @@ const std::string collapseWhitespace(const std::string& s) // Convert runs of 1 
 }
 
 
-bool isAllWhitespace(const std::string& s)
+bool isAllWhitespace(const string_view s)
 {
 	for(size_t i=0; i<s.size(); ++i)
 		if(!::isWhitespace(s[i]))
@@ -1516,6 +1516,26 @@ bool containsStringCaseInvariant(const string_view s, const string_view target)
 	const auto res = std::search(s.begin(), s.end(), target.begin(), target.end(), caseInvariantCompare);
 
 	return res != s.end();
+}
+
+
+// Return the number of times target occurs in s.  Does not count overlapping occurrences.
+size_t countOccurrences(const string_view s, const string_view target)
+{
+	if(target.empty())
+		return 0;
+	size_t count = 0;
+	size_t pos = 0;
+	while(1)
+	{
+		pos = s.find(target, pos);
+		if(pos == std::string_view::npos)
+			break;
+
+		count++;
+		pos += target.size();
+	}
+	return count;
 }
 
 
@@ -3007,6 +3027,19 @@ void StringUtils::test()
 	testAssert(!containsStringCaseInvariant("abc", "ad"));
 	testAssert(!containsStringCaseInvariant("Abc", "abcd"));
 	testAssert(!containsStringCaseInvariant("", "a"));
+
+	//========================== countOccurrences ==========================
+	testAssert(countOccurrences("", "") == 0);
+	testAssert(countOccurrences("abc", "") == 0);
+	testAssert(countOccurrences("abc", "z") == 0);
+	testAssert(countOccurrences("abc", "a") == 1);
+	testAssert(countOccurrences("aac", "a") == 2);
+	testAssert(countOccurrences("aaa", "a") == 3);
+	testAssert(countOccurrences("aaaa", "aa") == 2);
+	testAssert(countOccurrences("hello", "hellZ") == 0);
+	testAssert(countOccurrences("hello", "hello") == 1);
+	testAssert(countOccurrences("hellohello", "hello") == 2);
+	testAssert(countOccurrences("hello hello", "hello") == 2);
 
 	//========================== getCharIndexForLinePosition ==========================
 	testAssert(getCharIndexForLinePosition("abc", /*line=*/0, /*col=*/0) == 0);
